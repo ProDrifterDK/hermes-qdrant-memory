@@ -1,6 +1,6 @@
 # Hermes Qdrant Memory Provider
 
-Qdrant-backed semantic memory provider for [Hermes Agent](https://github.com/NousResearch/hermes-agent), based on Alan Garate / Resyst Softwares' hippocampal associative memory system originally implemented in ResystBot, Alan's PicoClaw fork.
+Qdrant-backed semantic memory provider for [Hermes Agent](https://github.com/NousResearch/hermes-agent), based on Alan Gárate / Resyst Softwares' hippocampal associative memory system originally implemented in ResystBot, Alan's PicoClaw fork.
 
 This plugin turns Hermes memory into an external associative substrate: conversations, manually stored memories, and selected Markdown/text files are embedded into Qdrant and recalled when semantically relevant to the current turn.
 
@@ -58,19 +58,131 @@ Public beta / experimental. The MVP is functional and tested, but it depends on 
 - An OpenAI-compatible embedding endpoint at `/v1/embeddings`.
 - A known vector size that matches the embedding model.
 
-Tested local stack:
+Tested local stack used by Resyst Softwares:
 
 - Qdrant: `http://127.0.0.1:6333`
 - Embeddings: local llama.cpp OpenAI-compatible server at `http://127.0.0.1:8080/v1`
-- Model: `bge-m3`
+- Model: `bge-m3-q6_k.gguf`, exposed to Hermes as `bge-m3`
 - Vector size: `1024`
 
-Example Qdrant local service:
+### Install and run Qdrant locally
+
+The plugin needs Qdrant reachable over HTTP. The simplest local setup is Docker:
 
 ```bash
 docker run -p 6333:6333 \
   -v "$HOME/.qdrant/hermes:/qdrant/storage" \
   qdrant/qdrant
+```
+
+Recommended persistent container:
+
+```bash
+docker run -d \
+  --name hermes-qdrant \
+  --restart unless-stopped \
+  -p 6333:6333 \
+  -p 6334:6334 \
+  -v "$HOME/.qdrant/hermes:/qdrant/storage" \
+  qdrant/qdrant:latest
+```
+
+Verify Qdrant:
+
+```bash
+curl http://127.0.0.1:6333/collections
+```
+
+If you already run Qdrant elsewhere, point Hermes at it:
+
+```bash
+hermes config set qdrant_memory.qdrant_url http://127.0.0.1:6333
+```
+
+For Qdrant Cloud or another authenticated endpoint, also set:
+
+```bash
+hermes config set qdrant_memory.qdrant_api_key YOUR_QDRANT_API_KEY
+```
+
+### Install and run the local embedding server with llama.cpp
+
+This plugin does not require a specific embedding backend. It only needs an OpenAI-compatible `/v1/embeddings` API. The Resyst Softwares local setup uses llama.cpp serving `bge-m3-q6_k.gguf` on localhost.
+
+Build llama.cpp with server support:
+
+```bash
+git clone https://github.com/ggml-org/llama.cpp ~/src/llama.cpp
+cmake -S ~/src/llama.cpp -B ~/src/llama.cpp/build -DLLAMA_CURL=ON
+cmake --build ~/src/llama.cpp/build --config Release -j"$(nproc)"
+```
+
+Download a GGUF BGE-M3 embedding model. The Resyst Softwares deployment uses:
+
+```text
+~/.local/share/llama/models/bge-m3-q6_k.gguf
+```
+
+Start llama.cpp as an embedding server:
+
+```bash
+~/src/llama.cpp/build/bin/llama-server \
+  -m ~/.local/share/llama/models/bge-m3-q6_k.gguf \
+  --embeddings \
+  --port 8080 \
+  --host 127.0.0.1 \
+  -ngl 999 \
+  -c 4096
+```
+
+The currently tested Resyst Softwares service runs the same shape as a user systemd service:
+
+```ini
+[Unit]
+Description=llama.cpp embedding server (bge-m3)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/path/to/llama.cpp/build/bin/llama-server \
+    -m /path/to/bge-m3-q6_k.gguf \
+    --embeddings \
+    --port 8080 \
+    --host 127.0.0.1 \
+    -ngl 999 \
+    -c 4096
+Restart=on-failure
+RestartSec=3
+StartLimitBurst=5
+StartLimitIntervalSec=30
+
+[Install]
+WantedBy=default.target
+```
+
+Verify the embedding endpoint:
+
+```bash
+curl http://127.0.0.1:8080/v1/embeddings \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"bge-m3","input":"search_document: Hermes Qdrant memory test"}'
+```
+
+Configure Hermes for this local embedding setup:
+
+```bash
+hermes config set qdrant_memory.embedding_url http://127.0.0.1:8080/v1
+hermes config set qdrant_memory.embedding_model bge-m3
+hermes config set qdrant_memory.vector_size 1024
+hermes config set qdrant_memory.query_prefix 'search_query: '
+hermes config set qdrant_memory.document_prefix 'search_document: '
+```
+
+If llama.cpp returns an error like `input (...) is too large to process. increase the physical batch size`, reduce chunk size:
+
+```bash
+hermes config set qdrant_memory.max_chunk_tokens 128
 ```
 
 Any embedding server is acceptable if it supports OpenAI-style requests:
