@@ -1,6 +1,6 @@
 # Hermes Qdrant Memory Provider
 
-Qdrant-backed semantic memory provider for [Hermes Agent](https://github.com/NousResearch/hermes-agent), inspired by PicoClaw/Kael's hippocampal associative memory system.
+Qdrant-backed semantic memory provider for [Hermes Agent](https://github.com/NousResearch/hermes-agent), based on Alan Garate / Resyst Softwares' hippocampal associative memory system originally implemented in ResystBot, Alan's PicoClaw fork.
 
 This plugin turns Hermes memory into an external associative substrate: conversations, manually stored memories, and selected Markdown/text files are embedded into Qdrant and recalled when semantically relevant to the current turn.
 
@@ -29,7 +29,7 @@ Public beta / experimental. The MVP is functional and tested, but it depends on 
 - It does not automatically detect and remove secrets before indexing.
 - It does not guarantee truth; it retrieves semantically similar chunks.
 - It does not automatically mutate or rewrite memories through reconsolidation.
-- It is not a complete PicoClaw/Kael memory clone yet; it is the stable MemoryProvider foundation.
+- It is not a complete ResystBot memory clone yet; it is the stable MemoryProvider foundation.
 
 ## Capabilities
 
