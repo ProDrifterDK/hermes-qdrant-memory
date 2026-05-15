@@ -224,6 +224,154 @@ hermes chat -q 'Call the qdrant_memory_status tool and summarize whether qdrant_
 
 If both backends are reachable, the status tool should report `qdrant_ok: true` and `embedding_ok: true`.
 
+## AI agent install playbook
+
+This section is written for AI agents operating a user's machine. Follow it exactly unless the user gives different paths or already has Qdrant/embeddings running.
+
+### Goal
+
+Install this plugin as the active Hermes memory provider using:
+
+- plugin path: `$HOME/.hermes/plugins/qdrant`
+- Qdrant URL: `http://127.0.0.1:6333`
+- embedding URL: `http://127.0.0.1:8080/v1`
+- embedding model name in Hermes: `bge-m3`
+- embedding model file example: `~/.local/share/llama/models/bge-m3-q6_k.gguf`
+- vector size: `1024`
+- query prefix: `search_query: `
+- document prefix: `search_document: `
+
+### Agent rules
+
+1. Do not index broad directories until the user explicitly approves the target path.
+2. Always run `qdrant_memory_index` with `dry_run: true` first.
+3. Do not delete memories by query. Use `qdrant_memory_forget` only with explicit point IDs and `dry_run: true` first.
+4. If the user already has Qdrant or an embedding server, reuse it instead of starting another one.
+5. Restart Hermes/gateway only after warning the user if they are in an active gateway conversation.
+
+### Step 1: Check prerequisites
+
+```bash
+command -v hermes
+command -v git
+command -v docker || true
+curl -fsS http://127.0.0.1:6333/collections || true
+curl -fsS http://127.0.0.1:8080/v1/models || true
+```
+
+If Qdrant is not reachable and Docker is available, start Qdrant:
+
+```bash
+docker run -d \
+  --name hermes-qdrant \
+  --restart unless-stopped \
+  -p 6333:6333 \
+  -p 6334:6334 \
+  -v "$HOME/.qdrant/hermes:/qdrant/storage" \
+  qdrant/qdrant:latest
+```
+
+Verify:
+
+```bash
+curl -fsS http://127.0.0.1:6333/collections
+```
+
+### Step 2: Ensure the embedding endpoint
+
+If `http://127.0.0.1:8080/v1/embeddings` is already available, do not start a second server.
+
+If the user wants the Resyst Softwares local setup, ensure llama.cpp is built and run:
+
+```bash
+mkdir -p "$HOME/src" "$HOME/.local/share/llama/models"
+if [ ! -d "$HOME/src/llama.cpp/.git" ]; then
+  git clone https://github.com/ggml-org/llama.cpp "$HOME/src/llama.cpp"
+fi
+cmake -S "$HOME/src/llama.cpp" -B "$HOME/src/llama.cpp/build" -DLLAMA_CURL=ON
+cmake --build "$HOME/src/llama.cpp/build" --config Release -j"$(nproc)"
+```
+
+Place a BGE-M3 GGUF model at:
+
+```text
+$HOME/.local/share/llama/models/bge-m3-q6_k.gguf
+```
+
+Then start the embedding server:
+
+```bash
+"$HOME/src/llama.cpp/build/bin/llama-server" \
+  -m "$HOME/.local/share/llama/models/bge-m3-q6_k.gguf" \
+  --embeddings \
+  --port 8080 \
+  --host 127.0.0.1 \
+  -ngl 999 \
+  -c 4096
+```
+
+For long-running use, put that command in a user systemd service. After starting, verify:
+
+```bash
+curl -fsS http://127.0.0.1:8080/v1/embeddings \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"bge-m3","input":"search_document: Hermes Qdrant memory test"}' \
+  | head -c 300
+```
+
+### Step 3: Install the plugin
+
+```bash
+mkdir -p "$HOME/.hermes/plugins"
+if [ -d "$HOME/.hermes/plugins/qdrant/.git" ]; then
+  git -C "$HOME/.hermes/plugins/qdrant" pull --ff-only
+else
+  rm -rf "$HOME/.hermes/plugins/qdrant"
+  git clone https://github.com/ProDrifterDK/hermes-qdrant-memory "$HOME/.hermes/plugins/qdrant"
+fi
+```
+
+### Step 4: Configure Hermes
+
+```bash
+hermes config set memory.provider qdrant
+hermes config set qdrant_memory.enabled true
+hermes config set qdrant_memory.qdrant_url http://127.0.0.1:6333
+hermes config set qdrant_memory.embedding_url http://127.0.0.1:8080/v1
+hermes config set qdrant_memory.embedding_model bge-m3
+hermes config set qdrant_memory.vector_size 1024
+hermes config set qdrant_memory.query_prefix 'search_query: '
+hermes config set qdrant_memory.document_prefix 'search_document: '
+hermes config set qdrant_memory.max_chunk_tokens 128
+hermes config set qdrant_memory.index_dry_run_default true
+```
+
+Start a fresh Hermes CLI session or restart the gateway if the user wants gateway sessions to use the plugin immediately.
+
+### Step 5: Verify inside Hermes
+
+```bash
+hermes chat -q 'Call the qdrant_memory_status tool. Answer OK only if qdrant_ok and embedding_ok are true; otherwise answer FAIL and summarize the failing fields.' --quiet
+```
+
+Expected result: `OK`.
+
+### Step 6: Optional safe indexing
+
+Only after the user gives a path, dry-run first:
+
+```text
+Call qdrant_memory_index with {"paths":["~/Documents/Notes"],"dry_run":true,"max_files":100}
+```
+
+If the dry-run looks correct and the user approves live indexing:
+
+```text
+Call qdrant_memory_index with {"paths":["~/Documents/Notes"],"dry_run":false,"force":true,"max_files":100}
+```
+
+Then verify recall with a concrete topic from the indexed notes.
+
 ## Configuration
 
 The plugin reads config in this order:
