@@ -1,0 +1,453 @@
+from __future__ import annotations
+
+import hashlib
+import os
+import re
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterable
+
+from .schema import build_payload, score_importance
+
+DEFAULT_EXCLUDE_DIRS = {
+    ".git",
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "dist",
+    "build",
+    "target",
+    ".next",
+    ".cache",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".hg",
+    ".svn",
+}
+
+BINARYISH_EXTENSIONS = {
+    ".7z", ".a", ".bin", ".bmp", ".bz2", ".class", ".dll", ".dmg", ".doc",
+    ".docx", ".dylib", ".exe", ".gif", ".gz", ".ico", ".jar", ".jpeg",
+    ".jpg", ".lock", ".o", ".pdf", ".png", ".pyc", ".pyo", ".rar", ".so",
+    ".sqlite", ".sqlite3", ".tar", ".wasm", ".webp", ".xls", ".xlsx", ".zip",
+}
+
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+_DATE_HEADING_RE = re.compile(r"^(#{1,6})\s+(\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b.*$")
+_HR_RE = re.compile(r"^\s{0,3}([-*_])(?:\s*\1){2,}\s*$")
+_TAG_RE = re.compile(r"(?<!\w)#([A-Za-z0-9_/-]+)")
+_FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?", re.S)
+
+
+@dataclass
+class FileChunk:
+    id: str
+    text: str
+    source: str
+    source_type: str
+    file_path: str
+    file_mtime: float
+    chunk_index: int
+    chunk_count: int
+    heading: str = ""
+    tags: list[str] = field(default_factory=list)
+
+    def payload(
+        self,
+        *,
+        profile_id: str = "default",
+        platform: str = "cli",
+        session_id: str = "",
+        user_id_hash: str = "",
+        chat_id_hash: str = "",
+        project_path: str = "",
+        model: str = "",
+    ) -> dict[str, Any]:
+        payload = build_payload(
+            text=self.text,
+            source=self.source,
+            source_type=self.source_type,
+            chunk_type="file_chunk",
+            importance=score_importance(self.text, self.source_type),
+            tags=self.tags,
+            profile_id=profile_id,
+            platform=platform,
+            user_id_hash=user_id_hash,
+            chat_id_hash=chat_id_hash,
+            session_id=session_id,
+            project_path=project_path,
+            model=model,
+        )
+        payload.update(
+            {
+                "file_path": self.file_path,
+                "file_mtime": self.file_mtime,
+                "chunk_index": self.chunk_index,
+                "chunk_count": self.chunk_count,
+                "heading": self.heading,
+            }
+        )
+        return payload
+
+
+def expand_path(value: str) -> Path:
+    return Path(os.path.expandvars(os.path.expanduser(str(value)))).resolve()
+
+
+def normalize_extensions(values: Iterable[str]) -> set[str]:
+    out = set()
+    for value in values:
+        ext = str(value).strip().lower()
+        if not ext:
+            continue
+        if not ext.startswith("."):
+            ext = "." + ext
+        out.add(ext)
+    return out or {".md", ".txt"}
+
+
+def make_file_chunk_id(file_path: str, chunk_index: int) -> str:
+    digest = hashlib.sha256(f"indexed-file\n{file_path}\n{chunk_index}".encode("utf-8")).hexdigest()
+    return str(uuid.UUID(digest[:32]))
+
+
+def extract_tags(text: str) -> list[str]:
+    tags: set[str] = set(_TAG_RE.findall(text or ""))
+    match = _FRONTMATTER_RE.match(text or "")
+    if match:
+        frontmatter = match.group(1)
+        in_tags_list = False
+        for raw in frontmatter.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith("tags:"):
+                in_tags_list = True
+                rest = line.split(":", 1)[1].strip()
+                if rest.startswith("[") and rest.endswith("]"):
+                    for item in rest.strip("[]").split(","):
+                        item = item.strip().strip("'\"")
+                        if item:
+                            tags.add(item.lstrip("#"))
+                elif rest:
+                    tags.add(rest.strip("'\"").lstrip("#"))
+                continue
+            if in_tags_list and line.startswith("-"):
+                item = line[1:].strip().strip("'\"")
+                if item:
+                    tags.add(item.lstrip("#"))
+            elif not raw.startswith((" ", "\t", "-")):
+                in_tags_list = False
+    return sorted(t for t in tags if t)
+
+
+def strip_frontmatter(text: str) -> str:
+    return _FRONTMATTER_RE.sub("", text or "", count=1).strip()
+
+
+def classify_source_type(path: Path) -> str:
+    parts = {p.lower() for p in path.parts}
+    path_s = str(path).lower()
+    if "skills" in parts or "/.hermes/skills/" in path_s:
+        return "skill_doc"
+    # Obsidian vault names often contain spaces (e.g. "Example Vault"), so check
+    # substrings in the normalized full path as well as exact path components.
+    # Vault classification wins over generic docs/plans/project folders inside a vault.
+    if ".obsidian" in parts or "vault" in path_s or "obsidian" in path_s:
+        return "vault_note"
+    if any(p in parts for p in ("docs", "plans", "project", "projects")):
+        return "project_doc"
+    return "indexed_file"
+
+
+def _split_oversized(text: str, max_chars: int) -> list[str]:
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+    parts: list[str] = []
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    current = ""
+    for para in paragraphs:
+        if len(para) > max_chars:
+            if current:
+                parts.append(current.strip())
+                current = ""
+            for i in range(0, len(para), max_chars):
+                chunk = para[i : i + max_chars].strip()
+                if chunk:
+                    parts.append(chunk)
+            continue
+        candidate = para if not current else current + "\n\n" + para
+        if len(candidate) > max_chars and current:
+            parts.append(current.strip())
+            current = para
+        else:
+            current = candidate
+    if current.strip():
+        parts.append(current.strip())
+    return parts
+
+
+def chunk_markdown(text: str, *, max_chars: int) -> list[tuple[str, str]]:
+    text = strip_frontmatter(text)
+    if not text:
+        return []
+    sections: list[tuple[str, list[str]]] = []
+    current_heading = ""
+    current_lines: list[str] = []
+
+    def flush() -> None:
+        nonlocal current_lines
+        body = "\n".join(current_lines).strip()
+        if body:
+            sections.append((current_heading, current_lines[:]))
+        current_lines = []
+
+    for line in text.splitlines():
+        heading_match = _HEADING_RE.match(line)
+        date_heading_match = _DATE_HEADING_RE.match(line)
+        if heading_match or date_heading_match:
+            flush()
+            current_heading = (heading_match.group(2) if heading_match else line.lstrip("# ")).strip()
+            current_lines = [line]
+            continue
+        if _HR_RE.match(line) and current_lines and len("\n".join(current_lines)) >= max_chars // 2:
+            flush()
+            current_heading = current_heading
+            continue
+        current_lines.append(line)
+    flush()
+
+    if not sections:
+        sections = [("", text.splitlines())]
+
+    chunks: list[tuple[str, str]] = []
+    for heading, lines in sections:
+        body = "\n".join(lines).strip()
+        for piece in _split_oversized(body, max_chars):
+            chunks.append((heading, piece))
+    return chunks
+
+
+def chunk_text(text: str, *, max_chars: int) -> list[tuple[str, str]]:
+    text = (text or "").strip()
+    if not text:
+        return []
+    return [("", piece) for piece in _split_oversized(text, max_chars)]
+
+
+class FileIndexer:
+    def __init__(
+        self,
+        *,
+        qdrant=None,
+        embeddings=None,
+        collection_name: str = "hermes_memory",
+        config: dict[str, Any] | None = None,
+        profile_id: str = "default",
+        platform: str = "cli",
+        session_id: str = "",
+        user_id_hash: str = "",
+        chat_id_hash: str = "",
+        project_path: str = "",
+        model: str = "",
+    ):
+        self.qdrant = qdrant
+        self.embeddings = embeddings
+        self.collection_name = collection_name
+        self.config = config or {}
+        self.profile_id = profile_id
+        self.platform = platform
+        self.session_id = session_id
+        self.user_id_hash = user_id_hash
+        self.chat_id_hash = chat_id_hash
+        self.project_path = project_path
+        self.model = model
+
+    @property
+    def max_chars(self) -> int:
+        try:
+            tokens = int(self.config.get("max_chunk_tokens", 512))
+        except Exception:
+            tokens = 512
+        return max(400, tokens * 4)
+
+    @property
+    def extensions(self) -> set[str]:
+        return normalize_extensions(self.config.get("index_extensions", [".md", ".txt"]))
+
+    @property
+    def exclude_dirs(self) -> set[str]:
+        configured = self.config.get("index_exclude_dirs", list(DEFAULT_EXCLUDE_DIRS))
+        return {str(x) for x in configured} | DEFAULT_EXCLUDE_DIRS
+
+    def should_skip_file(self, path: Path) -> bool:
+        if path.suffix.lower() in BINARYISH_EXTENSIONS:
+            return True
+        if path.suffix.lower() not in self.extensions:
+            return True
+        if any(part in self.exclude_dirs for part in path.parts):
+            return True
+        try:
+            with path.open("rb") as handle:
+                sample = handle.read(2048)
+            if b"\x00" in sample:
+                return True
+        except Exception:
+            return True
+        return False
+
+    def iter_files(self, paths: Iterable[str | Path], *, max_files: int | None = None) -> tuple[list[Path], list[dict[str, str]]]:
+        files: list[Path] = []
+        skipped: list[dict[str, str]] = []
+        limit = int(max_files or self.config.get("index_max_files", 500) or 500)
+        for raw in paths:
+            root = expand_path(str(raw))
+            if not root.exists():
+                skipped.append({"path": str(root), "reason": "missing"})
+                continue
+            candidates = [root] if root.is_file() else []
+            if root.is_dir():
+                for dirpath, dirnames, filenames in os.walk(root):
+                    dirnames[:] = [d for d in dirnames if d not in self.exclude_dirs and d.lower() not in self.exclude_dirs]
+                    for filename in sorted(filenames):
+                        candidates.append(Path(dirpath) / filename)
+                        if len(files) + len(skipped) >= limit * 10:
+                            break
+                    if len(files) >= limit:
+                        break
+            for candidate in candidates:
+                if len(files) >= limit:
+                    skipped.append({"path": str(candidate), "reason": "max_files"})
+                    continue
+                if self.should_skip_file(candidate):
+                    skipped.append({"path": str(candidate), "reason": "excluded"})
+                    continue
+                files.append(candidate.resolve())
+        return files, skipped
+
+    def prepare_file(self, path: Path) -> list[FileChunk]:
+        path = path.resolve()
+        text = path.read_text(encoding="utf-8", errors="replace")
+        tags = extract_tags(text)
+        max_chars = self.max_chars
+        if path.suffix.lower() == ".md":
+            raw_chunks = chunk_markdown(text, max_chars=max_chars)
+        else:
+            raw_chunks = chunk_text(text, max_chars=max_chars)
+        source = str(path)
+        source_type = classify_source_type(path)
+        mtime = path.stat().st_mtime
+        count = len(raw_chunks)
+        chunks: list[FileChunk] = []
+        for index, (heading, chunk_text_value) in enumerate(raw_chunks):
+            clean = chunk_text_value.strip()
+            if not clean:
+                continue
+            chunks.append(
+                FileChunk(
+                    id=make_file_chunk_id(source, index),
+                    text=clean,
+                    source=source,
+                    source_type=source_type,
+                    file_path=source,
+                    file_mtime=mtime,
+                    chunk_index=index,
+                    chunk_count=count,
+                    heading=heading,
+                    tags=tags,
+                )
+            )
+        return chunks
+
+    def prepare(self, paths: Iterable[str | Path], *, max_files: int | None = None) -> dict[str, Any]:
+        files, skipped = self.iter_files(paths, max_files=max_files)
+        errors: list[dict[str, str]] = []
+        chunks: list[FileChunk] = []
+        indexed_files = 0
+        for path in files:
+            try:
+                file_chunks = self.prepare_file(path)
+                if file_chunks:
+                    indexed_files += 1
+                    chunks.extend(file_chunks)
+                else:
+                    skipped.append({"path": str(path), "reason": "empty"})
+            except Exception as exc:
+                errors.append({"path": str(path), "error": str(exc)})
+        return {
+            "files": files,
+            "files_seen": len(files) + len(skipped),
+            "files_indexed": indexed_files,
+            "files_skipped": len(skipped),
+            "skipped": skipped[:50],
+            "chunks": chunks,
+            "chunks_prepared": len(chunks),
+            "errors": errors[:20],
+        }
+
+    def index(self, paths: Iterable[str | Path], *, dry_run: bool = True, force: bool = False, max_files: int | None = None) -> dict[str, Any]:
+        prepared = self.prepare(paths, max_files=max_files)
+        chunks: list[FileChunk] = prepared.pop("chunks")
+        summary: dict[str, Any] = {
+            "dry_run": bool(dry_run),
+            "files_seen": prepared["files_seen"],
+            "files_indexed": prepared["files_indexed"],
+            "files_skipped": prepared["files_skipped"],
+            "chunks_prepared": len(chunks),
+            "chunks_upserted": 0,
+            "errors": list(prepared.get("errors", []))[:20],
+            "paths": [str(p) for p in paths],
+            "force": bool(force),
+        }
+        if dry_run:
+            return summary
+        if not self.qdrant or not self.embeddings:
+            summary["errors"].append({"error": "qdrant and embeddings are required when dry_run is false"})
+            return summary
+        points: list[dict[str, Any]] = []
+        file_paths_with_points: set[str] = set()
+        for chunk in chunks:
+            try:
+                payload = chunk.payload(
+                    profile_id=self.profile_id,
+                    platform=self.platform,
+                    session_id=self.session_id,
+                    user_id_hash=self.user_id_hash,
+                    chat_id_hash=self.chat_id_hash,
+                    project_path=self.project_path,
+                    model=self.model,
+                )
+                points.append({"id": chunk.id, "vector": self.embeddings.embed_document(chunk.text), "payload": payload})
+                file_paths_with_points.add(chunk.file_path)
+            except Exception as exc:
+                summary["errors"].append({"id": chunk.id, "error": str(exc)})
+        # With force=true, treat each indexed file as the source of truth: remove
+        # older chunks for that file before writing the freshly prepared chunks.
+        # This prevents stale high-index chunks from surviving after a note shrinks.
+        if force and file_paths_with_points and hasattr(self.qdrant, "delete_filter"):
+            for file_path in sorted(file_paths_with_points):
+                try:
+                    self.qdrant.delete_filter(
+                        self.collection_name,
+                        {"must": [{"key": "file_path", "match": {"value": file_path}}]},
+                    )
+                except Exception as exc:
+                    summary["errors"].append({"file_path": file_path, "error": f"delete stale chunks failed: {exc}"})
+        for i in range(0, len(points), 64):
+            batch = points[i : i + 64]
+            if not batch:
+                continue
+            try:
+                self.qdrant.upsert(self.collection_name, batch)
+                summary["chunks_upserted"] += len(batch)
+            except Exception as exc:
+                summary["errors"].append({"error": f"upsert failed: {exc}"})
+        summary["errors"] = summary["errors"][:20]
+        return summary
