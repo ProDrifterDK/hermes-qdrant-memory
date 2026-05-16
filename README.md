@@ -42,7 +42,8 @@ Public beta / experimental. The MVP is functional and tested, but it depends on 
 | Manual memory store/search/status tools | Implemented |
 | Markdown/text file indexing | Implemented |
 | Dry-run index preview | Implemented |
-| Manifest sync / stale chunk deletion | Implemented |
+| File-level manifest sync / stale chunk deletion | Implemented |
+| Directory-level deleted file sync | Implemented |
 | Legacy force reindex by `file_path` fallback | Implemented |
 | Safe forget by explicit point IDs | Implemented |
 | Learning collection | Configured, future behavior |
@@ -482,7 +483,7 @@ Call qdrant_memory_index with:
 }
 ```
 
-Reindexing uses manifest sync by `file_path`: the dry run reports stale point IDs, and live indexing deletes only stale IDs before upserting fresh chunks. `force: true` is now only needed for legacy fallback clients that cannot scroll existing points by filter.
+Reindexing uses manifest sync by `file_path`: the dry run reports stale point IDs, and live indexing deletes only stale IDs before upserting fresh chunks. When indexing a directory, M6.1 also reports/deletes chunks for files that no longer exist on disk under that directory (`deleted_file_paths`, `deleted_file_ids`). `force: true` is now only needed for legacy fallback clients that cannot scroll existing points by filter.
 
 ### `qdrant_memory_forget`
 
@@ -495,7 +496,7 @@ Before indexing a broad directory:
 1. Start with dry-run.
 2. Inspect file count, skipped files, and chunk count.
 3. Exclude private/secret-heavy directories.
-4. Inspect `stale_count` / `stale_ids` in dry-run output when reindexing changed files.
+4. Inspect `stale_count`, `stale_ids`, `deleted_file_paths`, and `deleted_file_ids` in dry-run output when reindexing changed files or directories.
 5. Verify retrieval with a concrete topic query.
 
 This plugin does not know which files are safe for your threat model. Treat indexed files as memory that may later be surfaced in model context.

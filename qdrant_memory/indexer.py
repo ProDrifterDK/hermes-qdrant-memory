@@ -132,6 +132,18 @@ def file_path_filter(file_path: str) -> dict[str, Any]:
     return {"must": [{"key": "file_path", "match": {"value": file_path}}]}
 
 
+def file_chunk_filter() -> dict[str, Any]:
+    return {"must": [{"key": "chunk_type", "match": {"value": "file_chunk"}}]}
+
+
+def is_path_within(path: str, root: Path) -> bool:
+    try:
+        Path(path).resolve().relative_to(root.resolve())
+        return True
+    except Exception:
+        return False
+
+
 def extract_tags(text: str) -> list[str]:
     tags: set[str] = set(_TAG_RE.findall(text or ""))
     match = _FRONTMATTER_RE.match(text or "")
@@ -427,6 +439,7 @@ class FileIndexer:
             "chunks": chunks,
             "chunks_prepared": len(chunks),
             "errors": errors[:20],
+            "max_files_truncated": any(item.get("reason") == "max_files" for item in skipped),
         }
 
     def index(self, paths: Iterable[str | Path], *, dry_run: bool = True, force: bool = False, max_files: int | None = None) -> dict[str, Any]:
@@ -450,6 +463,10 @@ class FileIndexer:
             "stale_count": 0,
             "files_with_stale_chunks": 0,
             "manifest_checked": False,
+            "directory_manifest_checked": False,
+            "directory_roots_checked": [],
+            "deleted_file_paths": [],
+            "deleted_file_ids": [],
             "delete_mode": "none",
             "errors": list(prepared.get("errors", []))[:20],
             "paths": [str(p) for p in input_paths],
@@ -457,6 +474,7 @@ class FileIndexer:
         }
 
         stale_ids: list[str] = []
+        stale_seen: set[str] = set()
         manifest_capable = bool(self.qdrant and callable(getattr(self.qdrant, "scroll_by_filter", None)))
         if manifest_capable:
             summary["manifest_checked"] = True
@@ -470,12 +488,56 @@ class FileIndexer:
                         with_vector=False,
                     )
                     desired = desired_ids_by_file.get(file_path, set())
-                    file_stale = [str(point.get("id")) for point in existing if point.get("id") and str(point.get("id")) not in desired]
+                    file_stale = [str(point.get("id")) for point in existing if point.get("id") is not None and str(point.get("id")) not in desired]
                     if file_stale:
                         summary["files_with_stale_chunks"] += 1
-                        stale_ids.extend(file_stale)
+                        for point_id in file_stale:
+                            if point_id not in stale_seen:
+                                stale_seen.add(point_id)
+                                stale_ids.append(point_id)
                 except Exception as exc:
                     summary["errors"].append({"file_path": file_path, "error": f"manifest sync failed: {exc}"})
+
+            directory_roots = [expand_path(str(path)) for path in input_paths if expand_path(str(path)).is_dir()]
+            max_file_truncated = bool(prepared.get("max_files_truncated"))
+            if directory_roots and not max_file_truncated:
+                summary["directory_manifest_checked"] = True
+                summary["directory_roots_checked"] = [str(root) for root in directory_roots]
+                try:
+                    existing_file_chunks = self.qdrant.scroll_by_filter(
+                        self.collection_name,
+                        file_chunk_filter(),
+                        limit=256,
+                        with_payload=True,
+                        with_vector=False,
+                    )
+                    current_file_paths = set(desired_ids_by_file)
+                    deleted_ids_by_path: dict[str, list[str]] = {}
+                    for point in existing_file_chunks:
+                        payload = point.get("payload", {}) or {}
+                        existing_path = str(payload.get("file_path") or "")
+                        point_id = point.get("id")
+                        if not existing_path or point_id is None:
+                            continue
+                        if existing_path in current_file_paths:
+                            continue
+                        if Path(existing_path).exists():
+                            continue
+                        if not any(is_path_within(existing_path, root) for root in directory_roots):
+                            continue
+                        deleted_ids_by_path.setdefault(existing_path, []).append(str(point_id))
+                    for deleted_path in sorted(deleted_ids_by_path):
+                        summary["deleted_file_paths"].append(deleted_path)
+                        for point_id in deleted_ids_by_path[deleted_path]:
+                            summary["deleted_file_ids"].append(point_id)
+                            if point_id not in stale_seen:
+                                stale_seen.add(point_id)
+                                stale_ids.append(point_id)
+                    if deleted_ids_by_path:
+                        summary["files_with_stale_chunks"] += len(deleted_ids_by_path)
+                except Exception as exc:
+                    summary["errors"].append({"error": f"directory manifest sync failed: {exc}"})
+
             summary["stale_ids"] = stale_ids
             summary["stale_count"] = len(stale_ids)
             if stale_ids:

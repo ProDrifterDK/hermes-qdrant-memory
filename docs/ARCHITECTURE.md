@@ -80,6 +80,16 @@ Each file chunk carries manifest metadata (`file_sha256`, `file_size`, `chunk_id
 - `force: true` falls back to broad `delete_filter(file_path)` only for older clients that cannot scroll existing points.
 - empty files still participate in manifest sync, so shrinking a file to zero chunks removes all previous chunks for that file.
 
+When an input path is a directory, M6.1 also performs directory-level deletion sync:
+
+- scroll existing `chunk_type=file_chunk` points;
+- client-side filter to points whose `file_path` is under the indexed directory roots;
+- compare against the current file manifest;
+- report `deleted_file_paths` and `deleted_file_ids` in dry-run;
+- delete those IDs in live mode only when the path no longer exists on disk.
+
+Directory deletion sync is disabled when file walking hits `max_files`, because a truncated walk is not a safe source of truth.
+
 ## Source types
 
 Common `source_type` values:
@@ -110,6 +120,6 @@ For shared gateway deployments, avoid `global` unless you explicitly want cross-
 - Auto-recall is context-only; retrieved memory is not itself a command.
 - The writer strips known injected memory markers to reduce recursive contamination.
 - File indexing defaults to dry-run.
-- File reindexing uses manifest sync to prevent stale high-index chunks after a file shrinks.
+- File reindexing uses manifest sync to prevent stale high-index chunks after a file shrinks and stale chunks after files are deleted from indexed directories.
 - Deletion requires explicit point IDs and defaults to dry-run.
 - Reconsolidation is not enabled in this MVP.

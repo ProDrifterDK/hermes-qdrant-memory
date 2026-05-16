@@ -96,4 +96,11 @@ Use `max_files`, dry-run, and small initial directories before broad indexing.
 
 ## Directory deletion sync
 
-Manifest sync reconciles files that are present in the current indexing run, including files that shrink to zero chunks. It does not yet maintain a persistent directory-level manifest, so chunks for files deleted or renamed outside the current run may remain until explicitly forgotten or a future directory manifest feature is added.
+M6.1 supports conservative directory-level deletion sync. When the input path is a directory, the indexer can detect existing Qdrant file chunks whose `file_path` is under that directory but whose file no longer exists on disk. Dry-run reports `deleted_file_paths` and `deleted_file_ids`; live indexing deletes those explicit IDs.
+
+Safety constraints:
+
+- directory deletion sync is skipped if walking hit `max_files`, because a truncated walk is not a complete source of truth;
+- existing files that are merely excluded by extension/config are not deleted;
+- only points with `chunk_type=file_chunk` participate in directory deletion sync;
+- paths outside the explicitly indexed directory roots are ignored.

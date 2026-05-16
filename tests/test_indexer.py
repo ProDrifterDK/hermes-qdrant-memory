@@ -36,8 +36,18 @@ class FakeQdrant:
         return {"status": "ok"}
 
     def scroll_by_filter(self, name, filter, limit=256, with_payload=True, with_vector=False):
-        target = filter["must"][0]["match"]["value"]
-        return [point for point in self.points if point.get("payload", {}).get("file_path") == target]
+        must = filter.get("must", [])
+
+        def matches(point):
+            payload = point.get("payload", {})
+            for clause in must:
+                key = clause["key"]
+                value = clause["match"]["value"]
+                if payload.get(key) != value:
+                    return False
+            return True
+
+        return [point for point in self.points if matches(point)]
 
 
 class FakeLegacyQdrant(FakeQdrant):
@@ -287,6 +297,99 @@ def test_empty_file_with_existing_chunks_reports_all_existing_as_stale(tmp_path)
     assert dry["stale_ids"] == old_ids
     assert live["chunks_deleted"] == 2
     assert qdrant.deleted == [("c", old_ids)]
+
+
+def test_dry_run_directory_sync_reports_deleted_files_without_mutation(tmp_path):
+    keep = tmp_path / "keep.md"
+    keep.write_text("# Keep\ncurrent", encoding="utf-8")
+    removed_path = str((tmp_path / "removed.md").resolve())
+    removed_id = make_file_chunk_id(removed_path, 0)
+    qdrant = FakeQdrant()
+    qdrant.points = [
+        {"id": make_file_chunk_id(str(keep.resolve()), 0), "payload": {"file_path": str(keep.resolve()), "chunk_type": "file_chunk"}},
+        {"id": removed_id, "payload": {"file_path": removed_path, "chunk_type": "file_chunk"}},
+    ]
+    emb = FakeEmbedding()
+    indexer = FileIndexer(qdrant=qdrant, embeddings=emb, collection_name="c", config={"max_chunk_tokens": 128})
+
+    summary = indexer.index([tmp_path], dry_run=True)
+
+    assert summary["directory_manifest_checked"] is True
+    assert summary["deleted_file_paths"] == [removed_path]
+    assert summary["deleted_file_ids"] == [removed_id]
+    assert summary["stale_ids"] == [removed_id]
+    assert summary["chunks_deleted"] == 0
+    assert qdrant.deleted == []
+    assert qdrant.upserts == []
+    assert emb.documents == []
+
+
+def test_live_directory_sync_deletes_chunks_for_removed_files(tmp_path):
+    keep = tmp_path / "keep.md"
+    keep.write_text("# Keep\ncurrent", encoding="utf-8")
+    removed_path = str((tmp_path / "removed.md").resolve())
+    removed_id = make_file_chunk_id(removed_path, 0)
+    qdrant = FakeQdrant()
+    qdrant.points = [
+        {"id": removed_id, "payload": {"file_path": removed_path, "chunk_type": "file_chunk"}},
+    ]
+    indexer = FileIndexer(qdrant=qdrant, embeddings=FakeEmbedding(), collection_name="c", config={"max_chunk_tokens": 128})
+
+    summary = indexer.index([tmp_path], dry_run=False)
+
+    assert summary["directory_manifest_checked"] is True
+    assert summary["deleted_file_paths"] == [removed_path]
+    assert summary["chunks_deleted"] == 1
+    assert qdrant.deleted == [("c", [removed_id])]
+
+
+def test_directory_sync_does_not_delete_existing_but_excluded_file(tmp_path):
+    path = tmp_path / "note.txt"
+    path.write_text("still here", encoding="utf-8")
+    file_path = str(path.resolve())
+    point_id = make_file_chunk_id(file_path, 0)
+    qdrant = FakeQdrant()
+    qdrant.points = [{"id": point_id, "payload": {"file_path": file_path, "chunk_type": "file_chunk"}}]
+    indexer = FileIndexer(
+        qdrant=qdrant,
+        embeddings=FakeEmbedding(),
+        collection_name="c",
+        config={"index_extensions": [".md"], "max_chunk_tokens": 128},
+    )
+
+    summary = indexer.index([tmp_path], dry_run=False)
+
+    assert summary["directory_manifest_checked"] is True
+    assert summary["deleted_file_paths"] == []
+    assert summary["deleted_file_ids"] == []
+    assert summary["chunks_deleted"] == 0
+    assert qdrant.deleted == []
+
+
+def test_directory_sync_is_skipped_when_max_files_truncates_walk_after_many_skips(tmp_path):
+    for i in range(60):
+        (tmp_path / f"a{i:02d}.bin").write_bytes(b"binary-ish")
+    keep = tmp_path / "z_keep.md"
+    extra = tmp_path / "z_extra.md"
+    keep.write_text("# Keep", encoding="utf-8")
+    extra.write_text("# Extra", encoding="utf-8")
+    removed_path = str((tmp_path / "z_removed.md").resolve())
+    removed_id = make_file_chunk_id(removed_path, 0)
+    qdrant = FakeQdrant()
+    qdrant.points = [{"id": removed_id, "payload": {"file_path": removed_path, "chunk_type": "file_chunk"}}]
+    indexer = FileIndexer(
+        qdrant=qdrant,
+        embeddings=FakeEmbedding(),
+        collection_name="c",
+        config={"index_max_files": 1, "max_chunk_tokens": 128},
+    )
+
+    summary = indexer.index([tmp_path], dry_run=False)
+
+    assert summary["directory_manifest_checked"] is False
+    assert summary["deleted_file_paths"] == []
+    assert summary["chunks_deleted"] == 0
+    assert qdrant.deleted == []
 
 
 def test_provider_index_tool_requires_paths_when_unconfigured():
