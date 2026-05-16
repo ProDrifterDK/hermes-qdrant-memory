@@ -22,7 +22,7 @@ DEFAULTS: dict[str, Any] = {
     "display_tokens": 300,
     "sync_turns": True,
     "sync_subagents": False,
-    "learning_enabled": False,
+    "learning_enabled": True,
     "consolidation_enabled": False,
     "reconsolidation_enabled": False,
     "query_prefix": "search_query: ",

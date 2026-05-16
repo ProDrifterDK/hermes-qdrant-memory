@@ -31,6 +31,7 @@ from qdrant_memory.client import QdrantClient
 from qdrant_memory.config import load_config
 from qdrant_memory.embeddings import EmbeddingClient
 from qdrant_memory.indexer import FileIndexer
+from qdrant_memory.learning import LearningStore
 from qdrant_memory.retriever import MemoryRetriever, format_for_prompt
 from qdrant_memory.tools import TOOL_SCHEMAS
 from qdrant_memory.writer import ConversationWriter
@@ -54,6 +55,7 @@ class QdrantMemoryProvider(MemoryProvider):
         self._qdrant: Optional[QdrantClient] = None
         self._embeddings: Optional[EmbeddingClient] = None
         self._retriever: Optional[MemoryRetriever] = None
+        self._learning_store: Optional[LearningStore] = None
         self._writer: Optional[ConversationWriter] = None
         self._executor: Optional[ThreadPoolExecutor] = None
         self._prefetch_cache: dict[str, str] = {}
@@ -126,6 +128,22 @@ class QdrantMemoryProvider(MemoryProvider):
             chat_id_hash=self._chat_id_hash,
             model=self._config["embedding_model"],
         )
+        self._learning_store = LearningStore(
+            qdrant=self._qdrant,
+            embeddings=self._embeddings,
+            collection_name=self._config["learning_collection_name"],
+            profile_id=self._profile_id,
+            platform=self._platform,
+            session_id=self._session_id,
+            user_id_hash=self._user_id_hash,
+            chat_id_hash=self._chat_id_hash,
+            model=self._config["embedding_model"],
+            scope=scope,
+            search_candidates=self._config["search_candidates"],
+            decay_rate=self._config["decay_rate"],
+            min_raw_score=self._config.get("min_raw_score", 0.0),
+            min_final_score=self._config.get("min_final_score", 0.0),
+        )
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="qdrant-memory")
         try:
             self._qdrant.ensure_collection(self._config["collection_name"], self._config["vector_size"], self._config["distance"])
@@ -150,7 +168,8 @@ class QdrantMemoryProvider(MemoryProvider):
         return (
             "# Qdrant Memory\n"
             "Active local long-term semantic memory. Use qdrant_memory_search, "
-            "qdrant_memory_store, qdrant_memory_index, and qdrant_memory_status for explicit memory operations."
+            "qdrant_memory_store, qdrant_memory_index, qdrant_learning_search, "
+            "qdrant_learning_store, and qdrant_memory_status for explicit memory operations."
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
@@ -212,6 +231,8 @@ class QdrantMemoryProvider(MemoryProvider):
         self._session_id = new_session_id or ""
         if self._writer:
             self._writer.session_id = self._session_id
+        if self._learning_store:
+            self._learning_store.session_id = self._session_id
         if reset:
             with self._prefetch_lock:
                 self._prefetch_cache.clear()
@@ -254,7 +275,9 @@ class QdrantMemoryProvider(MemoryProvider):
             "vector_size": self._config["vector_size"],
             "point_count": point_count,
             "learning_collection_name": self._config["learning_collection_name"],
+            "learning_collection_exists": self._config["learning_collection_name"] in collections,
             "learning_point_count": learning_point_count,
+            "learning_enabled": self._config.get("learning_enabled", True),
             "auto_recall": self._config["auto_recall"],
             "sync_turns": self._config["sync_turns"],
         }
@@ -357,6 +380,98 @@ class QdrantMemoryProvider(MemoryProvider):
         except Exception as exc:
             return _json_error(f"Forget failed: {exc}")
 
+    def _ensure_learning_store(self) -> Optional[LearningStore]:
+        if self._learning_store:
+            return self._learning_store
+        if not self._qdrant or not self._embeddings:
+            return None
+        self._learning_store = LearningStore(
+            qdrant=self._qdrant,
+            embeddings=self._embeddings,
+            collection_name=self._config["learning_collection_name"],
+            profile_id=self._profile_id,
+            platform=self._platform,
+            session_id=self._session_id,
+            user_id_hash=self._user_id_hash,
+            chat_id_hash=self._chat_id_hash,
+            model=self._config.get("embedding_model", ""),
+            scope=self._scope_filter_values(),
+            search_candidates=self._config.get("search_candidates", 20),
+            decay_rate=self._config.get("decay_rate", 0.001),
+            min_raw_score=self._config.get("min_raw_score", 0.0),
+            min_final_score=self._config.get("min_final_score", 0.0),
+        )
+        return self._learning_store
+
+    def _tool_learning_store(self, args: dict) -> str:
+        if not self._config.get("learning_enabled", True):
+            return _json_error("Qdrant learning tools are disabled by qdrant_memory.learning_enabled")
+        store = self._ensure_learning_store()
+        if not store:
+            return _json_error("Qdrant learning store is not initialized")
+        lesson = str(args.get("lesson") or "").strip()
+        if not lesson:
+            return _json_error("lesson is required")
+        tags = args.get("tags") or []
+        if not isinstance(tags, list):
+            tags = []
+        try:
+            importance = max(1, min(10, int(args.get("importance", 7))))
+        except Exception:
+            importance = 7
+        try:
+            confidence = max(0.0, min(1.0, float(args.get("confidence", 0.8))))
+        except Exception:
+            confidence = 0.8
+        try:
+            point_id = store.store(
+                lesson=lesson,
+                learning_type=str(args.get("learning_type") or ""),
+                trigger=str(args.get("trigger") or ""),
+                mistake=str(args.get("mistake") or ""),
+                correction=str(args.get("correction") or ""),
+                evidence=str(args.get("evidence") or ""),
+                tool_name=str(args.get("tool_name") or ""),
+                command=str(args.get("command") or ""),
+                importance=importance,
+                confidence=confidence,
+                tags=[str(t) for t in tags],
+                promote_to_skill_candidate=bool(args.get("promote_to_skill_candidate", False)),
+            )
+            return json.dumps({"saved": bool(point_id), "id": point_id, "collection_name": self._config["learning_collection_name"]})
+        except Exception as exc:
+            return _json_error(f"Failed to store learning: {exc}")
+
+    def _tool_learning_search(self, args: dict) -> str:
+        if not self._config.get("learning_enabled", True):
+            return _json_error("Qdrant learning tools are disabled by qdrant_memory.learning_enabled")
+        store = self._ensure_learning_store()
+        if not store:
+            return _json_error("Qdrant learning store is not initialized")
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return _json_error("query is required")
+        try:
+            top_k = max(1, min(20, int(args.get("top_k", 5))))
+        except Exception:
+            top_k = 5
+        include_metadata = bool(args.get("include_metadata", False))
+        learning_type = args.get("learning_type") or None
+        try:
+            chunks = store.search(query, top_k=top_k, learning_type=learning_type)
+            results = []
+            for chunk in chunks:
+                item: dict[str, Any] = {"id": chunk.id, "text": chunk.text, "score": round(chunk.final_score, 6)}
+                payload = chunk.payload or {}
+                if payload.get("learning_type"):
+                    item["learning_type"] = payload.get("learning_type")
+                if include_metadata:
+                    item["metadata"] = payload
+                results.append(item)
+            return json.dumps({"results": results, "count": len(results), "collection_name": self._config["learning_collection_name"]})
+        except Exception as exc:
+            return _json_error(f"Learning search failed: {exc}")
+
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         args = args or {}
         if tool_name == "qdrant_memory_status":
@@ -369,6 +484,10 @@ class QdrantMemoryProvider(MemoryProvider):
             return self._tool_index(args)
         if tool_name == "qdrant_memory_forget":
             return self._tool_forget(args)
+        if tool_name == "qdrant_learning_store":
+            return self._tool_learning_store(args)
+        if tool_name == "qdrant_learning_search":
+            return self._tool_learning_search(args)
         return _json_error(f"Unknown tool: {tool_name}")
 
     def shutdown(self) -> None:

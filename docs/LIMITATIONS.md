@@ -50,9 +50,11 @@ Low thresholds can surface weakly related chunks. Tune:
 - `min_final_score`
 - `display_tokens`
 
-## Learning is not complete
+## Learning is manual/gated
 
-The `hermes_learnings` collection exists as a future target for procedural lessons, tool failures, and user corrections. The MVP does not yet implement a mature learning pipeline.
+M7 implements the `hermes_learnings` collection plus explicit `qdrant_learning_store` and `qdrant_learning_search` tools. These tools are enabled by default and can be disabled with `qdrant_memory.learning_enabled: false`.
+
+It does not yet implement automatic learning extraction from every tool failure or user correction. That is intentionally deferred until stronger gating exists, because automatic learning can overfit transient errors or turn stale context into false procedures.
 
 ## Consolidation is not complete
 

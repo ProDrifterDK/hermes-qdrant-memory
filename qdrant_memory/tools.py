@@ -67,4 +67,47 @@ FORGET_SCHEMA = {
     },
 }
 
-TOOL_SCHEMAS = [STATUS_SCHEMA, STORE_SCHEMA, SEARCH_SCHEMA, INDEX_SCHEMA, FORGET_SCHEMA]
+LEARNING_STORE_SCHEMA = {
+    "name": "qdrant_learning_store",
+    "description": "Store an explicit procedural learning in the separate Qdrant learning collection. Manual/gated only; not automatic learning.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "lesson": {"type": "string", "description": "The durable lesson/procedure learned."},
+            "learning_type": {
+                "type": "string",
+                "description": "tool_failure_lesson, user_correction, workflow_lesson, or environment_quirk. Auto-classified if omitted.",
+            },
+            "trigger": {"type": "string", "description": "Situation that should trigger recall of this lesson."},
+            "mistake": {"type": "string", "description": "What went wrong or what should be avoided."},
+            "correction": {"type": "string", "description": "The corrected action/procedure."},
+            "evidence": {"type": "string", "description": "Evidence that supports the lesson."},
+            "tool_name": {"type": "string", "description": "Tool involved, if any."},
+            "command": {"type": "string", "description": "Command involved, if any."},
+            "importance": {"type": "integer", "description": "Importance from 1 to 10. Defaults to 7.", "minimum": 1, "maximum": 10},
+            "confidence": {"type": "number", "description": "Confidence 0 to 1. Defaults to 0.8.", "minimum": 0, "maximum": 1},
+            "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional tags."},
+            "promote_to_skill_candidate": {"type": "boolean", "description": "Mark as candidate for future skill promotion. Defaults false."},
+        },
+        "required": ["lesson"],
+        "additionalProperties": False,
+    },
+}
+
+LEARNING_SEARCH_SCHEMA = {
+    "name": "qdrant_learning_search",
+    "description": "Search procedural learnings from the separate Qdrant learning collection.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "What procedural lesson to search for."},
+            "top_k": {"type": "integer", "description": "Maximum results, 1 to 20. Defaults to 5.", "minimum": 1, "maximum": 20},
+            "learning_type": {"type": "string", "description": "Optional learning_type filter."},
+            "include_metadata": {"type": "boolean", "description": "Include full payload metadata. Defaults to false."},
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    },
+}
+
+TOOL_SCHEMAS = [STATUS_SCHEMA, STORE_SCHEMA, SEARCH_SCHEMA, INDEX_SCHEMA, FORGET_SCHEMA, LEARNING_STORE_SCHEMA, LEARNING_SEARCH_SCHEMA]

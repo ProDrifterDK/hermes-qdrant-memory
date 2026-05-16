@@ -33,7 +33,7 @@ It is intentionally not a context engine. Context engines such as LCM recover de
 Default collections:
 
 - `hermes_memory` — conversations, manual memories, indexed files.
-- `hermes_learnings` — reserved for future procedural/outcome learning.
+- `hermes_learnings` — procedural lessons, tool failure lessons, workflow lessons, environment quirks, and user corrections.
 
 ## Payload fields
 
@@ -68,6 +68,24 @@ Typical payload fields include:
 - `chunk_index`
 - `chunk_count`
 - `heading`
+
+## Learning collection
+
+M7 separates declarative memory from procedural learning:
+
+- `hermes_memory` stores conversations, manual memories, and indexed files.
+- `hermes_learnings` stores operational lessons that should change future behavior.
+
+Learning payloads use `source_type=learning` plus `learning_type` / `chunk_type` values:
+
+- `tool_failure_lesson`
+- `user_correction`
+- `workflow_lesson`
+- `environment_quirk`
+
+Learning payloads also carry `trigger`, `mistake`, `correction`, `evidence`, `tool_name`, `command`, and `promote_to_skill_candidate` fields.
+
+M7 is manual/gated: use `qdrant_learning_store` and `qdrant_learning_search`. Automatic extraction from every tool failure is intentionally deferred. `qdrant_memory.learning_enabled` controls whether the explicit learning tools are available.
 
 ## File manifest sync
 

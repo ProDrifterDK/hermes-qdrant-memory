@@ -46,7 +46,7 @@ Public beta / experimental. The MVP is functional and tested, but it depends on 
 | Directory-level deleted file sync | Implemented |
 | Legacy force reindex by `file_path` fallback | Implemented |
 | Safe forget by explicit point IDs | Implemented |
-| Learning collection | Configured, future behavior |
+| Manual procedural learning collection | Implemented |
 | Sleep consolidation | Future |
 | Reconsolidation | Future, disabled by design |
 | Dashboard/UI | Not included |
@@ -488,6 +488,33 @@ Reindexing uses manifest sync by `file_path`: the dry run reports stale point ID
 ### `qdrant_memory_forget`
 
 Deletes explicit point IDs only. Dry-run defaults to true. There is intentionally no query-based deletion without preview.
+
+### `qdrant_learning_store`
+
+Stores an explicit procedural learning in the separate `hermes_learnings` collection. This is manual/gated in M7; the plugin does not auto-learn from every tool failure. Set `qdrant_memory.learning_enabled: false` to disable these learning tools.
+
+Useful fields:
+
+- `lesson`
+- `learning_type`: `tool_failure_lesson`, `user_correction`, `workflow_lesson`, or `environment_quirk`
+- `trigger`
+- `mistake`
+- `correction`
+- `evidence`
+- `tool_name`
+- `command`
+- `promote_to_skill_candidate`
+
+### `qdrant_learning_search`
+
+Semantic search over procedural learnings in `hermes_learnings`, separate from declarative/conversation/file memory.
+
+Useful arguments:
+
+- `query`
+- `top_k`
+- `learning_type`
+- `include_metadata`
 
 ## Indexing safety
 

@@ -17,7 +17,9 @@ Expected fields:
   "qdrant_ok": true,
   "embedding_ok": true,
   "collection_name": "hermes_memory",
-  "point_count": 123
+  "point_count": 123,
+  "learning_collection_name": "hermes_learnings",
+  "learning_point_count": 12
 }
 ```
 
@@ -95,6 +97,38 @@ Example:
 
 ```bash
 hermes chat -q 'Without using tools, if Qdrant memory contains context about Project X, answer with the file_path of the most relevant memory; otherwise answer NO_QDRANT_CONTEXT.' --quiet
+```
+
+## Store a procedural learning
+
+Ask Hermes:
+
+```text
+Store this as a Qdrant learning: lesson="When llama.cpp embeddings fail with physical batch size 512, lower qdrant_memory.max_chunk_tokens to 128." learning_type=tool_failure_lesson trigger="embedding HTTP 500 input too large" correction="set max_chunk_tokens=128" evidence="vault-wide indexing passes after lowering chunk size"
+```
+
+Equivalent tool payload:
+
+```json
+{
+  "lesson": "When llama.cpp embeddings fail with physical batch size 512, lower qdrant_memory.max_chunk_tokens to 128.",
+  "learning_type": "tool_failure_lesson",
+  "trigger": "embedding HTTP 500 input too large",
+  "correction": "set max_chunk_tokens=128",
+  "evidence": "vault-wide indexing passes after lowering chunk size",
+  "tool_name": "qdrant_memory_index"
+}
+```
+
+## Search procedural learnings
+
+```json
+{
+  "query": "llama.cpp embedding input too large",
+  "learning_type": "tool_failure_lesson",
+  "top_k": 5,
+  "include_metadata": true
+}
 ```
 
 ## Safe delete
