@@ -107,7 +107,7 @@ hermes config set qdrant_memory.qdrant_url http://127.0.0.1:6333
 For Qdrant Cloud or another authenticated endpoint, also set:
 
 ```bash
-hermes config set qdrant_memory.qdrant_api_key YOUR_QDRANT_API_KEY
+hermes config set qdrant_memory.qdrant_api_key '<REDACTED_QDRANT_API_KEY>'
 ```
 
 ### Install and run the local embedding server with llama.cpp
@@ -532,6 +532,8 @@ Useful arguments:
 
 Proposal types include duplicate clusters, stale low-value memory candidates, learning promotion candidates, quality warnings such as possible secret-bearing memories, and optional reconsolidation candidates.
 
+For operational report review and watcher usage, see [docs/OPERATIONS.md](docs/OPERATIONS.md).
+
 ### `qdrant_memory_consolidation_apply`
 
 M9b/M9c apply exactly one persisted proposal by `report_id` + `proposal_id`. Dry-run defaults to true and returns a concrete operation plan without mutating Qdrant or writing skill drafts. Live mode requires both `dry_run: false` and `approve: true`.
@@ -544,6 +546,8 @@ Supported actions:
 - `draft_review`: only for `reconsolidation_candidate`; creates a local markdown review draft under `$HERMES_HOME/qdrant_memory/consolidation/reconsolidation_drafts/`. It does not mutate Qdrant memory.
 
 `quality_warning` proposals are manual-review only and cannot be applied automatically. Reconsolidation drafts are also manual artifacts: they can guide a human/agent to later perform explicit memory edits, but M10 never rewrites facts directly.
+
+For the approved apply flow and post-apply verification, see [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ### `qdrant_learning_store`
 
@@ -594,7 +598,8 @@ Before indexing a broad directory:
 
 This plugin does not know which files are safe for your threat model. Treat indexed files as memory that may later be surfaced in model context.
 
-For the full canonical safety contract, see `docs/SAFETY.md`.
+For the full canonical safety contract, see [docs/SAFETY.md](docs/SAFETY.md).
+For operational checks and approved maintenance procedures, see [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ## Philosophy
 
@@ -620,12 +625,13 @@ No third-party Python package is required by the plugin runtime; it uses the Pyt
 
 ## Documentation
 
-- `docs/SAFETY.md` — canonical safety contract for indexing, deletion, consolidation, reconsolidation, cron/reporting, and scanner-safe docs/tests.
-- `docs/ARCHITECTURE.md`
-- `docs/REQUIREMENTS.md`
-- `docs/LIMITATIONS.md`
-- `docs/EXAMPLES.md`
-- `docs/PLUGIN_ROADMAP.md`
+- [docs/SAFETY.md](docs/SAFETY.md) — canonical safety contract for indexing, deletion, consolidation, reconsolidation, cron/reporting, and scanner-safe docs/tests.
+- [docs/OPERATIONS.md](docs/OPERATIONS.md) — operator runbook for status checks, smoke tests, watcher reports, approved apply flow, post-apply verification, gateway/process restarts, and troubleshooting.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md)
+- [docs/LIMITATIONS.md](docs/LIMITATIONS.md)
+- [docs/EXAMPLES.md](docs/EXAMPLES.md)
+- [docs/PLUGIN_ROADMAP.md](docs/PLUGIN_ROADMAP.md)
 
 ## License
 

@@ -4,6 +4,8 @@
 
 This document is the canonical safety contract for indexing, deletion, learning approval, consolidation, reconsolidation, cron/reporting, local artifacts, and scanner-safe docs/tests.
 
+Operational runbook: [OPERATIONS.md](OPERATIONS.md).
+
 ---
 
 ## 1. Boundary: MemoryProvider, not context engine

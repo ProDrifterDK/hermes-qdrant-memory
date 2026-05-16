@@ -649,6 +649,8 @@ python -m pytest tests/test_consolidation.py tests/test_consolidation_apply.py t
 - Create: `docs/OPERATIONS.md`
 - Modify: `README.md`
 
+Status: completed in `docs/OPERATIONS.md`.
+
 **Minimum sections:**
 
 - Status check.
