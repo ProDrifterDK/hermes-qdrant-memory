@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from qdrant_memory.config import load_config
-from qdrant_memory.indexer import FileIndexer, chunk_markdown, chunk_text, classify_source_type, make_file_chunk_id
+from qdrant_memory.indexer import FileChunk, FileIndexer, chunk_markdown, chunk_text, classify_source_type, make_file_chunk_id
 from qdrant_memory.tools import FORGET_SCHEMA, INDEX_SCHEMA
 
 
@@ -126,6 +126,76 @@ def test_prepare_file_metadata_classification_tags_and_idempotent_ids(tmp_path):
     assert "roadmap" in first[0].tags
     assert "decision" in first[0].tags
     assert first[0].payload()["file_path"] == str(path.resolve())
+
+
+def test_file_chunk_payload_adds_fact_metadata_from_explicit_fact_tag():
+    chunk = FileChunk(
+        id="chunk-1",
+        text="The production API endpoint is /api/v2.",
+        source="test.md",
+        source_type="vault_note",
+        file_path="/vault/test.md",
+        file_mtime=1.0,
+        file_size=12,
+        file_sha256="abc",
+        chunk_index=0,
+        chunk_count=1,
+        chunk_hash="hash",
+        heading="API",
+        tags=["fact:production.api.endpoint"],
+    )
+
+    payload = chunk.payload()
+
+    assert payload["fact_key"] == "production.api.endpoint"
+    assert payload["reconsolidation_key"] == "production.api.endpoint"
+    assert payload["topic"] == "API"
+
+
+def test_file_chunk_payload_uses_heading_as_topic_not_fact_key_when_weak():
+    chunk = FileChunk(
+        id="chunk-1",
+        text="General notes and loose ideas.",
+        source="notes.md",
+        source_type="vault_note",
+        file_path="/vault/notes.md",
+        file_mtime=1.0,
+        file_size=12,
+        file_sha256="abc",
+        chunk_index=0,
+        chunk_count=1,
+        chunk_hash="hash",
+        heading="Notes",
+    )
+
+    payload = chunk.payload()
+
+    assert payload["topic"] == "Notes"
+    assert "fact_key" not in payload
+    assert "reconsolidation_key" not in payload
+
+
+def test_file_chunk_payload_extracts_fact_key_from_clear_chunk_statement():
+    chunk = FileChunk(
+        id="chunk-1",
+        text="Production API endpoint is /api/v2.",
+        source="api.md",
+        source_type="project_doc",
+        file_path="/project/docs/api.md",
+        file_mtime=1.0,
+        file_size=12,
+        file_sha256="abc",
+        chunk_index=0,
+        chunk_count=1,
+        chunk_hash="hash",
+        heading="API",
+    )
+
+    payload = chunk.payload()
+
+    assert payload["subject"] == "Production API endpoint"
+    assert payload["fact_key"] == "production.api.endpoint"
+    assert payload["reconsolidation_key"] == "production.api.endpoint"
 
 
 def test_classify_source_type_skill_and_vault_paths(tmp_path):

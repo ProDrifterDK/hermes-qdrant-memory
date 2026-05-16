@@ -8,7 +8,7 @@ This plugin turns Hermes memory into an external associative substrate: conversa
 
 ## Status
 
-Public beta / experimental. The MVP is functional and tested, but it depends on external Qdrant and embedding services. Learning, sleep consolidation, and manual-review reconsolidation are implemented with conservative gates; automatic reconsolidation remains disabled by design.
+Public beta / experimental. The MVP is functional and tested, but it depends on external Qdrant and embedding services. Learning, origin-time fact metadata, sleep consolidation, and manual-review reconsolidation are implemented with conservative gates; automatic reconsolidation remains disabled by design.
 
 ## What it does
 
@@ -20,6 +20,7 @@ Public beta / experimental. The MVP is functional and tested, but it depends on 
 - Provides explicit tools for status, search, store, indexing, and safe deletion.
 - Can index Markdown and text notes/directories with dry-run first.
 - Preserves provenance fields such as `source_type`, `file_path`, `heading`, `session_id`, `profile_id`, and timestamps.
+- Adds conservative origin-time fact metadata (`fact_key`, `reconsolidation_key`, `subject`, `topic`, `entity`) when explicit tags or clear fact statements make the key safe enough for later reconsolidation review.
 
 ## What it does not do
 
@@ -47,6 +48,7 @@ Public beta / experimental. The MVP is functional and tested, but it depends on 
 | Legacy force reindex by `file_path` fallback | Implemented |
 | Safe forget by explicit point IDs | Implemented |
 | Manual procedural learning collection | Implemented |
+| Origin-time fact metadata | Implemented conservatively from explicit tags, clear fact statements, file headings, and structured learning context |
 | Sleep consolidation | M9 gated report persistence and apply-by-proposal-id implemented |
 | Reconsolidation | M10 report-only conflict candidates + local review drafts implemented; no automatic memory rewrites |
 | Dashboard/UI | Not included |

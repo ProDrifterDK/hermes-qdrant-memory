@@ -67,6 +67,21 @@ def test_writer_stores_completed_turn_with_fake_clients():
     assert payload["source_type"] == "conversation"
     assert payload["chunk_type"] == "turn"
     assert "User: User asks about alpha" in payload["text"]
+    assert "fact_key" not in payload
+
+
+def test_writer_store_text_adds_fact_metadata_for_explicit_manual_fact():
+    emb = FakeEmbedding()
+    q = FakeQdrant()
+    writer = ConversationWriter(qdrant=q, embeddings=emb, collection_name="test_collection")
+
+    point_id = writer.store_text("TeamForge MCP binary is teamforge-mcp", source_type="manual")
+
+    assert point_id
+    payload = q.points[0]["payload"]
+    assert payload["subject"] == "TeamForge MCP binary"
+    assert payload["fact_key"] == "teamforge.mcp.binary"
+    assert payload["reconsolidation_key"] == "teamforge.mcp.binary"
 
 
 def test_tool_error_json_shape_with_uninitialized_provider():

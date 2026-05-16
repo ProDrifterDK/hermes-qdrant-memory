@@ -97,6 +97,23 @@ def test_reconsolidation_schema_and_status_flags(tmp_path):
     assert status["reconsolidation_supported_actions"] == ["draft_review"]
 
 
+def test_reconsolidation_ignores_weak_topic_only_groups(tmp_path):
+    provider = _provider(tmp_path)
+    provider._qdrant = FakeQdrant(
+        {
+            "memory": [
+                _point("m1", "General project notes", source_type="vault_note", topic="Notes", importance=5, confidence=0.95),
+                _point("m2", "Unrelated meeting notes", source_type="vault_note", topic="Notes", importance=5, confidence=0.95),
+            ],
+            "learnings": [],
+        }
+    )
+
+    result = json.loads(provider.handle_tool_call("qdrant_memory_consolidate", {"scope": "memory", "include_reconsolidation": True}))
+
+    assert [p for p in result["proposals"] if p["proposal_type"] == "reconsolidation_candidate"] == []
+
+
 def test_reconsolidation_detects_conflicting_fact_candidates_without_mutation(tmp_path):
     provider = _provider(tmp_path)
     provider._qdrant = FakeQdrant(

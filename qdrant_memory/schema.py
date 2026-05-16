@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from .lesson_extractor import contains_secret
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -100,10 +102,11 @@ def build_payload(
     model: str = "",
     provider: str = "qdrant",
     created_at: str | None = None,
+    fact_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     created = created_at or now_iso()
     imp = importance if importance is not None else score_importance(text, source_type)
-    return {
+    payload = {
         "text": text,
         "source": source,
         "source_type": source_type,
@@ -124,3 +127,7 @@ def build_payload(
         "model": model,
         "provider": provider,
     }
+    for key, value in (fact_metadata or {}).items():
+        if key in {"fact_key", "subject", "topic", "entity", "reconsolidation_key"} and value and not contains_secret(str(value)):
+            payload[key] = value
+    return payload

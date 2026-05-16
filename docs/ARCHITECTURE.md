@@ -68,6 +68,9 @@ Typical payload fields include:
 - `chunk_index`
 - `chunk_count`
 - `heading`
+- optional fact metadata: `fact_key`, `reconsolidation_key`, `subject`, `topic`, `entity`
+
+Fact metadata is generated conservatively at write origin by `qdrant_memory/fact_metadata.py`. It accepts explicit tags such as `fact:teamforge.mcp.binary`, `subject:TeamForge MCP binary`, `topic:TeamForge`, and `entity:terminal`; clear single-line fact statements such as `TeamForge MCP binary is teamforge-mcp`; file headings as weak `topic`; and structured learning context (`learning_type`, `tool_name`, command executable, project basename). Secret-bearing text or secret-like tags produce no fact metadata. Generic conversation turns do not get fact keys by default.
 
 ## Learning collection
 
@@ -97,7 +100,7 @@ M8 introduced `qdrant_memory_consolidate` as a dry-run reflection pass. It reads
 
 M9a persists each report as a local JSON artifact under `$HERMES_HOME/qdrant_memory/consolidation/` (or `consolidation_artifact_dir`). M9b/M9c add `qdrant_memory_consolidation_apply`, which loads a persisted `report_id`, finds one exact `proposal_id`, previews by default, and only performs live work when `dry_run=false` and `approve=true`.
 
-M10 adds optional `reconsolidation_candidate` proposals. These detect multiple memory points that share an explicit fact key (`reconsolidation_key`, `fact_key`, `subject`, `topic`, or `entity`) but contain different normalized text. They are opt-in via `include_reconsolidation` or config. M10 never rewrites Qdrant facts; its only supported live action is `draft_review`, which writes a local markdown review artifact.
+M10 adds optional `reconsolidation_candidate` proposals. These detect multiple memory points that share an explicit strong fact key (`reconsolidation_key`, `fact_key`, or `subject`) but contain different normalized text. `topic` and `entity` are retained as filters/provenance only and do not drive grouping. Reconsolidation is opt-in via `include_reconsolidation` or config. M10 never rewrites Qdrant facts; its only supported live action is `draft_review`, which writes a local markdown review artifact.
 
 The report may propose duplicate clusters, stale low-value memory candidates, learning promotion candidates, quality warnings, and optional reconsolidation candidates. Apply semantics are intentionally narrow: duplicate clusters can merge by preserving one canonical point and deleting explicit duplicates; stale low-value proposals can delete explicit IDs only; learning promotion candidates create local draft skill artifacts and mark the learning as promoted-to-draft; reconsolidation candidates create review drafts only. Quality warnings remain manual-review only.
 

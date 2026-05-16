@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .fact_metadata import derive_fact_metadata
 from .schema import build_payload, clean_text_for_memory, make_point_id, score_importance
 
 
@@ -39,6 +40,13 @@ class ConversationWriter:
             return ""
         clean = clean[:12000]
         point_id = make_point_id(source, clean)
+        fact_metadata = derive_fact_metadata(
+            text=clean,
+            source_type=source_type,
+            chunk_type=chunk_type,
+            tags=tags or [],
+            project_path=self.project_path,
+        )
         payload = build_payload(
             text=clean,
             source=source,
@@ -53,6 +61,7 @@ class ConversationWriter:
             session_id=self.session_id,
             project_path=self.project_path,
             model=self.model,
+            fact_metadata=fact_metadata,
         )
         vector = self.embeddings.embed_document(clean)
         self.qdrant.upsert(self.collection_name, [{"id": point_id, "vector": vector, "payload": payload}])

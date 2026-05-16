@@ -424,7 +424,7 @@ def _learning_promotion_proposals(points: list[ConsolidationPoint], *, include_e
 
 def _fact_key(point: ConsolidationPoint) -> str:
     payload = point.payload or {}
-    for key in ("reconsolidation_key", "fact_key", "subject", "topic", "entity"):
+    for key in ("reconsolidation_key", "fact_key", "subject"):
         value = str(payload.get(key) or "").strip().lower()
         if value:
             return f"{key}:{value}"

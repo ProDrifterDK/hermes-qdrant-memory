@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+from .fact_metadata import derive_fact_metadata
 from .schema import build_payload, score_importance
 
 DEFAULT_EXCLUDE_DIRS = {
@@ -70,6 +71,15 @@ class FileChunk:
         project_path: str = "",
         model: str = "",
     ) -> dict[str, Any]:
+        fact_metadata = derive_fact_metadata(
+            text=self.text,
+            source_type=self.source_type,
+            chunk_type="file_chunk",
+            tags=self.tags,
+            heading=self.heading,
+            file_path=self.file_path,
+            project_path=project_path,
+        )
         payload = build_payload(
             text=self.text,
             source=self.source,
@@ -84,6 +94,7 @@ class FileChunk:
             session_id=session_id,
             project_path=project_path,
             model=model,
+            fact_metadata=fact_metadata,
         )
         payload.update(
             {

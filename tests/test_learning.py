@@ -104,6 +104,42 @@ def test_build_learning_payload_has_procedural_fields_and_source_type():
     assert payload["command"] == "pytest tests -q"
     assert payload["project_path"] == "/repo"
     assert payload["promote_to_skill_candidate"] is False
+    assert payload["topic"] == "environment_quirk"
+    assert payload["entity"] == "terminal"
+    assert payload["fact_key"] == "learning.environment.quirk.terminal"
+    assert payload["reconsolidation_key"] == "learning.environment.quirk.terminal"
+
+
+def test_learning_payload_does_not_fact_key_secret_command():
+    secret = " ".join(["Authorization:", "Bearer", "abcdefghijklmnopqrstuvwxyz"])
+    payload = build_learning_payload(
+        lesson="Do not leak API auth headers.",
+        learning_type="tool_failure_lesson",
+        trigger="curl failed",
+        correction="remove the header from logs",
+        tool_name="terminal",
+        command=f"curl -H '{secret}' https://example.com",
+    )
+
+    assert "fact_key" not in payload
+    assert "reconsolidation_key" not in payload
+
+
+def test_learning_store_persists_fact_metadata_in_upsert_payload():
+    qdrant = FakeQdrant()
+    embeddings = FakeEmbedding()
+    store = LearningStore(qdrant=qdrant, embeddings=embeddings, collection_name="learnings", profile_id="coder", platform="cli")
+
+    store.store(
+        lesson="Use the Hermes venv for pytest in this plugin.",
+        learning_type="environment_quirk",
+        trigger="pytest not found",
+        tool_name="terminal",
+    )
+
+    payload = qdrant.upserts[0][1][0]["payload"]
+    assert payload["fact_key"] == "learning.environment.quirk.terminal"
+    assert payload["reconsolidation_key"] == "learning.environment.quirk.terminal"
 
 
 def test_learning_store_writes_to_learning_collection_only():

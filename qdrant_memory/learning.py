@@ -4,6 +4,7 @@ import hashlib
 import uuid
 from typing import Any
 
+from .fact_metadata import derive_fact_metadata
 from .schema import build_payload, clean_text_for_memory, now_iso
 from .scoring import final_memory_score, normalize_minmax
 from .retriever import RetrievedMemory
@@ -89,6 +90,16 @@ def build_learning_payload(
         correction=clean_correction,
         evidence=clean_evidence,
     )
+    fact_metadata = derive_fact_metadata(
+        text=text,
+        source_type="learning",
+        chunk_type=learning_type,
+        tags=tags or [],
+        learning_type=learning_type,
+        tool_name=tool_name,
+        command=command,
+        project_path=project_path,
+    )
     payload = build_payload(
         text=text,
         source="hermes_learning",
@@ -104,6 +115,7 @@ def build_learning_payload(
         session_id=session_id,
         project_path=project_path,
         model=model,
+        fact_metadata=fact_metadata,
     )
     payload.update(
         {
