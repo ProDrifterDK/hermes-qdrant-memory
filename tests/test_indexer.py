@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from qdrant_memory.config import load_config
-from qdrant_memory.indexer import FileIndexer, chunk_markdown, chunk_text, classify_source_type
+from qdrant_memory.indexer import FileIndexer, chunk_markdown, chunk_text, classify_source_type, make_file_chunk_id
 from qdrant_memory.tools import FORGET_SCHEMA, INDEX_SCHEMA
 
 
@@ -20,6 +20,8 @@ class FakeQdrant:
     def __init__(self):
         self.upserts = []
         self.deleted = []
+        self.delete_filters = []
+        self.points = []
 
     def upsert(self, name, points):
         self.upserts.append((name, points))
@@ -28,6 +30,21 @@ class FakeQdrant:
     def delete_ids(self, name, ids):
         self.deleted.append((name, ids))
         return {"status": "ok"}
+
+    def delete_filter(self, name, filter):
+        self.delete_filters.append((name, filter))
+        return {"status": "ok"}
+
+    def scroll_by_filter(self, name, filter, limit=256, with_payload=True, with_vector=False):
+        target = filter["must"][0]["match"]["value"]
+        return [point for point in self.points if point.get("payload", {}).get("file_path") == target]
+
+
+class FakeLegacyQdrant(FakeQdrant):
+    def __getattribute__(self, name):
+        if name == "scroll_by_filter":
+            raise AttributeError(name)
+        return super().__getattribute__(name)
 
 
 def test_config_index_defaults_and_list_coercion(tmp_path):
@@ -153,6 +170,123 @@ def test_index_execution_with_fake_embedding_and_qdrant(tmp_path):
     assert payload["chunk_type"] == "file_chunk"
     assert payload["profile_id"] == "coder"
     assert payload["model"] == "fake-model"
+
+
+def test_file_chunk_payload_includes_manifest_fields(tmp_path):
+    path = tmp_path / "note.txt"
+    path.write_text("alpha\n\nbeta", encoding="utf-8")
+    emb = FakeEmbedding()
+    qdrant = FakeQdrant()
+    indexer = FileIndexer(qdrant=qdrant, embeddings=emb, collection_name="c", config={"max_chunk_tokens": 128})
+
+    summary = indexer.index([path], dry_run=False)
+
+    assert summary["chunks_upserted"] == 1
+    point = qdrant.upserts[0][1][0]
+    payload = point["payload"]
+    assert payload["manifest_version"] == 1
+    assert payload["chunk_id"] == point["id"]
+    assert payload["file_path"] == str(path.resolve())
+    assert payload["file_size"] == path.stat().st_size
+    assert len(payload["file_sha256"]) == 64
+    assert len(payload["chunk_hash"]) == 64
+    assert payload["chunk_index"] == 0
+    assert payload["chunk_count"] == 1
+
+
+def test_dry_run_reports_stale_chunk_ids_when_file_shrinks(tmp_path):
+    path = tmp_path / "note.txt"
+    path.write_text("alpha", encoding="utf-8")
+    file_path = str(path.resolve())
+    stale_ids = [make_file_chunk_id(file_path, 1), make_file_chunk_id(file_path, 2)]
+    qdrant = FakeQdrant()
+    qdrant.points = [
+        {"id": make_file_chunk_id(file_path, 0), "payload": {"file_path": file_path}},
+        {"id": stale_ids[0], "payload": {"file_path": file_path}},
+        {"id": stale_ids[1], "payload": {"file_path": file_path}},
+    ]
+    emb = FakeEmbedding()
+    indexer = FileIndexer(qdrant=qdrant, embeddings=emb, collection_name="c", config={"max_chunk_tokens": 128})
+
+    summary = indexer.index([path], dry_run=True)
+
+    assert summary["manifest_checked"] is True
+    assert summary["stale_ids"] == stale_ids
+    assert summary["stale_count"] == 2
+    assert summary["chunks_deleted"] == 0
+    assert summary["chunks_upserted"] == 0
+    assert emb.documents == []
+    assert qdrant.upserts == []
+    assert qdrant.deleted == []
+
+
+def test_live_index_deletes_only_stale_ids_before_upsert(tmp_path):
+    path = tmp_path / "note.txt"
+    path.write_text("alpha", encoding="utf-8")
+    file_path = str(path.resolve())
+    stale_id = make_file_chunk_id(file_path, 1)
+    qdrant = FakeQdrant()
+    qdrant.points = [
+        {"id": make_file_chunk_id(file_path, 0), "payload": {"file_path": file_path}},
+        {"id": stale_id, "payload": {"file_path": file_path}},
+    ]
+    emb = FakeEmbedding()
+    indexer = FileIndexer(qdrant=qdrant, embeddings=emb, collection_name="c", config={"max_chunk_tokens": 128})
+
+    summary = indexer.index([path], dry_run=False)
+
+    assert summary["delete_mode"] == "ids"
+    assert summary["chunks_deleted"] == 1
+    assert qdrant.deleted == [("c", [stale_id])]
+    assert qdrant.delete_filters == []
+    assert summary["chunks_upserted"] == summary["chunks_prepared"] == 1
+
+
+def test_live_index_prefers_id_sync_over_filter_delete_even_with_force(tmp_path):
+    path = tmp_path / "note.txt"
+    path.write_text("alpha", encoding="utf-8")
+    file_path = str(path.resolve())
+    stale_id = make_file_chunk_id(file_path, 1)
+    qdrant = FakeQdrant()
+    qdrant.points = [{"id": stale_id, "payload": {"file_path": file_path}}]
+    indexer = FileIndexer(qdrant=qdrant, embeddings=FakeEmbedding(), collection_name="c", config={"max_chunk_tokens": 128})
+
+    summary = indexer.index([path], dry_run=False, force=True)
+
+    assert summary["delete_mode"] == "ids"
+    assert qdrant.deleted == [("c", [stale_id])]
+    assert qdrant.delete_filters == []
+
+
+def test_live_index_falls_back_to_delete_filter_when_scroll_unavailable_and_force_true(tmp_path):
+    path = tmp_path / "note.txt"
+    path.write_text("alpha", encoding="utf-8")
+    qdrant = FakeLegacyQdrant()
+    indexer = FileIndexer(qdrant=qdrant, embeddings=FakeEmbedding(), collection_name="c", config={"max_chunk_tokens": 128})
+
+    summary = indexer.index([path], dry_run=False, force=True)
+
+    assert summary["manifest_checked"] is False
+    assert summary["delete_mode"] == "filter"
+    assert qdrant.delete_filters == [("c", {"must": [{"key": "file_path", "match": {"value": str(path.resolve())}}]})]
+
+
+def test_empty_file_with_existing_chunks_reports_all_existing_as_stale(tmp_path):
+    path = tmp_path / "note.txt"
+    path.write_text("", encoding="utf-8")
+    file_path = str(path.resolve())
+    old_ids = [make_file_chunk_id(file_path, 0), make_file_chunk_id(file_path, 1)]
+    qdrant = FakeQdrant()
+    qdrant.points = [{"id": point_id, "payload": {"file_path": file_path}} for point_id in old_ids]
+    indexer = FileIndexer(qdrant=qdrant, embeddings=FakeEmbedding(), collection_name="c", config={"max_chunk_tokens": 128})
+
+    dry = indexer.index([path], dry_run=True)
+    live = indexer.index([path], dry_run=False)
+
+    assert dry["chunks_prepared"] == 0
+    assert dry["stale_ids"] == old_ids
+    assert live["chunks_deleted"] == 2
+    assert qdrant.deleted == [("c", old_ids)]
 
 
 def test_provider_index_tool_requires_paths_when_unconfigured():

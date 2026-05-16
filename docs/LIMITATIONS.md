@@ -93,3 +93,7 @@ ln -s ~/.hermes/plugins/memory/qdrant ~/.hermes/plugins/qdrant
 Large indexing runs are embedding-bound. Local CPU embedding servers may take several minutes for thousands of chunks.
 
 Use `max_files`, dry-run, and small initial directories before broad indexing.
+
+## Directory deletion sync
+
+Manifest sync reconciles files that are present in the current indexing run, including files that shrink to zero chunks. It does not yet maintain a persistent directory-level manifest, so chunks for files deleted or renamed outside the current run may remain until explicitly forgotten or a future directory manifest feature is added.

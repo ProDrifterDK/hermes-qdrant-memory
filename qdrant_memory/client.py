@@ -91,3 +91,32 @@ class QdrantClient:
     def delete_filter(self, name: str, filter: dict[str, Any]) -> Any:
         body = {"filter": filter}
         return self._request("POST", f"/collections/{urllib.parse.quote(name)}/points/delete?wait=true", body)
+
+    def scroll_by_filter(
+        self,
+        name: str,
+        filter: dict[str, Any],
+        *,
+        limit: int = 256,
+        with_payload: bool = True,
+        with_vector: bool = False,
+    ) -> list[dict[str, Any]]:
+        points: list[dict[str, Any]] = []
+        offset: Any = None
+        while True:
+            body: dict[str, Any] = {
+                "filter": filter,
+                "limit": int(limit),
+                "with_payload": with_payload,
+                "with_vector": with_vector,
+            }
+            if offset is not None:
+                body["offset"] = offset
+            data = self._request("POST", f"/collections/{urllib.parse.quote(name)}/points/scroll", body)
+            result = data.get("result", {}) or {}
+            batch = result.get("points", []) or []
+            points.extend(batch)
+            offset = result.get("next_page_offset")
+            if offset is None or not batch:
+                break
+        return points

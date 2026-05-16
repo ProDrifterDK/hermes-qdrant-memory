@@ -60,9 +60,25 @@ Typical payload fields include:
 - `provider`
 - `file_path`
 - `file_mtime`
+- `file_size`
+- `file_sha256`
+- `manifest_version`
+- `chunk_id`
+- `chunk_hash`
 - `chunk_index`
 - `chunk_count`
 - `heading`
+
+## File manifest sync
+
+Indexed files are treated as a source of truth by `file_path`.
+
+Each file chunk carries manifest metadata (`file_sha256`, `file_size`, `chunk_id`, `chunk_hash`, `chunk_index`, `chunk_count`). On reindex, the indexer uses Qdrant scroll by `file_path` to compare existing point IDs with the freshly prepared chunk IDs:
+
+- `dry_run: true` reports `stale_ids` and `stale_count` without embedding, upserting, or deleting.
+- live indexing deletes only stale point IDs with `delete_ids` when scroll is available.
+- `force: true` falls back to broad `delete_filter(file_path)` only for older clients that cannot scroll existing points.
+- empty files still participate in manifest sync, so shrinking a file to zero chunks removes all previous chunks for that file.
 
 ## Source types
 
@@ -94,5 +110,6 @@ For shared gateway deployments, avoid `global` unless you explicitly want cross-
 - Auto-recall is context-only; retrieved memory is not itself a command.
 - The writer strips known injected memory markers to reduce recursive contamination.
 - File indexing defaults to dry-run.
+- File reindexing uses manifest sync to prevent stale high-index chunks after a file shrinks.
 - Deletion requires explicit point IDs and defaults to dry-run.
 - Reconsolidation is not enabled in this MVP.

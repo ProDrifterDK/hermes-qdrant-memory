@@ -51,8 +51,11 @@ class FileChunk:
     source_type: str
     file_path: str
     file_mtime: float
+    file_size: int
+    file_sha256: str
     chunk_index: int
     chunk_count: int
+    chunk_hash: str
     heading: str = ""
     tags: list[str] = field(default_factory=list)
 
@@ -86,6 +89,11 @@ class FileChunk:
             {
                 "file_path": self.file_path,
                 "file_mtime": self.file_mtime,
+                "file_size": self.file_size,
+                "file_sha256": self.file_sha256,
+                "manifest_version": 1,
+                "chunk_id": self.id,
+                "chunk_hash": self.chunk_hash,
                 "chunk_index": self.chunk_index,
                 "chunk_count": self.chunk_count,
                 "heading": self.heading,
@@ -113,6 +121,15 @@ def normalize_extensions(values: Iterable[str]) -> set[str]:
 def make_file_chunk_id(file_path: str, chunk_index: int) -> str:
     digest = hashlib.sha256(f"indexed-file\n{file_path}\n{chunk_index}".encode("utf-8")).hexdigest()
     return str(uuid.UUID(digest[:32]))
+
+
+def sha256_hex(value: bytes | str) -> str:
+    data = value.encode("utf-8") if isinstance(value, str) else value
+    return hashlib.sha256(data).hexdigest()
+
+
+def file_path_filter(file_path: str) -> dict[str, Any]:
+    return {"must": [{"key": "file_path", "match": {"value": file_path}}]}
 
 
 def extract_tags(text: str) -> list[str]:
@@ -334,7 +351,8 @@ class FileIndexer:
 
     def prepare_file(self, path: Path) -> list[FileChunk]:
         path = path.resolve()
-        text = path.read_text(encoding="utf-8", errors="replace")
+        raw = path.read_bytes()
+        text = raw.decode("utf-8", errors="replace")
         tags = extract_tags(text)
         max_chars = self.max_chars
         if path.suffix.lower() == ".md":
@@ -343,7 +361,10 @@ class FileIndexer:
             raw_chunks = chunk_text(text, max_chars=max_chars)
         source = str(path)
         source_type = classify_source_type(path)
-        mtime = path.stat().st_mtime
+        stat = path.stat()
+        mtime = stat.st_mtime
+        file_size = stat.st_size
+        file_sha256 = sha256_hex(raw)
         count = len(raw_chunks)
         chunks: list[FileChunk] = []
         for index, (heading, chunk_text_value) in enumerate(raw_chunks):
@@ -358,8 +379,11 @@ class FileIndexer:
                     source_type=source_type,
                     file_path=source,
                     file_mtime=mtime,
+                    file_size=file_size,
+                    file_sha256=file_sha256,
                     chunk_index=index,
                     chunk_count=count,
+                    chunk_hash=sha256_hex(clean),
                     heading=heading,
                     tags=tags,
                 )
@@ -371,9 +395,21 @@ class FileIndexer:
         errors: list[dict[str, str]] = []
         chunks: list[FileChunk] = []
         indexed_files = 0
+        file_manifests: list[dict[str, Any]] = []
         for path in files:
+            resolved = path.resolve()
             try:
-                file_chunks = self.prepare_file(path)
+                stat = resolved.stat()
+                raw = resolved.read_bytes()
+                file_manifests.append(
+                    {
+                        "file_path": str(resolved),
+                        "file_size": stat.st_size,
+                        "file_mtime": stat.st_mtime,
+                        "file_sha256": sha256_hex(raw),
+                    }
+                )
+                file_chunks = self.prepare_file(resolved)
                 if file_chunks:
                     indexed_files += 1
                     chunks.extend(file_chunks)
@@ -383,6 +419,7 @@ class FileIndexer:
                 errors.append({"path": str(path), "error": str(exc)})
         return {
             "files": files,
+            "file_manifests": file_manifests,
             "files_seen": len(files) + len(skipped),
             "files_indexed": indexed_files,
             "files_skipped": len(skipped),
@@ -393,8 +430,14 @@ class FileIndexer:
         }
 
     def index(self, paths: Iterable[str | Path], *, dry_run: bool = True, force: bool = False, max_files: int | None = None) -> dict[str, Any]:
-        prepared = self.prepare(paths, max_files=max_files)
+        input_paths = list(paths)
+        prepared = self.prepare(input_paths, max_files=max_files)
         chunks: list[FileChunk] = prepared.pop("chunks")
+        file_manifests: list[dict[str, Any]] = prepared.get("file_manifests", [])
+        desired_ids_by_file: dict[str, set[str]] = {str(item["file_path"]): set() for item in file_manifests}
+        for chunk in chunks:
+            desired_ids_by_file.setdefault(chunk.file_path, set()).add(chunk.id)
+
         summary: dict[str, Any] = {
             "dry_run": bool(dry_run),
             "files_seen": prepared["files_seen"],
@@ -402,17 +445,50 @@ class FileIndexer:
             "files_skipped": prepared["files_skipped"],
             "chunks_prepared": len(chunks),
             "chunks_upserted": 0,
+            "chunks_deleted": 0,
+            "stale_ids": [],
+            "stale_count": 0,
+            "files_with_stale_chunks": 0,
+            "manifest_checked": False,
+            "delete_mode": "none",
             "errors": list(prepared.get("errors", []))[:20],
-            "paths": [str(p) for p in paths],
+            "paths": [str(p) for p in input_paths],
             "force": bool(force),
         }
+
+        stale_ids: list[str] = []
+        manifest_capable = bool(self.qdrant and callable(getattr(self.qdrant, "scroll_by_filter", None)))
+        if manifest_capable:
+            summary["manifest_checked"] = True
+            for file_path in sorted(desired_ids_by_file):
+                try:
+                    existing = self.qdrant.scroll_by_filter(
+                        self.collection_name,
+                        file_path_filter(file_path),
+                        limit=256,
+                        with_payload=True,
+                        with_vector=False,
+                    )
+                    desired = desired_ids_by_file.get(file_path, set())
+                    file_stale = [str(point.get("id")) for point in existing if point.get("id") and str(point.get("id")) not in desired]
+                    if file_stale:
+                        summary["files_with_stale_chunks"] += 1
+                        stale_ids.extend(file_stale)
+                except Exception as exc:
+                    summary["errors"].append({"file_path": file_path, "error": f"manifest sync failed: {exc}"})
+            summary["stale_ids"] = stale_ids
+            summary["stale_count"] = len(stale_ids)
+            if stale_ids:
+                summary["delete_mode"] = "ids"
+
         if dry_run:
+            summary["errors"] = summary["errors"][:20]
             return summary
-        if not self.qdrant or not self.embeddings:
+        if not self.qdrant or (chunks and not self.embeddings):
             summary["errors"].append({"error": "qdrant and embeddings are required when dry_run is false"})
             return summary
+
         points: list[dict[str, Any]] = []
-        file_paths_with_points: set[str] = set()
         for chunk in chunks:
             try:
                 payload = chunk.payload(
@@ -425,21 +501,24 @@ class FileIndexer:
                     model=self.model,
                 )
                 points.append({"id": chunk.id, "vector": self.embeddings.embed_document(chunk.text), "payload": payload})
-                file_paths_with_points.add(chunk.file_path)
             except Exception as exc:
                 summary["errors"].append({"id": chunk.id, "error": str(exc)})
-        # With force=true, treat each indexed file as the source of truth: remove
-        # older chunks for that file before writing the freshly prepared chunks.
-        # This prevents stale high-index chunks from surviving after a note shrinks.
-        if force and file_paths_with_points and hasattr(self.qdrant, "delete_filter"):
-            for file_path in sorted(file_paths_with_points):
+
+        if stale_ids and hasattr(self.qdrant, "delete_ids"):
+            try:
+                self.qdrant.delete_ids(self.collection_name, stale_ids)
+                summary["chunks_deleted"] = len(stale_ids)
+                summary["delete_mode"] = "ids"
+            except Exception as exc:
+                summary["errors"].append({"error": f"delete stale ids failed: {exc}"})
+        elif force and desired_ids_by_file and hasattr(self.qdrant, "delete_filter"):
+            summary["delete_mode"] = "filter"
+            for file_path in sorted(desired_ids_by_file):
                 try:
-                    self.qdrant.delete_filter(
-                        self.collection_name,
-                        {"must": [{"key": "file_path", "match": {"value": file_path}}]},
-                    )
+                    self.qdrant.delete_filter(self.collection_name, file_path_filter(file_path))
                 except Exception as exc:
                     summary["errors"].append({"file_path": file_path, "error": f"delete stale chunks failed: {exc}"})
+
         for i in range(0, len(points), 64):
             batch = points[i : i + 64]
             if not batch:
