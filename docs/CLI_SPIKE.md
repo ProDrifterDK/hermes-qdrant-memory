@@ -225,7 +225,7 @@ hermes qdrant search <query> [--top-k N] [--source-type TYPE] [--json]
 hermes qdrant index <path...> [--dry-run] [--no-dry-run --approve] [--max-files N] [--force]
 hermes qdrant forget <point-id...> [--dry-run] [--no-dry-run --approve]
 hermes qdrant learning search <query> [--top-k N] [--json]
-hermes qdrant learning preview [--limit N] [--json]
+hermes qdrant learning preview [--json]
 hermes qdrant consolidate [--scope memory|learning|both] [--persist] [--include-reconsolidation] [--json]
 hermes qdrant apply --report-id ID --proposal-id ID --action ACTION [--dry-run] [--no-dry-run --approve]
 ```

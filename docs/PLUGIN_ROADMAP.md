@@ -791,6 +791,8 @@ python -m pytest tests -q
 - Create/Modify: `qdrant_memory/cli_core.py`
 - Add tests under `tests/`.
 
+Status: completed with top-level `cli.py`, `qdrant_memory/cli_core.py`, and `tests/test_cli.py`. The CLI is a thin native Hermes memory-provider wrapper over existing tool calls, with dry-run/approval gates and installed-plugin import coverage.
+
 **Commands MVP:**
 
 ```bash
@@ -803,8 +805,10 @@ hermes qdrant consolidate --scope both --persist --dry-run
 **Verification:**
 
 ```bash
+python -m pytest tests/test_cli.py -q
 python -m pytest tests -q
-python -m compileall -q qdrant_memory __init__.py
+python -m compileall -q qdrant_memory __init__.py cli.py
+python scripts/check_no_literal_fake_secrets.py
 ```
 
 ### Task 9: Release documentation update

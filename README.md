@@ -602,6 +602,31 @@ This plugin does not know which files are safe for your threat model. Treat inde
 For the full canonical safety contract, see [docs/SAFETY.md](docs/SAFETY.md).
 For operational checks and approved maintenance procedures, see [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
+## CLI MVP
+
+When the plugin is installed as the active Hermes memory provider, Hermes can discover the native provider CLI from the top-level `cli.py` file:
+
+```bash
+hermes qdrant status
+hermes qdrant doctor
+hermes qdrant search "agent memory" --top-k 5 --json
+hermes qdrant index docs README.md --dry-run
+hermes qdrant forget POINT_ID --dry-run
+hermes qdrant learning search "tool failure" --top-k 5 --json
+hermes qdrant learning preview --json
+hermes qdrant consolidate --scope both --persist --dry-run --json
+hermes qdrant apply --report-id REPORT_ID --proposal-id PROPOSAL_ID --action merge --dry-run --json
+```
+
+Mutation safety mirrors the tool surface:
+
+- mutating commands default to `--dry-run`;
+- live mutation requires both `--no-dry-run` and `--approve`;
+- `forget` only accepts explicit point IDs;
+- `apply` requires explicit report/proposal IDs and expected action.
+
+The CLI is a thin wrapper over existing `qdrant_memory_*` and `qdrant_learning_*` tool calls. See [docs/CLI_SPIKE.md](docs/CLI_SPIKE.md) for feasibility findings and caveats.
+
 ## Philosophy
 
 The design follows a hippocampal pattern rather than a static prompt-stuffing pattern:
@@ -621,7 +646,8 @@ Run tests:
 
 ```bash
 python -m pytest tests -q
-python -m compileall -q qdrant_memory __init__.py
+python -m compileall -q qdrant_memory __init__.py cli.py
+python scripts/check_no_literal_fake_secrets.py
 ```
 
 No third-party Python package is required by the plugin runtime; it uses the Python standard library for HTTP calls. Tests require `pytest`.
