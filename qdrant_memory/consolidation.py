@@ -156,6 +156,7 @@ def expected_action_for_proposal(proposal_type: str) -> str | None:
         "duplicate_cluster": "merge",
         "stale_low_value": "delete",
         "learning_promotion_candidate": "promote_to_skill",
+        "reconsolidation_candidate": "draft_review",
     }.get(proposal_type)
 
 
@@ -210,6 +211,51 @@ def build_skill_draft_text(point: ConsolidationPoint, *, proposal_id: str, repor
             "",
         ]
     )
+
+
+def build_reconsolidation_draft_text(points: list[ConsolidationPoint], *, proposal: dict[str, Any], report_id: str) -> str:
+    safe_proposal = redact_secrets(proposal)
+    lines = [
+        "# Reconsolidation review draft",
+        "",
+        "This is a manual review artifact only. It does not mutate Qdrant memory.",
+        "",
+        f"- report_id: {report_id}",
+        f"- proposal_id: {safe_proposal.get('proposal_id')}",
+        f"- fact_key: {safe_proposal.get('fact_key') or 'N/A'}",
+        f"- collection_name: {safe_proposal.get('collection_name')}",
+        f"- affected_ids: {', '.join(str(i) for i in safe_proposal.get('affected_ids', []))}",
+        "",
+        "## Candidate statement",
+        str(safe_proposal.get("candidate_statement") or "Manual review required."),
+        "",
+        "## Evidence",
+    ]
+    for point in points:
+        payload = redact_secrets(point.payload)
+        lines.extend(
+            [
+                "",
+                f"### {point.id}",
+                f"- source_type: {payload.get('source_type', 'unknown')}",
+                f"- importance: {payload.get('importance', 'unknown')}",
+                f"- confidence: {payload.get('confidence', 'unknown')}",
+                "",
+                _snippet(point.text, max_chars=500),
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "## Reviewer checklist",
+            "",
+            "- Decide whether one fact supersedes another, or whether both are context-dependent.",
+            "- If a durable procedural lesson emerges, create or update a Hermes skill manually.",
+            "- If a memory should be changed, use explicit memory tools with dry-run first; do not bulk edit by query.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def _parse_datetime(value: Any) -> datetime | None:
@@ -376,6 +422,88 @@ def _learning_promotion_proposals(points: list[ConsolidationPoint], *, include_e
     return proposals
 
 
+def _fact_key(point: ConsolidationPoint) -> str:
+    payload = point.payload or {}
+    for key in ("reconsolidation_key", "fact_key", "subject", "topic", "entity"):
+        value = str(payload.get(key) or "").strip().lower()
+        if value:
+            return f"{key}:{value}"
+    return ""
+
+
+def _reconsolidation_proposals(
+    points: list[ConsolidationPoint],
+    *,
+    include_examples: bool,
+    max_candidates: int,
+    min_confidence: float,
+    collection_name: str,
+) -> list[dict[str, Any]]:
+    groups: dict[str, list[ConsolidationPoint]] = {}
+    for point in points:
+        key = _fact_key(point)
+        if not key:
+            continue
+        confidence = _as_float(point.payload.get("confidence"), 1.0)
+        if confidence < min_confidence:
+            continue
+        groups.setdefault(key, []).append(point)
+
+    proposals: list[dict[str, Any]] = []
+    for key, group in sorted(groups.items()):
+        if len(group) < 2:
+            continue
+        unique_texts = {normalize_text_fingerprint(point.text) for point in group if normalize_text_fingerprint(point.text)}
+        if len(unique_texts) < 2:
+            continue
+        affected_ids = [point.id for point in group if point.id]
+        contains_secret_text = any(contains_secret(point.text) for point in group)
+        important_fact = any(_as_int(point.payload.get("importance"), 5) >= 7 or str(point.payload.get("source_type") or "") in {"manual", "user_memory", "profile_memory"} for point in group)
+        canonical = max(
+            group,
+            key=lambda point: (
+                _as_int(point.payload.get("importance"), 5),
+                _as_float(point.payload.get("confidence"), 0.0),
+                str(point.payload.get("created_at") or ""),
+                point.id,
+            ),
+        )
+        evidence = []
+        for point in group:
+            evidence.append(
+                {
+                    "id": point.id,
+                    "source_type": point.payload.get("source_type", ""),
+                    "importance": _as_int(point.payload.get("importance"), 5),
+                    "confidence": _as_float(point.payload.get("confidence"), 1.0),
+                    "snippet": _snippet(point.text) if include_examples else "redacted/manual review",
+                }
+            )
+        proposal: dict[str, Any] = {
+            "proposal_id": _proposal_id("reconsolidation_candidate", affected_ids),
+            "proposal_type": "reconsolidation_candidate",
+            "collection_name": collection_name,
+            "affected_ids": affected_ids,
+            "canonical_or_current_id": canonical.id,
+            "conflicting_ids": [point.id for point in group if point.id != canonical.id],
+            "fact_key": key,
+            "candidate_statement": "Secret-bearing conflicting memories require manual review." if contains_secret_text else f"Conflicting memories share {key}; review before changing any fact.",
+            "suggested_action": "reconsolidate_review_only",
+            "confidence": min(0.9, max(_as_float(point.payload.get("confidence"), 0.0) for point in group)),
+            "risk": "high",
+            "important_fact": important_fact,
+            "manual_review_required": True,
+            "evidence": evidence,
+            "requires_explicit_approval": True,
+        }
+        if include_examples:
+            proposal["examples"] = [{"id": point.id, "text": _snippet(point.text)} for point in group]
+        proposals.append(proposal)
+        if len(proposals) >= max_candidates:
+            break
+    return proposals
+
+
 def _quality_warning_proposals(points: list[ConsolidationPoint], *, max_groups: int) -> list[dict[str, Any]]:
     proposals: list[dict[str, Any]] = []
     for point in points:
@@ -424,6 +552,9 @@ def build_consolidation_report(
     duplicate_threshold: float = 0.92,
     consolidation_enabled: bool = False,
     reconsolidation_enabled: bool = False,
+    include_reconsolidation: bool = False,
+    reconsolidation_max_candidates: int = 10,
+    reconsolidation_min_confidence: float = 0.6,
 ) -> dict[str, Any]:
     proposals: list[dict[str, Any]] = []
     proposals.extend(_quality_warning_proposals(memory_points + learning_points, max_groups=max_groups))
@@ -439,6 +570,16 @@ def build_consolidation_report(
         )
     )
     proposals.extend(_learning_promotion_proposals(learning_points, include_examples=include_examples, max_groups=max_groups))
+    if include_reconsolidation:
+        proposals.extend(
+            _reconsolidation_proposals(
+                memory_points,
+                include_examples=include_examples,
+                max_candidates=reconsolidation_max_candidates,
+                min_confidence=reconsolidation_min_confidence,
+                collection_name=collection_name,
+            )
+        )
     proposals = proposals[:max_groups]
     summary: dict[str, int] = {}
     for proposal in proposals:
@@ -452,6 +593,8 @@ def build_consolidation_report(
         "collections": {"memory": collection_name, "learning": learning_collection_name},
         "consolidation_enabled": consolidation_enabled,
         "reconsolidation_enabled": reconsolidation_enabled,
+        "include_reconsolidation": include_reconsolidation,
+        "reconsolidation_report_only": True,
         "analyzed": {"memory_points": len(memory_points), "learning_points": len(learning_points)},
         "summary": summary,
         "proposals": proposals,

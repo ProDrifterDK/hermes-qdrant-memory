@@ -8,7 +8,7 @@ This plugin turns Hermes memory into an external associative substrate: conversa
 
 ## Status
 
-Public beta / experimental. The MVP is functional and tested, but it depends on external Qdrant and embedding services. Learning, sleep consolidation, and reconsolidation are roadmap items and are intentionally disabled by default.
+Public beta / experimental. The MVP is functional and tested, but it depends on external Qdrant and embedding services. Learning, sleep consolidation, and manual-review reconsolidation are implemented with conservative gates; automatic reconsolidation remains disabled by design.
 
 ## What it does
 
@@ -48,7 +48,7 @@ Public beta / experimental. The MVP is functional and tested, but it depends on 
 | Safe forget by explicit point IDs | Implemented |
 | Manual procedural learning collection | Implemented |
 | Sleep consolidation | M9 gated report persistence and apply-by-proposal-id implemented |
-| Reconsolidation | Future, disabled by design |
+| Reconsolidation | M10 report-only conflict candidates + local review drafts implemented; no automatic memory rewrites |
 | Dashboard/UI | Not included |
 
 ## Requirements
@@ -425,6 +425,10 @@ qdrant_memory:
   consolidation_artifact_dir: ""
   consolidation_apply_dry_run_default: true
   reconsolidation_enabled: false
+  reconsolidation_report_only: true
+  reconsolidation_include_by_default: false
+  reconsolidation_min_confidence: 0.6
+  reconsolidation_max_candidates: 10
   query_prefix: "search_query: "
   document_prefix: "search_document: "
   scope_mode: profile
@@ -518,8 +522,10 @@ Useful arguments:
 - `max_groups`: cap returned proposal groups.
 - `include_examples`: include redacted snippets for representative points.
 - `persist`: write the local report artifact. Defaults to true.
+- `include_reconsolidation`: include M10 same-fact/conflicting-memory candidates. Defaults to false unless configured.
+- `reconsolidation_max_candidates`: cap reconsolidation candidates.
 
-Proposal types include duplicate clusters, stale low-value memory candidates, learning promotion candidates, and quality warnings such as possible secret-bearing memories.
+Proposal types include duplicate clusters, stale low-value memory candidates, learning promotion candidates, quality warnings such as possible secret-bearing memories, and optional reconsolidation candidates.
 
 ### `qdrant_memory_consolidation_apply`
 
@@ -530,8 +536,9 @@ Supported actions:
 - `delete`: only for `stale_low_value`; deletes explicit `affected_ids` only. No filter/query deletion.
 - `merge`: only for `duplicate_cluster`; chooses a canonical point by importance/confidence, updates its payload with consolidation metadata, then deletes explicit duplicate IDs.
 - `promote_to_skill`: only for `learning_promotion_candidate`; creates a local draft skill artifact under `$HERMES_HOME/qdrant_memory/consolidation/skill_drafts/` and marks the learning point as promoted-to-draft. It does not install a live skill automatically.
+- `draft_review`: only for `reconsolidation_candidate`; creates a local markdown review draft under `$HERMES_HOME/qdrant_memory/consolidation/reconsolidation_drafts/`. It does not mutate Qdrant memory.
 
-`quality_warning` proposals are manual-review only and cannot be applied automatically.
+`quality_warning` proposals are manual-review only and cannot be applied automatically. Reconsolidation drafts are also manual artifacts: they can guide a human/agent to later perform explicit memory edits, but M10 never rewrites facts directly.
 
 ### `qdrant_learning_store`
 

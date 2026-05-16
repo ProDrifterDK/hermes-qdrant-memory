@@ -68,9 +68,13 @@ M9 actions are deliberately narrow: delete uses explicit IDs only, merge preserv
 
 The duplicate detector is intentionally conservative and mostly text-fingerprint based; it is a safety report, not a semantic merge engine. Future versions may add similarity search or LLM-assisted abstraction, but those should remain gated and apply-by-proposal-id.
 
-## Reconsolidation is intentionally absent
+## Reconsolidation is manual-review only in M10
 
-Automatically rewriting remembered facts is dangerous. Future reconsolidation should be gated by:
+Automatically rewriting remembered facts is dangerous. M10 can optionally report `reconsolidation_candidate` proposals when explicitly requested with `include_reconsolidation: true` (or enabled by config), but it does not rewrite Qdrant memory.
+
+Reconsolidation apply supports only `draft_review`: a local markdown artifact under `$HERMES_HOME/qdrant_memory/consolidation/reconsolidation_drafts/`. Live draft creation still requires exact `report_id`, exact `proposal_id`, `dry_run: false`, and `approve: true`. It must not call Qdrant `upsert`, `update_payload`, `delete_ids`, or `delete_filter`.
+
+Future fact rewriting, if ever added, should remain gated by:
 
 - explicit enablement,
 - dry-run preview,

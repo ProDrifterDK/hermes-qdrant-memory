@@ -41,6 +41,10 @@ DEFAULTS: dict[str, Any] = {
     "consolidation_artifact_dir": "",
     "consolidation_apply_dry_run_default": True,
     "reconsolidation_enabled": False,
+    "reconsolidation_report_only": True,
+    "reconsolidation_include_by_default": False,
+    "reconsolidation_min_confidence": 0.6,
+    "reconsolidation_max_candidates": 10,
     "query_prefix": "search_query: ",
     "document_prefix": "search_document: ",
     "scope_mode": "profile",
@@ -79,6 +83,8 @@ _BOOL_KEYS = {
     "consolidation_persist_reports",
     "consolidation_apply_dry_run_default",
     "reconsolidation_enabled",
+    "reconsolidation_report_only",
+    "reconsolidation_include_by_default",
     "index_dry_run_default",
 }
 _INT_KEYS = {
@@ -94,8 +100,9 @@ _INT_KEYS = {
     "consolidation_report_max_groups",
     "consolidation_stale_days",
     "consolidation_min_importance_for_keep",
+    "reconsolidation_max_candidates",
 }
-_FLOAT_KEYS = {"decay_rate", "min_raw_score", "min_final_score", "learning_auto_extract_min_confidence", "learning_auto_extract_semantic_dedupe_threshold", "consolidation_duplicate_threshold"}
+_FLOAT_KEYS = {"decay_rate", "min_raw_score", "min_final_score", "learning_auto_extract_min_confidence", "learning_auto_extract_semantic_dedupe_threshold", "consolidation_duplicate_threshold", "reconsolidation_min_confidence"}
 _LIST_KEYS = {"index_dirs", "index_extensions", "index_exclude_dirs"}
 
 

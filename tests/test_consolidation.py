@@ -241,4 +241,6 @@ def test_status_includes_consolidation_report_flags():
     assert result["consolidation_report_only"] is False
     assert result["consolidation_persist_reports"] is True
     assert result["consolidation_apply_enabled"] is True
-    assert result["consolidation_supported_actions"] == ["merge", "delete", "promote_to_skill"]
+    assert result["consolidation_supported_actions"] == ["merge", "delete", "promote_to_skill", "draft_review"]
+    assert result["reconsolidation_report_only"] is True
+    assert result["reconsolidation_supported_actions"] == ["draft_review"]

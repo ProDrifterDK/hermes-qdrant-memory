@@ -97,7 +97,7 @@ def test_consolidation_apply_schema_is_exposed():
     assert apply_schema["parameters"]["additionalProperties"] is False
     assert "report_id" in apply_schema["parameters"]["required"]
     assert "proposal_id" in apply_schema["parameters"]["required"]
-    assert apply_schema["parameters"]["properties"]["action"]["enum"] == ["merge", "delete", "promote_to_skill"]
+    assert apply_schema["parameters"]["properties"]["action"]["enum"] == ["merge", "delete", "promote_to_skill", "draft_review"]
 
 
 def test_consolidate_persists_report_artifact_with_report_id(tmp_path):

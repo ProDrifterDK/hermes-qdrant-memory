@@ -33,6 +33,7 @@ from qdrant_memory.config import load_config
 from qdrant_memory.consolidation import (
     artifact_root,
     build_consolidation_report,
+    build_reconsolidation_draft_text,
     build_skill_draft_text,
     expected_action_for_proposal,
     find_proposal,
@@ -388,8 +389,10 @@ class QdrantMemoryProvider(MemoryProvider):
             "consolidation_enabled": self._config.get("consolidation_enabled", False),
             "consolidation_persist_reports": self._config.get("consolidation_persist_reports", True),
             "consolidation_apply_enabled": True,
-            "consolidation_supported_actions": ["merge", "delete", "promote_to_skill"],
+            "consolidation_supported_actions": ["merge", "delete", "promote_to_skill", "draft_review"],
             "reconsolidation_enabled": self._config.get("reconsolidation_enabled", False),
+            "reconsolidation_report_only": self._config.get("reconsolidation_report_only", True),
+            "reconsolidation_supported_actions": ["draft_review"],
             "consolidation_report_only": False,
             "auto_recall": self._config["auto_recall"],
             "sync_turns": self._config["sync_turns"],
@@ -510,6 +513,11 @@ class QdrantMemoryProvider(MemoryProvider):
         except Exception:
             max_groups = 20
         include_examples = bool(args.get("include_examples", False))
+        include_reconsolidation = parse_bool_arg(args.get("include_reconsolidation"), default=bool(self._config.get("reconsolidation_include_by_default", False)))
+        try:
+            reconsolidation_max_candidates = max(1, min(100, int(args.get("reconsolidation_max_candidates") or self._config.get("reconsolidation_max_candidates", 10))))
+        except Exception:
+            reconsolidation_max_candidates = 10
         base_scope = self._scope_filter_values()
         memory_points = []
         learning_points = []
@@ -547,6 +555,9 @@ class QdrantMemoryProvider(MemoryProvider):
                 duplicate_threshold=float(self._config.get("consolidation_duplicate_threshold", 0.92)),
                 consolidation_enabled=bool(self._config.get("consolidation_enabled", False)),
                 reconsolidation_enabled=bool(self._config.get("reconsolidation_enabled", False)),
+                include_reconsolidation=include_reconsolidation,
+                reconsolidation_max_candidates=reconsolidation_max_candidates,
+                reconsolidation_min_confidence=float(self._config.get("reconsolidation_min_confidence", 0.6)),
             )
             report.update(
                 {
@@ -601,6 +612,9 @@ class QdrantMemoryProvider(MemoryProvider):
         elif action == "promote_to_skill" and points:
             root = artifact_root(self._hermes_home, str(self._config.get("consolidation_artifact_dir") or "")) / "skill_drafts"
             plan.update({"skill_draft_path": str(root / f"{proposal.get('proposal_id')}.md")})
+        elif action == "draft_review" and points:
+            root = artifact_root(self._hermes_home, str(self._config.get("consolidation_artifact_dir") or "")) / "reconsolidation_drafts"
+            plan.update({"reconsolidation_draft_path": str(root / f"{proposal.get('proposal_id')}.md")})
         return plan
 
     def _select_canonical_point(self, points: list[Any]) -> Any:
@@ -652,6 +666,14 @@ class QdrantMemoryProvider(MemoryProvider):
             plan = self._proposal_apply_plan(report, proposal, action, points)
             if dry_run:
                 return json.dumps({"dry_run": True, "would_apply": True, **plan})
+            if action == "draft_review":
+                draft_root = artifact_root(self._hermes_home, str(self._config.get("consolidation_artifact_dir") or "")) / "reconsolidation_drafts"
+                draft_root.mkdir(parents=True, exist_ok=True)
+                draft_path = draft_root / f"{proposal_id}.md"
+                draft_text = build_reconsolidation_draft_text(points, proposal=proposal, report_id=report_id)
+                draft_path.write_text(draft_text, encoding="utf-8")
+                record = persist_application_record({"applied": True, **plan, "reconsolidation_draft_path": str(draft_path)}, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))
+                return json.dumps({"dry_run": False, "applied": True, **plan, "reconsolidation_draft_path": str(draft_path), "application_id": record.get("application_id"), "application_artifact": record.get("artifact_path")})
             if action == "delete":
                 self._qdrant.delete_ids(collection_name, affected_ids)
                 record = persist_application_record({"applied": True, **plan, "deleted_ids": affected_ids}, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))

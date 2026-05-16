@@ -148,6 +148,8 @@ CONSOLIDATE_SCHEMA = {
             "max_groups": {"type": "integer", "description": "Maximum proposals to return. Defaults to config.", "minimum": 1, "maximum": 100},
             "include_examples": {"type": "boolean", "description": "Include redacted representative snippets. Defaults to false."},
             "persist": {"type": "boolean", "description": "Persist the report as a local JSON artifact. Defaults to config/default true."},
+            "include_reconsolidation": {"type": "boolean", "description": "Include M10 reconsolidation candidates. Defaults to config/default false."},
+            "reconsolidation_max_candidates": {"type": "integer", "description": "Maximum reconsolidation candidates to include.", "minimum": 1, "maximum": 100},
         },
         "additionalProperties": False,
     },
@@ -161,7 +163,7 @@ CONSOLIDATION_APPLY_SCHEMA = {
         "properties": {
             "report_id": {"type": "string", "description": "Persisted report id returned by qdrant_memory_consolidate."},
             "proposal_id": {"type": "string", "description": "Proposal id to preview/apply."},
-            "action": {"type": "string", "enum": ["merge", "delete", "promote_to_skill"], "description": "Expected action for the proposal type."},
+            "action": {"type": "string", "enum": ["merge", "delete", "promote_to_skill", "draft_review"], "description": "Expected action for the proposal type."},
             "dry_run": {"type": "boolean", "description": "When true, return the operation plan without mutating Qdrant or writing drafts. Defaults true."},
             "approve": {"type": "boolean", "description": "Required true when dry_run=false."},
         },

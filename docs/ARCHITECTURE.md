@@ -91,13 +91,15 @@ M7.1 adds gated automatic extraction candidates from `on_pre_compress` and `on_s
 
 M7.2 adds semantic dedupe before candidates enter the pending buffer. It queries existing `hermes_learnings` with the same scope and `learning_type`, uses raw Qdrant similarity, does not update access metadata, and fails open if Qdrant/embeddings are unavailable.
 
-## M8/M9 sleep consolidation
+## M8/M9/M10 sleep consolidation
 
 M8 introduced `qdrant_memory_consolidate` as a dry-run reflection pass. It reads points with Qdrant scroll filters, respects the active scope, and analyzes `hermes_memory`, `hermes_learnings`, or both. Report generation never calls memory-action upsert/delete/approval/payload update methods and does not change access metadata.
 
 M9a persists each report as a local JSON artifact under `$HERMES_HOME/qdrant_memory/consolidation/` (or `consolidation_artifact_dir`). M9b/M9c add `qdrant_memory_consolidation_apply`, which loads a persisted `report_id`, finds one exact `proposal_id`, previews by default, and only performs live work when `dry_run=false` and `approve=true`.
 
-The report may propose duplicate clusters, stale low-value memory candidates, learning promotion candidates, and quality warnings. Apply semantics are intentionally narrow: duplicate clusters can merge by preserving one canonical point and deleting explicit duplicates; stale low-value proposals can delete explicit IDs only; learning promotion candidates create local draft skill artifacts and mark the learning as promoted-to-draft. Quality warnings remain manual-review only.
+M10 adds optional `reconsolidation_candidate` proposals. These detect multiple memory points that share an explicit fact key (`reconsolidation_key`, `fact_key`, `subject`, `topic`, or `entity`) but contain different normalized text. They are opt-in via `include_reconsolidation` or config. M10 never rewrites Qdrant facts; its only supported live action is `draft_review`, which writes a local markdown review artifact.
+
+The report may propose duplicate clusters, stale low-value memory candidates, learning promotion candidates, quality warnings, and optional reconsolidation candidates. Apply semantics are intentionally narrow: duplicate clusters can merge by preserving one canonical point and deleting explicit duplicates; stale low-value proposals can delete explicit IDs only; learning promotion candidates create local draft skill artifacts and mark the learning as promoted-to-draft; reconsolidation candidates create review drafts only. Quality warnings remain manual-review only.
 
 Safety gates:
 
@@ -107,7 +109,8 @@ Safety gates:
 - all deletes use explicit IDs only; `delete_filter` is not used by consolidation apply;
 - current affected points are re-fetched before live action, so missing points reject as stale;
 - secret-bearing quality warnings and secret-bearing merge/promotion inputs require manual review;
-- skill promotion creates a draft artifact only and never installs a skill automatically.
+- skill promotion creates a draft artifact only and never installs a skill automatically;
+- reconsolidation candidates can only create local review drafts and must not mutate Qdrant facts.
 
 ## File manifest sync
 
@@ -162,4 +165,4 @@ For shared gateway deployments, avoid `global` unless you explicitly want cross-
 - File indexing defaults to dry-run.
 - File reindexing uses manifest sync to prevent stale high-index chunks after a file shrinks and stale chunks after files are deleted from indexed directories.
 - Deletion requires explicit point IDs and defaults to dry-run.
-- Reconsolidation is not enabled in this MVP.
+- Reconsolidation is manual-review only in M10: report generation is opt-in, and live `draft_review` creates only local markdown artifacts without Qdrant mutation.

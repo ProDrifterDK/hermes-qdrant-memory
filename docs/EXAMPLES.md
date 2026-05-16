@@ -174,7 +174,7 @@ First search with metadata and copy the exact point IDs. Then ask Hermes to call
 
 Only run with `dry_run: false` after verifying the IDs.
 
-## M9 consolidation report and gated apply
+## M9/M10 consolidation report and gated apply
 
 Generate and persist a reflection pass over memory and procedural learnings:
 
@@ -184,6 +184,7 @@ Generate and persist a reflection pass over memory and procedural learnings:
   "max_points": 200,
   "max_groups": 20,
   "include_examples": true,
+  "include_reconsolidation": true,
   "persist": true
 }
 ```
@@ -212,4 +213,26 @@ Live apply requires explicit approval:
 }
 ```
 
-Supported live actions are explicit-ID `delete`, canonical-preserving duplicate `merge`, and `promote_to_skill` draft creation. `quality_warning` proposals are manual-only.
+Supported live actions are explicit-ID `delete`, canonical-preserving duplicate `merge`, `promote_to_skill` draft creation, and M10 `draft_review` for reconsolidation candidates. `quality_warning` proposals are manual-only. `draft_review` writes only a local markdown review artifact and never mutates Qdrant memory.
+
+Preview a reconsolidation review draft:
+
+```json
+{
+  "report_id": "abc123...",
+  "proposal_id": "reconsolidation_candidate-...",
+  "action": "draft_review"
+}
+```
+
+Create the review draft after inspecting the dry-run plan:
+
+```json
+{
+  "report_id": "abc123...",
+  "proposal_id": "reconsolidation_candidate-...",
+  "action": "draft_review",
+  "dry_run": false,
+  "approve": true
+}
+```
