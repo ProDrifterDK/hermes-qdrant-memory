@@ -214,6 +214,42 @@ class LearningStore:
             must.append({"key": "learning_type", "match": {"value": _normalize_learning_type(learning_type)}})
         return {"must": must}
 
+    def find_semantic_duplicate(
+        self,
+        query: str,
+        *,
+        learning_type: str | None = None,
+        threshold: float = 0.9,
+        top_k: int = 3,
+        scope: dict[str, str] | None = None,
+    ) -> dict[str, Any] | None:
+        """Return a likely duplicate learning without mutating access metadata."""
+        clean_query = clean_text_for_memory(query)
+        if not clean_query:
+            return None
+        vector = self.embeddings.embed_query(clean_query)
+        raw = self.qdrant.search(
+            self.collection_name,
+            vector,
+            limit=max(1, min(10, int(top_k))),
+            filter=self._filter(learning_type=learning_type, scope=scope),
+            with_payload=True,
+            with_vector=False,
+        )
+        best: dict[str, Any] | None = None
+        best_score = float("-inf")
+        for item in raw:
+            try:
+                score = float(item.get("score", 0.0))
+            except Exception:
+                score = 0.0
+            if score > best_score:
+                best = item
+                best_score = score
+        if best is not None and best_score >= float(threshold):
+            return best
+        return None
+
     def search(self, query: str, *, top_k: int = 5, learning_type: str | None = None, scope: dict[str, str] | None = None) -> list[RetrievedMemory]:
         vector = self.embeddings.embed_query(query)
         raw = self.qdrant.search(

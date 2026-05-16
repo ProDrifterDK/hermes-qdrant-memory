@@ -139,9 +139,11 @@ Automatic extraction is off by default. To test it temporarily:
 qdrant_memory:
   learning_auto_extract_enabled: true
   learning_auto_extract_mode: preview
+  learning_auto_extract_semantic_dedupe_enabled: true
+  learning_auto_extract_semantic_dedupe_threshold: 0.9
 ```
 
-When `on_pre_compress` or `on_session_end` sees a strong candidate, inspect it:
+When `on_pre_compress` or `on_session_end` sees a strong candidate, M7.2 first searches existing `hermes_learnings` with the same learning type. If no high-similarity duplicate is found, inspect the pending candidate:
 
 ```json
 {

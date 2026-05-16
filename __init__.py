@@ -254,6 +254,34 @@ class QdrantMemoryProvider(MemoryProvider):
             max_candidates = 3
         return min_confidence, max(1, max_candidates)
 
+    def _is_semantic_duplicate_learning_candidate(self, candidate: LearningCandidate) -> bool:
+        if not self._config.get("learning_auto_extract_semantic_dedupe_enabled", True):
+            return False
+        store = self._ensure_learning_store()
+        if not store:
+            return False
+        try:
+            threshold = float(self._config.get("learning_auto_extract_semantic_dedupe_threshold", 0.9))
+        except Exception:
+            threshold = 0.9
+        try:
+            top_k = int(self._config.get("learning_auto_extract_semantic_dedupe_top_k", 3))
+        except Exception:
+            top_k = 3
+        query = "\n".join(part for part in [candidate.lesson, candidate.trigger, candidate.correction] if part)
+        try:
+            return bool(
+                store.find_semantic_duplicate(
+                    query,
+                    learning_type=candidate.learning_type,
+                    threshold=threshold,
+                    top_k=top_k,
+                )
+            )
+        except Exception:
+            logger.debug("Qdrant learning semantic dedupe failed open", exc_info=True)
+            return False
+
     def _collect_learning_candidates(self, messages: list[Any], *, source_hook: str) -> list[LearningCandidate]:
         if not self._auto_learning_enabled():
             return []
@@ -277,6 +305,8 @@ class QdrantMemoryProvider(MemoryProvider):
             if len(self._pending_learning_candidates) >= max_candidates:
                 break
             if candidate.candidate_id in self._pending_learning_candidates:
+                continue
+            if self._is_semantic_duplicate_learning_candidate(candidate):
                 continue
             self._pending_learning_candidates[candidate.candidate_id] = candidate
             accepted.append(candidate)

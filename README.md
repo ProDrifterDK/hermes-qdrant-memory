@@ -412,6 +412,9 @@ qdrant_memory:
   learning_auto_extract_min_confidence: 0.85
   learning_auto_extract_max_candidates_per_session: 3
   learning_auto_extract_require_evidence: true
+  learning_auto_extract_semantic_dedupe_enabled: true
+  learning_auto_extract_semantic_dedupe_threshold: 0.9
+  learning_auto_extract_semantic_dedupe_top_k: 3
   consolidation_enabled: false
   reconsolidation_enabled: false
   query_prefix: "search_query: "
@@ -525,7 +528,7 @@ Useful arguments:
 
 Previews gated automatic learning candidates collected by `on_pre_compress` and `on_session_end`. It is dry-run only and never writes to Qdrant.
 
-M7.1 keeps automatic extraction disabled by default with `learning_auto_extract_enabled: false`. When enabled, candidates are buffered for review rather than stored automatically.
+M7.1 keeps automatic extraction disabled by default with `learning_auto_extract_enabled: false`. When enabled, candidates are buffered for review rather than stored automatically. M7.2 semantically checks existing `hermes_learnings` before adding a candidate to the pending buffer, so already-learned lessons are suppressed when the raw Qdrant score is at or above `learning_auto_extract_semantic_dedupe_threshold`.
 
 ### `qdrant_learning_approve`
 

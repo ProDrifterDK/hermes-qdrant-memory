@@ -13,17 +13,32 @@ def test_config_defaults_when_no_file(tmp_path):
     assert cfg["qdrant_url"] == "http://127.0.0.1:6333"
     assert cfg["embedding_model"] == "bge-m3"
     assert cfg["vector_size"] == 1024
+    assert cfg["learning_auto_extract_semantic_dedupe_enabled"] is True
+    assert cfg["learning_auto_extract_semantic_dedupe_threshold"] == 0.9
+    assert cfg["learning_auto_extract_semantic_dedupe_top_k"] == 3
     assert set(DEFAULTS).issubset(cfg)
 
 
 def test_config_overrides_from_qdrant_memory_section(tmp_path):
     cfg = load_config(
         hermes_home=str(tmp_path),
-        hermes_config={"qdrant_memory": {"enabled": "false", "auto_recall_top_k": "9", "distance": "Dot"}},
+        hermes_config={
+            "qdrant_memory": {
+                "enabled": "false",
+                "auto_recall_top_k": "9",
+                "distance": "Dot",
+                "learning_auto_extract_semantic_dedupe_enabled": "false",
+                "learning_auto_extract_semantic_dedupe_threshold": "0.93",
+                "learning_auto_extract_semantic_dedupe_top_k": "7",
+            }
+        },
     )
     assert cfg["enabled"] is False
     assert cfg["auto_recall_top_k"] == 9
     assert cfg["distance"] == "Dot"
+    assert cfg["learning_auto_extract_semantic_dedupe_enabled"] is False
+    assert cfg["learning_auto_extract_semantic_dedupe_threshold"] == 0.93
+    assert cfg["learning_auto_extract_semantic_dedupe_top_k"] == 7
 
 
 def test_point_id_is_deterministic_and_uuid_compatible():

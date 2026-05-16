@@ -89,6 +89,8 @@ M7 is manual/gated: use `qdrant_learning_store` and `qdrant_learning_search`. `q
 
 M7.1 adds gated automatic extraction candidates from `on_pre_compress` and `on_session_end`. Automatic extraction is disabled by default (`learning_auto_extract_enabled: false`). When enabled, heuristics detect explicit user corrections and tool failures with explicit follow-up corrections, then place candidates in an in-memory pending buffer. The candidates are reviewed with `qdrant_learning_preview` and stored only after explicit `qdrant_learning_approve` with `dry_run: false`. There is still no blind auto-store path.
 
+M7.2 adds semantic dedupe before candidates enter the pending buffer. It queries existing `hermes_learnings` with the same scope and `learning_type`, uses raw Qdrant similarity, does not update access metadata, and fails open if Qdrant/embeddings are unavailable.
+
 Safety gates:
 
 - explicit correction/resolution signal required
@@ -97,6 +99,7 @@ Safety gates:
 - secret-bearing text is blocked
 - reset clears pending candidates
 - approval stores only to `hermes_learnings`
+- semantic dedupe suppresses existing lessons using same scope/type and high raw similarity
 
 ## File manifest sync
 

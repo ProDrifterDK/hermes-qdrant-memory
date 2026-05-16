@@ -25,6 +25,8 @@ class FakeQdrant:
         self.upserts = []
         self.searches = []
         self.payload_updates = []
+        self.search_results = []
+        self.raise_on_search = False
         self.counts = {"memory": 3, "learnings": 2}
         self.collections = ["memory", "learnings"]
         self.health_ok = True
@@ -35,7 +37,9 @@ class FakeQdrant:
 
     def search(self, name, vector, limit, filter=None, with_payload=True, with_vector=False):
         self.searches.append((name, vector, limit, filter, with_payload, with_vector))
-        return []
+        if self.raise_on_search:
+            raise RuntimeError("search unavailable")
+        return self.search_results
 
     def update_payload(self, name, point_id, payload):
         self.payload_updates.append((name, point_id, payload))
@@ -78,6 +82,9 @@ def _provider_with_auto_extract():
             "learning_auto_extract_min_confidence": 0.8,
             "learning_auto_extract_max_candidates_per_session": 3,
             "learning_auto_extract_require_evidence": True,
+            "learning_auto_extract_semantic_dedupe_enabled": True,
+            "learning_auto_extract_semantic_dedupe_threshold": 0.9,
+            "learning_auto_extract_semantic_dedupe_top_k": 3,
         }
     )
     return provider
@@ -190,6 +197,63 @@ def test_pending_candidate_cap_is_enforced_across_multiple_hooks():
 
     preview = json.loads(provider.handle_tool_call("qdrant_learning_preview", {}))
     assert preview["count"] == 2
+
+
+def test_semantic_duplicate_existing_learning_is_not_added_to_pending_preview():
+    provider = _provider_with_auto_extract()
+    provider._qdrant.search_results = [
+        {
+            "id": "existing-learning",
+            "score": 0.95,
+            "payload": {
+                "text": "User correction: use Gárate, not Garate.",
+                "source_type": "learning",
+                "learning_type": "user_correction",
+            },
+        }
+    ]
+
+    provider.on_session_end([
+        {"role": "user", "content": "Actually, spell my surname Gárate, not Garate."},
+        {"role": "assistant", "content": "Corrected."},
+    ])
+
+    preview = json.loads(provider.handle_tool_call("qdrant_learning_preview", {}))
+    assert preview["count"] == 0
+    assert provider._qdrant.upserts == []
+    assert provider._qdrant.searches[0][0] == "learnings"
+    filter_payload = provider._qdrant.searches[0][3]
+    assert {"key": "source_type", "match": {"value": "learning"}} in filter_payload["must"]
+    assert {"key": "learning_type", "match": {"value": "user_correction"}} in filter_payload["must"]
+
+
+def test_semantic_dedupe_failure_fails_open_and_keeps_candidate_pending():
+    provider = _provider_with_auto_extract()
+    provider._qdrant.raise_on_search = True
+
+    provider.on_session_end([
+        {"role": "user", "content": "Actually, spell my surname Gárate, not Garate."},
+        {"role": "assistant", "content": "Corrected."},
+    ])
+
+    preview = json.loads(provider.handle_tool_call("qdrant_learning_preview", {}))
+    assert preview["count"] == 1
+    assert provider._qdrant.upserts == []
+
+
+def test_semantic_dedupe_disabled_keeps_candidate_pending_without_search():
+    provider = _provider_with_auto_extract()
+    provider._config["learning_auto_extract_semantic_dedupe_enabled"] = False
+    provider._qdrant.search_results = [{"id": "existing-learning", "score": 0.99, "payload": {"source_type": "learning"}}]
+
+    provider.on_session_end([
+        {"role": "user", "content": "Actually, spell my surname Gárate, not Garate."},
+        {"role": "assistant", "content": "Corrected."},
+    ])
+
+    preview = json.loads(provider.handle_tool_call("qdrant_learning_preview", {}))
+    assert preview["count"] == 1
+    assert provider._qdrant.searches == []
 
 
 def test_on_pre_compress_does_not_return_secret_bearing_candidate_text():
