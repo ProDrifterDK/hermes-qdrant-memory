@@ -50,11 +50,13 @@ Low thresholds can surface weakly related chunks. Tune:
 - `min_final_score`
 - `display_tokens`
 
-## Learning is manual/gated
+## Learning auto-extraction is gated
 
 M7 implements the `hermes_learnings` collection plus explicit `qdrant_learning_store` and `qdrant_learning_search` tools. These tools are enabled by default and can be disabled with `qdrant_memory.learning_enabled: false`.
 
-It does not yet implement automatic learning extraction from every tool failure or user correction. That is intentionally deferred until stronger gating exists, because automatic learning can overfit transient errors or turn stale context into false procedures.
+M7.1 adds heuristic candidate extraction, not blind auto-learning. `learning_auto_extract_enabled` defaults to false. When turned on, candidates are kept pending for review through `qdrant_learning_preview`; `qdrant_learning_approve` defaults to dry-run and requires explicit `dry_run: false` to store.
+
+The extractor is deliberately narrow: explicit user corrections and tool failures only when followed by a correction/resolution. It does not use an LLM yet and should not be treated as a full learning pipeline.
 
 ## Consolidation is not complete
 

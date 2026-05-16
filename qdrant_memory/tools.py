@@ -110,4 +110,40 @@ LEARNING_SEARCH_SCHEMA = {
     },
 }
 
-TOOL_SCHEMAS = [STATUS_SCHEMA, STORE_SCHEMA, SEARCH_SCHEMA, INDEX_SCHEMA, FORGET_SCHEMA, LEARNING_STORE_SCHEMA, LEARNING_SEARCH_SCHEMA]
+LEARNING_PREVIEW_SCHEMA = {
+    "name": "qdrant_learning_preview",
+    "description": "Preview gated automatic learning candidates detected from session/compression hooks. Dry-run only; does not store memories.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "include_metadata": {"type": "boolean", "description": "Include hook/source metadata. Defaults to false."},
+        },
+        "additionalProperties": False,
+    },
+}
+
+LEARNING_APPROVE_SCHEMA = {
+    "name": "qdrant_learning_approve",
+    "description": "Approve one pending gated learning candidate by candidate_id. Dry-run defaults to true; live mode stores to the learning collection only.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "candidate_id": {"type": "string", "description": "Candidate ID from qdrant_learning_preview."},
+            "dry_run": {"type": "boolean", "description": "When true, preview approval without storing. Defaults to true."},
+        },
+        "required": ["candidate_id"],
+        "additionalProperties": False,
+    },
+}
+
+TOOL_SCHEMAS = [
+    STATUS_SCHEMA,
+    STORE_SCHEMA,
+    SEARCH_SCHEMA,
+    INDEX_SCHEMA,
+    FORGET_SCHEMA,
+    LEARNING_STORE_SCHEMA,
+    LEARNING_SEARCH_SCHEMA,
+    LEARNING_PREVIEW_SCHEMA,
+    LEARNING_APPROVE_SCHEMA,
+]

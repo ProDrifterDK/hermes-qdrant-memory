@@ -23,6 +23,11 @@ DEFAULTS: dict[str, Any] = {
     "sync_turns": True,
     "sync_subagents": False,
     "learning_enabled": True,
+    "learning_auto_extract_enabled": False,
+    "learning_auto_extract_mode": "preview",
+    "learning_auto_extract_min_confidence": 0.85,
+    "learning_auto_extract_max_candidates_per_session": 3,
+    "learning_auto_extract_require_evidence": True,
     "consolidation_enabled": False,
     "reconsolidation_enabled": False,
     "query_prefix": "search_query: ",
@@ -56,12 +61,14 @@ _BOOL_KEYS = {
     "sync_turns",
     "sync_subagents",
     "learning_enabled",
+    "learning_auto_extract_enabled",
+    "learning_auto_extract_require_evidence",
     "consolidation_enabled",
     "reconsolidation_enabled",
     "index_dry_run_default",
 }
-_INT_KEYS = {"vector_size", "auto_recall_top_k", "search_candidates", "max_chunk_tokens", "display_tokens", "index_max_files"}
-_FLOAT_KEYS = {"decay_rate", "min_raw_score", "min_final_score"}
+_INT_KEYS = {"vector_size", "auto_recall_top_k", "search_candidates", "max_chunk_tokens", "display_tokens", "index_max_files", "learning_auto_extract_max_candidates_per_session"}
+_FLOAT_KEYS = {"decay_rate", "min_raw_score", "min_final_score", "learning_auto_extract_min_confidence"}
 _LIST_KEYS = {"index_dirs", "index_extensions", "index_exclude_dirs"}
 
 

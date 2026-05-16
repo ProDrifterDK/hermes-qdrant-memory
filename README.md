@@ -406,7 +406,12 @@ qdrant_memory:
   display_tokens: 500
   sync_turns: true
   sync_subagents: false
-  learning_enabled: false
+  learning_enabled: true
+  learning_auto_extract_enabled: false
+  learning_auto_extract_mode: preview
+  learning_auto_extract_min_confidence: 0.85
+  learning_auto_extract_max_candidates_per_session: 3
+  learning_auto_extract_require_evidence: true
   consolidation_enabled: false
   reconsolidation_enabled: false
   query_prefix: "search_query: "
@@ -515,6 +520,16 @@ Useful arguments:
 - `top_k`
 - `learning_type`
 - `include_metadata`
+
+### `qdrant_learning_preview`
+
+Previews gated automatic learning candidates collected by `on_pre_compress` and `on_session_end`. It is dry-run only and never writes to Qdrant.
+
+M7.1 keeps automatic extraction disabled by default with `learning_auto_extract_enabled: false`. When enabled, candidates are buffered for review rather than stored automatically.
+
+### `qdrant_learning_approve`
+
+Approves one pending candidate by `candidate_id`. `dry_run` defaults to true; live approval with `dry_run: false` stores into `hermes_learnings` only.
 
 ## Indexing safety
 

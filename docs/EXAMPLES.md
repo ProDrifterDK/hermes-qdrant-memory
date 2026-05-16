@@ -131,6 +131,41 @@ Equivalent tool payload:
 }
 ```
 
+## Preview and approve gated automatic candidates
+
+Automatic extraction is off by default. To test it temporarily:
+
+```yaml
+qdrant_memory:
+  learning_auto_extract_enabled: true
+  learning_auto_extract_mode: preview
+```
+
+When `on_pre_compress` or `on_session_end` sees a strong candidate, inspect it:
+
+```json
+{
+  "include_metadata": true
+}
+```
+
+Approve only after review. Dry-run is the default:
+
+```json
+{
+  "candidate_id": "<candidate_id>"
+}
+```
+
+Store live only when the candidate is durable and non-secret:
+
+```json
+{
+  "candidate_id": "<candidate_id>",
+  "dry_run": false
+}
+```
+
 ## Safe delete
 
 First search with metadata and copy the exact point IDs. Then ask Hermes to call `qdrant_memory_forget` with `dry_run: true`.

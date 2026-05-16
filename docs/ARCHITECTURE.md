@@ -85,7 +85,18 @@ Learning payloads use `source_type=learning` plus `learning_type` / `chunk_type`
 
 Learning payloads also carry `trigger`, `mistake`, `correction`, `evidence`, `tool_name`, `command`, and `promote_to_skill_candidate` fields.
 
-M7 is manual/gated: use `qdrant_learning_store` and `qdrant_learning_search`. Automatic extraction from every tool failure is intentionally deferred. `qdrant_memory.learning_enabled` controls whether the explicit learning tools are available.
+M7 is manual/gated: use `qdrant_learning_store` and `qdrant_learning_search`. `qdrant_memory.learning_enabled` controls whether learning tools are available.
+
+M7.1 adds gated automatic extraction candidates from `on_pre_compress` and `on_session_end`. Automatic extraction is disabled by default (`learning_auto_extract_enabled: false`). When enabled, heuristics detect explicit user corrections and tool failures with explicit follow-up corrections, then place candidates in an in-memory pending buffer. The candidates are reviewed with `qdrant_learning_preview` and stored only after explicit `qdrant_learning_approve` with `dry_run: false`. There is still no blind auto-store path.
+
+Safety gates:
+
+- explicit correction/resolution signal required
+- candidate confidence threshold (`learning_auto_extract_min_confidence`)
+- per-session candidate cap (`learning_auto_extract_max_candidates_per_session`)
+- secret-bearing text is blocked
+- reset clears pending candidates
+- approval stores only to `hermes_learnings`
 
 ## File manifest sync
 

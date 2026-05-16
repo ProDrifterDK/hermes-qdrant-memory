@@ -32,6 +32,7 @@ from qdrant_memory.config import load_config
 from qdrant_memory.embeddings import EmbeddingClient
 from qdrant_memory.indexer import FileIndexer
 from qdrant_memory.learning import LearningStore
+from qdrant_memory.lesson_extractor import LearningCandidate, candidate_to_learning_args, extract_learning_candidates_from_messages
 from qdrant_memory.retriever import MemoryRetriever, format_for_prompt
 from qdrant_memory.tools import TOOL_SCHEMAS
 from qdrant_memory.writer import ConversationWriter
@@ -68,6 +69,7 @@ class QdrantMemoryProvider(MemoryProvider):
         self._chat_id_hash = ""
         self._active = False
         self._write_enabled = True
+        self._pending_learning_candidates: dict[str, LearningCandidate] = {}
 
     @property
     def name(self) -> str:
@@ -236,6 +238,64 @@ class QdrantMemoryProvider(MemoryProvider):
         if reset:
             with self._prefetch_lock:
                 self._prefetch_cache.clear()
+            self._pending_learning_candidates.clear()
+
+    def _auto_learning_enabled(self) -> bool:
+        return bool(self._config.get("learning_enabled", True)) and bool(self._config.get("learning_auto_extract_enabled", False))
+
+    def _candidate_limits(self) -> tuple[float, int]:
+        try:
+            min_confidence = float(self._config.get("learning_auto_extract_min_confidence", 0.85))
+        except Exception:
+            min_confidence = 0.85
+        try:
+            max_candidates = int(self._config.get("learning_auto_extract_max_candidates_per_session", 3))
+        except Exception:
+            max_candidates = 3
+        return min_confidence, max(1, max_candidates)
+
+    def _collect_learning_candidates(self, messages: list[Any], *, source_hook: str) -> list[LearningCandidate]:
+        if not self._auto_learning_enabled():
+            return []
+        mode = str(self._config.get("learning_auto_extract_mode") or "preview")
+        if mode not in {"preview", "store"}:
+            return []
+        min_confidence, max_candidates = self._candidate_limits()
+        remaining = max_candidates - len(self._pending_learning_candidates)
+        if remaining <= 0:
+            return []
+        candidates = extract_learning_candidates_from_messages(
+            messages,
+            source_hook=source_hook,
+            min_confidence=min_confidence,
+            max_candidates=remaining,
+        )
+        if self._config.get("learning_auto_extract_require_evidence", True):
+            candidates = [candidate for candidate in candidates if candidate.evidence.strip()]
+        accepted: list[LearningCandidate] = []
+        for candidate in candidates:
+            if len(self._pending_learning_candidates) >= max_candidates:
+                break
+            if candidate.candidate_id in self._pending_learning_candidates:
+                continue
+            self._pending_learning_candidates[candidate.candidate_id] = candidate
+            accepted.append(candidate)
+        if mode == "store":
+            # Intentionally conservative: M7.1 still routes through approval/dry-run.
+            logger.info("qdrant learning auto_extract_mode=store is not active yet; candidates kept pending")
+        return accepted
+
+    def on_pre_compress(self, messages: list[Any]) -> str:
+        candidates = self._collect_learning_candidates(messages, source_hook="on_pre_compress")
+        if not candidates:
+            return ""
+        lines = ["# Qdrant Learning Candidates", "Potential procedural lessons detected but not stored. Review with qdrant_learning_preview and approve explicitly."]
+        for candidate in candidates:
+            lines.append(f"- {candidate.candidate_id} [{candidate.learning_type}] {candidate.lesson[:220]}")
+        return "\n".join(lines)
+
+    def on_session_end(self, messages: list[Any]) -> None:
+        self._collect_learning_candidates(messages, source_hook="on_session_end")
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return TOOL_SCHEMAS
@@ -278,6 +338,9 @@ class QdrantMemoryProvider(MemoryProvider):
             "learning_collection_exists": self._config["learning_collection_name"] in collections,
             "learning_point_count": learning_point_count,
             "learning_enabled": self._config.get("learning_enabled", True),
+            "learning_auto_extract_enabled": self._config.get("learning_auto_extract_enabled", False),
+            "learning_auto_extract_mode": self._config.get("learning_auto_extract_mode", "preview"),
+            "pending_learning_candidate_count": len(self._pending_learning_candidates),
             "auto_recall": self._config["auto_recall"],
             "sync_turns": self._config["sync_turns"],
         }
@@ -472,6 +535,34 @@ class QdrantMemoryProvider(MemoryProvider):
         except Exception as exc:
             return _json_error(f"Learning search failed: {exc}")
 
+    def _tool_learning_preview(self, args: dict) -> str:
+        include_metadata = bool(args.get("include_metadata", False))
+        candidates = [candidate.to_dict(include_metadata=include_metadata) for candidate in self._pending_learning_candidates.values()]
+        return json.dumps({"candidates": candidates, "count": len(candidates), "dry_run": True})
+
+    def _tool_learning_approve(self, args: dict) -> str:
+        if not self._config.get("learning_enabled", True):
+            return _json_error("Qdrant learning tools are disabled by qdrant_memory.learning_enabled")
+        candidate_id = str(args.get("candidate_id") or "").strip()
+        if not candidate_id:
+            return _json_error("candidate_id is required")
+        candidate = self._pending_learning_candidates.get(candidate_id)
+        if not candidate:
+            return _json_error(f"Unknown learning candidate: {candidate_id}")
+        dry_run = bool(args.get("dry_run", True))
+        learning_args = candidate_to_learning_args(candidate)
+        if dry_run:
+            return json.dumps({"dry_run": True, "saved": False, "candidate": candidate.to_dict(include_metadata=True), "learning_args": learning_args})
+        store = self._ensure_learning_store()
+        if not store:
+            return _json_error("Qdrant learning store is not initialized")
+        try:
+            point_id = store.store(**learning_args)
+            self._pending_learning_candidates.pop(candidate_id, None)
+            return json.dumps({"dry_run": False, "saved": bool(point_id), "id": point_id, "collection_name": self._config["learning_collection_name"]})
+        except Exception as exc:
+            return _json_error(f"Learning approval failed: {exc}")
+
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         args = args or {}
         if tool_name == "qdrant_memory_status":
@@ -488,6 +579,10 @@ class QdrantMemoryProvider(MemoryProvider):
             return self._tool_learning_store(args)
         if tool_name == "qdrant_learning_search":
             return self._tool_learning_search(args)
+        if tool_name == "qdrant_learning_preview":
+            return self._tool_learning_preview(args)
+        if tool_name == "qdrant_learning_approve":
+            return self._tool_learning_approve(args)
         return _json_error(f"Unknown tool: {tool_name}")
 
     def shutdown(self) -> None:
