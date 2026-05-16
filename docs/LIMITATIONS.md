@@ -60,9 +60,11 @@ M7.2 adds semantic dedupe against existing `hermes_learnings` before preview/pen
 
 The extractor is deliberately narrow: explicit user corrections and tool failures only when followed by a correction/resolution. It does not use an LLM yet and should not be treated as a full learning pipeline.
 
-## Consolidation is not complete
+## Consolidation is report-only in M8
 
-Sleep-style abstraction, pruning, strengthening, and reflection are roadmap items.
+`qdrant_memory_consolidate` produces dry-run proposals only. It does not embed new text, upsert memories, delete memories, approve learning candidates, merge duplicates, or update access metadata. `dry_run: false` is rejected. Treat stale/delete/merge/promotion proposals as review queues, not actions.
+
+The duplicate detector in M8 is intentionally conservative and mostly text-fingerprint based; it is a safety report, not a semantic merge engine. Future versions may add similarity search or LLM-assisted abstraction, but those should remain gated and apply-by-proposal-id.
 
 ## Reconsolidation is intentionally absent
 

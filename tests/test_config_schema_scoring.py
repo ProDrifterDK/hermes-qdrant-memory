@@ -16,6 +16,11 @@ def test_config_defaults_when_no_file(tmp_path):
     assert cfg["learning_auto_extract_semantic_dedupe_enabled"] is True
     assert cfg["learning_auto_extract_semantic_dedupe_threshold"] == 0.9
     assert cfg["learning_auto_extract_semantic_dedupe_top_k"] == 3
+    assert cfg["consolidation_report_max_points"] == 200
+    assert cfg["consolidation_report_max_groups"] == 20
+    assert cfg["consolidation_duplicate_threshold"] == 0.92
+    assert cfg["consolidation_stale_days"] == 90
+    assert cfg["consolidation_min_importance_for_keep"] == 4
     assert set(DEFAULTS).issubset(cfg)
 
 
@@ -30,6 +35,11 @@ def test_config_overrides_from_qdrant_memory_section(tmp_path):
                 "learning_auto_extract_semantic_dedupe_enabled": "false",
                 "learning_auto_extract_semantic_dedupe_threshold": "0.93",
                 "learning_auto_extract_semantic_dedupe_top_k": "7",
+                "consolidation_report_max_points": "42",
+                "consolidation_report_max_groups": "8",
+                "consolidation_duplicate_threshold": "0.88",
+                "consolidation_stale_days": "30",
+                "consolidation_min_importance_for_keep": "3",
             }
         },
     )
@@ -39,6 +49,11 @@ def test_config_overrides_from_qdrant_memory_section(tmp_path):
     assert cfg["learning_auto_extract_semantic_dedupe_enabled"] is False
     assert cfg["learning_auto_extract_semantic_dedupe_threshold"] == 0.93
     assert cfg["learning_auto_extract_semantic_dedupe_top_k"] == 7
+    assert cfg["consolidation_report_max_points"] == 42
+    assert cfg["consolidation_report_max_groups"] == 8
+    assert cfg["consolidation_duplicate_threshold"] == 0.88
+    assert cfg["consolidation_stale_days"] == 30
+    assert cfg["consolidation_min_importance_for_keep"] == 3
 
 
 def test_point_id_is_deterministic_and_uuid_compatible():

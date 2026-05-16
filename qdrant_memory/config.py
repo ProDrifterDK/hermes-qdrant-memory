@@ -32,6 +32,11 @@ DEFAULTS: dict[str, Any] = {
     "learning_auto_extract_semantic_dedupe_threshold": 0.9,
     "learning_auto_extract_semantic_dedupe_top_k": 3,
     "consolidation_enabled": False,
+    "consolidation_report_max_points": 200,
+    "consolidation_report_max_groups": 20,
+    "consolidation_duplicate_threshold": 0.92,
+    "consolidation_stale_days": 90,
+    "consolidation_min_importance_for_keep": 4,
     "reconsolidation_enabled": False,
     "query_prefix": "search_query: ",
     "document_prefix": "search_document: ",
@@ -71,8 +76,21 @@ _BOOL_KEYS = {
     "reconsolidation_enabled",
     "index_dry_run_default",
 }
-_INT_KEYS = {"vector_size", "auto_recall_top_k", "search_candidates", "max_chunk_tokens", "display_tokens", "index_max_files", "learning_auto_extract_max_candidates_per_session", "learning_auto_extract_semantic_dedupe_top_k"}
-_FLOAT_KEYS = {"decay_rate", "min_raw_score", "min_final_score", "learning_auto_extract_min_confidence", "learning_auto_extract_semantic_dedupe_threshold"}
+_INT_KEYS = {
+    "vector_size",
+    "auto_recall_top_k",
+    "search_candidates",
+    "max_chunk_tokens",
+    "display_tokens",
+    "index_max_files",
+    "learning_auto_extract_max_candidates_per_session",
+    "learning_auto_extract_semantic_dedupe_top_k",
+    "consolidation_report_max_points",
+    "consolidation_report_max_groups",
+    "consolidation_stale_days",
+    "consolidation_min_importance_for_keep",
+}
+_FLOAT_KEYS = {"decay_rate", "min_raw_score", "min_final_score", "learning_auto_extract_min_confidence", "learning_auto_extract_semantic_dedupe_threshold", "consolidation_duplicate_threshold"}
 _LIST_KEYS = {"index_dirs", "index_extensions", "index_exclude_dirs"}
 
 

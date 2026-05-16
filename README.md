@@ -47,7 +47,7 @@ Public beta / experimental. The MVP is functional and tested, but it depends on 
 | Legacy force reindex by `file_path` fallback | Implemented |
 | Safe forget by explicit point IDs | Implemented |
 | Manual procedural learning collection | Implemented |
-| Sleep consolidation | Future |
+| Sleep consolidation | M8 report-only/dry-run implemented |
 | Reconsolidation | Future, disabled by design |
 | Dashboard/UI | Not included |
 
@@ -416,6 +416,11 @@ qdrant_memory:
   learning_auto_extract_semantic_dedupe_threshold: 0.9
   learning_auto_extract_semantic_dedupe_top_k: 3
   consolidation_enabled: false
+  consolidation_report_max_points: 200
+  consolidation_report_max_groups: 20
+  consolidation_duplicate_threshold: 0.92
+  consolidation_stale_days: 90
+  consolidation_min_importance_for_keep: 4
   reconsolidation_enabled: false
   query_prefix: "search_query: "
   document_prefix: "search_document: "
@@ -496,6 +501,19 @@ Reindexing uses manifest sync by `file_path`: the dry run reports stale point ID
 ### `qdrant_memory_forget`
 
 Deletes explicit point IDs only. Dry-run defaults to true. There is intentionally no query-based deletion without preview.
+
+### `qdrant_memory_consolidate`
+
+Generates an M8 sleep-consolidation/reflection report over `hermes_memory`, `hermes_learnings`, or both. This is report-only: it scrolls existing points, proposes review actions, and never writes, deletes, merges, approves, or updates access metadata. `dry_run: false` is rejected in M8.
+
+Useful arguments:
+
+- `scope`: `memory`, `learning`, or `both`.
+- `max_points`: maximum points to inspect per collection.
+- `max_groups`: maximum proposals to return.
+- `include_examples`: include redacted snippets for representative points.
+
+Proposal types include duplicate clusters, stale low-value memory candidates, learning promotion candidates, and quality warnings such as possible secret-bearing memories. Every proposal is `*_review_only` and requires explicit human approval outside M8.
 
 ### `qdrant_learning_store`
 

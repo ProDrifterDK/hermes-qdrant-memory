@@ -136,6 +136,22 @@ LEARNING_APPROVE_SCHEMA = {
     },
 }
 
+CONSOLIDATE_SCHEMA = {
+    "name": "qdrant_memory_consolidate",
+    "description": "Generate a dry-run/report-only sleep consolidation and reflection report. M8 never writes, deletes, merges, approves, or mutates memories.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "dry_run": {"type": "boolean", "description": "Must remain true for M8 report-only mode. Defaults to true; false is rejected."},
+            "scope": {"type": "string", "enum": ["memory", "learning", "both"], "description": "Report scope: memory, learning, or both. Defaults to both."},
+            "max_points": {"type": "integer", "description": "Maximum points to inspect per collection. Defaults to config.", "minimum": 1, "maximum": 1000},
+            "max_groups": {"type": "integer", "description": "Maximum proposals to return. Defaults to config.", "minimum": 1, "maximum": 100},
+            "include_examples": {"type": "boolean", "description": "Include redacted representative snippets. Defaults to false."},
+        },
+        "additionalProperties": False,
+    },
+}
+
 TOOL_SCHEMAS = [
     STATUS_SCHEMA,
     STORE_SCHEMA,
@@ -146,4 +162,5 @@ TOOL_SCHEMAS = [
     LEARNING_SEARCH_SCHEMA,
     LEARNING_PREVIEW_SCHEMA,
     LEARNING_APPROVE_SCHEMA,
+    CONSOLIDATE_SCHEMA,
 ]

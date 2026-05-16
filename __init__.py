@@ -29,6 +29,7 @@ except Exception:  # pragma: no cover - used only for standalone tests without H
 
 from qdrant_memory.client import QdrantClient
 from qdrant_memory.config import load_config
+from qdrant_memory.consolidation import build_consolidation_report, make_filter, points_from_qdrant
 from qdrant_memory.embeddings import EmbeddingClient
 from qdrant_memory.indexer import FileIndexer
 from qdrant_memory.learning import LearningStore
@@ -371,6 +372,9 @@ class QdrantMemoryProvider(MemoryProvider):
             "learning_auto_extract_enabled": self._config.get("learning_auto_extract_enabled", False),
             "learning_auto_extract_mode": self._config.get("learning_auto_extract_mode", "preview"),
             "pending_learning_candidate_count": len(self._pending_learning_candidates),
+            "consolidation_enabled": self._config.get("consolidation_enabled", False),
+            "reconsolidation_enabled": self._config.get("reconsolidation_enabled", False),
+            "consolidation_report_only": True,
             "auto_recall": self._config["auto_recall"],
             "sync_turns": self._config["sync_turns"],
         }
@@ -472,6 +476,68 @@ class QdrantMemoryProvider(MemoryProvider):
             return json.dumps({"dry_run": False, "ids": ids, "deleted": len(ids)})
         except Exception as exc:
             return _json_error(f"Forget failed: {exc}")
+
+    def _tool_consolidate(self, args: dict) -> str:
+        dry_run_arg = args.get("dry_run", True)
+        if isinstance(dry_run_arg, str):
+            dry_run_arg = dry_run_arg.strip().lower() not in {"0", "false", "no", "off"}
+        if not bool(dry_run_arg):
+            return _json_error("qdrant_memory_consolidate is report-only in M8; dry_run=false is not supported")
+        if not self._qdrant:
+            return _json_error("Qdrant memory provider is not initialized")
+        scope = str(args.get("scope") or "both").strip().lower()
+        if scope not in {"memory", "learning", "both"}:
+            return _json_error("scope must be one of: memory, learning, both")
+        try:
+            max_points = max(1, min(1000, int(args.get("max_points") or self._config.get("consolidation_report_max_points", 200))))
+        except Exception:
+            max_points = 200
+        try:
+            max_groups = max(1, min(100, int(args.get("max_groups") or self._config.get("consolidation_report_max_groups", 20))))
+        except Exception:
+            max_groups = 20
+        include_examples = bool(args.get("include_examples", False))
+        base_scope = self._scope_filter_values()
+        memory_points = []
+        learning_points = []
+        try:
+            if scope in {"memory", "both"}:
+                raw_memory = self._qdrant.scroll_by_filter(
+                    self._config["collection_name"],
+                    make_filter(base_scope),
+                    limit=max_points,
+                    with_payload=True,
+                    with_vector=False,
+                    max_total=max_points,
+                )
+                memory_points = points_from_qdrant(raw_memory, collection_name=self._config["collection_name"])
+            if scope in {"learning", "both"}:
+                raw_learning = self._qdrant.scroll_by_filter(
+                    self._config["learning_collection_name"],
+                    make_filter(base_scope, source_type="learning"),
+                    limit=max_points,
+                    with_payload=True,
+                    with_vector=False,
+                    max_total=max_points,
+                )
+                learning_points = points_from_qdrant(raw_learning, collection_name=self._config["learning_collection_name"])
+            report = build_consolidation_report(
+                memory_points=memory_points,
+                learning_points=learning_points,
+                collection_name=self._config["collection_name"],
+                learning_collection_name=self._config["learning_collection_name"],
+                scope=scope,
+                include_examples=include_examples,
+                max_groups=max_groups,
+                stale_days=int(self._config.get("consolidation_stale_days", 90)),
+                min_importance_for_keep=int(self._config.get("consolidation_min_importance_for_keep", 4)),
+                duplicate_threshold=float(self._config.get("consolidation_duplicate_threshold", 0.92)),
+                consolidation_enabled=bool(self._config.get("consolidation_enabled", False)),
+                reconsolidation_enabled=bool(self._config.get("reconsolidation_enabled", False)),
+            )
+            return json.dumps(report)
+        except Exception as exc:
+            return _json_error(f"Consolidation report failed: {exc}")
 
     def _ensure_learning_store(self) -> Optional[LearningStore]:
         if self._learning_store:
@@ -605,6 +671,8 @@ class QdrantMemoryProvider(MemoryProvider):
             return self._tool_index(args)
         if tool_name == "qdrant_memory_forget":
             return self._tool_forget(args)
+        if tool_name == "qdrant_memory_consolidate":
+            return self._tool_consolidate(args)
         if tool_name == "qdrant_learning_store":
             return self._tool_learning_store(args)
         if tool_name == "qdrant_learning_search":

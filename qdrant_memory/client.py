@@ -100,13 +100,20 @@ class QdrantClient:
         limit: int = 256,
         with_payload: bool = True,
         with_vector: bool = False,
+        max_total: int | None = None,
     ) -> list[dict[str, Any]]:
         points: list[dict[str, Any]] = []
         offset: Any = None
+        page_limit = int(limit)
         while True:
+            if max_total is not None:
+                remaining = int(max_total) - len(points)
+                if remaining <= 0:
+                    break
+                page_limit = min(page_limit, remaining)
             body: dict[str, Any] = {
                 "filter": filter,
-                "limit": int(limit),
+                "limit": page_limit,
                 "with_payload": with_payload,
                 "with_vector": with_vector,
             }

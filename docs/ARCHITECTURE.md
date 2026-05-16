@@ -91,6 +91,12 @@ M7.1 adds gated automatic extraction candidates from `on_pre_compress` and `on_s
 
 M7.2 adds semantic dedupe before candidates enter the pending buffer. It queries existing `hermes_learnings` with the same scope and `learning_type`, uses raw Qdrant similarity, does not update access metadata, and fails open if Qdrant/embeddings are unavailable.
 
+## M8 report-only sleep consolidation
+
+M8 implements `qdrant_memory_consolidate` as a dry-run/report-only reflection pass. It reads points with Qdrant scroll filters, respects the active scope, and analyzes `hermes_memory`, `hermes_learnings`, or both. It never calls upsert, delete, approval, or payload update methods, and therefore does not change access metadata.
+
+The report may propose duplicate clusters, stale low-value memory candidates, learning promotion candidates, and quality warnings. All suggestions are review-only and require explicit human approval outside M8. `dry_run: false` is rejected; future M9 may add apply-by-proposal-id semantics.
+
 Safety gates:
 
 - explicit correction/resolution signal required

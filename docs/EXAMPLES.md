@@ -173,3 +173,18 @@ Store live only when the candidate is durable and non-secret:
 First search with metadata and copy the exact point IDs. Then ask Hermes to call `qdrant_memory_forget` with `dry_run: true`.
 
 Only run with `dry_run: false` after verifying the IDs.
+
+## M8 consolidation report
+
+Generate a report-only reflection pass over memory and procedural learnings:
+
+```json
+{
+  "scope": "both",
+  "max_points": 200,
+  "max_groups": 20,
+  "include_examples": true
+}
+```
+
+`qdrant_memory_consolidate` returns duplicate clusters, stale low-value candidates, learning promotion candidates, and quality warnings. M8 never applies the proposals. `dry_run: false` is rejected until a future gated apply flow exists.
