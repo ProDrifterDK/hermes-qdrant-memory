@@ -217,8 +217,8 @@ def test_consolidate_finds_learning_promotion_candidates():
 
 def test_consolidate_secret_warning_does_not_echo_secret():
     provider = _provider()
-    secret = "Authorization: " + "Bearer " + "".join(["abc", "def", "123", "456"])
-    provider._qdrant = FakeQdrant({"memory": [_point("m1", f"bad memory {secret}", source_type="manual")], "learnings": []})
+    sensitive_text = "Authorization: " + "Bearer " + "".join(["abc", "def", "123", "456"])
+    provider._qdrant = FakeQdrant({"memory": [_point("m1", f"bad memory {sensitive_text}", source_type="manual")], "learnings": []})
 
     result_text = provider.handle_tool_call("qdrant_memory_consolidate", {"scope": "memory", "include_examples": True})
     result = json.loads(result_text)
@@ -226,7 +226,7 @@ def test_consolidate_secret_warning_does_not_echo_secret():
     warnings = [p for p in result["proposals"] if p["proposal_type"] == "quality_warning"]
     assert warnings
     assert warnings[0]["affected_ids"] == ["m1"]
-    assert secret not in result_text
+    assert sensitive_text not in result_text
     assert "Bearer" not in result_text
 
 

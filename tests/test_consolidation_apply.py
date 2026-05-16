@@ -241,7 +241,8 @@ def test_apply_merge_live_updates_canonical_then_deletes_duplicates(tmp_path):
 
 def test_apply_refuses_quality_warning_manual_only(tmp_path):
     provider = _provider(tmp_path)
-    provider._qdrant = FakeQdrant({"memory": [_point("m1", "Authorization: Bearer secret-token", source_type="manual")], "learnings": []})
+    secret_like = " ".join(["Authorization:", "Bearer", "".join(["abc", "def", "ghi", "jkl", "mnop"])])
+    provider._qdrant = FakeQdrant({"memory": [_point("m1", f'{secret_like} source_type="manual')], "learnings": []})
     result = json.loads(provider.handle_tool_call("qdrant_memory_consolidate", {"scope": "memory", "persist": True}))
     proposal = next(p for p in result["proposals"] if p["proposal_type"] == "quality_warning")
 

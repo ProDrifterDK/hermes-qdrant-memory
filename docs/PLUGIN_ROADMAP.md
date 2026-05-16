@@ -717,6 +717,8 @@ python -m pytest tests/test_tools_retriever_writer.py -q
 python -m pytest tests/test_plugin_metadata.py -q
 ```
 
+Status: completed in `tests/test_plugin_metadata.py`.
+
 ### Task 6: Add scanner-safe fixture guard
 
 **Objective:** Avoid future GitGuardian-style false positives.
@@ -750,6 +752,8 @@ Allow:
 python scripts/check_no_literal_fake_secrets.py
 python -m pytest tests/test_secret_fixture_scan.py -q
 ```
+
+Status: completed with `scripts/check_no_literal_fake_secrets.py`, `tests/test_secret_fixture_scan.py`, and CI workflow integration.
 
 ### Task 7: CLI feasibility spike
 

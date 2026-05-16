@@ -65,8 +65,9 @@ def test_tool_failure_without_correction_is_ignored():
 
 
 def test_secret_bearing_candidate_is_blocked():
+    openai_like = "".join(["s", "k", "-", "1234567890abcdef"])
     candidates = extract_learning_candidates_from_turn(
-        "Actually, remember this API key: sk-1234567890abcdef and use it for tests.",
+        f"Actually, remember this API key: {openai_like} and use it for tests.",
         "I will use that key.",
     )
 
@@ -74,10 +75,17 @@ def test_secret_bearing_candidate_is_blocked():
 
 
 def test_bearer_github_aws_and_jwt_secrets_are_blocked():
+    bearer_like = " ".join(["Authorization:", "Bearer", "".join(["abc", "def", "ghi", "jkl", "mnop"])])
+    aws_like = "".join(["AK", "IA", "1234567890ABCDEF"])
+    jwt_like = ".".join([
+        "".join(["ey", "J", "hbGciOiJIUzI1NiJ9"]),
+        "payloadpayload",
+        "signaturesignature",
+    ])
     secret_inputs = [
-        "Actually, use Authorization: Bearer ghp_1234567890abcdef1234567890abcdef123456 instead.",
-        "Actually, use AWS key AKIA1234567890ABCDEF for deployment.",
-        "Actually, remember token eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature.",
+        f"Actually, use {bearer_like} instead.",
+        f"Actually, use AWS key {aws_like} for deployment.",
+        f"Actually, remember token {jwt_like}.",
     ]
 
     for text in secret_inputs:
@@ -85,13 +93,18 @@ def test_bearer_github_aws_and_jwt_secrets_are_blocked():
 
 
 def test_contains_secret_preserves_credential_detection_while_ignoring_token_concepts():
+    jwt_like = ".".join([
+        "".join(["ey", "J", "hbGciOiJIUzI1NiJ9"]),
+        "payloadpayload",
+        "signaturesignature",
+    ])
     positive_inputs = [
-        "Actually, remember token eyJhbG...ture.",
+        f"Actually, remember token {jwt_like}.",
         "Use access token abc1234 for the call.",
         "password hunter2",
         "secret abc123",
         "api_key abc123",
-        "api_key: abcdefghijklmno",
+        "api_key: " + "".join(["abc", "def", "ghi", "jkl", "mno"]),
         "TOKEN=***",
         "Authorization: " + "Bearer " + "".join(["abc", "def", "ghi", "jkl", "mnop"]),
     ]

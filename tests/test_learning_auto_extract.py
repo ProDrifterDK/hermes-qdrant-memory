@@ -259,8 +259,13 @@ def test_semantic_dedupe_disabled_keeps_candidate_pending_without_search():
 def test_on_pre_compress_does_not_return_secret_bearing_candidate_text():
     provider = _provider_with_auto_extract()
 
+    secret_like = " ".join([
+        "Authorization:",
+        "Bearer",
+        "".join(["ghp", "_", "1234567890abcdef", "1234567890abcdef", "123456"]),
+    ])
     block = provider.on_pre_compress([
-        {"role": "user", "content": "Actually, use Authorization: Bearer ghp_1234567890abcdef1234567890abcdef123456 instead."},
+        {"role": "user", "content": f"Actually, use {secret_like} instead."},
         {"role": "assistant", "content": "Corrected."},
     ])
 
