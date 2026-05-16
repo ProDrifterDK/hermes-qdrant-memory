@@ -88,7 +88,7 @@ Future fact rewriting, if ever added, should remain gated by:
 - source provenance,
 - and user confirmation for important facts.
 
-## Current install path caveat
+## Current install path and CLI discovery caveat
 
 Current Hermes user memory-provider discovery is most compatible with:
 
@@ -107,6 +107,10 @@ create a compatibility symlink:
 ```bash
 ln -s ~/.hermes/plugins/memory/qdrant ~/.hermes/plugins/qdrant
 ```
+
+The native CLI MVP uses Hermes memory-provider CLI discovery. `hermes qdrant ...` is available only when this plugin is installed as the active `qdrant` memory provider and a fresh Hermes process has loaded that configuration. Top-level `hermes --help` may not list plugin commands because Hermes avoids eager plugin imports for startup performance; use `hermes qdrant --help` as the direct check.
+
+`hermes qdrant doctor` is status-backed in this v0.2.0 candidate. It is a lightweight diagnostics alias, not a separate deep health checker yet.
 
 ## Performance
 

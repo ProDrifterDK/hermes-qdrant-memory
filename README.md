@@ -52,6 +52,7 @@ Public beta / experimental. The MVP is functional and tested, but it depends on 
 | Origin-time fact metadata | Implemented conservatively from explicit tags, clear fact statements, file headings, and structured learning context |
 | Sleep consolidation | M9 gated report persistence and apply-by-proposal-id implemented |
 | Reconsolidation | M10 report-only conflict candidates + local review drafts implemented; no automatic memory rewrites |
+| Native Hermes CLI MVP | Implemented for active memory provider (`hermes qdrant ...`) |
 | Dashboard/UI | Not included |
 
 ## Requirements
@@ -228,6 +229,40 @@ hermes chat -q 'Call the qdrant_memory_status tool and summarize whether qdrant_
 ```
 
 If both backends are reachable, the status tool should report `qdrant_ok: true` and `embedding_ok: true`.
+
+### Update, rollback, and remove
+
+Update a cloned plugin:
+
+```bash
+cd ~/.hermes/plugins/qdrant
+git pull --ff-only origin main
+```
+
+Use a published tag instead of `main` when you want a stable beta snapshot. For the current release-candidate docs, use `main` until `v0.2.0` is published:
+
+```bash
+cd ~/.hermes/plugins/qdrant
+git fetch --tags origin
+git checkout v0.2.0
+```
+
+Rollback plugin code:
+
+```bash
+cd ~/.hermes/plugins/qdrant
+git log --oneline --max-count=10
+git checkout <previous-commit-or-tag>
+```
+
+Remove the plugin:
+
+```bash
+hermes config set memory.provider ""
+rm -rf ~/.hermes/plugins/qdrant
+```
+
+Start a fresh Hermes session or restart the gateway after install/update/rollback/remove. These commands affect plugin code/config only; they do not delete Qdrant collections or indexed memory.
 
 ## AI agent install playbook
 
@@ -654,6 +689,8 @@ No third-party Python package is required by the plugin runtime; it uses the Pyt
 
 ## Documentation
 
+- [CHANGELOG.md](CHANGELOG.md) — release history.
+- [RELEASE_NOTES.md](RELEASE_NOTES.md) — v0.2.0 candidate install, upgrade, rollback, smoke checks, and caveats.
 - [docs/SAFETY.md](docs/SAFETY.md) — canonical safety contract for indexing, deletion, consolidation, reconsolidation, cron/reporting, and scanner-safe docs/tests.
 - [docs/OPERATIONS.md](docs/OPERATIONS.md) — operator runbook for status checks, smoke tests, watcher reports, approved apply flow, post-apply verification, gateway/process restarts, and troubleshooting.
 - [docs/LCM_BOUNDARY.md](docs/LCM_BOUNDARY.md) — boundary between active-session LCM recovery and cross-session Qdrant semantic memory.

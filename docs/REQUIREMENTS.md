@@ -2,7 +2,7 @@
 
 ## Hermes
 
-- Hermes Agent with user plugin support.
+- Hermes Agent with user plugin support and memory-provider CLI discovery for `hermes qdrant ...`.
 - Configure `memory.provider: qdrant`.
 - Install this repository at `~/.hermes/plugins/qdrant` for current compatibility.
 
@@ -30,7 +30,7 @@ docker run -p 6333:6333 \
   qdrant/qdrant
 ```
 
-Remote Qdrant is supported if reachable from Hermes. Use `qdrant_api_key` for authenticated deployments.
+Remote Qdrant is supported if reachable from Hermes. Use `qdrant_memory.qdrant_api_key` for authenticated deployments.
 
 ## Embeddings
 
