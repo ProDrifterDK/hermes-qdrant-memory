@@ -176,6 +176,8 @@ Only run with `dry_run: false` after verifying the IDs.
 
 ## M9/M10 consolidation report and gated apply
 
+These examples are operational examples only. The canonical safety rules are in `docs/SAFETY.md`.
+
 Generate and persist a reflection pass over memory and procedural learnings:
 
 ```json

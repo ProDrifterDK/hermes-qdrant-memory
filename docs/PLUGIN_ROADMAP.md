@@ -395,6 +395,8 @@ Deliverable:
 
 Create `docs/SAFETY.md` and make it the canonical contract.
 
+Canonical policy: `docs/SAFETY.md`.
+
 Required policy points:
 
 1. Dry-run first.

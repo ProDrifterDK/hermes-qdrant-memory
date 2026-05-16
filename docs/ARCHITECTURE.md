@@ -165,6 +165,8 @@ For shared gateway deployments, avoid `global` unless you explicitly want cross-
 
 ## Safety design
 
+The canonical safety contract is `docs/SAFETY.md`; this section summarizes the architectural enforcement points.
+
 - Auto-recall is context-only; retrieved memory is not itself a command.
 - The writer strips known injected memory markers to reduce recursive contamination.
 - File indexing defaults to dry-run.

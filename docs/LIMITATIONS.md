@@ -12,6 +12,8 @@ The file indexer does not automatically detect secrets, tokens, credentials, or 
 
 Do not index broad home directories blindly. Start with a dry-run and explicit paths.
 
+See `docs/SAFETY.md` for the scanner-safe docs/tests policy and the rule against literal fake secrets.
+
 ## Text-only file indexing
 
 Default file indexing supports:
@@ -66,6 +68,8 @@ The extractor is deliberately narrow: explicit user corrections and tool failure
 
 M9 actions are deliberately narrow: delete uses explicit IDs only, merge preserves a canonical point and deletes explicit duplicates, and promote-to-skill writes a local draft artifact rather than installing an active skill. `quality_warning` proposals and secret-bearing inputs remain manual-review only.
 
+See `docs/SAFETY.md` for the canonical report/apply and quality-warning rules.
+
 The duplicate detector is intentionally conservative and mostly text-fingerprint based; it is a safety report, not a semantic merge engine. Future versions may add similarity search or LLM-assisted abstraction, but those should remain gated and apply-by-proposal-id.
 
 ## Reconsolidation is manual-review only in M10
@@ -73,6 +77,8 @@ The duplicate detector is intentionally conservative and mostly text-fingerprint
 Automatically rewriting remembered facts is dangerous. M10 can optionally report `reconsolidation_candidate` proposals when explicitly requested with `include_reconsolidation: true` (or enabled by config), but it does not rewrite Qdrant memory.
 
 Reconsolidation apply supports only `draft_review`: a local markdown artifact under `$HERMES_HOME/qdrant_memory/consolidation/reconsolidation_drafts/`. Live draft creation still requires exact `report_id`, exact `proposal_id`, `dry_run: false`, and `approve: true`. It must not call Qdrant `upsert`, `update_payload`, `delete_ids`, or `delete_filter`.
+
+See `docs/SAFETY.md` for the canonical reconsolidation rules.
 
 Future fact rewriting, if ever added, should remain gated by:
 
