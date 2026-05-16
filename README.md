@@ -631,6 +631,7 @@ No third-party Python package is required by the plugin runtime; it uses the Pyt
 - [docs/SAFETY.md](docs/SAFETY.md) — canonical safety contract for indexing, deletion, consolidation, reconsolidation, cron/reporting, and scanner-safe docs/tests.
 - [docs/OPERATIONS.md](docs/OPERATIONS.md) — operator runbook for status checks, smoke tests, watcher reports, approved apply flow, post-apply verification, gateway/process restarts, and troubleshooting.
 - [docs/LCM_BOUNDARY.md](docs/LCM_BOUNDARY.md) — boundary between active-session LCM recovery and cross-session Qdrant semantic memory.
+- [docs/CLI_SPIKE.md](docs/CLI_SPIKE.md) — feasibility findings for native `hermes qdrant ...` CLI integration and fallback wrapper strategy.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md)
 - [docs/LIMITATIONS.md](docs/LIMITATIONS.md)

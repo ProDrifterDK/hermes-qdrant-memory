@@ -761,8 +761,10 @@ Status: completed with `scripts/check_no_literal_fake_secrets.py`, `tests/test_s
 
 **Files:**
 
-- Create: `docs/CLI_SPIKE.md`
-- Maybe create: `qdrant_memory/cli.py` if feasible.
+- Create: [CLI_SPIKE.md](CLI_SPIKE.md)
+- Maybe create: top-level `cli.py` if feasible.
+
+Status: completed in [CLI_SPIKE.md](CLI_SPIKE.md). Native Hermes memory-provider CLI integration is feasible via a top-level plugin `cli.py` using `register_cli(subparser)`; standalone wrapper remains a fallback.
 
 **Questions:**
 
@@ -785,8 +787,8 @@ python -m pytest tests -q
 
 **Files:**
 
-- Create/Modify: `qdrant_memory/cli.py`
-- Modify: `__init__.py` if plugin CLI registration is supported.
+- Create/Modify: top-level `cli.py`
+- Create/Modify: `qdrant_memory/cli_core.py`
 - Add tests under `tests/`.
 
 **Commands MVP:**
@@ -794,7 +796,7 @@ python -m pytest tests -q
 ```bash
 hermes qdrant status
 hermes qdrant search "query"
-hermes qdrant index --path PATH --dry-run
+hermes qdrant index <path...> --dry-run
 hermes qdrant consolidate --scope both --persist --dry-run
 ```
 
