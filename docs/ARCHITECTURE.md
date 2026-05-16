@@ -102,6 +102,8 @@ M9a persists each report as a local JSON artifact under `$HERMES_HOME/qdrant_mem
 
 M10 adds optional `reconsolidation_candidate` proposals. These detect multiple memory points that share an explicit strong fact key (`reconsolidation_key`, `fact_key`, or `subject`) but contain different normalized text. `topic` and `entity` are retained as filters/provenance only and do not drive grouping. Reconsolidation is opt-in via `include_reconsolidation` or config. M10 never rewrites Qdrant facts; its only supported live action is `draft_review`, which writes a local markdown review artifact.
 
+M11b reduces consolidation noise. Markdown indexing skips heading-only sections (for example `## Tareas`, `## Notas`, `### Contribution`) so they are not embedded as standalone memories. Secret detection distinguishes conceptual token-budget/cache/counting language from credential-bearing token assignments and still flags bearer/API/password/private-key patterns.
+
 The report may propose duplicate clusters, stale low-value memory candidates, learning promotion candidates, quality warnings, and optional reconsolidation candidates. Apply semantics are intentionally narrow: duplicate clusters can merge by preserving one canonical point and deleting explicit duplicates; stale low-value proposals can delete explicit IDs only; learning promotion candidates create local draft skill artifacts and mark the learning as promoted-to-draft; reconsolidation candidates create review drafts only. Quality warnings remain manual-review only.
 
 Safety gates:

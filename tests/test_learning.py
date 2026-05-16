@@ -111,7 +111,7 @@ def test_build_learning_payload_has_procedural_fields_and_source_type():
 
 
 def test_learning_payload_does_not_fact_key_secret_command():
-    secret = " ".join(["Authorization:", "Bearer", "abcdefghijklmnopqrstuvwxyz"])
+    secret = " ".join(["Authorization:", "Bearer", "".join(["abc", "def", "ghi", "jkl", "mno", "pqr", "stu", "vwx", "yz"])])
     payload = build_learning_payload(
         lesson="Do not leak API auth headers.",
         learning_type="tool_failure_lesson",

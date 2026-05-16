@@ -3,6 +3,7 @@ from __future__ import annotations
 from qdrant_memory.lesson_extractor import (
     LearningCandidate,
     candidate_to_learning_args,
+    contains_secret,
     extract_learning_candidates_from_messages,
     extract_learning_candidates_from_turn,
 )
@@ -81,6 +82,30 @@ def test_bearer_github_aws_and_jwt_secrets_are_blocked():
 
     for text in secret_inputs:
         assert extract_learning_candidates_from_turn(text, "ok") == []
+
+
+def test_contains_secret_preserves_credential_detection_while_ignoring_token_concepts():
+    positive_inputs = [
+        "Actually, remember token eyJhbG...ture.",
+        "Use access token abc1234 for the call.",
+        "password hunter2",
+        "secret abc123",
+        "api_key abc123",
+        "api_key: abcdefghijklmno",
+        "TOKEN=***",
+        "Authorization: " + "Bearer " + "".join(["abc", "def", "ghi", "jkl", "mnop"]),
+    ]
+    negative_inputs = [
+        "Token Budget Enforcement keeps summaries bounded.",
+        "Token Counting Cache improves tokenizer estimates.",
+        "The summary token overhead is four tokens per message.",
+        "JWT validation strategy uses HS256 for POC and RS256 for prod.",
+    ]
+
+    for text in positive_inputs:
+        assert contains_secret(text), text
+    for text in negative_inputs:
+        assert not contains_secret(text), text
 
 
 def test_candidate_ids_are_stable_and_args_match_learning_store_shape():

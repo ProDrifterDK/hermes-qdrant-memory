@@ -84,6 +84,24 @@ def test_markdown_chunking_uses_headings_and_bounds():
     assert all(len(body) <= 180 for _, body in chunks)
 
 
+def test_markdown_chunking_skips_heading_only_sections():
+    text = "# Daily\n\n## Tareas\n\n## Notas\nActual note body.\n\n### Contribution\n\n## Reflexión\n- Real reflection."
+
+    chunks = chunk_markdown(text, max_chars=180)
+
+    bodies = [body for _, body in chunks]
+    assert "## Tareas" not in bodies
+    assert "### Contribution" not in bodies
+    assert any("Actual note body" in body for body in bodies)
+    assert any("Real reflection" in body for body in bodies)
+
+
+def test_markdown_chunking_skips_all_heading_only_documents():
+    text = "# Daily\n\n## Tareas\n\n### Contribution\n\n## Reflexión"
+
+    assert chunk_markdown(text, max_chars=180) == []
+
+
 def test_text_chunking_groups_paragraphs_and_bounds():
     text = "para one\n\n" + ("x" * 500) + "\n\npara three"
     chunks = chunk_text(text, max_chars=120)

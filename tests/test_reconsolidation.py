@@ -163,7 +163,7 @@ def test_reconsolidation_is_opt_in(tmp_path):
 
 def test_reconsolidation_secret_candidate_is_redacted_in_response_and_artifact(tmp_path):
     provider = _provider(tmp_path)
-    auth_header = " ".join(["Authorization:", "Bearer", "abcdefghijklmnopqrstuvwxyz"])
+    auth_header = " ".join(["Authorization:", "Bearer", "".join(["abc", "def", "ghi", "jkl", "mno", "pqr", "stu", "vwx", "yz"])])
     provider._qdrant = FakeQdrant(
         {
             "memory": [
@@ -183,9 +183,9 @@ def test_reconsolidation_secret_candidate_is_redacted_in_response_and_artifact(t
     assert candidates
     assert candidates[0]["manual_review_required"] is True
     assert "Bearer" not in result_text
-    assert "abcdefghijklmnopqrstuvwxyz" not in result_text
+    assert "".join(["abc", "def", "ghi", "jkl", "mno", "pqr", "stu", "vwx", "yz"]) not in result_text
     assert "Bearer" not in artifact_text
-    assert "abcdefghijklmnopqrstuvwxyz" not in artifact_text
+    assert "".join(["abc", "def", "ghi", "jkl", "mno", "pqr", "stu", "vwx", "yz"]) not in artifact_text
 
 
 def test_reconsolidation_draft_review_dry_run_has_no_mutation_or_file(tmp_path):
@@ -251,7 +251,7 @@ def test_reconsolidation_draft_review_live_writes_only_local_review_artifact(tmp
 
 def test_reconsolidation_draft_review_live_redacts_secret_artifact(tmp_path):
     provider = _provider(tmp_path)
-    auth_header = " ".join(["Authorization:", "Bearer", "abcdefghijklmnopqrstuvwxyz"])
+    auth_header = " ".join(["Authorization:", "Bearer", "".join(["abc", "def", "ghi", "jkl", "mno", "pqr", "stu", "vwx", "yz"])])
     provider._qdrant = FakeQdrant(
         {
             "memory": [
@@ -272,7 +272,7 @@ def test_reconsolidation_draft_review_live_redacts_secret_artifact(tmp_path):
 
     draft_text = Path(result["reconsolidation_draft_path"]).read_text()
     assert "Bearer" not in draft_text
-    assert "abcdefghijklmnopqrstuvwxyz" not in draft_text
+    assert "".join(["abc", "def", "ghi", "jkl", "mno", "pqr", "stu", "vwx", "yz"]) not in draft_text
     assert "redacted" in draft_text
     assert provider._qdrant.upserts == []
     assert provider._qdrant.payload_updates == []

@@ -15,10 +15,13 @@ _SECRET_PATTERNS = [
     re.compile(r"(?i)authorization\s*:\s*bearer\s+\S+"),
     re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]{16,}"),
     re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}"),
-    re.compile(r"(?i)(api[_-]?key|token|password|secret)\s*[:=]?\s+\S+"),
+    re.compile(r"(?i)(api[_-]?key|password|secret)\s*[:=]\s*\S+"),
+    re.compile(r"(?i)token\s*[:=]\s*\S+"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     re.compile(r"https?://[^\s:@]+:[^\s:@]+@"),
 ]
+_TOKEN_CONTEXT_PATTERN = re.compile(r"(?i)\b(?:access\s+)?token\s+(?!budget\b|cache\b|count(?:ing)?\b|counter\b|estimate\b|estimates\b|estimation\b|hard\b|limit\b|overhead\b|window\b|context\b|izer\b)(\S{6,})")
+_CREDENTIAL_CONTEXT_PATTERN = re.compile(r"(?i)\b(api[_-]?key|password|secret)\s+(?!detection\b|patterns?\b|redaction\b|bearing\b|review\b|heuristic\b)(\S{6,})")
 
 _EXPLICIT_CORRECTION_PATTERNS = [
     re.compile(r"(?i)\bactually[, ]+(?P<body>.+)"),
@@ -34,7 +37,8 @@ _RESOLUTION_PATTERN = re.compile(r"(?i)(correction|fix|solution|resolved|use|ins
 
 
 def contains_secret(text: str) -> bool:
-    return any(pattern.search(text or "") for pattern in _SECRET_PATTERNS)
+    text = text or ""
+    return any(pattern.search(text) for pattern in _SECRET_PATTERNS) or bool(_TOKEN_CONTEXT_PATTERN.search(text)) or bool(_CREDENTIAL_CONTEXT_PATTERN.search(text))
 
 
 def _stable_id(parts: Iterable[str]) -> str:

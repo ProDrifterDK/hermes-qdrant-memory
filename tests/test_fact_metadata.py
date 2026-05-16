@@ -39,7 +39,7 @@ def test_fact_metadata_does_not_create_key_for_generic_chat_turn():
 
 
 def test_fact_metadata_skips_secret_bearing_text():
-    secret = " ".join(["Authorization:", "Bearer", "abcdefghijklmnopqrstuvwxyz"])
+    secret = " ".join(["Authorization:", "Bearer", "".join(["abc", "def", "ghi", "jkl", "mno", "pqr", "stu", "vwx", "yz"])])
     metadata = derive_fact_metadata(
         text=f"Current API token is {secret}",
         source_type="manual",

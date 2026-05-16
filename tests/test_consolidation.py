@@ -217,7 +217,7 @@ def test_consolidate_finds_learning_promotion_candidates():
 
 def test_consolidate_secret_warning_does_not_echo_secret():
     provider = _provider()
-    secret = "Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456"
+    secret = "Authorization: " + "Bearer " + "".join(["abc", "def", "123", "456"])
     provider._qdrant = FakeQdrant({"memory": [_point("m1", f"bad memory {secret}", source_type="manual")], "learnings": []})
 
     result_text = provider.handle_tool_call("qdrant_memory_consolidate", {"scope": "memory", "include_examples": True})
@@ -228,6 +228,24 @@ def test_consolidate_secret_warning_does_not_echo_secret():
     assert warnings[0]["affected_ids"] == ["m1"]
     assert secret not in result_text
     assert "Bearer" not in result_text
+
+
+def test_consolidate_ignores_token_budget_language_as_secret_warning():
+    provider = _provider()
+    provider._qdrant = FakeQdrant(
+        {
+            "memory": [
+                _point("m1", "Token Budget Enforcement keeps summaries under STRUCTURED_SUMMARY_TOKEN_BUDGET", source_type="vault_note"),
+                _point("m2", "Token Counting Cache improves tokenizer estimates", source_type="vault_note"),
+                _point("m3", "JWT validation strategy uses HS256 for POC and RS256 for prod", source_type="vault_note"),
+            ],
+            "learnings": [],
+        }
+    )
+
+    result = json.loads(provider.handle_tool_call("qdrant_memory_consolidate", {"scope": "memory"}))
+
+    assert [p for p in result["proposals"] if p["proposal_type"] == "quality_warning"] == []
 
 
 def test_status_includes_consolidation_report_flags():

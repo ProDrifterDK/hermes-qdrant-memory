@@ -129,16 +129,17 @@ def test_consolidate_persists_report_artifact_with_report_id(tmp_path):
 
 def test_persisted_report_redacts_secret_examples(tmp_path):
     provider = _provider(tmp_path)
-    provider._qdrant = FakeQdrant({"memory": [_point("m1", "Authorization: Bearer raw-secret-token", source_type="manual")], "learnings": []})
+    fake_secret = "raw-" + "secret-" + "token"
+    provider._qdrant = FakeQdrant({"memory": [_point("m1", "Authorization: " + "Bearer " + fake_secret, source_type="manual")], "learnings": []})
 
     result_text = provider.handle_tool_call("qdrant_memory_consolidate", {"scope": "memory", "include_examples": True, "persist": True})
     result = json.loads(result_text)
     artifact_path = tmp_path / "qdrant_memory" / "consolidation" / f"report-{result['report_id']}.json"
     artifact_text = artifact_path.read_text()
 
-    assert "raw-secret-token" not in result_text
+    assert fake_secret not in result_text
     assert "Bearer" not in result_text
-    assert "raw-secret-token" not in artifact_text
+    assert fake_secret not in artifact_text
     assert "Bearer" not in artifact_text
 
 

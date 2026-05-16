@@ -234,6 +234,11 @@ def _split_oversized(text: str, max_chars: int) -> list[str]:
     return parts
 
 
+def _is_heading_only_chunk(lines: list[str]) -> bool:
+    meaningful = [line.strip() for line in lines if line.strip()]
+    return bool(meaningful) and all(_HEADING_RE.match(line) for line in meaningful)
+
+
 def chunk_markdown(text: str, *, max_chars: int) -> list[tuple[str, str]]:
     text = strip_frontmatter(text)
     if not text:
@@ -245,7 +250,7 @@ def chunk_markdown(text: str, *, max_chars: int) -> list[tuple[str, str]]:
     def flush() -> None:
         nonlocal current_lines
         body = "\n".join(current_lines).strip()
-        if body:
+        if body and not _is_heading_only_chunk(current_lines):
             sections.append((current_heading, current_lines[:]))
         current_lines = []
 
@@ -265,7 +270,10 @@ def chunk_markdown(text: str, *, max_chars: int) -> list[tuple[str, str]]:
     flush()
 
     if not sections:
-        sections = [("", text.splitlines())]
+        fallback_lines = text.splitlines()
+        if _is_heading_only_chunk(fallback_lines):
+            return []
+        sections = [("", fallback_lines)]
 
     chunks: list[tuple[str, str]] = []
     for heading, lines in sections:
