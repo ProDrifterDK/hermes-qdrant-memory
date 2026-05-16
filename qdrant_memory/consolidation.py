@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from qdrant_memory.lesson_extractor import contains_secret
+
+SECRET_KEYWORDS = ("api_key", "apikey", "token", "password", "passwd", "secret", "authorization", "bearer", "credential", "private_key")
 
 
 @dataclass
@@ -49,6 +53,163 @@ def _snippet(text: str, *, max_chars: int = 160) -> str:
 def _proposal_id(proposal_type: str, affected_ids: list[str]) -> str:
     digest = hashlib.sha256((proposal_type + ":" + ":".join(sorted(affected_ids))).encode("utf-8")).hexdigest()[:16]
     return f"{proposal_type}-{digest}"
+
+
+def parse_bool_arg(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "off", ""}:
+            return False
+    return bool(value)
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def redact_secrets(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key).lower()
+            if any(keyword in key_text for keyword in SECRET_KEYWORDS):
+                redacted[key] = "[redacted: possible secret-bearing value]"
+            else:
+                redacted[key] = redact_secrets(item)
+        return redacted
+    if isinstance(value, list):
+        return [redact_secrets(item) for item in value]
+    if isinstance(value, str) and (contains_secret(value) or "bearer" in value.lower()):
+        return "[redacted: possible secret-bearing value]"
+    return value
+
+
+def artifact_root(hermes_home: str, configured_dir: str = "") -> Path:
+    root = Path(configured_dir).expanduser() if configured_dir else Path(hermes_home or str(Path.home() / ".hermes")) / "qdrant_memory" / "consolidation"
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        root.chmod(0o700)
+    except Exception:
+        pass
+    return root
+
+
+def compute_report_id(report: dict[str, Any], created_at: str) -> str:
+    proposal_ids = sorted(str(p.get("proposal_id") or "") for p in report.get("proposals", []))
+    seed = json.dumps(
+        {
+            "created_at": created_at,
+            "scope": report.get("scope"),
+            "profile_id": report.get("profile_id"),
+            "session_id": report.get("session_id"),
+            "proposal_ids": proposal_ids,
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+
+
+def persist_consolidation_report(report: dict[str, Any], *, hermes_home: str, configured_dir: str = "") -> dict[str, Any]:
+    created_at = str(report.get("created_at") or _utc_now())
+    report = redact_secrets({**report, "created_at": created_at})
+    report_id = str(report.get("report_id") or compute_report_id(report, created_at))
+    report["report_id"] = report_id
+    report["schema_version"] = 1
+    root = artifact_root(hermes_home, configured_dir)
+    path = root / f"report-{report_id}.json"
+    report["persisted"] = True
+    report["artifact"] = {"path": str(path), "proposal_count": len(report.get("proposals", []))}
+    path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    return report
+
+
+def load_consolidation_report(report_id: str, *, hermes_home: str, configured_dir: str = "") -> dict[str, Any]:
+    safe_id = "".join(ch for ch in str(report_id) if ch.isalnum() or ch in {"-", "_"})
+    if not safe_id or safe_id != str(report_id):
+        raise ValueError("invalid report_id")
+    path = artifact_root(hermes_home, configured_dir) / f"report-{safe_id}.json"
+    if not path.exists():
+        raise FileNotFoundError(f"consolidation report not found: {safe_id}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("invalid consolidation report")
+    return data
+
+
+def find_proposal(report: dict[str, Any], proposal_id: str) -> dict[str, Any]:
+    for proposal in report.get("proposals", []):
+        if str(proposal.get("proposal_id")) == str(proposal_id):
+            return proposal
+    raise KeyError(f"proposal_id not found: {proposal_id}")
+
+
+def expected_action_for_proposal(proposal_type: str) -> str | None:
+    return {
+        "duplicate_cluster": "merge",
+        "stale_low_value": "delete",
+        "learning_promotion_candidate": "promote_to_skill",
+    }.get(proposal_type)
+
+
+def persist_application_record(record: dict[str, Any], *, hermes_home: str, configured_dir: str = "") -> dict[str, Any]:
+    root = artifact_root(hermes_home, configured_dir) / "applications"
+    root.mkdir(parents=True, exist_ok=True)
+    created_at = str(record.get("created_at") or _utc_now())
+    record = redact_secrets({**record, "created_at": created_at, "schema_version": 1})
+    seed = f"{created_at}:{record.get('report_id')}:{record.get('proposal_id')}:{record.get('action')}"
+    application_id = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+    record["application_id"] = application_id
+    path = root / f"application-{application_id}.json"
+    record["artifact_path"] = str(path)
+    path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+    return record
+
+
+def build_skill_draft_text(point: ConsolidationPoint, *, proposal_id: str, report_id: str) -> str:
+    payload = redact_secrets(point.payload)
+    lesson = str(payload.get("lesson") or payload.get("text") or point.text).strip()
+    trigger = str(payload.get("trigger") or "").strip()
+    correction = str(payload.get("correction") or "").strip()
+    evidence = str(payload.get("evidence") or "").strip()
+    learning_type = str(payload.get("learning_type") or "workflow_lesson")
+    return "\n".join(
+        [
+            "---",
+            f"name: draft-{proposal_id}",
+            f"description: Draft skill promoted from Qdrant learning {point.id}",
+            "---",
+            "",
+            "# Draft skill from Qdrant learning",
+            "",
+            "This is a draft artifact only. It is not installed as an active Hermes skill.",
+            "",
+            f"- report_id: {report_id}",
+            f"- proposal_id: {proposal_id}",
+            f"- learning_id: {point.id}",
+            f"- learning_type: {learning_type}",
+            "",
+            "## Lesson",
+            lesson,
+            "",
+            "## Trigger",
+            trigger or "N/A",
+            "",
+            "## Correct procedure",
+            correction or lesson,
+            "",
+            "## Evidence",
+            evidence or "N/A",
+            "",
+        ]
+    )
 
 
 def _parse_datetime(value: Any) -> datetime | None:
@@ -294,10 +455,10 @@ def build_consolidation_report(
         "analyzed": {"memory_points": len(memory_points), "learning_points": len(learning_points)},
         "summary": summary,
         "proposals": proposals,
-        "warnings": ["M8 is report-only. No writes, deletes, metadata updates, merges, or approvals were performed."],
+        "warnings": ["M9a persists report artifacts when requested/defaulted; qdrant_memory_consolidation_apply is required for gated live actions."],
         "next_steps": [
             "Review proposals manually.",
-            "Do not apply merge/delete/promote suggestions without explicit approval.",
-            "Future M9 may add gated apply-by-proposal-id semantics.",
+            "Preview a proposal with qdrant_memory_consolidation_apply using dry_run=true.",
+            "Apply only one explicit proposal_id at a time with dry_run=false and approve=true.",
         ],
     }

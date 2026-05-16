@@ -47,7 +47,7 @@ Public beta / experimental. The MVP is functional and tested, but it depends on 
 | Legacy force reindex by `file_path` fallback | Implemented |
 | Safe forget by explicit point IDs | Implemented |
 | Manual procedural learning collection | Implemented |
-| Sleep consolidation | M8 report-only/dry-run implemented |
+| Sleep consolidation | M9 gated report persistence and apply-by-proposal-id implemented |
 | Reconsolidation | Future, disabled by design |
 | Dashboard/UI | Not included |
 
@@ -421,6 +421,9 @@ qdrant_memory:
   consolidation_duplicate_threshold: 0.92
   consolidation_stale_days: 90
   consolidation_min_importance_for_keep: 4
+  consolidation_persist_reports: true
+  consolidation_artifact_dir: ""
+  consolidation_apply_dry_run_default: true
   reconsolidation_enabled: false
   query_prefix: "search_query: "
   document_prefix: "search_document: "
@@ -504,16 +507,31 @@ Deletes explicit point IDs only. Dry-run defaults to true. There is intentionall
 
 ### `qdrant_memory_consolidate`
 
-Generates an M8 sleep-consolidation/reflection report over `hermes_memory`, `hermes_learnings`, or both. This is report-only: it scrolls existing points, proposes review actions, and never writes, deletes, merges, approves, or updates access metadata. `dry_run: false` is rejected in M8.
+Generates a sleep-consolidation/reflection report over `hermes_memory`, `hermes_learnings`, or both. Report generation is still dry-run with respect to memory contents: it scrolls existing points, proposes review actions, and never applies merges, deletes, promotions, approvals, or access-metadata updates. `dry_run: false` is rejected for this tool.
+
+M9a persists reports as local JSON artifacts by default under `$HERMES_HOME/qdrant_memory/consolidation/` (or `qdrant_memory.consolidation_artifact_dir` if configured). Reports include a `report_id`, stable `proposal_id` values, redacted examples, scope metadata, and review-only proposals.
 
 Useful arguments:
 
 - `scope`: `memory`, `learning`, or `both`.
-- `max_points`: maximum points to inspect per collection.
-- `max_groups`: maximum proposals to return.
+- `max_points`: cap scanned points per collection.
+- `max_groups`: cap returned proposal groups.
 - `include_examples`: include redacted snippets for representative points.
+- `persist`: write the local report artifact. Defaults to true.
 
-Proposal types include duplicate clusters, stale low-value memory candidates, learning promotion candidates, and quality warnings such as possible secret-bearing memories. Every proposal is `*_review_only` and requires explicit human approval outside M8.
+Proposal types include duplicate clusters, stale low-value memory candidates, learning promotion candidates, and quality warnings such as possible secret-bearing memories.
+
+### `qdrant_memory_consolidation_apply`
+
+M9b/M9c apply exactly one persisted proposal by `report_id` + `proposal_id`. Dry-run defaults to true and returns a concrete operation plan without mutating Qdrant or writing skill drafts. Live mode requires both `dry_run: false` and `approve: true`.
+
+Supported actions:
+
+- `delete`: only for `stale_low_value`; deletes explicit `affected_ids` only. No filter/query deletion.
+- `merge`: only for `duplicate_cluster`; chooses a canonical point by importance/confidence, updates its payload with consolidation metadata, then deletes explicit duplicate IDs.
+- `promote_to_skill`: only for `learning_promotion_candidate`; creates a local draft skill artifact under `$HERMES_HOME/qdrant_memory/consolidation/skill_drafts/` and marks the learning point as promoted-to-draft. It does not install a live skill automatically.
+
+`quality_warning` proposals are manual-review only and cannot be applied automatically.
 
 ### `qdrant_learning_store`
 

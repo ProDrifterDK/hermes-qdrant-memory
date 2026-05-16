@@ -92,6 +92,11 @@ class QdrantClient:
         body = {"filter": filter}
         return self._request("POST", f"/collections/{urllib.parse.quote(name)}/points/delete?wait=true", body)
 
+    def retrieve(self, name: str, ids: list[str], *, with_payload: bool = True, with_vector: bool = False) -> list[dict[str, Any]]:
+        body = {"ids": ids, "with_payload": with_payload, "with_vector": with_vector}
+        data = self._request("POST", f"/collections/{urllib.parse.quote(name)}/points", body)
+        return data.get("result", []) or []
+
     def scroll_by_filter(
         self,
         name: str,

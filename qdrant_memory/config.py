@@ -37,6 +37,9 @@ DEFAULTS: dict[str, Any] = {
     "consolidation_duplicate_threshold": 0.92,
     "consolidation_stale_days": 90,
     "consolidation_min_importance_for_keep": 4,
+    "consolidation_persist_reports": True,
+    "consolidation_artifact_dir": "",
+    "consolidation_apply_dry_run_default": True,
     "reconsolidation_enabled": False,
     "query_prefix": "search_query: ",
     "document_prefix": "search_document: ",
@@ -73,6 +76,8 @@ _BOOL_KEYS = {
     "learning_auto_extract_require_evidence",
     "learning_auto_extract_semantic_dedupe_enabled",
     "consolidation_enabled",
+    "consolidation_persist_reports",
+    "consolidation_apply_dry_run_default",
     "reconsolidation_enabled",
     "index_dry_run_default",
 }

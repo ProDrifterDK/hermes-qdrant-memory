@@ -138,16 +138,34 @@ LEARNING_APPROVE_SCHEMA = {
 
 CONSOLIDATE_SCHEMA = {
     "name": "qdrant_memory_consolidate",
-    "description": "Generate a dry-run/report-only sleep consolidation and reflection report. M8 never writes, deletes, merges, approves, or mutates memories.",
+    "description": "Generate a dry-run sleep consolidation report and optionally persist it as a local artifact. Live memory actions require qdrant_memory_consolidation_apply.",
     "parameters": {
         "type": "object",
         "properties": {
-            "dry_run": {"type": "boolean", "description": "Must remain true for M8 report-only mode. Defaults to true; false is rejected."},
+            "dry_run": {"type": "boolean", "description": "Must remain true for report generation. Defaults to true; false is rejected."},
             "scope": {"type": "string", "enum": ["memory", "learning", "both"], "description": "Report scope: memory, learning, or both. Defaults to both."},
             "max_points": {"type": "integer", "description": "Maximum points to inspect per collection. Defaults to config.", "minimum": 1, "maximum": 1000},
             "max_groups": {"type": "integer", "description": "Maximum proposals to return. Defaults to config.", "minimum": 1, "maximum": 100},
             "include_examples": {"type": "boolean", "description": "Include redacted representative snippets. Defaults to false."},
+            "persist": {"type": "boolean", "description": "Persist the report as a local JSON artifact. Defaults to config/default true."},
         },
+        "additionalProperties": False,
+    },
+}
+
+CONSOLIDATION_APPLY_SCHEMA = {
+    "name": "qdrant_memory_consolidation_apply",
+    "description": "Preview or apply one persisted consolidation proposal by report_id and proposal_id. Dry-run defaults to true; live actions require approve=true.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "report_id": {"type": "string", "description": "Persisted report id returned by qdrant_memory_consolidate."},
+            "proposal_id": {"type": "string", "description": "Proposal id to preview/apply."},
+            "action": {"type": "string", "enum": ["merge", "delete", "promote_to_skill"], "description": "Expected action for the proposal type."},
+            "dry_run": {"type": "boolean", "description": "When true, return the operation plan without mutating Qdrant or writing drafts. Defaults true."},
+            "approve": {"type": "boolean", "description": "Required true when dry_run=false."},
+        },
+        "required": ["report_id", "proposal_id"],
         "additionalProperties": False,
     },
 }
@@ -163,4 +181,5 @@ TOOL_SCHEMAS = [
     LEARNING_PREVIEW_SCHEMA,
     LEARNING_APPROVE_SCHEMA,
     CONSOLIDATE_SCHEMA,
+    CONSOLIDATION_APPLY_SCHEMA,
 ]

@@ -6,6 +6,7 @@ import logging
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -29,7 +30,19 @@ except Exception:  # pragma: no cover - used only for standalone tests without H
 
 from qdrant_memory.client import QdrantClient
 from qdrant_memory.config import load_config
-from qdrant_memory.consolidation import build_consolidation_report, make_filter, points_from_qdrant
+from qdrant_memory.consolidation import (
+    artifact_root,
+    build_consolidation_report,
+    build_skill_draft_text,
+    expected_action_for_proposal,
+    find_proposal,
+    load_consolidation_report,
+    make_filter,
+    parse_bool_arg,
+    persist_application_record,
+    persist_consolidation_report,
+    points_from_qdrant,
+)
 from qdrant_memory.embeddings import EmbeddingClient
 from qdrant_memory.indexer import FileIndexer
 from qdrant_memory.learning import LearningStore
@@ -373,8 +386,11 @@ class QdrantMemoryProvider(MemoryProvider):
             "learning_auto_extract_mode": self._config.get("learning_auto_extract_mode", "preview"),
             "pending_learning_candidate_count": len(self._pending_learning_candidates),
             "consolidation_enabled": self._config.get("consolidation_enabled", False),
+            "consolidation_persist_reports": self._config.get("consolidation_persist_reports", True),
+            "consolidation_apply_enabled": True,
+            "consolidation_supported_actions": ["merge", "delete", "promote_to_skill"],
             "reconsolidation_enabled": self._config.get("reconsolidation_enabled", False),
-            "consolidation_report_only": True,
+            "consolidation_report_only": False,
             "auto_recall": self._config["auto_recall"],
             "sync_turns": self._config["sync_turns"],
         }
@@ -478,11 +494,8 @@ class QdrantMemoryProvider(MemoryProvider):
             return _json_error(f"Forget failed: {exc}")
 
     def _tool_consolidate(self, args: dict) -> str:
-        dry_run_arg = args.get("dry_run", True)
-        if isinstance(dry_run_arg, str):
-            dry_run_arg = dry_run_arg.strip().lower() not in {"0", "false", "no", "off"}
-        if not bool(dry_run_arg):
-            return _json_error("qdrant_memory_consolidate is report-only in M8; dry_run=false is not supported")
+        if not parse_bool_arg(args.get("dry_run", True), default=True):
+            return _json_error("qdrant_memory_consolidate is report-only; use qdrant_memory_consolidation_apply with proposal_id for live actions")
         if not self._qdrant:
             return _json_error("Qdrant memory provider is not initialized")
         scope = str(args.get("scope") or "both").strip().lower()
@@ -535,9 +548,159 @@ class QdrantMemoryProvider(MemoryProvider):
                 consolidation_enabled=bool(self._config.get("consolidation_enabled", False)),
                 reconsolidation_enabled=bool(self._config.get("reconsolidation_enabled", False)),
             )
+            report.update(
+                {
+                    "profile_id": self._profile_id,
+                    "platform": self._platform,
+                    "session_id": self._session_id,
+                    "user_id_hash": self._user_id_hash,
+                    "chat_id_hash": self._chat_id_hash,
+                }
+            )
+            if parse_bool_arg(args.get("persist"), default=bool(self._config.get("consolidation_persist_reports", True))):
+                report = persist_consolidation_report(
+                    report,
+                    hermes_home=self._hermes_home,
+                    configured_dir=str(self._config.get("consolidation_artifact_dir") or ""),
+                )
+            else:
+                report["persisted"] = False
             return json.dumps(report)
         except Exception as exc:
             return _json_error(f"Consolidation report failed: {exc}")
+
+    def _collection_for_proposal(self, proposal: dict[str, Any]) -> str:
+        collection = str(proposal.get("collection_name") or "")
+        if collection in {"memory", self._config.get("collection_name")}:
+            return self._config["collection_name"]
+        if collection in {"learning", "learnings", self._config.get("learning_collection_name")}:
+            return self._config["learning_collection_name"]
+        return collection
+
+    def _retrieve_consolidation_points(self, collection_name: str, ids: list[str]) -> list[Any]:
+        if not self._qdrant:
+            return []
+        raw = self._qdrant.retrieve(collection_name, ids, with_payload=True, with_vector=False)
+        return points_from_qdrant(raw, collection_name=collection_name)
+
+    def _proposal_apply_plan(self, report: dict[str, Any], proposal: dict[str, Any], action: str, points: list[Any]) -> dict[str, Any]:
+        affected_ids = [str(item) for item in proposal.get("affected_ids") or [] if str(item)]
+        plan = {
+            "report_id": report.get("report_id"),
+            "proposal_id": proposal.get("proposal_id"),
+            "proposal_type": proposal.get("proposal_type"),
+            "action": action,
+            "affected_ids": affected_ids,
+            "collection_name": self._collection_for_proposal(proposal),
+        }
+        if action == "merge" and points:
+            canonical = self._select_canonical_point(points)
+            plan.update({"canonical_id": canonical.id, "delete_ids": [p.id for p in points if p.id != canonical.id]})
+        elif action == "delete":
+            plan.update({"delete_ids": affected_ids})
+        elif action == "promote_to_skill" and points:
+            root = artifact_root(self._hermes_home, str(self._config.get("consolidation_artifact_dir") or "")) / "skill_drafts"
+            plan.update({"skill_draft_path": str(root / f"{proposal.get('proposal_id')}.md")})
+        return plan
+
+    def _select_canonical_point(self, points: list[Any]) -> Any:
+        def key(point: Any) -> tuple[float, float, str, str]:
+            payload = point.payload or {}
+            try:
+                importance = float(payload.get("importance", 5))
+            except Exception:
+                importance = 5.0
+            try:
+                confidence = float(payload.get("confidence", 0.0))
+            except Exception:
+                confidence = 0.0
+            return (importance, confidence, str(payload.get("created_at") or ""), point.id)
+
+        return max(points, key=key)
+
+    def _tool_consolidation_apply(self, args: dict) -> str:
+        proposal_id = str(args.get("proposal_id") or "").strip()
+        if not proposal_id:
+            return _json_error("proposal_id is required")
+        report_id = str(args.get("report_id") or "").strip()
+        if not report_id:
+            return _json_error("report_id is required")
+        if not self._qdrant:
+            return _json_error("Qdrant memory provider is not initialized")
+        dry_run = parse_bool_arg(args.get("dry_run"), default=bool(self._config.get("consolidation_apply_dry_run_default", True)))
+        if not dry_run and not parse_bool_arg(args.get("approve"), default=False):
+            return _json_error("approve=true is required when dry_run=false")
+        try:
+            report = load_consolidation_report(report_id, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))
+            if str(report.get("profile_id") or self._profile_id) != self._profile_id:
+                return _json_error("proposal belongs to a different profile scope")
+            proposal = find_proposal(report, proposal_id)
+            proposal_type = str(proposal.get("proposal_type") or "")
+            expected_action = expected_action_for_proposal(proposal_type)
+            if not expected_action:
+                return _json_error("proposal requires manual review and cannot be applied automatically")
+            action = str(args.get("action") or expected_action).strip()
+            if action != expected_action:
+                return _json_error("action mismatch for proposal type")
+            affected_ids = [str(item) for item in proposal.get("affected_ids") or [] if str(item)]
+            if not affected_ids:
+                return _json_error("proposal has no explicit affected_ids")
+            collection_name = self._collection_for_proposal(proposal)
+            points = self._retrieve_consolidation_points(collection_name, affected_ids)
+            if len(points) != len(set(affected_ids)):
+                return _json_error("affected point missing; rerun consolidation")
+            plan = self._proposal_apply_plan(report, proposal, action, points)
+            if dry_run:
+                return json.dumps({"dry_run": True, "would_apply": True, **plan})
+            if action == "delete":
+                self._qdrant.delete_ids(collection_name, affected_ids)
+                record = persist_application_record({"applied": True, **plan, "deleted_ids": affected_ids}, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))
+                return json.dumps({"dry_run": False, "applied": True, **plan, "deleted_ids": affected_ids, "application_id": record.get("application_id"), "application_artifact": record.get("artifact_path")})
+            if action == "merge":
+                if len(points) < 2:
+                    return _json_error("merge requires at least two affected points")
+                if any("bearer" in p.text.lower() or "secret" in p.text.lower() for p in points):
+                    return _json_error("secret-bearing duplicate cluster requires manual review")
+                canonical = self._select_canonical_point(points)
+                delete_ids = [p.id for p in points if p.id != canonical.id]
+                payload_update = {
+                    "consolidated_from": delete_ids,
+                    "consolidation_proposal_id": proposal_id,
+                    "consolidation_report_id": report_id,
+                    "consolidated_at": datetime.utcnow().isoformat() + "Z",
+                    "duplicate_count": len(points),
+                }
+                self._qdrant.update_payload(collection_name, canonical.id, payload_update)
+                if delete_ids:
+                    self._qdrant.delete_ids(collection_name, delete_ids)
+                record = persist_application_record({"applied": True, **plan, "canonical_id": canonical.id, "deleted_ids": delete_ids}, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))
+                return json.dumps({"dry_run": False, "applied": True, **plan, "canonical_id": canonical.id, "deleted_ids": delete_ids, "application_id": record.get("application_id"), "application_artifact": record.get("artifact_path")})
+            if action == "promote_to_skill":
+                if collection_name != self._config["learning_collection_name"]:
+                    return _json_error("promote_to_skill requires a learning collection proposal")
+                point = points[0]
+                if "bearer" in point.text.lower() or "secret" in point.text.lower():
+                    return _json_error("secret-bearing learning requires manual review")
+                draft_root = artifact_root(self._hermes_home, str(self._config.get("consolidation_artifact_dir") or "")) / "skill_drafts"
+                draft_root.mkdir(parents=True, exist_ok=True)
+                draft_path = draft_root / f"{proposal_id}.md"
+                draft_text = build_skill_draft_text(point, proposal_id=proposal_id, report_id=report_id)
+                draft_path.write_text(draft_text, encoding="utf-8")
+                self._qdrant.update_payload(
+                    collection_name,
+                    point.id,
+                    {
+                        "promoted_to_skill_draft": True,
+                        "skill_draft_path": str(draft_path),
+                        "promoted_at": datetime.utcnow().isoformat() + "Z",
+                        "consolidation_proposal_id": proposal_id,
+                    },
+                )
+                record = persist_application_record({"applied": True, **plan, "skill_draft_path": str(draft_path)}, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))
+                return json.dumps({"dry_run": False, "applied": True, **plan, "skill_draft_path": str(draft_path), "application_id": record.get("application_id"), "application_artifact": record.get("artifact_path")})
+            return _json_error("unsupported consolidation action")
+        except Exception as exc:
+            return _json_error(f"Consolidation apply failed: {exc}")
 
     def _ensure_learning_store(self) -> Optional[LearningStore]:
         if self._learning_store:
@@ -673,6 +836,8 @@ class QdrantMemoryProvider(MemoryProvider):
             return self._tool_forget(args)
         if tool_name == "qdrant_memory_consolidate":
             return self._tool_consolidate(args)
+        if tool_name == "qdrant_memory_consolidation_apply":
+            return self._tool_consolidation_apply(args)
         if tool_name == "qdrant_learning_store":
             return self._tool_learning_store(args)
         if tool_name == "qdrant_learning_search":

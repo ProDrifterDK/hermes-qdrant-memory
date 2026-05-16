@@ -174,17 +174,42 @@ First search with metadata and copy the exact point IDs. Then ask Hermes to call
 
 Only run with `dry_run: false` after verifying the IDs.
 
-## M8 consolidation report
+## M9 consolidation report and gated apply
 
-Generate a report-only reflection pass over memory and procedural learnings:
+Generate and persist a reflection pass over memory and procedural learnings:
 
 ```json
 {
   "scope": "both",
   "max_points": 200,
   "max_groups": 20,
-  "include_examples": true
+  "include_examples": true,
+  "persist": true
 }
 ```
 
-`qdrant_memory_consolidate` returns duplicate clusters, stale low-value candidates, learning promotion candidates, and quality warnings. M8 never applies the proposals. `dry_run: false` is rejected until a future gated apply flow exists.
+`qdrant_memory_consolidate` returns duplicate clusters, stale low-value candidates, learning promotion candidates, quality warnings, a `report_id`, and a local artifact path. It still cannot apply actions; `dry_run: false` is rejected for report generation.
+
+Preview one proposal without mutation:
+
+```json
+{
+  "report_id": "abc123...",
+  "proposal_id": "stale_low_value-...",
+  "action": "delete"
+}
+```
+
+Live apply requires explicit approval:
+
+```json
+{
+  "report_id": "abc123...",
+  "proposal_id": "stale_low_value-...",
+  "action": "delete",
+  "dry_run": false,
+  "approve": true
+}
+```
+
+Supported live actions are explicit-ID `delete`, canonical-preserving duplicate `merge`, and `promote_to_skill` draft creation. `quality_warning` proposals are manual-only.

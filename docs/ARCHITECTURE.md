@@ -91,21 +91,23 @@ M7.1 adds gated automatic extraction candidates from `on_pre_compress` and `on_s
 
 M7.2 adds semantic dedupe before candidates enter the pending buffer. It queries existing `hermes_learnings` with the same scope and `learning_type`, uses raw Qdrant similarity, does not update access metadata, and fails open if Qdrant/embeddings are unavailable.
 
-## M8 report-only sleep consolidation
+## M8/M9 sleep consolidation
 
-M8 implements `qdrant_memory_consolidate` as a dry-run/report-only reflection pass. It reads points with Qdrant scroll filters, respects the active scope, and analyzes `hermes_memory`, `hermes_learnings`, or both. It never calls upsert, delete, approval, or payload update methods, and therefore does not change access metadata.
+M8 introduced `qdrant_memory_consolidate` as a dry-run reflection pass. It reads points with Qdrant scroll filters, respects the active scope, and analyzes `hermes_memory`, `hermes_learnings`, or both. Report generation never calls memory-action upsert/delete/approval/payload update methods and does not change access metadata.
 
-The report may propose duplicate clusters, stale low-value memory candidates, learning promotion candidates, and quality warnings. All suggestions are review-only and require explicit human approval outside M8. `dry_run: false` is rejected; future M9 may add apply-by-proposal-id semantics.
+M9a persists each report as a local JSON artifact under `$HERMES_HOME/qdrant_memory/consolidation/` (or `consolidation_artifact_dir`). M9b/M9c add `qdrant_memory_consolidation_apply`, which loads a persisted `report_id`, finds one exact `proposal_id`, previews by default, and only performs live work when `dry_run=false` and `approve=true`.
+
+The report may propose duplicate clusters, stale low-value memory candidates, learning promotion candidates, and quality warnings. Apply semantics are intentionally narrow: duplicate clusters can merge by preserving one canonical point and deleting explicit duplicates; stale low-value proposals can delete explicit IDs only; learning promotion candidates create local draft skill artifacts and mark the learning as promoted-to-draft. Quality warnings remain manual-review only.
 
 Safety gates:
 
-- explicit correction/resolution signal required
-- candidate confidence threshold (`learning_auto_extract_min_confidence`)
-- per-session candidate cap (`learning_auto_extract_max_candidates_per_session`)
-- secret-bearing text is blocked
-- reset clears pending candidates
-- approval stores only to `hermes_learnings`
-- semantic dedupe suppresses existing lessons using same scope/type and high raw similarity
+- report generation rejects `dry_run=false` and cannot apply proposals;
+- live apply requires `report_id`, `proposal_id`, `dry_run=false`, and `approve=true`;
+- actions are derived from proposal type and mismatches are rejected;
+- all deletes use explicit IDs only; `delete_filter` is not used by consolidation apply;
+- current affected points are re-fetched before live action, so missing points reject as stale;
+- secret-bearing quality warnings and secret-bearing merge/promotion inputs require manual review;
+- skill promotion creates a draft artifact only and never installs a skill automatically.
 
 ## File manifest sync
 
