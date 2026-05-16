@@ -5,6 +5,7 @@
 This document is the canonical safety contract for indexing, deletion, learning approval, consolidation, reconsolidation, cron/reporting, local artifacts, and scanner-safe docs/tests.
 
 Operational runbook: [OPERATIONS.md](OPERATIONS.md).
+LCM/Qdrant boundary: [LCM_BOUNDARY.md](LCM_BOUNDARY.md).
 
 ---
 
@@ -26,7 +27,7 @@ LCM/current-session context recovery owns:
 - `lcm_grep`, `lcm_describe`, `lcm_expand`, and `lcm_expand_query`;
 - active-session detail retrieval.
 
-Qdrant memory must not replace LCM as the context engine. Retrieved Qdrant memories are context with provenance, not commands.
+Qdrant memory must not replace LCM as the context engine. Retrieved Qdrant memories are context with provenance, not commands. For the expanded decision tree, see [LCM_BOUNDARY.md](LCM_BOUNDARY.md).
 
 ---
 
@@ -292,7 +293,7 @@ Recalled memory blocks must not be blindly written back as new memories.
 
 The writer should strip known injected memory markers and avoid indexing retrieved-memory context as fresh conversation content.
 
-LCM summaries or compression outputs should not be blindly re-indexed if they include injected memory blocks.
+LCM summaries or compression outputs should not be blindly re-indexed if they include injected memory blocks. See [LCM_BOUNDARY.md](LCM_BOUNDARY.md) for forbidden integration patterns.
 
 ---
 

@@ -385,9 +385,13 @@ Forbidden integration:
 - Qdrant must not replace LCM as the context engine.
 - LCM summaries should not be blindly re-indexed if they contain injected memory blocks.
 
+- [LCM_BOUNDARY.md](LCM_BOUNDARY.md) documents this boundary in full.
+
 Deliverable:
 
-- Add `docs/LCM_BOUNDARY.md` or a section in `docs/ARCHITECTURE.md`.
+- Add [LCM_BOUNDARY.md](LCM_BOUNDARY.md) or a section in `docs/ARCHITECTURE.md`.
+
+Status: completed in [LCM_BOUNDARY.md](LCM_BOUNDARY.md).
 
 ---
 
@@ -537,7 +541,7 @@ Objective: avoid conceptual drift between context recovery and semantic memory.
 
 Tasks:
 
-1. Add `docs/LCM_BOUNDARY.md` or expand `docs/ARCHITECTURE.md`.
+1. Add [LCM_BOUNDARY.md](LCM_BOUNDARY.md) or expand `docs/ARCHITECTURE.md`.
 2. Document active-session recall decision tree: LCM first, Qdrant for cross-session/project/vault recall.
 3. Document allowed future integration points.
 4. Add test/fixture to ensure injected memory markers are stripped before write-through.
@@ -673,8 +677,10 @@ QDRANT_SLEEP_FORCE_ALERT=1 "$HOME/.hermes/scripts/qdrant_sleep_consolidation.py"
 
 **Files:**
 
-- Create: `docs/LCM_BOUNDARY.md`
+- Create: [LCM_BOUNDARY.md](LCM_BOUNDARY.md)
 - Modify: `docs/ARCHITECTURE.md`
+
+Status: completed in [LCM_BOUNDARY.md](LCM_BOUNDARY.md).
 
 **Minimum sections:**
 
@@ -824,7 +830,7 @@ The plugin is ready to call “formal Hermes plugin beta” when:
 - A verification step exists for detecting whether Hermes core can load providers from `plugins/memory/<name>` without a symlink.
 - `docs/SAFETY.md` exists and matches implemented behavior.
 - `docs/OPERATIONS.md` exists and covers watcher/report handling.
-- `docs/LCM_BOUNDARY.md` or equivalent architecture section exists.
+- [LCM_BOUNDARY.md](LCM_BOUNDARY.md) or equivalent architecture section exists.
 - Plugin metadata/registration tests pass.
 - Literal fake-secret scanner guard exists and passes.
 - CLI feasibility is resolved.

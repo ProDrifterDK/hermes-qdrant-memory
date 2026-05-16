@@ -41,6 +41,8 @@ Ask Hermes:
 Search Qdrant memory for "Project X Railway deployment pnpm" and include metadata.
 ```
 
+`qdrant_memory_search` is for durable semantic memory, not exact active-session recovery. Use [LCM_BOUNDARY.md](LCM_BOUNDARY.md) to decide when LCM is the right tool.
+
 Useful filters:
 
 ```json
@@ -92,6 +94,8 @@ Equivalent tool payload:
 ## Verify auto-recall
 
 Start a fresh Hermes session and ask about a topic that exists only in the indexed notes. If auto-recall is working, Hermes should be able to cite the relevant `file_path` or source metadata without manually calling search.
+
+Auto-recall is Qdrant semantic recall, not LCM active-session expansion. For the boundary, see [LCM_BOUNDARY.md](LCM_BOUNDARY.md).
 
 Example:
 

@@ -40,7 +40,7 @@ Use a new collection or reindex from scratch.
 
 ## Retrieval is semantic, not authoritative
 
-Qdrant returns similar chunks. Similarity is not truth. Hermes should still reason, verify, and prefer current user instructions over stale memory.
+Qdrant returns similar chunks. Similarity is not truth. Hermes should still reason, verify, and prefer current user instructions over stale memory. Use [LCM_BOUNDARY.md](LCM_BOUNDARY.md) to decide when active-session LCM recovery is the correct tool instead.
 
 ## Auto-recall noise
 
@@ -60,7 +60,7 @@ M7.1 adds heuristic candidate extraction, not blind auto-learning. `learning_aut
 
 M7.2 adds semantic dedupe against existing `hermes_learnings` before preview/pending. This reduces repeated candidates, but the threshold uses the raw Qdrant similarity score, so deployments using a non-default distance/embedding scale may need to tune `learning_auto_extract_semantic_dedupe_threshold`.
 
-The extractor is deliberately narrow: explicit user corrections and tool failures only when followed by a correction/resolution. It does not use an LLM yet and should not be treated as a full learning pipeline.
+The extractor is deliberately narrow: explicit user corrections and tool failures only when followed by a correction/resolution. It does not use an LLM yet and should not be treated as a full learning pipeline. Compression/session-end behavior must preserve the [LCM boundary](LCM_BOUNDARY.md).
 
 ## Consolidation live actions are gated in M9
 

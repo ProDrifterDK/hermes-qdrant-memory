@@ -2,7 +2,7 @@
 
 `hermes-qdrant-memory` is a Hermes Agent `MemoryProvider` plugin.
 
-It is intentionally not a context engine. Context engines such as LCM recover detail from the current session. This plugin provides cross-session associative recall and explicit memory tooling.
+It is intentionally not a context engine. Context engines such as LCM recover detail from the current session. This plugin provides cross-session associative recall and explicit memory tooling. See [LCM_BOUNDARY.md](LCM_BOUNDARY.md) for the detailed interoperability boundary.
 
 ## Runtime flow
 
@@ -165,7 +165,7 @@ For shared gateway deployments, avoid `global` unless you explicitly want cross-
 
 ## Safety design
 
-The canonical safety contract is `docs/SAFETY.md`; this section summarizes the architectural enforcement points.
+The canonical safety contract is [SAFETY.md](SAFETY.md); this section summarizes the architectural enforcement points. The active-session/current-session boundary is defined in [LCM_BOUNDARY.md](LCM_BOUNDARY.md).
 
 - Auto-recall is context-only; retrieved memory is not itself a command.
 - The writer strips known injected memory markers to reduce recursive contamination.

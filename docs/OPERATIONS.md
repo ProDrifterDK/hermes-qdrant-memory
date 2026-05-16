@@ -10,7 +10,7 @@ Use this document for status checks, smoke tests, watcher runs, consolidation re
 
 ## 1. Operating boundaries
 
-`hermes-qdrant-memory` is a Hermes `MemoryProvider`, not an LCM/current-session context engine.
+`hermes-qdrant-memory` is a Hermes `MemoryProvider`, not an LCM/current-session context engine. See [LCM_BOUNDARY.md](LCM_BOUNDARY.md) for the operator decision tree.
 
 Qdrant memory provides:
 
@@ -395,7 +395,7 @@ Post-restart minimum checks:
 | vector size errors | Confirm embedding model dimension matches the Qdrant collection vector size; use a new collection or reindex after model changes. |
 | `collection_exists=false` | Collection may not be initialized yet; run status/store/index flow after confirming config. |
 | unexpected `point_count` | Check collection name, scope/profile, dry-run indexing output, stale IDs, deleted file IDs, and whether tests used another collection. |
-| irrelevant/stale search results | Treat semantic retrieval as non-authoritative; verify against files/tools; tune thresholds or dry-run reindex a narrow source path. |
+| irrelevant/stale search results | Treat semantic retrieval as non-authoritative; use LCM for exact active-session detail; verify against files/tools; tune thresholds or dry-run reindex a narrow source path. See [LCM_BOUNDARY.md](LCM_BOUNDARY.md). |
 | dry-run apply shows stale/missing points | Regenerate the report; do not live-apply stale proposals. |
 | action mismatch | Use only the action matching the proposal type; do not force mismatched actions. |
 | `quality_warning` proposals | Manual review only; never automatic apply. |
