@@ -483,31 +483,32 @@ hermes memory status
 
 Objective: provide a stable human CLI for the same operations exposed as tools.
 
-Status: partially completed in v0.2.0 as a native Hermes memory-provider CLI MVP. The implemented command surface is enough for beta operation, but not full parity with the original target UX.
+Status: partially completed in v0.2.0 as a native Hermes memory-provider CLI MVP and extended on `main` for v0.3.0 prep with M18 parity commands. This is not a v0.3.0 release claim until tagged.
 
 Completed tasks:
 
 1. Confirmed Hermes memory-provider CLI discovery path.
 2. Added top-level `cli.py` and `qdrant_memory/cli_core.py`.
 3. Implemented `status`, `doctor`, `search`, `index`, `forget`, `learning search`, `learning preview`, `consolidate`, and `apply`.
-4. Preserved dry-run defaults and live-mutation approval gates.
-5. Added CLI tests for parsing, command-to-tool mapping, import isolation, exit codes, and safety gates.
+4. Added M18 parity commands on `main` for v0.3.0 prep: `config show`, `store`, `learning store`, `learning approve`, `watcher status`, and report-only `watcher run`.
+5. Preserved dry-run defaults and live-mutation approval gates.
+6. Added CLI tests for parsing, command-to-tool mapping, import isolation, exit codes, config redaction/no-provider behavior, watcher state reads, and safety gates.
 
 Deferred to v0.3.0+ CLI parity:
 
-- `config show`
-- `store`
-- `learning store`
-- `learning approve`
-- `watcher status`
-- `watcher run`
 - optional backup/export commands
 
 Verification:
 
 ```bash
+hermes qdrant config show --json
 hermes qdrant status
+hermes qdrant store "Manual memory" --tag manual
 hermes qdrant search "Hermes Qdrant memory"
+hermes qdrant learning store "Procedural lesson" --tag manual
+hermes qdrant learning approve CANDIDATE_ID --dry-run
+hermes qdrant watcher status --json
+hermes qdrant watcher run --scope both --json
 hermes qdrant consolidate --scope both --persist --dry-run
 # For apply, first generate a real persisted report and select one real proposal_id.
 # If no proposal exists, verify argument validation and dry-run refusal paths instead.

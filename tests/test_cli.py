@@ -241,3 +241,139 @@ def test_qdrant_command_exits_with_execute_command_code(monkeypatch):
         cli.qdrant_command(args)
 
     assert exc.value.code == 2
+
+
+def test_config_show_prints_redacted_config_without_provider(monkeypatch, tmp_path, capsys):
+    from qdrant_memory.cli_core import execute_command
+
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "qdrant_memory.json").write_text(
+        json.dumps({"qdrant_api_key": "real-qdrant-key", "embedding_api_key": "real-embedding-key", "collection_name": "custom"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    parser = _parser()
+    args = parser.parse_args(["qdrant", "config", "show", "--json"])
+
+    exit_code = execute_command(args, provider_factory=lambda: pytest.fail("provider should not be constructed"))
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["collection_name"] == "custom"
+    assert payload["qdrant_api_key"] == "<redacted>"
+    assert payload["embedding_api_key"] == "<redacted>"
+
+
+def test_build_tool_call_maps_store_with_comma_friendly_tags():
+    from qdrant_memory.cli_core import CliUsageError, build_tool_call
+
+    parser = _parser()
+    args = parser.parse_args(["qdrant", "store", "remember this", "--source-type", "manual", "--importance", "8", "--tag", "alpha,beta", "--tag", "gamma"])
+    assert build_tool_call(args) == (
+        "qdrant_memory_store",
+        {"text": "remember this", "source_type": "manual", "importance": 8, "tags": ["alpha", "beta", "gamma"]},
+    )
+
+    with pytest.raises(CliUsageError, match="text is required"):
+        build_tool_call(parser.parse_args(["qdrant", "store", "   "]))
+    with pytest.raises(SystemExit):
+        parser.parse_args(["qdrant", "store", "x", "--importance", "11"])
+
+
+def test_build_tool_call_maps_learning_store_and_approve_gate():
+    from qdrant_memory.cli_core import CliUsageError, build_tool_call
+
+    parser = _parser()
+    store = parser.parse_args([
+        "qdrant",
+        "learning",
+        "store",
+        "Prefer ctx_execute_file for large files",
+        "--learning-type",
+        "workflow_lesson",
+        "--trigger",
+        "large file",
+        "--mistake",
+        "cat huge file",
+        "--correction",
+        "use ctx_execute_file",
+        "--evidence",
+        "tool guidance",
+        "--tool-name",
+        "ctx_execute_file",
+        "--command",
+        "python",
+        "--importance",
+        "9",
+        "--confidence",
+        "0.9",
+        "--tag",
+        "cli,learning",
+        "--promote-to-skill-candidate",
+    ])
+    assert build_tool_call(store) == (
+        "qdrant_learning_store",
+        {
+            "lesson": "Prefer ctx_execute_file for large files",
+            "learning_type": "workflow_lesson",
+            "trigger": "large file",
+            "mistake": "cat huge file",
+            "correction": "use ctx_execute_file",
+            "evidence": "tool guidance",
+            "tool_name": "ctx_execute_file",
+            "command": "python",
+            "importance": 9,
+            "confidence": 0.9,
+            "tags": ["cli", "learning"],
+            "promote_to_skill_candidate": True,
+        },
+    )
+
+    dry_run = parser.parse_args(["qdrant", "learning", "approve", "candidate-1"])
+    assert build_tool_call(dry_run) == ("qdrant_learning_approve", {"candidate_id": "candidate-1", "dry_run": True})
+
+    unapproved = parser.parse_args(["qdrant", "learning", "approve", "candidate-1", "--no-dry-run"])
+    with pytest.raises(CliUsageError, match="--approve is required"):
+        build_tool_call(unapproved)
+
+    live = parser.parse_args(["qdrant", "learning", "approve", "candidate-1", "--no-dry-run", "--approve"])
+    assert build_tool_call(live) == ("qdrant_learning_approve", {"candidate_id": "candidate-1", "dry_run": False})
+
+
+def test_watcher_status_missing_state_without_provider(monkeypatch, tmp_path, capsys):
+    from qdrant_memory.cli_core import execute_command
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    parser = _parser()
+    args = parser.parse_args(["qdrant", "watcher", "status", "--json"])
+
+    exit_code = execute_command(args, provider_factory=lambda: pytest.fail("provider should not be constructed"))
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["configured"] is True
+    assert payload["state_exists"] is False
+    assert payload["state"] == {}
+    assert payload["state_path"].endswith("qdrant_memory/consolidation/watcher_state.json")
+
+
+def test_watcher_run_maps_to_report_only_consolidation():
+    from qdrant_memory.cli_core import build_tool_call
+
+    parser = _parser()
+    args = parser.parse_args(["qdrant", "watcher", "run", "--scope", "memory", "--max-points", "123", "--max-groups", "7", "--reconsolidation-max-candidates", "4", "--no-include-reconsolidation"])
+
+    assert build_tool_call(args) == (
+        "qdrant_memory_consolidate",
+        {
+            "dry_run": True,
+            "scope": "memory",
+            "persist": True,
+            "include_reconsolidation": False,
+            "include_examples": False,
+            "max_points": 123,
+            "max_groups": 7,
+            "reconsolidation_max_candidates": 4,
+        },
+    )

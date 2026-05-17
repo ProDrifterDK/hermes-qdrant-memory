@@ -642,22 +642,32 @@ For operational checks and approved maintenance procedures, see [docs/OPERATIONS
 When the plugin is installed as the active Hermes memory provider, Hermes can discover the native provider CLI from the top-level `cli.py` file:
 
 ```bash
+hermes qdrant config show --json
 hermes qdrant status
 hermes qdrant doctor
+hermes qdrant store "Remember this explicit memory" --source-type manual --importance 5 --tag manual
 hermes qdrant search "agent memory" --top-k 5 --json
 hermes qdrant index docs README.md --dry-run
 hermes qdrant forget POINT_ID --dry-run
 hermes qdrant learning search "tool failure" --top-k 5 --json
 hermes qdrant learning preview --json
+hermes qdrant learning store "Prefer dry-run before broad indexing" --learning-type workflow_lesson --confidence 0.8 --tag cli
+hermes qdrant learning approve CANDIDATE_ID --dry-run --json
 hermes qdrant consolidate --scope both --persist --dry-run --json
+hermes qdrant watcher status --json
+hermes qdrant watcher run --scope both --json
 hermes qdrant apply --report-id REPORT_ID --proposal-id PROPOSAL_ID --action merge --dry-run --json
 ```
 
 Mutation safety mirrors the tool surface:
 
-- mutating commands default to `--dry-run`;
-- live mutation requires both `--no-dry-run` and `--approve`;
+- `config show` and `watcher status` are local JSON reads and do not instantiate the provider or contact Qdrant/embedding services; secret-like API key fields are redacted;
+- `store` and `learning store` are explicit live storage commands by design and require non-empty positional text/lesson;
+- mutating maintenance commands default to `--dry-run`;
+- live maintenance mutation requires both `--no-dry-run` and `--approve`;
+- `learning approve` follows the same live approval gate;
 - `forget` only accepts explicit point IDs;
+- `watcher run` is report-only consolidation with `dry_run=true`, `persist=true`, and no apply/proposal mutation;
 - `apply` requires explicit report/proposal IDs and expected action.
 
 The CLI is a thin wrapper over existing `qdrant_memory_*` and `qdrant_learning_*` tool calls. See [docs/CLI_SPIKE.md](docs/CLI_SPIKE.md) for feasibility findings and caveats.

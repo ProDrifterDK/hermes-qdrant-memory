@@ -4,6 +4,25 @@ All notable changes to this project are documented here.
 
 This project is currently public beta / experimental. The format follows Keep a Changelog style, but the repository is still pre-1.0 and the public API may change.
 
+## [0.3.0]
+
+Next beta work on `main`; not published until a release tag is created.
+
+### Added
+
+- M18 CLI parity commands for v0.3.0 prep:
+  - `hermes qdrant config show` prints effective config JSON without constructing the provider and redacts API-key fields.
+  - `hermes qdrant store TEXT` maps to `qdrant_memory_store` for explicit manual memory writes.
+  - `hermes qdrant learning store LESSON` maps to `qdrant_learning_store`.
+  - `hermes qdrant learning approve CANDIDATE_ID` maps to `qdrant_learning_approve` with dry-run default and live approval gate.
+  - `hermes qdrant watcher status` reads local watcher state without contacting services.
+  - `hermes qdrant watcher run` runs report-only persisted consolidation with no apply/proposal mutation.
+
+### Safety
+
+- Preserved v0.2.1 CLI exit-code propagation and mutation gates.
+- Watcher CLI remains report-only; no query deletion or autonomous apply was added.
+
 ## [0.2.1]
 
 Hotfix release discovered by the post-release consumer install/runtime smoke test.

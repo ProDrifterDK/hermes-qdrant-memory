@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 from argparse import Namespace
 from collections.abc import Callable
@@ -24,6 +25,72 @@ def _optional_int(value: Any) -> int | None:
     return int(value)
 
 
+def _split_tags(values: Any) -> list[str]:
+    if not values:
+        return []
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, list):
+        return []
+    tags: list[str] = []
+    for raw in values:
+        for item in str(raw).split(","):
+            tag = item.strip()
+            if tag:
+                tags.append(tag)
+    return tags
+
+
+def _non_empty(value: Any, name: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise CliUsageError(f"{name} is required")
+    return text
+
+
+def _hermes_home() -> Path:
+    return Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+
+
+def _redacted_config() -> dict[str, Any]:
+    from qdrant_memory.config import load_config
+
+    config = load_config(hermes_home=str(_hermes_home()))
+    sanitized = dict(config)
+    for key in ("qdrant_api_key", "embedding_api_key"):
+        sanitized[key] = "<redacted>" if sanitized.get(key) else ""
+    return sanitized
+
+
+def _watcher_status_payload() -> dict[str, Any]:
+    state_path = _hermes_home() / "qdrant_memory" / "consolidation" / "watcher_state.json"
+    state: dict[str, Any] = {}
+    exists = state_path.exists()
+    if exists:
+        try:
+            parsed = json.loads(state_path.read_text(encoding="utf-8"))
+            state = parsed if isinstance(parsed, dict) else {"raw": parsed}
+        except Exception as exc:
+            state = {"error": f"failed to read watcher state: {exc}"}
+    return {
+        "configured": True,
+        "state_path": str(state_path),
+        "state_exists": exists,
+        "state": state,
+    }
+
+
+def _execute_local_command(args: Namespace, stdout) -> int | None:
+    subcommand = getattr(args, "qdrant_subcommand", None)
+    if subcommand == "config" and getattr(args, "config_subcommand", None) == "show":
+        print(json.dumps(_redacted_config(), sort_keys=True), file=stdout)
+        return 0
+    if subcommand == "watcher" and getattr(args, "watcher_subcommand", None) == "status":
+        print(json.dumps(_watcher_status_payload(), sort_keys=True), file=stdout)
+        return 0
+    return None
+
+
 def build_tool_call(args: Namespace) -> tuple[str, dict[str, Any]]:
     """Convert parsed qdrant CLI args into the existing Hermes tool surface."""
 
@@ -31,6 +98,18 @@ def build_tool_call(args: Namespace) -> tuple[str, dict[str, Any]]:
 
     if subcommand in {"status", "doctor"}:
         return "qdrant_memory_status", {}
+
+    if subcommand == "config":
+        raise CliUsageError("unsupported qdrant config command")
+
+    if subcommand == "store":
+        text = _non_empty(args.text, "text")
+        return "qdrant_memory_store", {
+            "text": text,
+            "source_type": args.source_type or "manual",
+            "importance": args.importance,
+            "tags": _split_tags(getattr(args, "tag", [])),
+        }
 
     if subcommand == "search":
         return "qdrant_memory_search", {
@@ -87,6 +166,41 @@ def build_tool_call(args: Namespace) -> tuple[str, dict[str, Any]]:
             }
         if learning_subcommand == "preview":
             return "qdrant_learning_preview", {"include_metadata": args.include_metadata}
+        if learning_subcommand == "store":
+            lesson = _non_empty(args.lesson, "lesson")
+            return "qdrant_learning_store", {
+                "lesson": lesson,
+                "learning_type": args.learning_type,
+                "trigger": args.trigger,
+                "mistake": args.mistake,
+                "correction": args.correction,
+                "evidence": args.evidence,
+                "tool_name": args.tool_name,
+                "command": args.command,
+                "importance": args.importance,
+                "confidence": args.confidence,
+                "tags": _split_tags(getattr(args, "tag", [])),
+                "promote_to_skill_candidate": args.promote_to_skill_candidate,
+            }
+        if learning_subcommand == "approve":
+            _require_live_approval(args)
+            candidate_id = _non_empty(args.candidate_id, "candidate_id")
+            return "qdrant_learning_approve", {"candidate_id": candidate_id, "dry_run": args.dry_run}
+
+    if subcommand == "watcher":
+        watcher_subcommand = getattr(args, "watcher_subcommand", None)
+        if watcher_subcommand == "run":
+            return "qdrant_memory_consolidate", {
+                "dry_run": True,
+                "scope": args.scope,
+                "persist": True,
+                "include_reconsolidation": args.include_reconsolidation,
+                "include_examples": False,
+                "max_points": args.max_points,
+                "max_groups": args.max_groups,
+                "reconsolidation_max_candidates": args.reconsolidation_max_candidates,
+            }
+        raise CliUsageError("unsupported qdrant watcher command")
 
     raise CliUsageError(f"unsupported qdrant command: {subcommand or '<missing>'}")
 
@@ -125,6 +239,10 @@ def execute_command(
     stdout = stdout or sys.stdout
     stderr = stderr or sys.stderr
     provider_factory = provider_factory or default_provider_factory
+
+    local_exit = _execute_local_command(args, stdout)
+    if local_exit is not None:
+        return local_exit
 
     try:
         tool_name, tool_args = build_tool_call(args)

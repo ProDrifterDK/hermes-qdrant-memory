@@ -167,7 +167,7 @@ Never delete by query.
 
 ### Step 5: Native CLI smoke after installing a release tag
 
-For release-tag validation, verify the installed plugin as a user would run it:
+For release-tag validation, verify the installed plugin as a user would run it. For the latest published v0.2.x release:
 
 ```bash
 cd ~/.hermes/plugins/qdrant
@@ -180,12 +180,27 @@ hermes qdrant learning preview --json
 hermes qdrant consolidate --scope both --persist --include-reconsolidation --json
 ```
 
+For unreleased v0.3.0/main validation after M18 CLI parity, use the development checkout or a future v0.3.0 tag:
+
+```bash
+hermes qdrant config show --json
+hermes qdrant store "Release smoke explicit memory" --source-type manual --importance 5 --tag smoke
+hermes qdrant learning store "Release smoke procedural lesson" --learning-type workflow_lesson --confidence 0.8 --tag smoke
+hermes qdrant learning approve CANDIDATE_ID --dry-run --json
+hermes qdrant watcher status --json
+hermes qdrant watcher run --scope both --json
+```
+
 Expected behavior:
 
+- `config show` prints effective JSON config with `qdrant_api_key` and `embedding_api_key` redacted, without provider construction or service contact.
 - `status` and `doctor` print JSON status and report `qdrant_ok: true` and `embedding_ok: true`.
+- `store` and `learning store` are explicit live writes; use only harmless smoke text and remove later by explicit point ID if needed.
 - `search` returns valid JSON; zero results is acceptable on a fresh install.
-- `learning preview` returns valid JSON and performs no mutation.
+- `learning preview` and `learning approve --dry-run` return valid JSON and perform no mutation.
 - `consolidate --persist` creates a local report artifact under `$HERMES_HOME/qdrant_memory/consolidation/` and performs no Qdrant mutation.
+- `watcher status` reads local watcher state only; missing state is not an error.
+- `watcher run` maps to report-only consolidation (`dry_run=true`, `persist=true`, `include_examples=false`) and performs no Qdrant mutation.
 
 Verify the CLI process exit gate for live mutation without approval:
 
@@ -213,7 +228,14 @@ Check that the watcher script exists before running it:
 test -x "$HOME/.hermes/scripts/qdrant_sleep_consolidation.py"
 ```
 
-Force a watcher/report run:
+Native report-only watcher checks are available through the CLI:
+
+```bash
+hermes qdrant watcher status --json
+hermes qdrant watcher run --scope both --max-points 300 --max-groups 20 --reconsolidation-max-candidates 10 --json
+```
+
+If using the external reference script, force a watcher/report run:
 
 ```bash
 QDRANT_SLEEP_FORCE_ALERT=1 "$HOME/.hermes/scripts/qdrant_sleep_consolidation.py"
@@ -223,7 +245,8 @@ Expected behavior:
 
 - it checks/generates consolidation proposals;
 - it may persist local redacted report artifacts;
-- it may update watcher signature state;
+- CLI `watcher status` may report missing watcher state without error;
+- external script runs may update watcher signature state;
 - it must not apply proposals;
 - it must not upsert, delete, or update Qdrant points.
 
