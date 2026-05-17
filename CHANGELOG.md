@@ -4,9 +4,9 @@ All notable changes to this project are documented here.
 
 This project is currently public beta / experimental. The format follows Keep a Changelog style, but the repository is still pre-1.0 and the public API may change.
 
-## [0.2.0] - Unreleased
+## [0.2.0]
 
-Release-candidate documentation for the next public beta of the Hermes Qdrant Memory Provider.
+Second public beta release of the Hermes Qdrant Memory Provider.
 
 ### Added
 

@@ -1,6 +1,6 @@
-# Release Notes: v0.2.0 Candidate
+# Release Notes: v0.2.0 Public Beta
 
-Hermes Qdrant Memory Provider v0.2.0 is the next public beta candidate for Alan Gárate / Resyst Softwares' Qdrant-backed hippocampal memory system for Hermes Agent. The plugin metadata in `plugin.yaml` now reports `0.2.0` at HEAD.
+Hermes Qdrant Memory Provider v0.2.0 is the second public beta of Alan Gárate / Resyst Softwares' Qdrant-backed hippocampal memory system for Hermes Agent. The plugin metadata in `plugin.yaml` reports `0.2.0`.
 
 It gives Hermes a cross-session associative memory substrate backed by Qdrant and OpenAI-compatible embeddings. It is not a replacement for LCM/current-session lossless recovery and it does not treat retrieved memories as instructions.
 
@@ -8,9 +8,9 @@ It gives Hermes a cross-session associative memory substrate backed by Qdrant an
 
 Public beta / experimental.
 
-Status: candidate documentation at repository HEAD. The older `v0.1.0` tag does not contain the learning, consolidation, reconsolidation, scanner guard, or native CLI MVP described here.
+Status: public beta release. The older `v0.1.0` tag does not contain the learning, consolidation, reconsolidation, scanner guard, or native CLI MVP described here.
 
-The core MemoryProvider, tools, safety gates, documentation, CI, scanner guard, and native CLI MVP are implemented and tested at HEAD. The plugin still requires operator judgment for indexing, deletion, consolidation, and reconsolidation review.
+The core MemoryProvider, tools, safety gates, documentation, CI, scanner guard, and native CLI MVP are implemented and tested in this release. The plugin still requires operator judgment for indexing, deletion, consolidation, and reconsolidation review.
 
 ## Requirements
 
@@ -49,14 +49,14 @@ hermes chat -q 'Call the qdrant_memory_status tool and summarize whether qdrant_
 
 ## Upgrade
 
-Upgrade from an existing clone to the release-candidate state:
+Upgrade from an existing clone:
 
 ```bash
 cd ~/.hermes/plugins/qdrant
 git pull --ff-only origin main
 ```
 
-After a `v0.2.0` tag is published, pin that tag with:
+Pin the v0.2.0 release tag with:
 
 ```bash
 cd ~/.hermes/plugins/qdrant
@@ -166,7 +166,7 @@ Core rules:
 - Secret detection for indexed user files is not automatic.
 - Only Markdown/text indexing is supported by default.
 - CLI discovery depends on Hermes memory-provider plugin discovery and active provider configuration.
-- `doctor` is status-backed in this v0.2.0 candidate.
+- `doctor` is status-backed in v0.2.0.
 - Public API may change before v1.0.
 
 ## Verification used for release readiness
