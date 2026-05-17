@@ -228,3 +228,16 @@ def test_execute_command_returns_nonzero_when_provider_returns_json_error(capsys
 
     assert exit_code == 1
     assert json.loads(capsys.readouterr().out)["error"] == "Qdrant memory provider is not initialized"
+
+
+def test_qdrant_command_exits_with_execute_command_code(monkeypatch):
+    cli = _load_plugin_cli_module()
+    parser = _parser()
+    args = parser.parse_args(["qdrant", "forget", "point-1", "--no-dry-run"])
+
+    monkeypatch.setattr(cli, "execute_command", lambda received: 2)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.qdrant_command(args)
+
+    assert exc.value.code == 2

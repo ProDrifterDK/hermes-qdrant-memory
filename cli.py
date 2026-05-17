@@ -84,5 +84,5 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     apply_parser.add_argument("--json", action="store_true", help="Emit raw JSON output.")
 
 
-def qdrant_command(args) -> int:
-    return execute_command(args)
+def qdrant_command(args) -> None:
+    raise SystemExit(execute_command(args))

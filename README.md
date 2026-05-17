@@ -239,12 +239,12 @@ cd ~/.hermes/plugins/qdrant
 git pull --ff-only origin main
 ```
 
-Use the published `v0.2.0` tag instead of `main` when you want a stable beta snapshot:
+Use the published `v0.2.1` tag instead of `main` when you want a stable beta snapshot:
 
 ```bash
 cd ~/.hermes/plugins/qdrant
 git fetch --tags origin
-git checkout v0.2.0
+git checkout v0.2.1
 ```
 
 Rollback plugin code:
@@ -690,7 +690,7 @@ No third-party Python package is required by the plugin runtime; it uses the Pyt
 ## Documentation
 
 - [CHANGELOG.md](CHANGELOG.md) — release history.
-- [RELEASE_NOTES.md](RELEASE_NOTES.md) — v0.2.0 install, upgrade, rollback, smoke checks, and caveats.
+- [RELEASE_NOTES.md](RELEASE_NOTES.md) — v0.2.1 hotfix notes, upgrade command, and exit-status smoke check.
 - [docs/SAFETY.md](docs/SAFETY.md) — canonical safety contract for indexing, deletion, consolidation, reconsolidation, cron/reporting, and scanner-safe docs/tests.
 - [docs/OPERATIONS.md](docs/OPERATIONS.md) — operator runbook for status checks, smoke tests, watcher reports, approved apply flow, post-apply verification, gateway/process restarts, and troubleshooting.
 - [docs/LCM_BOUNDARY.md](docs/LCM_BOUNDARY.md) — boundary between active-session LCM recovery and cross-session Qdrant semantic memory.

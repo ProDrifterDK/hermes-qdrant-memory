@@ -12,11 +12,11 @@
 
 ## 1. Current state
 
-The project is published as `v0.2.0 Public Beta` and is functional as a Hermes Qdrant-backed memory provider. The release URL is:
+The project is published as `v0.2.1 Public Beta Hotfix` and is functional as a Hermes Qdrant-backed memory provider. The latest release URL is:
 
-- <https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.2.0>
+- <https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.2.1>
 
-Implemented capabilities in v0.2.0:
+Implemented capabilities through v0.2.1:
 
 - Hermes `MemoryProvider` subclass: `QdrantMemoryProvider`.
 - Plugin registration through `register(ctx)`.
@@ -44,10 +44,11 @@ Known compatibility detail:
 - Current Hermes compatibility path: `~/.hermes/plugins/qdrant` or symlink from `plugins/qdrant` to `plugins/memory/qdrant`.
 - This is documented as a compatibility shim until Hermes core scans category paths for user memory providers.
 
-Post-release validation still needed:
+Post-release validation status:
 
-- Run a consumer install/runtime smoke test from the published `v0.2.0` tag in the local Hermes environment.
-- Verify whether current Hermes core can discover providers from `~/.hermes/plugins/memory/<name>` without the compatibility symlink.
+- Consumer install/runtime smoke from published `v0.2.0` completed and found one CLI process-exit propagation bug: unapproved live mutation was safely refused but exited with process status `0` under Hermes v0.13.
+- The fix is released in `v0.2.1`: `qdrant_command()` raises `SystemExit(execute_command(args))` so usage/safety/provider errors propagate as non-zero CLI exits.
+- Still verify whether current Hermes core can discover providers from `~/.hermes/plugins/memory/<name>` without the compatibility symlink.
 
 ---
 

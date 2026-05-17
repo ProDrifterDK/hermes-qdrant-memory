@@ -4,13 +4,26 @@ All notable changes to this project are documented here.
 
 This project is currently public beta / experimental. The format follows Keep a Changelog style, but the repository is still pre-1.0 and the public API may change.
 
+## [0.2.1]
+
+Hotfix release discovered by the post-release consumer install/runtime smoke test.
+
+### Fixed
+
+- Native `hermes qdrant ...` commands now propagate `execute_command()` exit codes through `SystemExit`, so Hermes v0.13 CLI invocations return non-zero process status for usage/safety errors and provider JSON errors.
+- Added regression coverage for `qdrant_command()` process-exit behavior.
+
+### Verification
+
+- Consumer smoke against the installed plugin found that v0.2.0 correctly blocked unapproved live mutation but exited with process status `0`; v0.2.1 fixes the process status while preserving the safety block.
+
 ## [0.2.0]
 
 Second public beta release of the Hermes Qdrant Memory Provider.
 
 ### Added
 
-- Plugin metadata version bumped to `0.2.0` for the next beta candidate.
+- Plugin metadata version bumped to `0.2.0` for the second public beta.
 - Qdrant-backed Hermes `MemoryProvider` for cross-session semantic recall.
 - OpenAI-compatible embedding client support.
 - Automatic completed-turn indexing through Hermes memory hooks.
@@ -78,6 +91,6 @@ Second public beta release of the Hermes Qdrant Memory Provider.
 
 ## [0.1.0] - 2026-05-16
 
-Initial public beta tag. The v0.1.0 tag predates the learning, consolidation, reconsolidation, scanner guard, and native CLI MVP work now documented under the unreleased v0.2.0 candidate.
+Initial public beta tag. The v0.1.0 tag predates the learning, consolidation, reconsolidation, scanner guard, and native CLI MVP work documented in later releases.
 
 [0.1.0]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.1.0

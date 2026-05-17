@@ -165,6 +165,42 @@ Call qdrant_memory_forget with ids=["<POINT_ID>"] and dry_run=false.
 
 Never delete by query.
 
+### Step 5: Native CLI smoke after installing a release tag
+
+For release-tag validation, verify the installed plugin as a user would run it:
+
+```bash
+cd ~/.hermes/plugins/qdrant
+git fetch --tags origin
+git checkout v0.2.1
+hermes qdrant status
+hermes qdrant doctor
+hermes qdrant search "Hermes Qdrant memory" --top-k 3 --include-metadata --json
+hermes qdrant learning preview --json
+hermes qdrant consolidate --scope both --persist --include-reconsolidation --json
+```
+
+Expected behavior:
+
+- `status` and `doctor` print JSON status and report `qdrant_ok: true` and `embedding_ok: true`.
+- `search` returns valid JSON; zero results is acceptable on a fresh install.
+- `learning preview` returns valid JSON and performs no mutation.
+- `consolidate --persist` creates a local report artifact under `$HERMES_HOME/qdrant_memory/consolidation/` and performs no Qdrant mutation.
+
+Verify the CLI process exit gate for live mutation without approval:
+
+```bash
+hermes qdrant forget 00000000-0000-0000-0000-000000000000 --no-dry-run
+```
+
+Expected behavior in v0.2.1+:
+
+- output contains `--approve is required when using --no-dry-run`;
+- process exit status is non-zero;
+- no Qdrant deletion occurs.
+
+The v0.2.0 tag correctly refused the mutation but returned process exit status `0` because Hermes v0.13 ignores plugin handler return values. v0.2.1 fixes this by making the plugin command raise `SystemExit` with the computed exit code.
+
 ---
 
 ## 6. Watcher force-run
