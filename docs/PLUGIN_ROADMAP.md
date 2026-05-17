@@ -12,9 +12,11 @@
 
 ## 1. Current state
 
-The project is already functional as a Hermes Qdrant-backed memory provider.
+The project is published as `v0.2.0 Public Beta` and is functional as a Hermes Qdrant-backed memory provider. The release URL is:
 
-Implemented capabilities:
+- <https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.2.0>
+
+Implemented capabilities in v0.2.0:
 
 - Hermes `MemoryProvider` subclass: `QdrantMemoryProvider`.
 - Plugin registration through `register(ctx)`.
@@ -32,13 +34,20 @@ Implemented capabilities:
 - Persisted consolidation reports and gated apply-by-proposal-id.
 - Reconsolidation candidates as review drafts only.
 - Conservative no-agent watcher script.
-- GitHub Actions test workflow.
+- Native Hermes memory-provider CLI MVP: `hermes qdrant ...`.
+- GitHub Actions test workflow with pytest, compileall, and scanner guard.
+- Release documentation: `CHANGELOG.md`, `RELEASE_NOTES.md`, install/update/remove/rollback notes.
 
 Known compatibility detail:
 
 - Desired category layout: `~/.hermes/plugins/memory/qdrant/`.
 - Current Hermes compatibility path: `~/.hermes/plugins/qdrant` or symlink from `plugins/qdrant` to `plugins/memory/qdrant`.
-- This should be documented as compatibility shim until Hermes core scans category paths for user memory providers.
+- This is documented as a compatibility shim until Hermes core scans category paths for user memory providers.
+
+Post-release validation still needed:
+
+- Run a consumer install/runtime smoke test from the published `v0.2.0` tag in the local Hermes environment.
+- Verify whether current Hermes core can discover providers from `~/.hermes/plugins/memory/<name>` without the compatibility symlink.
 
 ---
 
@@ -451,7 +460,9 @@ Required policy points:
 
 Objective: make the project visibly conform to Hermes plugin conventions.
 
-Tasks:
+Status: completed before v0.2.0.
+
+Completed tasks:
 
 1. Document preferred install path and compatibility symlink.
 2. Verify `plugin.yaml` metadata: name, category, provider type, version, description.
@@ -471,13 +482,25 @@ hermes memory status
 
 Objective: provide a stable human CLI for the same operations exposed as tools.
 
-Tasks:
+Status: partially completed in v0.2.0 as a native Hermes memory-provider CLI MVP. The implemented command surface is enough for beta operation, but not full parity with the original target UX.
 
-1. Decide whether Hermes plugin CLI hooks exist and are stable enough.
-2. Add CLI entrypoint or temporary standalone script.
-3. Implement `status`, `doctor`, `search`, `index`, `forget`, `learning`, `consolidate`, `apply`, `watcher` commands.
-4. Keep dry-run defaults and approval gates identical to tool behavior.
-5. Add CLI tests for argument parsing and dry-run/live gating.
+Completed tasks:
+
+1. Confirmed Hermes memory-provider CLI discovery path.
+2. Added top-level `cli.py` and `qdrant_memory/cli_core.py`.
+3. Implemented `status`, `doctor`, `search`, `index`, `forget`, `learning search`, `learning preview`, `consolidate`, and `apply`.
+4. Preserved dry-run defaults and live-mutation approval gates.
+5. Added CLI tests for parsing, command-to-tool mapping, import isolation, exit codes, and safety gates.
+
+Deferred to v0.3.0+ CLI parity:
+
+- `config show`
+- `store`
+- `learning store`
+- `learning approve`
+- `watcher status`
+- `watcher run`
+- optional backup/export commands
 
 Verification:
 
@@ -519,7 +542,9 @@ Expected:
 
 Objective: consolidate safety rules and make scanners/test gates enforce them.
 
-Tasks:
+Status: completed before v0.2.0.
+
+Completed tasks:
 
 1. Create `docs/SAFETY.md`.
 2. Add tests for scanner-safe fake secret construction.
@@ -539,7 +564,9 @@ python scripts/check_no_literal_fake_secrets.py
 
 Objective: avoid conceptual drift between context recovery and semantic memory.
 
-Tasks:
+Status: completed before v0.2.0.
+
+Completed tasks:
 
 1. Add [LCM_BOUNDARY.md](LCM_BOUNDARY.md) or expand `docs/ARCHITECTURE.md`.
 2. Document active-session recall decision tree: LCM first, Qdrant for cross-session/project/vault recall.
@@ -556,24 +583,31 @@ python -m pytest tests/test_tools_retriever_writer.py tests/test_learning_auto_e
 
 Objective: produce a stable public release with clear upgrade path.
 
-Tasks:
+Status: completed for `v0.2.0 Public Beta`.
 
-1. Add `CHANGELOG.md`.
-2. Tag version, e.g. `v0.2.0`.
-3. Add compatibility matrix:
-   - Hermes Agent version/range.
-   - Python version.
-   - Qdrant version.
-   - embedding model/vector size.
-4. Add install/update/remove docs.
-5. Add real-service smoke test checklist.
-6. Create release notes with honest beta limitations.
+Completed tasks:
 
-Verification:
+1. Added `CHANGELOG.md`.
+2. Bumped `plugin.yaml` to `0.2.0`.
+3. Added install/update/remove/rollback docs.
+4. Added real-service smoke test checklist.
+5. Created `RELEASE_NOTES.md` with honest beta limitations.
+6. Created annotated tag `v0.2.0`.
+7. Published GitHub prerelease: <https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.2.0>.
+8. Verified release CI: <https://github.com/ProDrifterDK/hermes-qdrant-memory/actions/runs/25977733752>.
+
+Still useful for future releases:
+
+- Keep the compatibility matrix current as Hermes core plugin discovery evolves.
+- Run a consumer install/runtime smoke test after each published tag.
+
+Verification used for v0.2.0:
 
 ```bash
-gh release create v0.2.0 --title "v0.2.0" --notes-file RELEASE_NOTES.md
 python -m pytest tests -q
+python scripts/check_no_literal_fake_secrets.py
+python -m compileall -q qdrant_memory __init__.py cli.py scripts/check_no_literal_fake_secrets.py
+gh release view v0.2.0 --repo ProDrifterDK/hermes-qdrant-memory
 gh run list --repo ProDrifterDK/hermes-qdrant-memory --limit 5
 ```
 
@@ -583,17 +617,17 @@ gh run list --repo ProDrifterDK/hermes-qdrant-memory --limit 5
 
 Recommended execution order:
 
-| Order | Task | Blocks | Reason |
-|---|---|---|---|
-| 1 | Plugin roadmap | All later roadmap work | Establishes shared plan. |
-| 2 | Safety policy | CLI, cron, release | Safety contract must exist before adding easier mutation surfaces. |
-| 3 | Operations document | Cron, release | Operators need report/review/apply runbooks. |
-| 4 | LCM boundary document | Release | Prevents wrong mental model and support burden. |
-| 5 | Plugin metadata tests | Release | Locks formal plugin shape. |
-| 6 | Scanner-safe fixture guard | More tests/docs | Prevents repeat GitGuardian incidents. |
-| 7 | CLI feasibility spike | CLI MVP | Determines whether commands are Hermes-native or standalone wrapper. |
-| 8 | CLI MVP | Release candidate | Adds human operation surface after safety gates. |
-| 9 | Release documentation update | Release | Packages everything for public users. |
+| Order | Task | Status | Blocks | Reason |
+|---|---|---|---|---|
+| 1 | Plugin roadmap | Completed | All later roadmap work | Establishes shared plan. |
+| 2 | Safety policy | Completed | CLI, cron, release | Safety contract must exist before adding easier mutation surfaces. |
+| 3 | Operations document | Completed | Cron, release | Operators need report/review/apply runbooks. |
+| 4 | LCM boundary document | Completed | Release | Prevents wrong mental model and support burden. |
+| 5 | Plugin metadata tests | Completed | Release | Locks formal plugin shape. |
+| 6 | Scanner-safe fixture guard | Completed | More tests/docs | Prevents repeat GitGuardian incidents. |
+| 7 | CLI feasibility spike | Completed | CLI MVP | Determines whether commands are Hermes-native or standalone wrapper. |
+| 8 | CLI MVP | Completed | Release candidate | Adds human operation surface after safety gates. |
+| 9 | Release documentation update | Completed | Release | Packages everything for public users. |
 
 Verification categories:
 
@@ -815,6 +849,8 @@ python scripts/check_no_literal_fake_secrets.py
 
 **Objective:** Prepare the next public release.
 
+Status: completed for `v0.2.0 Public Beta`.
+
 **Files:**
 
 - Create: `CHANGELOG.md`
@@ -834,6 +870,8 @@ gh run list --repo ProDrifterDK/hermes-qdrant-memory --limit 5
 ## 11. Acceptance criteria
 
 The plugin is ready to call “formal Hermes plugin beta” when:
+
+Status after v0.2.0: most criteria are satisfied by the published beta. The remaining operational checks are the post-release consumer install/runtime smoke and the category-path discovery verification.
 
 - README documents preferred install path and compatibility symlink.
 - Install, update, remove, and rollback docs exist for both preferred category path and current compatibility path.
@@ -862,18 +900,58 @@ The plugin is ready to call “formal Hermes plugin beta” when:
 | Keep reconsolidation draft-only | Accepted | Fact rewriting is high risk. |
 | Keep quality warnings manual-only | Accepted | False positives are safer than secret ingestion. |
 | Use compatibility symlink until Hermes scans category paths | Accepted | Avoid Hermes core patch while preserving desired layout. |
-| Add CLI wrapper | Proposed | Tool calls work, but formal operation needs a human CLI. |
-| Add safety/operations/LCM docs | Proposed | Current docs are strong but safety policy is scattered. |
+| Add CLI wrapper | Accepted | Implemented as native memory-provider CLI MVP in v0.2.0. |
+| Add safety/operations/LCM docs | Accepted | Implemented before widening the CLI/release surface. |
+| Publish v0.2.0 as prerelease | Accepted | Honest beta label while the plugin remains experimental and externally service-dependent. |
 
 ---
 
-## 13. Immediate next action
+## 13. Post-v0.2.0 roadmap
 
-Recommended next implementation step:
+Recommended next phase: `v0.3.0` should focus on operational confidence, not conceptual expansion. The plugin already has the philosophical/safety core; the next work should make it easier to install, inspect, and keep healthy.
 
-1. Commit `docs/PLUGIN_ROADMAP.md`.
-2. Create `docs/SAFETY.md` from Section 8.
-3. Add scanner guard for literal fake secrets before touching more tests.
-4. Then do CLI feasibility spike.
+### Priority 1: Consumer install/runtime smoke
 
-This order is deliberate: safety and docs first, CLI later. A memory plugin that can delete, merge, promote, or recall durable context must have its operating constitution written before expanding its command surface.
+- Install or pin `~/.hermes/plugins/qdrant` to the published `v0.2.0` tag.
+- Start a fresh Hermes CLI/gateway process.
+- Verify `hermes qdrant status`, `doctor`, `search`, and `consolidate --persist`.
+- Verify the tag works outside the development checkout.
+- Document the exact commands and any gotchas in `docs/OPERATIONS.md` or `RELEASE_NOTES.md` for the next release.
+
+### Priority 2: CLI parity
+
+Add the deferred command groups without weakening safety gates:
+
+- `hermes qdrant config show`
+- `hermes qdrant store`
+- `hermes qdrant learning store`
+- `hermes qdrant learning approve`
+- `hermes qdrant watcher status`
+- `hermes qdrant watcher run`
+- optional `backup` / `export` helpers before broader mutation surfaces
+
+### Priority 3: Cron/watcher durability
+
+- Add watcher state inspection.
+- Add install/update/remove docs for the watcher.
+- Add unchanged-signature silence regression tests.
+- Add Qdrant/embedding outage failure-mode docs.
+- Keep cron no-agent and report-only; no autonomous Qdrant mutation.
+
+### Priority 4: Integration tests
+
+Add optional live-service tests gated by explicit environment variables, e.g. `QDRANT_MEMORY_INTEGRATION=1`, so CI remains hermetic by default but maintainers can validate real Qdrant + embedding behavior before releases.
+
+### Priority 5: Hermes core compatibility
+
+Verify whether current Hermes core can discover user memory providers from `~/.hermes/plugins/memory/<name>` without a symlink. If not, keep the shim documented or open a Hermes core issue/PR.
+
+---
+
+## 14. Immediate next action
+
+1. Run the post-release consumer install/runtime smoke test from the published `v0.2.0` tag.
+2. Update `docs/OPERATIONS.md` with any runtime gotchas found.
+3. Start v0.3.0 work with CLI parity and watcher durability.
+
+This order keeps the project grounded: verify the published artifact first, then extend ergonomics. Do not add stronger memory mutation capabilities until backup/export and runtime smoke coverage exist.
