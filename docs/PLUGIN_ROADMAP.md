@@ -913,11 +913,16 @@ Recommended next phase: `v0.3.0` should focus on operational confidence, not con
 
 ### Priority 1: Consumer install/runtime smoke
 
-- Install or pin `~/.hermes/plugins/qdrant` to the published `v0.2.0` tag.
-- Start a fresh Hermes CLI/gateway process.
-- Verify `hermes qdrant status`, `doctor`, `search`, and `consolidate --persist`.
-- Verify the tag works outside the development checkout.
-- Document the exact commands and any gotchas in `docs/OPERATIONS.md` or `RELEASE_NOTES.md` for the next release.
+Status: completed for `v0.2.0`, which exposed the CLI process-exit propagation bug, then repeated successfully from the published `v0.2.1` hotfix tag.
+
+Verified from the installed plugin outside the development checkout:
+
+- `hermes qdrant status`
+- `hermes qdrant doctor`
+- `hermes qdrant search ... --json`
+- `hermes qdrant learning preview --json`
+- `hermes qdrant consolidate --scope both --persist --include-reconsolidation --json`
+- safety-gated `forget` and `apply` without `--approve`, now returning non-zero exit status in `v0.2.1`.
 
 ### Priority 2: CLI parity
 
@@ -951,8 +956,9 @@ Verify whether current Hermes core can discover user memory providers from `~/.h
 
 ## 14. Immediate next action
 
-1. Run the post-release consumer install/runtime smoke test from the published `v0.2.0` tag.
-2. Update `docs/OPERATIONS.md` with any runtime gotchas found.
-3. Start v0.3.0 work with CLI parity and watcher durability.
+1. Start `v0.3.0` with CLI parity: `config show`, manual `store`, learning store/approve, watcher status/run, and optional backup/export helpers before broader mutation surfaces.
+2. Add watcher durability: state inspection, install/update/remove docs, unchanged-signature silence regression tests, and outage failure-mode docs.
+3. Add optional live-service integration tests gated by explicit environment variables.
+4. Verify Hermes core plugin discovery from `~/.hermes/plugins/memory/<name>` without the compatibility symlink, then either document the shim permanently or open a Hermes core issue/PR.
 
-This order keeps the project grounded: verify the published artifact first, then extend ergonomics. Do not add stronger memory mutation capabilities until backup/export and runtime smoke coverage exist.
+This order keeps the project grounded: the published artifact is verified; the next work should improve operator ergonomics and runtime confidence before adding stronger memory mutation capabilities.
