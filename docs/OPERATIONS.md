@@ -167,28 +167,28 @@ Never delete by query.
 
 ### Step 5: Native CLI smoke after installing a release tag
 
-For release-tag validation, verify the installed plugin as a user would run it. For the latest published v0.2.x release:
+For release-tag validation, verify the installed plugin as a user would run it. For the latest published beta release:
 
 ```bash
 cd ~/.hermes/plugins/qdrant
 git fetch --tags origin
-git checkout v0.2.1
+git checkout v0.3.0
+hermes qdrant config show --json
 hermes qdrant status
 hermes qdrant doctor
 hermes qdrant search "Hermes Qdrant memory" --top-k 3 --include-metadata --json
 hermes qdrant learning preview --json
 hermes qdrant consolidate --scope both --persist --include-reconsolidation --json
+hermes qdrant watcher status --json
+hermes qdrant watcher run --scope both --json
 ```
 
-For unreleased v0.3.0/main validation after M18 CLI parity, use the development checkout or a future v0.3.0 tag:
+Optional explicit-write smoke, only when you intentionally want harmless test records in Qdrant:
 
 ```bash
-hermes qdrant config show --json
 hermes qdrant store "Release smoke explicit memory" --source-type manual --importance 5 --tag smoke
 hermes qdrant learning store "Release smoke procedural lesson" --learning-type workflow_lesson --confidence 0.8 --tag smoke
 hermes qdrant learning approve CANDIDATE_ID --dry-run --json
-hermes qdrant watcher status --json
-hermes qdrant watcher run --scope both --json
 ```
 
 Expected behavior:
@@ -208,13 +208,13 @@ Verify the CLI process exit gate for live mutation without approval:
 hermes qdrant forget 00000000-0000-0000-0000-000000000000 --no-dry-run
 ```
 
-Expected behavior in v0.2.1+:
+Expected behavior in v0.3.0:
 
 - output contains `--approve is required when using --no-dry-run`;
 - process exit status is non-zero;
 - no Qdrant deletion occurs.
 
-The v0.2.0 tag correctly refused the mutation but returned process exit status `0` because Hermes v0.13 ignores plugin handler return values. v0.2.1 fixes this by making the plugin command raise `SystemExit` with the computed exit code.
+The v0.2.0 tag correctly refused the mutation but returned process exit status `0` because Hermes v0.13 ignores plugin handler return values. v0.2.1 and later fix this by making the plugin command raise `SystemExit` with the computed exit code.
 
 ---
 

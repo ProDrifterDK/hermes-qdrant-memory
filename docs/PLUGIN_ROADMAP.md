@@ -12,11 +12,11 @@
 
 ## 1. Current state
 
-The project is published as `v0.2.1 Public Beta Hotfix` and is functional as a Hermes Qdrant-backed memory provider. The latest release URL is:
+The project is published as `v0.3.0 Public Beta` and is functional as a Hermes Qdrant-backed memory provider. The latest release URL is:
 
-- <https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.2.1>
+- <https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.3.0>
 
-Implemented capabilities through v0.2.1:
+Implemented capabilities through v0.3.0:
 
 - Hermes `MemoryProvider` subclass: `QdrantMemoryProvider`.
 - Plugin registration through `register(ctx)`.
@@ -34,7 +34,7 @@ Implemented capabilities through v0.2.1:
 - Persisted consolidation reports and gated apply-by-proposal-id.
 - Reconsolidation candidates as review drafts only.
 - Conservative no-agent watcher script.
-- Native Hermes memory-provider CLI MVP: `hermes qdrant ...`.
+- Native Hermes memory-provider CLI beta surface: `hermes qdrant ...`.
 - GitHub Actions test workflow with pytest, compileall, and scanner guard.
 - Release documentation: `CHANGELOG.md`, `RELEASE_NOTES.md`, install/update/remove/rollback notes.
 
@@ -47,7 +47,8 @@ Known compatibility detail:
 Post-release validation status:
 
 - Consumer install/runtime smoke from published `v0.2.0` completed and found one CLI process-exit propagation bug: unapproved live mutation was safely refused but exited with process status `0` under Hermes v0.13.
-- The fix is released in `v0.2.1`: `qdrant_command()` raises `SystemExit(execute_command(args))` so usage/safety/provider errors propagate as non-zero CLI exits.
+- The fix was released in `v0.2.1`: `qdrant_command()` raises `SystemExit(execute_command(args))` so usage/safety/provider errors propagate as non-zero CLI exits.
+- v0.3.0 release validation should repeat the installed-plugin smoke from the published tag, including the added CLI parity commands.
 - Still verify whether current Hermes core can discover providers from `~/.hermes/plugins/memory/<name>` without the compatibility symlink.
 
 ---
@@ -268,48 +269,46 @@ Forbidden:
 
 ## 5. Formal command surface
 
-The current stable surface is Hermes tool calls. The formal plugin should add a human-friendly CLI wrapper without weakening tool safety.
+The current stable surface includes Hermes tool calls and the native `hermes qdrant ...` provider CLI. The CLI remains a thin operator wrapper over the tool surface and must not weaken tool safety.
 
-### M13 provisional target commands
+### M13 implemented v0.3.0 commands
 
-These commands are target UX, not a confirmed Hermes plugin API contract. Task 7 must first verify whether user plugins can register CLI subcommands. If Hermes does not expose stable plugin CLI hooks yet, ship the same command surface as a temporary standalone wrapper and document it honestly.
-
-Preferred command namespace:
+Implemented command namespace:
 
 ```bash
+hermes qdrant config show --json
 hermes qdrant status
 hermes qdrant doctor
-hermes qdrant config show
-hermes qdrant search "query text"
-hermes qdrant store --text "..." --source-type manual --importance 5 --dry-run
-hermes qdrant index --path ~/Documentos/Resyst\ Vault --dry-run
-hermes qdrant forget --id POINT_ID --dry-run
-hermes qdrant learning search "pytest hermes venv"
-hermes qdrant learning store --lesson "..." --dry-run
-hermes qdrant learning preview
-hermes qdrant learning approve --candidate-id ID --dry-run
-hermes qdrant consolidate --scope both --persist --include-reconsolidation --dry-run
-hermes qdrant apply --report-id REPORT --proposal-id PROPOSAL --action merge --dry-run
-hermes qdrant watcher status
-hermes qdrant watcher run --dry-run
+hermes qdrant store "Remember this explicit memory" --source-type manual --importance 5 --tag manual
+hermes qdrant search "query text" --top-k 5 --json
+hermes qdrant index docs README.md --dry-run
+hermes qdrant forget POINT_ID --dry-run
+hermes qdrant learning search "pytest hermes venv" --top-k 5 --json
+hermes qdrant learning preview --json
+hermes qdrant learning store "Procedural lesson" --learning-type workflow_lesson --confidence 0.8 --tag manual
+hermes qdrant learning approve CANDIDATE_ID --dry-run --json
+hermes qdrant consolidate --scope both --persist --include-reconsolidation --dry-run --json
+hermes qdrant apply --report-id REPORT --proposal-id PROPOSAL --action merge --dry-run --json
+hermes qdrant watcher status --json
+hermes qdrant watcher run --scope both --json
 ```
 
 CLI rules:
 
-- Mutating commands default to `--dry-run`.
-- Live mutation requires both `--no-dry-run` and `--approve`.
+- `config show` and `watcher status` are local reads and do not construct the provider.
+- `store` and `learning store` are explicit live writes by design.
+- Maintenance mutations default to `--dry-run`.
+- Live maintenance mutation requires both `--no-dry-run` and `--approve`.
 - Apply commands require exact `report_id` and `proposal_id`.
 - Delete commands require explicit point IDs.
 - `quality_warning` proposals must refuse all live apply attempts.
 - `draft_review` is the only allowed reconsolidation action and writes local markdown only.
 
-Implementation options:
+Implementation:
 
-1. If Hermes plugin CLI hooks are available:
-   - Add a `cli.py` or plugin registration hook that attaches subcommands.
-2. If plugin CLI hooks are not available yet:
-   - Provide a standalone script `scripts/hermes-qdrant-memory` or Python module entrypoint.
-   - Keep docs explicit that this is a temporary wrapper.
+- Native Hermes memory-provider CLI discovery is implemented through top-level `cli.py`.
+- Reusable dispatch logic lives in `qdrant_memory/cli_core.py`.
+- If future Hermes versions change provider CLI discovery, ship a standalone wrapper that reuses `cli_core`.
 
 ---
 
@@ -483,18 +482,18 @@ hermes memory status
 
 Objective: provide a stable human CLI for the same operations exposed as tools.
 
-Status: partially completed in v0.2.0 as a native Hermes memory-provider CLI MVP and extended on `main` for v0.3.0 prep with M18 parity commands. This is not a v0.3.0 release claim until tagged.
+Status: completed for v0.3.0 as a native Hermes memory-provider CLI beta surface.
 
 Completed tasks:
 
 1. Confirmed Hermes memory-provider CLI discovery path.
 2. Added top-level `cli.py` and `qdrant_memory/cli_core.py`.
 3. Implemented `status`, `doctor`, `search`, `index`, `forget`, `learning search`, `learning preview`, `consolidate`, and `apply`.
-4. Added M18 parity commands on `main` for v0.3.0 prep: `config show`, `store`, `learning store`, `learning approve`, `watcher status`, and report-only `watcher run`.
+4. Added M18 parity commands in v0.3.0: `config show`, `store`, `learning store`, `learning approve`, `watcher status`, and report-only `watcher run`.
 5. Preserved dry-run defaults and live-mutation approval gates.
 6. Added CLI tests for parsing, command-to-tool mapping, import isolation, exit codes, config redaction/no-provider behavior, watcher state reads, and safety gates.
 
-Deferred to v0.3.0+ CLI parity:
+Deferred to post-v0.3.0 CLI roadmap:
 
 - optional backup/export commands
 
@@ -905,61 +904,121 @@ Status after v0.2.0: most criteria are satisfied by the published beta. The rema
 | Add CLI wrapper | Accepted | Implemented as native memory-provider CLI MVP in v0.2.0. |
 | Add safety/operations/LCM docs | Accepted | Implemented before widening the CLI/release surface. |
 | Publish v0.2.0 as prerelease | Accepted | Honest beta label while the plugin remains experimental and externally service-dependent. |
+| Publish v0.3.0 as prerelease | Accepted | CLI parity is useful enough for public beta, while backup/export, deep doctor diagnostics, and formatter polish remain post-v0.3.0 work. |
 
 ---
 
-## 13. Post-v0.2.0 roadmap
+## 13. Post-v0.3.0 CLI and operations roadmap
 
-Recommended next phase: `v0.3.0` should focus on operational confidence, not conceptual expansion. The plugin already has the philosophical/safety core; the next work should make it easier to install, inspect, and keep healthy.
+Recommended next phase: post-v0.3.0 should focus on making the CLI a dependable operator interface rather than expanding memory mutation authority. The plugin already has the MemoryProvider core and a safe CLI beta surface; the next work should improve diagnostics, backup/rollback, formatting, watcher operations, and integration confidence.
 
 ### Priority 1: Consumer install/runtime smoke
 
-Status: completed for `v0.2.0`, which exposed the CLI process-exit propagation bug, then repeated successfully from the published `v0.2.1` hotfix tag.
+Status: required after publishing the v0.3.0 tag.
 
-Verified from the installed plugin outside the development checkout:
+Verify from the installed plugin outside the development checkout:
 
+- `git checkout v0.3.0`
+- `hermes qdrant config show --json`
 - `hermes qdrant status`
 - `hermes qdrant doctor`
 - `hermes qdrant search ... --json`
 - `hermes qdrant learning preview --json`
 - `hermes qdrant consolidate --scope both --persist --include-reconsolidation --json`
-- safety-gated `forget` and `apply` without `--approve`, now returning non-zero exit status in `v0.2.1`.
+- `hermes qdrant watcher status --json`
+- `hermes qdrant watcher run --scope both --json`
+- safety-gated `forget`, `apply`, and `learning approve` without `--approve`, all returning non-zero exit status and performing no mutation.
 
-### Priority 2: CLI parity
+### Priority 2: CLI UX and output contract
 
-Add the deferred command groups without weakening safety gates:
+The v0.3.0 CLI intentionally remains close to provider JSON. The next design pass should define:
 
-- `hermes qdrant config show`
-- `hermes qdrant store`
-- `hermes qdrant learning store`
-- `hermes qdrant learning approve`
-- `hermes qdrant watcher status`
-- `hermes qdrant watcher run`
-- optional `backup` / `export` helpers before broader mutation surfaces
+- concise human-readable default output;
+- `--json` as stable machine-readable output;
+- optional `--pretty` / `--quiet` modes;
+- stable JSON schemas for automation;
+- consistent exit-code semantics for usage, provider, and service errors.
 
-### Priority 3: Cron/watcher durability
+### Priority 3: Real `doctor` diagnostics
 
-- Add watcher state inspection.
-- Add install/update/remove docs for the watcher.
-- Add unchanged-signature silence regression tests.
-- Add Qdrant/embedding outage failure-mode docs.
-- Keep cron no-agent and report-only; no autonomous Qdrant mutation.
+Upgrade `hermes qdrant doctor` from status-backed health alias into diagnostics:
 
-### Priority 4: Integration tests
+- active provider is `qdrant`;
+- plugin path/symlink/category discovery is valid;
+- metadata version matches release docs;
+- Qdrant is reachable;
+- embedding endpoint is reachable;
+- collection vector size matches configured embedding size;
+- memory and learning collections exist;
+- watcher state/artifact directory are readable/writable;
+- config redaction catches API-key fields and credentialed URLs.
+
+### Priority 4: Backup/export/rollback before broader mutation
+
+Before adding stronger cleanup/rewrite workflows, add operator recovery primitives:
+
+- `hermes qdrant export memory|learning --out FILE`;
+- `hermes qdrant backup create`;
+- `hermes qdrant backup list`;
+- `hermes qdrant backup inspect ID`;
+- `hermes qdrant restore --backup ID --dry-run`;
+- optional `--backup-first` for live `apply`.
+
+### Priority 5: Inspection/search ergonomics
+
+Add point/report inspection commands:
+
+- `hermes qdrant show POINT_ID`;
+- `hermes qdrant reports list`;
+- `hermes qdrant reports show REPORT_ID`;
+- `hermes qdrant proposals show REPORT_ID PROPOSAL_ID`;
+- search filters by tag, source type, path/source, date range, and collection.
+
+### Priority 6: Safer explicit write workflows
+
+Keep manual writes ergonomic, but consider:
+
+- optional `--dry-run` preview for `store` and `learning store`;
+- duplicate/similarity preview before live store;
+- `--stdin` and `--file` input modes;
+- scanner/noise warnings before live store;
+- explicit `--approve` option for non-interactive scripts.
+
+### Priority 7: Watcher/cron management CLI
+
+Keep watcher report-only, but add lifecycle commands:
+
+- `watcher install`;
+- `watcher uninstall`;
+- `watcher status --verbose`;
+- `watcher run --force-alert`;
+- `watcher logs`;
+- `watcher inspect-state`;
+- `watcher reset-signature --approve`.
+
+### Priority 8: Integration and compatibility tests
 
 Add optional live-service tests gated by explicit environment variables, e.g. `QDRANT_MEMORY_INTEGRATION=1`, so CI remains hermetic by default but maintainers can validate real Qdrant + embedding behavior before releases.
 
-### Priority 5: Hermes core compatibility
+Also verify:
 
-Verify whether current Hermes core can discover user memory providers from `~/.hermes/plugins/memory/<name>` without a symlink. If not, keep the shim documented or open a Hermes core issue/PR.
+- installed-plugin `hermes qdrant --help`;
+- category path vs compatibility symlink;
+- Hermes version matrix;
+- CLI process exit behavior from real subprocesses.
+
+### Priority 9: Hermes core compatibility or wrapper fallback
+
+Verify whether current Hermes core can discover user memory providers from `~/.hermes/plugins/memory/<name>` without a symlink. If not, keep the shim documented, open a Hermes core issue/PR, or ship a standalone wrapper that reuses `qdrant_memory.cli_core`.
 
 ---
 
 ## 14. Immediate next action
 
-1. Start `v0.3.0` with CLI parity: `config show`, manual `store`, learning store/approve, watcher status/run, and optional backup/export helpers before broader mutation surfaces.
-2. Add watcher durability: state inspection, install/update/remove docs, unchanged-signature silence regression tests, and outage failure-mode docs.
-3. Add optional live-service integration tests gated by explicit environment variables.
-4. Verify Hermes core plugin discovery from `~/.hermes/plugins/memory/<name>` without the compatibility symlink, then either document the shim permanently or open a Hermes core issue/PR.
+1. Publish and verify `v0.3.0` from the exact release commit.
+2. Run consumer install/runtime smoke from the published tag.
+3. Design the post-v0.3.0 CLI UX contract: human default output, JSON schema, exit codes, and formatter rules.
+4. Implement `doctor` as a real diagnostic command.
+5. Add backup/export/rollback primitives before widening any mutation surface.
 
-This order keeps the project grounded: the published artifact is verified; the next work should improve operator ergonomics and runtime confidence before adding stronger memory mutation capabilities.
+This order keeps the project grounded: the published artifact is verified first; the next work improves operator ergonomics and runtime confidence before adding stronger memory mutation capabilities.

@@ -8,7 +8,7 @@ This plugin turns Hermes memory into an external associative substrate: conversa
 
 ## Status
 
-Public beta / experimental. The MVP is functional and tested, but it depends on external Qdrant and embedding services. Learning, origin-time fact metadata, sleep consolidation, and manual-review reconsolidation are implemented with conservative gates; automatic reconsolidation remains disabled by design.
+Public beta / experimental. Current release: `v0.3.0 Public Beta`. The plugin is functional and tested, but it depends on external Qdrant and embedding services. Learning, origin-time fact metadata, sleep consolidation, manual-review reconsolidation, and native Hermes CLI parity commands are implemented with conservative gates; automatic reconsolidation remains disabled by design.
 
 ## What it does
 
@@ -52,7 +52,7 @@ Public beta / experimental. The MVP is functional and tested, but it depends on 
 | Origin-time fact metadata | Implemented conservatively from explicit tags, clear fact statements, file headings, and structured learning context |
 | Sleep consolidation | M9 gated report persistence and apply-by-proposal-id implemented |
 | Reconsolidation | M10 report-only conflict candidates + local review drafts implemented; no automatic memory rewrites |
-| Native Hermes CLI MVP | Implemented for active memory provider (`hermes qdrant ...`) |
+| Native Hermes CLI beta | Implemented for active memory provider (`hermes qdrant ...`) with v0.3.0 CLI parity commands |
 | Dashboard/UI | Not included |
 
 ## Requirements
@@ -239,12 +239,12 @@ cd ~/.hermes/plugins/qdrant
 git pull --ff-only origin main
 ```
 
-Use the published `v0.2.1` tag instead of `main` when you want a stable beta snapshot:
+Use the published `v0.3.0` tag instead of `main` when you want a stable beta snapshot:
 
 ```bash
 cd ~/.hermes/plugins/qdrant
 git fetch --tags origin
-git checkout v0.2.1
+git checkout v0.3.0
 ```
 
 Rollback plugin code:
@@ -637,7 +637,7 @@ This plugin does not know which files are safe for your threat model. Treat inde
 For the full canonical safety contract, see [docs/SAFETY.md](docs/SAFETY.md).
 For operational checks and approved maintenance procedures, see [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
-## CLI MVP
+## Native Hermes CLI beta
 
 When the plugin is installed as the active Hermes memory provider, Hermes can discover the native provider CLI from the top-level `cli.py` file:
 
@@ -700,7 +700,7 @@ No third-party Python package is required by the plugin runtime; it uses the Pyt
 ## Documentation
 
 - [CHANGELOG.md](CHANGELOG.md) — release history.
-- [RELEASE_NOTES.md](RELEASE_NOTES.md) — v0.2.1 hotfix notes, upgrade command, and exit-status smoke check.
+- [RELEASE_NOTES.md](RELEASE_NOTES.md) — v0.3.0 public beta notes, upgrade command, CLI parity smoke checks, and deferred post-v0.3.0 work.
 - [docs/SAFETY.md](docs/SAFETY.md) — canonical safety contract for indexing, deletion, consolidation, reconsolidation, cron/reporting, and scanner-safe docs/tests.
 - [docs/OPERATIONS.md](docs/OPERATIONS.md) — operator runbook for status checks, smoke tests, watcher reports, approved apply flow, post-apply verification, gateway/process restarts, and troubleshooting.
 - [docs/LCM_BOUNDARY.md](docs/LCM_BOUNDARY.md) — boundary between active-session LCM recovery and cross-session Qdrant semantic memory.

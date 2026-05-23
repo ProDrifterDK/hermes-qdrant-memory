@@ -248,6 +248,35 @@ def test_consolidate_ignores_token_budget_language_as_secret_warning():
     assert [p for p in result["proposals"] if p["proposal_type"] == "quality_warning"] == []
 
 
+def test_consolidate_ignores_task_ids_as_openai_style_secret_warning():
+    provider = _provider()
+    task_id = "".join(["ta", "sk", "-", "1778977497560258115"])
+    provider._qdrant = FakeQdrant(  # type: ignore[assignment]
+        {
+            "memory": [
+                _point("m1", f"Use request_restart without task_id for global restarts; affected ticket was {task_id}.", source_type="conversation"),
+            ],
+            "learnings": [],
+        }
+    )
+
+    result = json.loads(provider.handle_tool_call("qdrant_memory_consolidate", {"scope": "memory"}))
+
+    assert [p for p in result["proposals"] if p["proposal_type"] == "quality_warning"] == []
+
+
+def test_consolidate_still_flags_openai_style_secret_warning():
+    provider = _provider()
+    key = "".join(["s", "k", "-", "abcdefghijklmnopqrstuvwxyz"])
+    provider._qdrant = FakeQdrant({"memory": [_point("m1", f"bad memory {key}", source_type="manual")], "learnings": []})  # type: ignore[assignment]
+
+    result = json.loads(provider.handle_tool_call("qdrant_memory_consolidate", {"scope": "memory"}))
+
+    warnings = [p for p in result["proposals"] if p["proposal_type"] == "quality_warning"]
+    assert warnings
+    assert warnings[0]["affected_ids"] == ["m1"]
+
+
 def test_status_includes_consolidation_report_flags():
     provider = _provider()
     provider._qdrant = None

@@ -47,7 +47,7 @@ JWT_PREFIX = "".join(("e", "y", "J"))
 RULES = (
     Rule("authorization-bearer", re.compile(r"Authorization:\s*Bearer\s+[\"']?([^\s`'\"]{8,})[\"']?", re.IGNORECASE)),
     Rule("bare-bearer", re.compile(r"\bBearer\s+[\"']?([^\s`'\"]{12,})[\"']?", re.IGNORECASE)),
-    Rule("openai-style-key", re.compile(re.escape(OPENAI_PREFIX) + r"[A-Za-z0-9_\-]{8,}")),
+    Rule("openai-style-key", re.compile(r"(?<![A-Za-z0-9_])" + re.escape(OPENAI_PREFIX) + r"[A-Za-z0-9_\-]{8,}")),
     Rule("github-token", re.compile(r"(?:" + "|".join(re.escape(p) for p in GITHUB_PREFIXES) + r")[A-Za-z0-9_]{8,}")),
     Rule("aws-access-key", re.compile(re.escape(AWS_PREFIX) + r"[0-9A-Z]{12,}")),
     Rule("jwt-like-token", re.compile(re.escape(JWT_PREFIX) + r"[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}")),

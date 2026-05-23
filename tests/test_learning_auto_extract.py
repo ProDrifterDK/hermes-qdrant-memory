@@ -94,7 +94,7 @@ def test_on_pre_compress_preview_collects_candidates_without_upsert():
     provider = _provider_with_auto_extract()
     messages = [
         {"role": "tool", "name": "terminal", "content": "pytest: command not found"},
-        {"role": "assistant", "content": "Correction: use /home/prodrifterdk/.hermes/hermes-agent/venv/bin/python -m pytest tests -q."},
+        {"role": "assistant", "content": "Correction: use <hermes-venv>/bin/python -m pytest tests -q."},
     ]
 
     block = provider.on_pre_compress(messages)

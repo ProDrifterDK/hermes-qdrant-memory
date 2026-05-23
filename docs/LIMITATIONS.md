@@ -110,7 +110,7 @@ ln -s ~/.hermes/plugins/memory/qdrant ~/.hermes/plugins/qdrant
 
 The native CLI MVP uses Hermes memory-provider CLI discovery. `hermes qdrant ...` is available only when this plugin is installed as the active `qdrant` memory provider and a fresh Hermes process has loaded that configuration. Top-level `hermes --help` may not list plugin commands because Hermes avoids eager plugin imports for startup performance; use `hermes qdrant --help` as the direct check.
 
-`hermes qdrant doctor` is status-backed in v0.2.1. It is a lightweight diagnostics alias, not a separate deep health checker yet.
+`hermes qdrant doctor` is status-backed in v0.3.0. It is a lightweight diagnostics alias, not a separate deep health checker yet.
 
 ## Performance
 

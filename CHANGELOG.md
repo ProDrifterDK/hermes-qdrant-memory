@@ -6,11 +6,12 @@ This project is currently public beta / experimental. The format follows Keep a 
 
 ## [0.3.0]
 
-Next beta work on `main`; not published until a release tag is created.
+Third public beta release of the Hermes Qdrant Memory Provider. This release broadens the native `hermes qdrant ...` CLI surface, keeps maintenance operations dry-run/review-gated, and tightens release hygiene for public users.
 
 ### Added
 
-- M18 CLI parity commands for v0.3.0 prep:
+- Plugin metadata version bumped to `0.3.0`.
+- M18 CLI parity commands:
   - `hermes qdrant config show` prints effective config JSON without constructing the provider and redacts API-key fields.
   - `hermes qdrant store TEXT` maps to `qdrant_memory_store` for explicit manual memory writes.
   - `hermes qdrant learning store LESSON` maps to `qdrant_learning_store`.
@@ -18,10 +19,16 @@ Next beta work on `main`; not published until a release tag is created.
   - `hermes qdrant watcher status` reads local watcher state without contacting services.
   - `hermes qdrant watcher run` runs report-only persisted consolidation with no apply/proposal mutation.
 
+### Fixed
+
+- OpenAI-style `sk-...` secret detection now requires a left boundary, preventing false-positive quality warnings on TeamForge-style `task-...` IDs while still detecting real `sk-...` shaped keys.
+- Release/test fixtures no longer contain a user-specific absolute Hermes venv path.
+
 ### Safety
 
 - Preserved v0.2.1 CLI exit-code propagation and mutation gates.
 - Watcher CLI remains report-only; no query deletion or autonomous apply was added.
+- Backup/export helpers remain deferred until after v0.3.0 so broader mutation workflows are not widened without rollback primitives.
 
 ## [0.2.1]
 
@@ -112,4 +119,7 @@ Second public beta release of the Hermes Qdrant Memory Provider.
 
 Initial public beta tag. The v0.1.0 tag predates the learning, consolidation, reconsolidation, scanner guard, and native CLI MVP work documented in later releases.
 
+[0.3.0]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.3.0
+[0.2.1]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.2.1
+[0.2.0]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.2.0
 [0.1.0]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.1.0

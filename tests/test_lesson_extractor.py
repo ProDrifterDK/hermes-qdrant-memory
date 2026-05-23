@@ -41,7 +41,7 @@ def test_extract_tool_failure_candidate_only_with_resolution():
     messages = [
         {"role": "user", "content": "Run the tests."},
         {"role": "tool", "name": "terminal", "content": "pytest: command not found"},
-        {"role": "assistant", "content": "The terminal command failed. Correction: use /home/prodrifterdk/.hermes/hermes-agent/venv/bin/python -m pytest tests -q."},
+        {"role": "assistant", "content": "The terminal command failed. Correction: use <hermes-venv>/bin/python -m pytest tests -q."},
     ]
 
     candidates = extract_learning_candidates_from_messages(messages, source_hook="on_session_end", min_confidence=0.8)
@@ -51,7 +51,7 @@ def test_extract_tool_failure_candidate_only_with_resolution():
     assert candidate.learning_type == "tool_failure_lesson"
     assert candidate.tool_name == "terminal"
     assert "pytest" in candidate.trigger
-    assert "venv/bin/python -m pytest" in candidate.correction
+    assert "<hermes-venv>/bin/python -m pytest" in candidate.correction
     assert candidate.confidence >= 0.8
 
 

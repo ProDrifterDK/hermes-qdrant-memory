@@ -87,7 +87,7 @@ def test_build_learning_payload_has_procedural_fields_and_source_type():
         learning_type="environment_quirk",
         trigger="pytest not found",
         mistake="ran pytest from system shell",
-        correction="run /home/prodrifterdk/.hermes/hermes-agent/venv/bin/python -m pytest",
+        correction="run <hermes-venv>/bin/python -m pytest",
         evidence="system pytest missing, venv pytest passes",
         tool_name="terminal",
         command="pytest tests -q",
@@ -99,7 +99,7 @@ def test_build_learning_payload_has_procedural_fields_and_source_type():
     assert payload["learning_type"] == "environment_quirk"
     assert payload["trigger"] == "pytest not found"
     assert payload["mistake"] == "ran pytest from system shell"
-    assert payload["correction"].startswith("run /home")
+    assert payload["correction"].startswith("run <hermes-venv>")
     assert payload["tool_name"] == "terminal"
     assert payload["command"] == "pytest tests -q"
     assert payload["project_path"] == "/repo"

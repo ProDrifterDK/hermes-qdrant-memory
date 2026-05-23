@@ -9,7 +9,7 @@ from typing import Any, Iterable
 VALID_LEARNING_TYPES = {"tool_failure_lesson", "user_correction", "workflow_lesson", "environment_quirk"}
 
 _SECRET_PATTERNS = [
-    re.compile(r"sk-[A-Za-z0-9_-]{10,}"),
+    re.compile(r"(?<![A-Za-z0-9_])sk-[A-Za-z0-9_-]{10,}"),
     re.compile(r"gh[pousr]_[A-Za-z0-9_]{20,}"),
     re.compile(r"AKIA[0-9A-Z]{16}"),
     re.compile(r"(?i)authorization\s*:\s*bearer\s+\S+"),
