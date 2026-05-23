@@ -351,6 +351,8 @@ class QdrantMemoryProvider(MemoryProvider):
         collections: list[str] = []
         point_count = None
         learning_point_count = None
+        collection_vector_size = None
+        learning_collection_vector_size = None
         if self._qdrant:
             qdrant_ok = self._qdrant.health()
             try:
@@ -365,6 +367,14 @@ class QdrantMemoryProvider(MemoryProvider):
                 learning_point_count = self._qdrant.count(self._config["learning_collection_name"])
             except Exception:
                 learning_point_count = None
+            try:
+                collection_vector_size = self._qdrant.collection_vector_size(self._config["collection_name"])
+            except Exception:
+                collection_vector_size = None
+            try:
+                learning_collection_vector_size = self._qdrant.collection_vector_size(self._config["learning_collection_name"])
+            except Exception:
+                learning_collection_vector_size = None
         if self._embeddings:
             embedding_ok = self._embeddings.health()
         payload = {
@@ -378,9 +388,13 @@ class QdrantMemoryProvider(MemoryProvider):
             "collection_name": self._config["collection_name"],
             "collection_exists": self._config["collection_name"] in collections,
             "vector_size": self._config["vector_size"],
+            "collection_vector_size": collection_vector_size,
+            "collection_vector_size_matches": collection_vector_size == self._config["vector_size"] if collection_vector_size is not None else False,
             "point_count": point_count,
             "learning_collection_name": self._config["learning_collection_name"],
             "learning_collection_exists": self._config["learning_collection_name"] in collections,
+            "learning_collection_vector_size": learning_collection_vector_size,
+            "learning_collection_vector_size_matches": learning_collection_vector_size == self._config["vector_size"] if learning_collection_vector_size is not None else False,
             "learning_point_count": learning_point_count,
             "learning_enabled": self._config.get("learning_enabled", True),
             "learning_auto_extract_enabled": self._config.get("learning_auto_extract_enabled", False),

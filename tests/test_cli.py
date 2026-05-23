@@ -38,11 +38,25 @@ class FakeProvider:
         return json.dumps({"tool": tool_name, "args": args})
 
 
+class FakeStatusProvider:
+    def __init__(self, status):
+        self.status = status
+        self.calls = []
+
+    def handle_tool_call(self, tool_name, args):
+        self.calls.append((tool_name, args))
+        return json.dumps(self.status)
+
+
 def test_register_cli_adds_mvp_subcommands_and_safe_defaults():
     parser = _parser()
 
     status = parser.parse_args(["qdrant", "status"])
     assert status.qdrant_subcommand == "status"
+
+    doctor = parser.parse_args(["qdrant", "doctor", "--json"])
+    assert doctor.qdrant_subcommand == "doctor"
+    assert doctor.json is True
 
     search = parser.parse_args(["qdrant", "search", "agent memory", "--top-k", "3", "--json"])
     assert search.query == "agent memory"
@@ -263,6 +277,177 @@ def test_config_show_prints_redacted_config_without_provider(monkeypatch, tmp_pa
     assert payload["collection_name"] == "custom"
     assert payload["qdrant_api_key"] == "<redacted>"
     assert payload["embedding_api_key"] == "<redacted>"
+
+
+def test_config_show_redacts_credentialed_urls_without_provider(monkeypatch, tmp_path, capsys):
+    from qdrant_memory.cli_core import execute_command
+
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    raw_qdrant_url = "http://" + "user-name" + ":" + "pass-word" + "@example.local:6333"
+    raw_embedding_url = "https://" + "embed-user" + ":" + "embed-pass" + "@embeddings.local/v1"
+    (hermes_home / "qdrant_memory.json").write_text(
+        json.dumps(
+            {
+                "qdrant_url": raw_qdrant_url,
+                "embedding_url": raw_embedding_url,
+                "qdrant_api_key": "MARKER_QDRANT_VALUE",
+                "embedding_api_key": "MARKER_EMBEDDING_VALUE",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    parser = _parser()
+    args = parser.parse_args(["qdrant", "config", "show", "--json"])
+
+    exit_code = execute_command(args, provider_factory=lambda: pytest.fail("provider should not be constructed"))
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert raw_qdrant_url not in output
+    assert raw_embedding_url not in output
+    payload = json.loads(output)
+    assert payload["qdrant_url"] == "http://<redacted>@example.local:6333"
+    assert payload["embedding_url"] == "https://<redacted>@embeddings.local/v1"
+    assert payload["qdrant_api_key"] == "<redacted>"
+    assert payload["embedding_api_key"] == "<redacted>"
+
+
+def test_config_show_redacts_url_query_and_fragment_credentials_without_provider(monkeypatch, tmp_path, capsys):
+    from qdrant_memory.cli_core import execute_command
+
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    marker_query = "MARKER_QUERY_VALUE"
+    marker_fragment = "MARKER_FRAGMENT_VALUE"
+    marker_password = "MARKER_PASSWORD_VALUE"
+    sensitive_query_key = "_".join(["api", "key"])
+    sensitive_fragment_key = "_".join(["access", "token"])
+    sensitive_token_key = "".join(["to", "ken"])
+    raw_qdrant_url = f"https://user:{marker_password}@example.local:6333/path?{sensitive_query_key}={marker_query}&safe=kept#{sensitive_fragment_key}={marker_fragment}"
+    raw_embedding_url = f"https://embeddings.local/v1?{sensitive_token_key}={marker_query}"
+    (hermes_home / "qdrant_memory.json").write_text(
+        json.dumps({"qdrant_url": raw_qdrant_url, "embedding_url": raw_embedding_url}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    parser = _parser()
+    args = parser.parse_args(["qdrant", "config", "show", "--json"])
+
+    exit_code = execute_command(args, provider_factory=lambda: pytest.fail("provider should not be constructed"))
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert marker_query not in output
+    assert marker_fragment not in output
+    assert marker_password not in output
+    payload = json.loads(output)
+    redacted_value = "%3Credacted%3E"
+    expected_qdrant_url = f"https://<redacted>@example.local:6333/path?{sensitive_query_key}={redacted_value}&safe=kept#{sensitive_fragment_key}={redacted_value}"
+    expected_embedding_url = f"https://embeddings.local/v1?{sensitive_token_key}={redacted_value}"
+    assert payload["qdrant_url"] == expected_qdrant_url
+    assert payload["embedding_url"] == expected_embedding_url
+
+
+def test_doctor_returns_structured_checks_and_success_exit(monkeypatch, tmp_path, capsys):
+    from qdrant_memory.cli_core import execute_command
+
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    diag_qdrant_url = "http://" + "diag-user" + ":" + "diag-pass" + "@example.local:6333"
+    diag_embedding_url = "https://" + "embed-user" + ":" + "embed-pass" + "@embeddings.local/v1"
+    (hermes_home / "qdrant_memory.json").write_text(
+        json.dumps(
+            {
+                "qdrant_url": diag_qdrant_url,
+                "embedding_url": diag_embedding_url,
+                "qdrant_api_key": "MARKER_QDRANT_VALUE",
+                "embedding_api_key": "MARKER_EMBEDDING_VALUE",
+                "collection_name": "memory",
+                "learning_collection_name": "learnings",
+                "vector_size": 1024,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    provider = FakeStatusProvider(
+        {
+            "provider": "qdrant",
+            "active": True,
+            "qdrant_ok": True,
+            "embedding_ok": True,
+            "collection_name": "memory",
+            "collection_exists": True,
+            "collection_vector_size": 1024,
+            "learning_collection_name": "learnings",
+            "learning_collection_exists": True,
+            "learning_collection_vector_size": 1024,
+            "vector_size": 1024,
+        }
+    )
+    parser = _parser()
+    args = parser.parse_args(["qdrant", "doctor", "--json"])
+
+    exit_code = execute_command(args, provider_factory=lambda: provider)
+
+    assert exit_code == 0
+    assert provider.calls == [("qdrant_memory_status", {})]
+    output = capsys.readouterr().out
+    assert "diag-pass" not in output
+    assert "embed-pass" not in output
+    assert "MARKER_QDRANT_VALUE" not in output
+    payload = json.loads(output)
+    assert payload["ok"] is True
+    assert payload["summary"]["failed_critical"] == 0
+    checks = {check["name"]: check for check in payload["checks"]}
+    for name in {
+        "active_provider",
+        "plugin_discovery",
+        "metadata_version",
+        "qdrant_reachable",
+        "embedding_reachable",
+        "collection_vector_size",
+        "memory_collection",
+        "learning_collection",
+        "watcher_artifacts",
+        "config_redaction",
+    }:
+        assert checks[name]["ok"] is True
+
+
+def test_doctor_returns_nonzero_for_critical_failures(monkeypatch, tmp_path, capsys):
+    from qdrant_memory.cli_core import execute_command
+
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    provider = FakeStatusProvider(
+        {
+            "provider": "qdrant",
+            "active": False,
+            "qdrant_ok": False,
+            "embedding_ok": True,
+            "collection_name": "memory",
+            "collection_exists": True,
+            "collection_vector_size": 768,
+            "learning_collection_name": "learnings",
+            "learning_collection_exists": False,
+            "learning_collection_vector_size": None,
+            "vector_size": 1024,
+        }
+    )
+    parser = _parser()
+    args = parser.parse_args(["qdrant", "doctor", "--json"])
+
+    exit_code = execute_command(args, provider_factory=lambda: provider)
+
+    assert exit_code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    failed = {check["name"] for check in payload["checks"] if check["critical"] and not check["ok"]}
+    assert {"active_provider", "qdrant_reachable", "collection_vector_size", "learning_collection"}.issubset(failed)
 
 
 def test_build_tool_call_maps_store_with_comma_friendly_tags():

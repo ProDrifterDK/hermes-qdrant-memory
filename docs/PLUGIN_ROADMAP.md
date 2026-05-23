@@ -939,9 +939,9 @@ The v0.3.0 CLI intentionally remains close to provider JSON. The next design pas
 - stable JSON schemas for automation;
 - consistent exit-code semantics for usage, provider, and service errors.
 
-### Priority 3: Real `doctor` diagnostics
+### Priority 3: Real `doctor` diagnostics (implemented)
 
-Upgrade `hermes qdrant doctor` from status-backed health alias into diagnostics:
+`hermes qdrant doctor` now emits structured diagnostics instead of forwarding the raw status payload. The checks cover:
 
 - active provider is `qdrant`;
 - plugin path/symlink/category discovery is valid;
@@ -1015,10 +1015,9 @@ Verify whether current Hermes core can discover user memory providers from `~/.h
 
 ## 14. Immediate next action
 
-1. Publish and verify `v0.3.0` from the exact release commit.
-2. Run consumer install/runtime smoke from the published tag.
-3. Design the post-v0.3.0 CLI UX contract: human default output, JSON schema, exit codes, and formatter rules.
-4. Implement `doctor` as a real diagnostic command.
-5. Add backup/export/rollback primitives before widening any mutation surface.
+1. Run consumer install/runtime smoke from the published `v0.3.0` tag on a clean machine.
+2. Design the remaining post-v0.3.0 CLI UX contract: human default output, formatter rules, and stable schemas beyond the current doctor JSON.
+3. Add backup/export/rollback primitives before widening any mutation surface.
+4. Add inspection/report commands (`show`, `reports list/show`, `proposals show`) once backup/export exists.
 
 This order keeps the project grounded: the published artifact is verified first; the next work improves operator ergonomics and runtime confidence before adding stronger memory mutation capabilities.

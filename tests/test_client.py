@@ -25,3 +25,27 @@ def test_scroll_by_filter_continues_when_next_page_offset_is_zero():
     assert [point["id"] for point in points] == [0, 1]
     assert client.calls[0][2]["limit"] == 1
     assert client.calls[1][2]["offset"] == 0
+
+
+def test_extract_vector_size_from_single_vector_config():
+    info = {"config": {"params": {"vectors": {"size": 1024, "distance": "Cosine"}}}}
+
+    assert QdrantClient._extract_vector_size(info) == 1024
+
+
+def test_extract_vector_size_from_named_vectors_when_sizes_match():
+    info = {"config": {"params": {"vectors": {"dense": {"size": 1024}, "other": {"size": "1024"}}}}}
+
+    assert QdrantClient._extract_vector_size(info) == 1024
+
+
+def test_extract_vector_size_returns_none_for_mixed_named_vector_sizes():
+    info = {"config": {"params": {"vectors": {"dense": {"size": 1024}, "other": {"size": 768}}}}}
+
+    assert QdrantClient._extract_vector_size(info) is None
+
+
+def test_extract_vector_size_returns_none_for_missing_or_invalid_sizes():
+    assert QdrantClient._extract_vector_size({"config": {"params": {}}}) is None
+    assert QdrantClient._extract_vector_size({"config": {"params": {"vectors": {"size": "not-int"}}}}) is None
+    assert QdrantClient._extract_vector_size({"config": {"params": {"vectors": {"dense": {"size": "not-int"}}}}}) is None

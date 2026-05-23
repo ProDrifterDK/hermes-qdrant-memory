@@ -46,6 +46,34 @@ class QdrantClient:
         items = data.get("result", {}).get("collections", [])
         return [str(item.get("name")) for item in items if item.get("name")]
 
+    def collection_info(self, name: str) -> dict[str, Any]:
+        data = self._request("GET", f"/collections/{urllib.parse.quote(name)}")
+        result = data.get("result", {})
+        return result if isinstance(result, dict) else {}
+
+    @staticmethod
+    def _extract_vector_size(info: dict[str, Any]) -> int | None:
+        vectors = (((info.get("config") or {}).get("params") or {}).get("vectors"))
+        if isinstance(vectors, dict):
+            if "size" in vectors:
+                try:
+                    return int(vectors["size"])
+                except Exception:
+                    return None
+            sizes: list[int] = []
+            for item in vectors.values():
+                if isinstance(item, dict) and "size" in item:
+                    try:
+                        sizes.append(int(item["size"]))
+                    except Exception:
+                        pass
+            if sizes and len(set(sizes)) == 1:
+                return sizes[0]
+        return None
+
+    def collection_vector_size(self, name: str) -> int | None:
+        return self._extract_vector_size(self.collection_info(name))
+
     def ensure_collection(self, name: str, vector_size: int, distance: str) -> dict[str, Any]:
         if name in self.get_collections():
             return {"exists": True, "name": name}

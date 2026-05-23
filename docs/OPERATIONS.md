@@ -194,7 +194,8 @@ hermes qdrant learning approve CANDIDATE_ID --dry-run --json
 Expected behavior:
 
 - `config show` prints effective JSON config with `qdrant_api_key` and `embedding_api_key` redacted, without provider construction or service contact.
-- `status` and `doctor` print JSON status and report `qdrant_ok: true` and `embedding_ok: true`.
+- `status` prints raw JSON provider status and reports `qdrant_ok: true` and `embedding_ok: true` when services are reachable.
+- `doctor` prints structured JSON diagnostics with top-level `ok`, `summary`, and `checks`; a healthy install exits `0`, while any failed critical check exits non-zero.
 - `store` and `learning store` are explicit live writes; use only harmless smoke text and remove later by explicit point ID if needed.
 - `search` returns valid JSON; zero results is acceptable on a fresh install.
 - `learning preview` and `learning approve --dry-run` return valid JSON and perform no mutation.

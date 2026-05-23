@@ -57,7 +57,8 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     subcommands = parser.add_subparsers(dest="qdrant_subcommand", required=True)
 
     subcommands.add_parser("status", help="Show Qdrant provider status.")
-    subcommands.add_parser("doctor", help="Show status-backed lightweight diagnostics.")
+    doctor = subcommands.add_parser("doctor", help="Run structured Qdrant memory diagnostics.")
+    doctor.add_argument("--json", action="store_true", help="Emit raw JSON output.")
 
     config = subcommands.add_parser("config", help="Inspect local qdrant_memory configuration without contacting services.")
     config_subcommands = config.add_subparsers(dest="config_subcommand", required=True)
