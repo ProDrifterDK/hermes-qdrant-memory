@@ -221,9 +221,9 @@ Expected behavior:
 
 For automation, add `--json` where available, keep stdout/stderr separate, and always check the process exit code. Exit `2` means usage/safety validation failure; exit `1` means provider/service/runtime failure or failed diagnostics. Do not parse default human summaries; see [CLI_OUTPUT_CONTRACT.md](CLI_OUTPUT_CONTRACT.md).
 
-### Step 6: Env-gated live integration tests for search filters
+### Step 6: Env-gated live integration tests
 
-The repository includes pytest integration tests that create temporary Qdrant collections, seed live memory/learning points, and verify search filters against real Qdrant plus a real embedding service.
+The repository includes pytest integration tests that create temporary Qdrant collections, seed live memory/learning points, and verify search filters plus selected write and maintenance paths against real Qdrant and a real embedding service.
 
 Default behavior is safe: without `RUN_QDRANT_INTEGRATION`, these tests skip cleanly.
 
@@ -257,6 +257,8 @@ Safety requirements:
 - Never set the test prefix to a production collection name or a broad shared prefix.
 - The tests generate unique `<prefix>_<token>_memory` and `<prefix>_<token>_learnings` collection names.
 - Teardown deletes only the exact temporary collections created by the fixture, and only when those names start with the configured test prefix.
+- Live store/index/consolidation tests use only the disposable collections plus local artifact directories under pytest `tmp_path`.
+- Consolidation report generation remains report-only; live apply assertions exercise explicit `report_id` + `proposal_id` + compatible `action` gates and still require `dry_run=false` plus `approve=true` before deletion/merge/draft actions.
 - If live mode is enabled and Qdrant, embeddings, or vector-size checks fail, the suite fails instead of silently skipping.
 
 Backup/export/restore smoke for v0.4.0 and later:
