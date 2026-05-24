@@ -16,7 +16,70 @@ class RetrievedMemory:
     final_score: float
 
 
-def _scope_filter(scope: dict[str, str] | None, source_type: str | None = None) -> dict[str, Any] | None:
+def _filter_value(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _filter_tags(tags: Any) -> list[str]:
+    if not tags:
+        return []
+    if isinstance(tags, str):
+        values = [tags]
+    elif isinstance(tags, (list, tuple, set)):
+        values = list(tags)
+    else:
+        return []
+    normalized: list[str] = []
+    for raw in values:
+        for item in str(raw).split(","):
+            tag = item.strip()
+            if tag:
+                normalized.append(tag)
+    return normalized
+
+
+def _extend_search_filter_conditions(
+    must: list[dict[str, Any]],
+    *,
+    tags: Any = None,
+    source: Any = None,
+    file_path: Any = None,
+    project_path: Any = None,
+    since: Any = None,
+    until: Any = None,
+) -> None:
+    for tag in _filter_tags(tags):
+        must.append({"key": "tags", "match": {"value": tag}})
+    for key, value in (
+        ("source", source),
+        ("file_path", file_path),
+        ("project_path", project_path),
+    ):
+        text = _filter_value(value)
+        if text:
+            must.append({"key": key, "match": {"value": text}})
+    created_at_range: dict[str, str] = {}
+    since_text = _filter_value(since)
+    until_text = _filter_value(until)
+    if since_text:
+        created_at_range["gte"] = since_text
+    if until_text:
+        created_at_range["lte"] = until_text
+    if created_at_range:
+        must.append({"key": "created_at", "range": created_at_range})
+
+
+def _scope_filter(
+    scope: dict[str, str] | None,
+    source_type: str | None = None,
+    *,
+    tags: Any = None,
+    source: Any = None,
+    file_path: Any = None,
+    project_path: Any = None,
+    since: Any = None,
+    until: Any = None,
+) -> dict[str, Any] | None:
     must = []
     if scope:
         for key, value in scope.items():
@@ -24,6 +87,15 @@ def _scope_filter(scope: dict[str, str] | None, source_type: str | None = None) 
                 must.append({"key": key, "match": {"value": value}})
     if source_type:
         must.append({"key": "source_type", "match": {"value": source_type}})
+    _extend_search_filter_conditions(
+        must,
+        tags=tags,
+        source=source,
+        file_path=file_path,
+        project_path=project_path,
+        since=since,
+        until=until,
+    )
     return {"must": must} if must else None
 
 
@@ -70,7 +142,20 @@ class MemoryRetriever:
         self.min_raw_score = float(min_raw_score)
         self.min_final_score = float(min_final_score)
 
-    def search(self, query: str, top_k: int = 5, source_type: str | None = None, scope: dict[str, str] | None = None) -> list[RetrievedMemory]:
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        source_type: str | None = None,
+        scope: dict[str, str] | None = None,
+        *,
+        tags: list[str] | None = None,
+        source: str | None = None,
+        file_path: str | None = None,
+        project_path: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> list[RetrievedMemory]:
         vector = self.embeddings.embed_query(query)
         active_scope = self.scope.copy()
         if scope:
@@ -79,7 +164,16 @@ class MemoryRetriever:
             self.collection_name,
             vector,
             limit=max(int(top_k), self.search_candidates),
-            filter=_scope_filter(active_scope, source_type=source_type),
+            filter=_scope_filter(
+                active_scope,
+                source_type=source_type,
+                tags=tags,
+                source=source,
+                file_path=file_path,
+                project_path=project_path,
+                since=since,
+                until=until,
+            ),
             with_payload=True,
             with_vector=False,
         )

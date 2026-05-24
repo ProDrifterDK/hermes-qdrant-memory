@@ -16,7 +16,7 @@ The project is published as `v0.6.0 Public Beta` and is functional as a Hermes Q
 
 - <https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.6.0>
 
-Implemented capabilities through v0.6.0:
+Implemented capabilities through v0.6.0 plus current unreleased v0.7.0 work:
 
 - Hermes `MemoryProvider` subclass: `QdrantMemoryProvider`.
 - Plugin registration through `register(ctx)`.
@@ -38,6 +38,7 @@ Implemented capabilities through v0.6.0:
 - Backup/export/restore recovery primitives with private local artifacts, dry-run restore default, live approval gate, and automatic pre-restore backup.
 - Human-readable default CLI output with `--json` as the stable machine-readable mode, documented in `docs/CLI_OUTPUT_CONTRACT.md`.
 - Read-only CLI inspection helpers for exact point lookup, persisted report listing/showing, and proposal inspection.
+- Unreleased v0.7.0 read-only search filters for memory and learning search by tag, source, file path, project path, creation date range, and collection routing.
 - GitHub Actions test workflow with pytest, compileall, and scanner guard.
 - Release documentation: `CHANGELOG.md`, `RELEASE_NOTES.md`, install/update/remove/rollback notes.
 
@@ -985,23 +986,23 @@ Operator recovery primitives now exist before any broader cleanup/rewrite workfl
 
 ### Priority 5: Inspection/search ergonomics
 
-Point/report inspection commands are implemented for the first ergonomics pass:
+Point/report inspection commands and search filters are implemented for the first ergonomics pass:
 
 - `hermes qdrant show POINT_ID --collection memory|learning`;
 - `hermes qdrant reports list`;
 - `hermes qdrant reports show REPORT_ID`;
-- `hermes qdrant proposals show REPORT_ID PROPOSAL_ID`.
+- `hermes qdrant proposals show REPORT_ID PROPOSAL_ID`;
+- `hermes qdrant search "query" --tag TAG --source-type TYPE --source SOURCE --file-path PATH --project-path PATH --since ISO --until ISO`;
+- `hermes qdrant search "query" --collection learning --tag TAG`;
+- `hermes qdrant learning search "query" --learning-type TYPE --tag TAG --source SOURCE --file-path PATH --project-path PATH --since ISO --until ISO`.
 
 Safety shape:
 
 - `show` is exact-ID only and omits payloads/vectors unless explicitly requested;
 - `reports` and `proposals` inspect local persisted artifacts only;
 - report/proposal IDs are validated and path traversal inputs are rejected;
+- search filters only add read-side Qdrant `must` constraints and collection routing;
 - no provider construction, embeddings, upserts, deletes, collection creation, or apply shortcut is introduced.
-
-Remaining ergonomics work:
-
-- search filters by tag, source type, path/source, date range, and collection.
 
 ### Priority 6: Safer explicit write workflows
 
@@ -1045,7 +1046,7 @@ Verify whether current Hermes core can discover user memory providers from `~/.h
 ## 14. Immediate next action
 
 1. Repeat consumer install/runtime smoke for the next published tag.
-2. Add richer search filters by tag, source/path, date range, and collection.
-3. Add watcher lifecycle commands only after inspection/report ergonomics are stable.
+2. Add watcher lifecycle commands only after inspection/report ergonomics are stable.
+3. Add env-gated live-service integration tests for real Qdrant plus embedding behavior.
 
 This order keeps the project grounded: the published artifact is verified first; the next work improves operator ergonomics and runtime confidence before adding stronger memory mutation capabilities.

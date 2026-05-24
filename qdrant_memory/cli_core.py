@@ -44,6 +44,29 @@ def _split_tags(values: Any) -> list[str]:
     return tags
 
 
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _search_filter_tool_args(args: Namespace, *, include_collection: bool = False) -> dict[str, Any]:
+    tool_args: dict[str, Any] = {}
+    tags = _split_tags(getattr(args, "tag", []))
+    if tags:
+        tool_args["tags"] = tags
+    for key in ("source", "file_path", "project_path", "since", "until"):
+        value = _optional_text(getattr(args, key, None))
+        if value:
+            tool_args[key] = value
+    if include_collection:
+        collection = _optional_text(getattr(args, "collection", None))
+        if collection:
+            tool_args["collection"] = collection
+    return tool_args
+
+
 def _non_empty(value: Any, name: str) -> str:
     text = str(value or "").strip()
     if not text:
@@ -1242,12 +1265,14 @@ def build_tool_call(args: Namespace) -> tuple[str, dict[str, Any]]:
         }
 
     if subcommand == "search":
-        return "qdrant_memory_search", {
+        tool_args = {
             "query": args.query,
             "top_k": args.top_k,
             "source_type": args.source_type,
             "include_metadata": args.include_metadata,
         }
+        tool_args.update(_search_filter_tool_args(args, include_collection=True))
+        return "qdrant_memory_search", tool_args
 
     if subcommand == "index":
         _require_live_approval(args)
@@ -1291,12 +1316,14 @@ def build_tool_call(args: Namespace) -> tuple[str, dict[str, Any]]:
     if subcommand == "learning":
         learning_subcommand = getattr(args, "learning_subcommand", None)
         if learning_subcommand == "search":
-            return "qdrant_learning_search", {
+            tool_args = {
                 "query": args.query,
                 "top_k": args.top_k,
                 "learning_type": args.learning_type,
                 "include_metadata": args.include_metadata,
             }
+            tool_args.update(_search_filter_tool_args(args))
+            return "qdrant_learning_search", tool_args
         if learning_subcommand == "preview":
             return "qdrant_learning_preview", {"include_metadata": args.include_metadata}
         if learning_subcommand == "store":

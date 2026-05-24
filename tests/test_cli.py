@@ -123,6 +123,90 @@ def test_build_tool_call_maps_read_only_commands():
     assert build_tool_call(preview) == ("qdrant_learning_preview", {"include_metadata": True})
 
 
+def test_build_tool_call_maps_richer_search_filters_and_collection():
+    from qdrant_memory.cli_core import build_tool_call
+
+    parser = _parser()
+
+    search = parser.parse_args(
+        [
+            "qdrant",
+            "search",
+            "agent memory",
+            "--source-type",
+            "project_doc",
+            "--tag",
+            "api",
+            "--tag",
+            "v0.7,release",
+            "--source",
+            "api.md",
+            "--path",
+            "/repo/docs/api.md",
+            "--project-path",
+            "/repo",
+            "--since",
+            "2026-01-01T00:00:00Z",
+            "--until",
+            "2026-01-31T23:59:59Z",
+            "--collection",
+            "learning",
+        ]
+    )
+    assert build_tool_call(search) == (
+        "qdrant_memory_search",
+        {
+            "query": "agent memory",
+            "top_k": 5,
+            "source_type": "project_doc",
+            "include_metadata": False,
+            "tags": ["api", "v0.7", "release"],
+            "source": "api.md",
+            "file_path": "/repo/docs/api.md",
+            "project_path": "/repo",
+            "since": "2026-01-01T00:00:00Z",
+            "until": "2026-01-31T23:59:59Z",
+            "collection": "learning",
+        },
+    )
+
+    learning = parser.parse_args(
+        [
+            "qdrant",
+            "learning",
+            "search",
+            "tool failure",
+            "--tag",
+            "workflow",
+            "--source",
+            "hermes_learning",
+            "--file-path",
+            "/repo/lessons.md",
+            "--project-path",
+            "/repo",
+            "--since",
+            "2026-02-01T00:00:00Z",
+            "--until",
+            "2026-02-28T23:59:59Z",
+        ]
+    )
+    assert build_tool_call(learning) == (
+        "qdrant_learning_search",
+        {
+            "query": "tool failure",
+            "top_k": 5,
+            "learning_type": None,
+            "include_metadata": False,
+            "tags": ["workflow"],
+            "source": "hermes_learning",
+            "file_path": "/repo/lessons.md",
+            "project_path": "/repo",
+            "since": "2026-02-01T00:00:00Z",
+            "until": "2026-02-28T23:59:59Z",
+        },
+    )
+
+
 def test_build_tool_call_preserves_dry_run_and_approval_gates():
     from qdrant_memory.cli_core import CliUsageError, build_tool_call
 

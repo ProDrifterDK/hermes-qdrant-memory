@@ -66,6 +66,38 @@ def _hash_value(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
 
 
+def _tool_tag_filters(value: Any) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, list):
+        values = value
+    else:
+        return []
+    tags: list[str] = []
+    for raw in values:
+        for item in str(raw).split(","):
+            tag = item.strip()
+            if tag:
+                tags.append(tag)
+    return tags
+
+
+def _tool_search_filters(args: dict[str, Any]) -> dict[str, Any]:
+    filters: dict[str, Any] = {}
+    tags = _tool_tag_filters(args.get("tags"))
+    if tags:
+        filters["tags"] = tags
+    for key in ("source", "file_path", "project_path", "since", "until"):
+        if key not in args:
+            continue
+        value = str(args.get(key) or "").strip()
+        if value:
+            filters[key] = value
+    return filters
+
+
 class QdrantMemoryProvider(MemoryProvider):
     def __init__(self):
         self._config = load_config()
@@ -435,11 +467,19 @@ class QdrantMemoryProvider(MemoryProvider):
             return _json_error(f"Failed to store memory: {exc}")
 
     def _tool_search(self, args: dict) -> str:
-        if not self._retriever:
-            return _json_error("Qdrant memory provider is not initialized")
         query = str(args.get("query") or "").strip()
         if not query:
             return _json_error("query is required")
+        collection = str(args.get("collection") or "memory").strip().lower()
+        if collection not in {"memory", "learning"}:
+            return _json_error("collection must be one of: memory, learning")
+        if collection == "learning":
+            routed_args = dict(args)
+            routed_args.pop("collection", None)
+            routed_args.pop("source_type", None)
+            return self._tool_learning_search(routed_args)
+        if not self._retriever:
+            return _json_error("Qdrant memory provider is not initialized")
         try:
             top_k = max(1, min(20, int(args.get("top_k", 5))))
         except Exception:
@@ -447,7 +487,7 @@ class QdrantMemoryProvider(MemoryProvider):
         include_metadata = bool(args.get("include_metadata", False))
         source_type = args.get("source_type") or None
         try:
-            chunks = self._retriever.search(query, top_k=top_k, source_type=source_type)
+            chunks = self._retriever.search(query, top_k=top_k, source_type=source_type, **_tool_search_filters(args))
             results = []
             for chunk in chunks:
                 item: dict[str, Any] = {"id": chunk.id, "text": chunk.text, "score": round(chunk.final_score, 6)}
@@ -821,7 +861,7 @@ class QdrantMemoryProvider(MemoryProvider):
         include_metadata = bool(args.get("include_metadata", False))
         learning_type = args.get("learning_type") or None
         try:
-            chunks = store.search(query, top_k=top_k, learning_type=learning_type)
+            chunks = store.search(query, top_k=top_k, learning_type=learning_type, **_tool_search_filters(args))
             results = []
             for chunk in chunks:
                 item: dict[str, Any] = {"id": chunk.id, "text": chunk.text, "score": round(chunk.final_score, 6)}

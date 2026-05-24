@@ -8,7 +8,7 @@ This plugin turns Hermes memory into an external associative substrate: conversa
 
 ## Status
 
-Public beta / experimental. Current release: `v0.6.0 Public Beta`. The plugin is functional and tested, but it depends on external Qdrant and embedding services. Learning, origin-time fact metadata, sleep consolidation, manual-review reconsolidation, native Hermes CLI commands with human-readable defaults, backup/export/restore recovery primitives, and read-only inspection helpers are implemented with conservative gates; automatic reconsolidation remains disabled by design.
+Public beta / experimental. Current published release: `v0.6.0 Public Beta`. The plugin is functional and tested, but it depends on external Qdrant and embedding services. Learning, origin-time fact metadata, sleep consolidation, manual-review reconsolidation, native Hermes CLI commands with human-readable defaults, backup/export/restore recovery primitives, and read-only inspection helpers are implemented with conservative gates. The current unreleased v0.7.0 work adds filtered search ergonomics without widening mutation authority; automatic reconsolidation remains disabled by design.
 
 ## What it does
 
@@ -52,9 +52,9 @@ Public beta / experimental. Current release: `v0.6.0 Public Beta`. The plugin is
 | Origin-time fact metadata | Implemented conservatively from explicit tags, clear fact statements, file headings, and structured learning context |
 | Sleep consolidation | M9 gated report persistence and apply-by-proposal-id implemented |
 | Reconsolidation | M10 report-only conflict candidates + local review drafts implemented; no automatic memory rewrites |
-| Native Hermes CLI beta | Implemented for active memory provider (`hermes qdrant ...`) with human-readable defaults, stable `--json`, CLI parity, recovery commands, and read-only inspection helpers |
+| Native Hermes CLI beta | Implemented for active memory provider (`hermes qdrant ...`) with human-readable defaults, stable `--json`, CLI parity, recovery commands, read-only inspection helpers, and filtered search ergonomics |
 | Backup/export/restore recovery | Implemented with private local artifacts, dry-run restore default, live approval gate, and automatic pre-restore backup |
-| CLI inspection/ergonomics | Implemented for exact point lookup, persisted report listing/showing, and proposal inspection without widening mutation authority |
+| CLI inspection/ergonomics | Implemented for exact point lookup, persisted report listing/showing, proposal inspection, and read-only search filters without widening mutation authority |
 | Dashboard/UI | Not included |
 
 ## Requirements
@@ -518,6 +518,32 @@ Safety notes:
 - `reports list/show` and `proposals show` read persisted local consolidation artifacts only and do not contact Qdrant.
 - `reports show` and `proposals show` validate exact IDs and reject path traversal inputs.
 
+## Native CLI search filters
+
+Semantic search supports optional read-only filters for narrowing results without changing the mutation boundary:
+
+```bash
+hermes qdrant search "agent memory" \
+  --source-type project_doc \
+  --tag api --tag v0.7 \
+  --source docs/api.md \
+  --file-path /repo/docs/api.md \
+  --project-path /repo \
+  --since 2026-01-01T00:00:00Z \
+  --until 2026-01-31T23:59:59Z
+
+hermes qdrant search "tool failure" --collection learning --tag pytest
+hermes qdrant learning search "tool failure" --learning-type workflow_lesson --tag pytest
+```
+
+Filter behavior:
+
+- `--tag` may be repeated and may contain comma-separated values; all tags are added as Qdrant `must` conditions on the `tags` payload field.
+- `--source`, `--file-path` / `--path`, and `--project-path` are exact payload-field filters.
+- `--since` and `--until` apply inclusive `created_at` range filters.
+- `--collection learning` on `hermes qdrant search` routes through the learning collection search path. Use `hermes qdrant learning search` when you also need `--learning-type`.
+- These filters only restrict reads; they do not enable query-based deletion or broad mutation.
+
 ## Tools exposed to Hermes
 
 ### `qdrant_memory_status`
@@ -533,6 +559,13 @@ Useful arguments:
 - `query`
 - `top_k`
 - `source_type`
+- `tags`
+- `source`
+- `file_path`
+- `project_path`
+- `since`
+- `until`
+- `collection`: `memory` or `learning`
 - `include_metadata`
 
 ### `qdrant_memory_store`
@@ -634,6 +667,12 @@ Useful arguments:
 - `query`
 - `top_k`
 - `learning_type`
+- `tags`
+- `source`
+- `file_path`
+- `project_path`
+- `since`
+- `until`
 - `include_metadata`
 
 ### `qdrant_learning_preview`
@@ -671,9 +710,12 @@ hermes qdrant status
 hermes qdrant doctor
 hermes qdrant store "Remember this explicit memory" --source-type manual --importance 5 --tag manual
 hermes qdrant search "agent memory" --top-k 5
+hermes qdrant search "agent memory" --tag docs --source-type project_doc --since 2026-01-01T00:00:00Z
+hermes qdrant search "tool failure" --collection learning --tag pytest
 hermes qdrant index docs README.md --dry-run
 hermes qdrant forget POINT_ID --dry-run
 hermes qdrant learning search "tool failure" --top-k 5
+hermes qdrant learning search "tool failure" --learning-type workflow_lesson --tag pytest --project-path /repo
 hermes qdrant learning preview
 hermes qdrant learning store "Prefer dry-run before broad indexing" --learning-type workflow_lesson --confidence 0.8 --tag cli
 hermes qdrant learning approve CANDIDATE_ID --dry-run
@@ -734,7 +776,7 @@ No third-party Python package is required by the plugin runtime; it uses the Pyt
 ## Documentation
 
 - [CHANGELOG.md](CHANGELOG.md) — release history.
-- [RELEASE_NOTES.md](RELEASE_NOTES.md) — v0.6.0 public beta notes, upgrade command, inspection smoke checks, and remaining future work.
+- [RELEASE_NOTES.md](RELEASE_NOTES.md) — latest public beta notes, upgrade command, smoke checks, and remaining future work.
 - [docs/SAFETY.md](docs/SAFETY.md) — canonical safety contract for indexing, deletion, consolidation, reconsolidation, cron/reporting, and scanner-safe docs/tests.
 - [docs/OPERATIONS.md](docs/OPERATIONS.md) — operator runbook for status checks, smoke tests, watcher reports, approved apply flow, post-apply verification, gateway/process restarts, and troubleshooting.
 - [docs/LCM_BOUNDARY.md](docs/LCM_BOUNDARY.md) — boundary between active-session LCM recovery and cross-session Qdrant semantic memory.

@@ -50,6 +50,17 @@ def _add_dry_run_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--approve", action="store_true", help="Required with --no-dry-run for live mutation.")
 
 
+def _add_search_filter_flags(parser: argparse.ArgumentParser, *, include_collection: bool = False) -> None:
+    _add_tag_flags(parser)
+    parser.add_argument("--source", default=None, help="Optional exact payload source filter.")
+    parser.add_argument("--file-path", "--path", dest="file_path", default=None, help="Optional exact payload file_path filter.")
+    parser.add_argument("--project-path", default=None, help="Optional exact payload project_path filter.")
+    parser.add_argument("--since", default=None, help="Optional inclusive created_at lower bound (ISO timestamp).")
+    parser.add_argument("--until", default=None, help="Optional inclusive created_at upper bound (ISO timestamp).")
+    if include_collection:
+        parser.add_argument("--collection", choices=["memory", "learning"], default=None, help="Collection to search. Default: memory.")
+
+
 def register_cli(parser: argparse.ArgumentParser) -> None:
     """Register the qdrant memory-provider CLI under `hermes qdrant`."""
 
@@ -78,6 +89,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     search.add_argument("query", help="Search query.")
     search.add_argument("--top-k", type=_top_k, default=5, help="Maximum results to return, 1 to 20. Default: 5.")
     search.add_argument("--source-type", default=None, help="Optional source_type filter.")
+    _add_search_filter_flags(search, include_collection=True)
     search.add_argument("--include-metadata", action="store_true", help="Include full payload metadata.")
     search.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
 
@@ -156,6 +168,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     learning_search.add_argument("query", help="Search query.")
     learning_search.add_argument("--top-k", type=_top_k, default=5, help="Maximum results to return, 1 to 20. Default: 5.")
     learning_search.add_argument("--learning-type", default=None, help="Optional learning_type filter.")
+    _add_search_filter_flags(learning_search)
     learning_search.add_argument("--include-metadata", action="store_true", help="Include full payload metadata.")
     learning_search.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
 

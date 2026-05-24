@@ -6,6 +6,18 @@ This project is currently public beta / experimental. The format follows Keep a 
 
 ## [Unreleased]
 
+### Added
+
+- v0.7.0 search filter work:
+  - `qdrant_memory_search` now accepts `tags`, `source`, `file_path`, `project_path`, `since`, `until`, and `collection` filters.
+  - `qdrant_learning_search` now accepts `tags`, `source`, `file_path`, `project_path`, `since`, and `until` filters.
+  - Native CLI search commands now expose the same filters through `--tag`, `--source`, `--file-path` / `--path`, `--project-path`, `--since`, `--until`, and `--collection memory|learning` where applicable.
+
+### Safety
+
+- Search filters only narrow read results. They do not add query-based deletion, broad mutation, automatic reconsolidation, or any new write authority.
+- Existing profile/platform scope filters are preserved and combined with the new Qdrant `must` conditions.
+
 ## [0.6.0]
 
 Sixth public beta release of the Hermes Qdrant Memory Provider. This release adds read-only inspection commands for exact point lookup, persisted consolidation report review, and proposal review without expanding mutation authority.

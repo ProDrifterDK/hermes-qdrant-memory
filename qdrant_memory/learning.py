@@ -7,7 +7,7 @@ from typing import Any
 from .fact_metadata import derive_fact_metadata
 from .schema import build_payload, clean_text_for_memory, now_iso
 from .scoring import final_memory_score, normalize_minmax
-from .retriever import RetrievedMemory
+from .retriever import RetrievedMemory, _extend_search_filter_conditions
 
 LEARNING_TYPES = {
     "tool_failure_lesson",
@@ -214,7 +214,18 @@ class LearningStore:
         self.qdrant.upsert(self.collection_name, [{"id": point_id, "vector": vector, "payload": payload}])
         return point_id
 
-    def _filter(self, learning_type: str | None = None, scope: dict[str, str] | None = None) -> dict[str, Any]:
+    def _filter(
+        self,
+        learning_type: str | None = None,
+        scope: dict[str, str] | None = None,
+        *,
+        tags: list[str] | None = None,
+        source: str | None = None,
+        file_path: str | None = None,
+        project_path: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> dict[str, Any]:
         must = [{"key": "source_type", "match": {"value": "learning"}}]
         active_scope = self.scope.copy()
         if scope:
@@ -224,6 +235,15 @@ class LearningStore:
                 must.append({"key": key, "match": {"value": value}})
         if learning_type:
             must.append({"key": "learning_type", "match": {"value": _normalize_learning_type(learning_type)}})
+        _extend_search_filter_conditions(
+            must,
+            tags=tags,
+            source=source,
+            file_path=file_path,
+            project_path=project_path,
+            since=since,
+            until=until,
+        )
         return {"must": must}
 
     def find_semantic_duplicate(
@@ -262,13 +282,35 @@ class LearningStore:
             return best
         return None
 
-    def search(self, query: str, *, top_k: int = 5, learning_type: str | None = None, scope: dict[str, str] | None = None) -> list[RetrievedMemory]:
+    def search(
+        self,
+        query: str,
+        *,
+        top_k: int = 5,
+        learning_type: str | None = None,
+        scope: dict[str, str] | None = None,
+        tags: list[str] | None = None,
+        source: str | None = None,
+        file_path: str | None = None,
+        project_path: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> list[RetrievedMemory]:
         vector = self.embeddings.embed_query(query)
         raw = self.qdrant.search(
             self.collection_name,
             vector,
             limit=max(int(top_k), self.search_candidates),
-            filter=self._filter(learning_type=learning_type, scope=scope),
+            filter=self._filter(
+                learning_type=learning_type,
+                scope=scope,
+                tags=tags,
+                source=source,
+                file_path=file_path,
+                project_path=project_path,
+                since=since,
+                until=until,
+            ),
             with_payload=True,
             with_vector=False,
         )

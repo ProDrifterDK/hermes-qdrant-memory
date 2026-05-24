@@ -180,6 +180,37 @@ def test_learning_search_uses_learning_collection():
     assert {"key": "learning_type", "match": {"value": "tool_failure_lesson"}} in filter_payload["must"]
 
 
+def test_learning_search_adds_richer_filters_as_must_conditions():
+    qdrant = FakeQdrant()
+    embeddings = FakeEmbedding()
+    store = LearningStore(qdrant=qdrant, embeddings=embeddings, collection_name="learnings", scope={"profile_id": "coder"})
+
+    results = store.search(
+        "embedding batch failure",
+        top_k=3,
+        learning_type="tool_failure_lesson",
+        tags=["workflow", "cli"],
+        source="hermes_learning",
+        file_path="/repo/lessons.md",
+        project_path="/repo",
+        since="2026-02-01T00:00:00Z",
+        until="2026-02-28T23:59:59Z",
+    )
+
+    assert len(results) == 1
+    filter_payload = qdrant.searches[0][3]
+    must = filter_payload["must"]
+    assert {"key": "profile_id", "match": {"value": "coder"}} in must
+    assert {"key": "source_type", "match": {"value": "learning"}} in must
+    assert {"key": "learning_type", "match": {"value": "tool_failure_lesson"}} in must
+    assert {"key": "tags", "match": {"value": "workflow"}} in must
+    assert {"key": "tags", "match": {"value": "cli"}} in must
+    assert {"key": "source", "match": {"value": "hermes_learning"}} in must
+    assert {"key": "file_path", "match": {"value": "/repo/lessons.md"}} in must
+    assert {"key": "project_path", "match": {"value": "/repo"}} in must
+    assert {"key": "created_at", "range": {"gte": "2026-02-01T00:00:00Z", "lte": "2026-02-28T23:59:59Z"}} in must
+
+
 def test_learning_semantic_duplicate_search_uses_learning_collection_without_access_update():
     qdrant = FakeQdrant()
     embeddings = FakeEmbedding()
@@ -221,6 +252,11 @@ def test_learning_tool_schemas_are_exposed():
     assert LEARNING_SEARCH_SCHEMA["name"] == "qdrant_learning_search"
     assert "qdrant_learning_store" in names
     assert "qdrant_learning_search" in names
+    params = LEARNING_SEARCH_SCHEMA["parameters"]
+    props = params["properties"]
+    for key in ("tags", "source", "file_path", "project_path", "since", "until"):
+        assert key in props
+    assert params["additionalProperties"] is False
 
 
 def test_provider_learning_tools_and_status_use_learning_collection():
@@ -263,6 +299,59 @@ def test_provider_learning_tools_and_status_use_learning_collection():
     assert status["learning_collection_exists"] is True
     assert status["learning_point_count"] == 2
     assert status["learning_enabled"] is True
+
+
+def test_memory_search_collection_learning_routes_to_learning_collection_with_filters():
+    from __init__ import QdrantMemoryProvider
+
+    provider = QdrantMemoryProvider()
+    provider._qdrant = FakeQdrant()
+    provider._embeddings = FakeEmbedding()
+    provider._active = True
+    provider._config.update(
+        {
+            "collection_name": "memory",
+            "learning_collection_name": "learnings",
+            "qdrant_url": "http://qdrant",
+            "embedding_url": "http://embed/v1",
+            "embedding_model": "bge-m3",
+            "vector_size": 1024,
+            "auto_recall": True,
+            "sync_turns": True,
+            "search_candidates": 20,
+            "decay_rate": 0.001,
+            "min_raw_score": 0.0,
+            "min_final_score": 0.0,
+        }
+    )
+
+    searched = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_search",
+            {
+                "query": "dry-run directory sync",
+                "collection": "learning",
+                "tags": ["workflow", "cli"],
+                "source": "hermes_learning",
+                "file_path": "/repo/lessons.md",
+                "project_path": "/repo",
+                "since": "2026-02-01T00:00:00Z",
+                "until": "2026-02-28T23:59:59Z",
+            },
+        )
+    )
+
+    assert searched["count"] == 1
+    assert searched["collection_name"] == "learnings"
+    assert provider._qdrant.searches[0][0] == "learnings"
+    must = provider._qdrant.searches[0][3]["must"]
+    assert {"key": "source_type", "match": {"value": "learning"}} in must
+    assert {"key": "tags", "match": {"value": "workflow"}} in must
+    assert {"key": "tags", "match": {"value": "cli"}} in must
+    assert {"key": "source", "match": {"value": "hermes_learning"}} in must
+    assert {"key": "file_path", "match": {"value": "/repo/lessons.md"}} in must
+    assert {"key": "project_path", "match": {"value": "/repo"}} in must
+    assert {"key": "created_at", "range": {"gte": "2026-02-01T00:00:00Z", "lte": "2026-02-28T23:59:59Z"}} in must
 
 
 def test_provider_learning_tools_respect_learning_enabled_flag():

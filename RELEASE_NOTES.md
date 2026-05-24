@@ -1,5 +1,7 @@
 # Release Notes: v0.6.0 Public Beta
 
+> Draft note for the next release: v0.7.0 adds read-only search filters for memory and learning search. The v0.6.0 release notes below remain the latest published release notes until v0.7.0 is tagged.
+
 Hermes Qdrant Memory Provider v0.6.0 is a public beta release focused on read-only inspection ergonomics for the native `hermes qdrant ...` CLI. It adds exact point lookup, persisted consolidation report inspection, and proposal inspection while preserving the conservative mutation boundary established in earlier releases.
 
 The plugin remains experimental/pre-1.0: it requires external Qdrant and embedding services, retrieved memories are context rather than instructions, and all broad/destructive maintenance paths remain dry-run/review-gated.
@@ -84,6 +86,15 @@ python -m compileall -q qdrant_memory __init__.py cli.py scripts/check_no_litera
 git diff --check
 ```
 
+Additional v0.7.0 search-filter verification:
+
+```bash
+python -m pytest tests/test_retriever_search_filters.py tests/test_learning.py tests/test_cli.py -q
+hermes qdrant search "agent memory" --tag docs --source-type project_doc --since 2026-01-01T00:00:00Z --json
+hermes qdrant search "tool failure" --collection learning --tag pytest --json
+hermes qdrant learning search "tool failure" --learning-type workflow_lesson --tag pytest --json
+```
+
 Recommended consumer smoke after checking out the release tag:
 
 ```bash
@@ -121,9 +132,8 @@ Expected:
 
 ## Not included yet
 
-The following remain future work:
+The following remain future work after the current v0.7.0 filter work:
 
-- richer search filters by tag, source/path, date range, and collection;
 - optional `--dry-run`/duplicate-preview flows for explicit manual stores;
 - env-gated live-service integration tests;
 - watcher install/uninstall/log management commands;
