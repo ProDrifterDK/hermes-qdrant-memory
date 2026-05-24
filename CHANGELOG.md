@@ -6,6 +6,15 @@ This project is currently public beta / experimental. The format follows Keep a 
 
 ## [Unreleased]
 
+### Added
+
+- Env-gated live integration tests for read-only search filters against real Qdrant plus an OpenAI-compatible embedding endpoint.
+- Documentation for `RUN_QDRANT_INTEGRATION` and `QDRANT_TEST_*` live test configuration in README and the operations runbook.
+
+### Safety
+
+- Live integration tests skip by default, use uniquely named temporary collections, and delete only the exact collections created by the test fixture when names match the configured test prefix.
+
 ## [0.7.0]
 
 Seventh public beta release of the Hermes Qdrant Memory Provider. This release adds read-only search filters for memory and learning search, including native CLI parity, while preserving the existing dry-run/review-gated mutation boundary.

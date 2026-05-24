@@ -763,13 +763,42 @@ For the active-session vs long-term-memory boundary, see [docs/LCM_BOUNDARY.md](
 
 ## Development
 
-Run tests:
+Run the default offline test suite:
 
 ```bash
 python -m pytest tests -q
-python -m compileall -q qdrant_memory __init__.py cli.py
+python -m pytest tests/integration -q
 python scripts/check_no_literal_fake_secrets.py
+python -m compileall -q qdrant_memory __init__.py cli.py scripts/check_no_literal_fake_secrets.py
 ```
+
+`tests/integration` is safe in the default environment: live-service tests are skipped unless explicitly enabled.
+
+### Live Qdrant/embedding integration tests
+
+The live integration suite verifies memory search filters, learning search filters, and `qdrant_memory_search` routing to the learning collection against real Qdrant and a real OpenAI-compatible embedding endpoint.
+
+Run only against disposable test collections. The tests create unique collection names from `QDRANT_TEST_COLLECTION_PREFIX` plus a random token and delete only those exact names during teardown, but you should still never point the integration environment at production-only services or use a prefix that overlaps production collection names.
+
+Required enable flag:
+
+```bash
+RUN_QDRANT_INTEGRATION=1 python -m pytest tests/integration -q
+```
+
+Optional environment overrides:
+
+```bash
+QDRANT_TEST_URL=http://127.0.0.1:6333
+QDRANT_TEST_API_KEY=
+QDRANT_TEST_EMBEDDING_URL=http://127.0.0.1:8080/v1
+QDRANT_TEST_EMBEDDING_MODEL=bge-m3
+QDRANT_TEST_VECTOR_SIZE=1024
+QDRANT_TEST_DISTANCE=Cosine
+QDRANT_TEST_COLLECTION_PREFIX=hermes_qdrant_itest
+```
+
+When `RUN_QDRANT_INTEGRATION` is truthy (`1`, `true`, `yes`, or `on`), Qdrant/embedding health or vector-size mismatches fail the tests instead of skipping them.
 
 No third-party Python package is required by the plugin runtime; it uses the Python standard library for HTTP calls. Tests require `pytest`.
 

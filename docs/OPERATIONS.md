@@ -216,6 +216,44 @@ Expected behavior:
 
 For automation, add `--json` where available, keep stdout/stderr separate, and always check the process exit code. Exit `2` means usage/safety validation failure; exit `1` means provider/service/runtime failure or failed diagnostics. Do not parse default human summaries; see [CLI_OUTPUT_CONTRACT.md](CLI_OUTPUT_CONTRACT.md).
 
+### Step 6: Env-gated live integration tests for search filters
+
+The repository includes pytest integration tests that create temporary Qdrant collections, seed live memory/learning points, and verify search filters against real Qdrant plus a real embedding service.
+
+Default behavior is safe: without `RUN_QDRANT_INTEGRATION`, these tests skip cleanly.
+
+```bash
+python -m pytest tests/integration -q
+```
+
+To run live mode, start Qdrant and the embedding server first, then enable the explicit gate:
+
+```bash
+RUN_QDRANT_INTEGRATION=1 python -m pytest tests/integration -q
+```
+
+Supported environment variables:
+
+```bash
+RUN_QDRANT_INTEGRATION=1
+QDRANT_TEST_URL=http://127.0.0.1:6333
+QDRANT_TEST_API_KEY=
+QDRANT_TEST_EMBEDDING_URL=http://127.0.0.1:8080/v1
+QDRANT_TEST_EMBEDDING_MODEL=bge-m3
+QDRANT_TEST_VECTOR_SIZE=1024
+QDRANT_TEST_DISTANCE=Cosine
+QDRANT_TEST_COLLECTION_PREFIX=hermes_qdrant_itest
+```
+
+Safety requirements:
+
+- Use a disposable test prefix; the default is `hermes_qdrant_itest`.
+- Never run these tests against production-only Qdrant collections.
+- Never set the test prefix to a production collection name or a broad shared prefix.
+- The tests generate unique `<prefix>_<token>_memory` and `<prefix>_<token>_learnings` collection names.
+- Teardown deletes only the exact temporary collections created by the fixture, and only when those names start with the configured test prefix.
+- If live mode is enabled and Qdrant, embeddings, or vector-size checks fail, the suite fails instead of silently skipping.
+
 Backup/export/restore smoke for v0.4.0 and later:
 
 ```bash

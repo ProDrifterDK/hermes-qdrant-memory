@@ -1029,7 +1029,7 @@ Keep watcher report-only, but add lifecycle commands:
 
 ### Priority 8: Integration and compatibility tests
 
-Add optional live-service tests gated by explicit environment variables, e.g. `QDRANT_MEMORY_INTEGRATION=1`, so CI remains hermetic by default but maintainers can validate real Qdrant + embedding behavior before releases.
+Add optional live-service tests gated by explicit environment variables, e.g. `RUN_QDRANT_INTEGRATION=1`, so CI remains hermetic by default but maintainers can validate real Qdrant + embedding behavior before releases.
 
 Also verify:
 
@@ -1046,8 +1046,8 @@ Verify whether current Hermes core can discover user memory providers from `~/.h
 
 ## 14. Immediate next action
 
-1. Repeat consumer install/runtime smoke for v0.7.0 after tagging.
-2. Add watcher lifecycle commands only after inspection/report ergonomics are stable.
-3. Add env-gated live-service integration tests for real Qdrant plus embedding behavior.
+1. Add watcher lifecycle commands only after inspection/report ergonomics are stable.
+2. Add optional `--dry-run` / duplicate-preview flows for explicit manual stores.
+3. Expand env-gated live-service coverage beyond search filters after watcher and manual-store ergonomics are stable.
 
-This order keeps the project grounded: the published artifact is verified first; the next work improves operator ergonomics and runtime confidence before adding stronger memory mutation capabilities.
+This order keeps the project grounded: the published artifact and v0.7.0 search-filter integration path are verified first; the next work improves operator ergonomics and runtime confidence before adding stronger memory mutation capabilities.
