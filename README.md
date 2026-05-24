@@ -52,7 +52,7 @@ Public beta / experimental. Current published release: `v0.7.0 Public Beta`. The
 | Origin-time fact metadata | Implemented conservatively from explicit tags, clear fact statements, file headings, and structured learning context |
 | Sleep consolidation | M9 gated report persistence and apply-by-proposal-id implemented |
 | Reconsolidation | M10 report-only conflict candidates + local review drafts implemented; no automatic memory rewrites |
-| Native Hermes CLI beta | Implemented for active memory provider (`hermes qdrant ...`) with human-readable defaults, stable `--json`, CLI parity, recovery commands, read-only inspection helpers, and filtered search ergonomics |
+| Native Hermes CLI beta | Implemented for active memory provider (`hermes qdrant ...`) with human-readable defaults, stable `--json`, CLI parity, recovery commands, read-only inspection helpers, filtered search ergonomics, and watcher lifecycle management |
 | Backup/export/restore recovery | Implemented with private local artifacts, dry-run restore default, live approval gate, and automatic pre-restore backup |
 | CLI inspection/ergonomics | Implemented for exact point lookup, persisted report listing/showing, proposal inspection, and read-only search filters without widening mutation authority |
 | Dashboard/UI | Not included |
@@ -720,8 +720,13 @@ hermes qdrant learning preview
 hermes qdrant learning store "Prefer dry-run before broad indexing" --learning-type workflow_lesson --confidence 0.8 --tag cli
 hermes qdrant learning approve CANDIDATE_ID --dry-run
 hermes qdrant consolidate --scope both --persist --dry-run
-hermes qdrant watcher status
-hermes qdrant watcher run --scope both
+hermes qdrant watcher status --verbose
+hermes qdrant watcher install --schedule "0 3 * * *"
+hermes qdrant watcher run --scope both --force-alert
+hermes qdrant watcher logs --tail 20
+hermes qdrant watcher inspect-state
+hermes qdrant watcher reset-signature --approve
+hermes qdrant watcher uninstall --approve
 hermes qdrant apply --report-id REPORT_ID --proposal-id PROPOSAL_ID --action merge --dry-run
 hermes qdrant export memory --out memory.jsonl
 hermes qdrant backup create --scope both
@@ -734,13 +739,15 @@ Default output is human-readable text. Use `--json` for scripts and automation; 
 
 Mutation safety mirrors the tool surface:
 
-- `config show` and `watcher status` are local reads and do not instantiate the provider or contact Qdrant/embedding services; secret-like API key fields are redacted;
+- `config show`, `watcher status`, `watcher logs`, and `watcher inspect-state` are local reads and do not instantiate the provider or contact Qdrant/embedding services; secret-like API key fields are redacted;
 - `store` and `learning store` are explicit live storage commands by design and require non-empty positional text/lesson;
 - mutating maintenance commands default to `--dry-run`;
 - live maintenance mutation requires both `--no-dry-run` and `--approve`;
 - `learning approve` follows the same live approval gate;
 - `forget` only accepts explicit point IDs;
-- `watcher run` is report-only consolidation with `dry_run=true`, `persist=true`, and no apply/proposal mutation;
+- `watcher run` is report-only consolidation with `dry_run=true`, `persist=true`, and no apply/proposal mutation; it updates only local watcher state/log artifacts and `--force-alert` does not widen Qdrant authority;
+- `watcher install` / `watcher uninstall --approve` edit only the sentinel-managed crontab block; replacing an existing different watcher block requires `--approve`;
+- `watcher reset-signature --approve` clears only local watcher signature fields and preserves unrelated watcher state;
 - `apply` requires explicit report/proposal IDs and expected action;
 - `export memory|learning` and `backup create` write private JSONL artifacts that contain raw memory payloads and vectors, but stdout only returns summaries;
 - `backup list` and `backup inspect` are local artifact reads and re-redact stored Qdrant URLs before printing;
@@ -807,7 +814,7 @@ No third-party Python package is required by the plugin runtime; it uses the Pyt
 - [CHANGELOG.md](CHANGELOG.md) — release history.
 - [RELEASE_NOTES.md](RELEASE_NOTES.md) — latest public beta notes, upgrade command, smoke checks, and remaining future work.
 - [docs/SAFETY.md](docs/SAFETY.md) — canonical safety contract for indexing, deletion, consolidation, reconsolidation, cron/reporting, and scanner-safe docs/tests.
-- [docs/OPERATIONS.md](docs/OPERATIONS.md) — operator runbook for status checks, smoke tests, watcher reports, approved apply flow, post-apply verification, gateway/process restarts, and troubleshooting.
+- [docs/OPERATIONS.md](docs/OPERATIONS.md) — operator runbook for status checks, smoke tests, watcher lifecycle/log/state handling, approved apply flow, post-apply verification, gateway/process restarts, and troubleshooting.
 - [docs/LCM_BOUNDARY.md](docs/LCM_BOUNDARY.md) — boundary between active-session LCM recovery and cross-session Qdrant semantic memory.
 - [docs/CLI_OUTPUT_CONTRACT.md](docs/CLI_OUTPUT_CONTRACT.md) — human/default and `--json` machine-output contract for `hermes qdrant ...`.
 - [docs/CLI_SPIKE.md](docs/CLI_SPIKE.md) — feasibility findings for native `hermes qdrant ...` CLI integration and fallback wrapper strategy.

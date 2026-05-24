@@ -33,7 +33,7 @@ Implemented capabilities through v0.7.0:
 - Report-only sleep consolidation.
 - Persisted consolidation reports and gated apply-by-proposal-id.
 - Reconsolidation candidates as review drafts only.
-- Conservative no-agent watcher script.
+- Conservative no-agent watcher model, now exposed through native watcher lifecycle CLI commands.
 - Native Hermes memory-provider CLI beta surface: `hermes qdrant ...`.
 - Backup/export/restore recovery primitives with private local artifacts, dry-run restore default, live approval gate, and automatic pre-restore backup.
 - Human-readable default CLI output with `--json` as the stable machine-readable mode, documented in `docs/CLI_OUTPUT_CONTRACT.md`.
@@ -297,13 +297,18 @@ hermes qdrant learning store "Procedural lesson" --learning-type workflow_lesson
 hermes qdrant learning approve CANDIDATE_ID --dry-run --json
 hermes qdrant consolidate --scope both --persist --include-reconsolidation --dry-run --json
 hermes qdrant apply --report-id REPORT --proposal-id PROPOSAL --action merge --dry-run --json
-hermes qdrant watcher status --json
-hermes qdrant watcher run --scope both --json
+hermes qdrant watcher status --verbose --json
+hermes qdrant watcher install --schedule "0 3 * * *" --json
+hermes qdrant watcher run --scope both --force-alert --json
+hermes qdrant watcher logs --tail 20 --json
+hermes qdrant watcher inspect-state --json
+hermes qdrant watcher reset-signature --approve --json
+hermes qdrant watcher uninstall --approve --json
 ```
 
 CLI rules:
 
-- `config show` and `watcher status` are local reads and do not construct the provider.
+- `config show`, `watcher status`, `watcher logs`, `watcher inspect-state`, `watcher install`, `watcher uninstall`, and `watcher reset-signature` are local provider-free operations.
 - `store` and `learning store` are explicit live writes by design.
 - Maintenance mutations default to `--dry-run`.
 - Live maintenance mutation requires both `--no-dry-run` and `--approve`.
@@ -373,8 +378,8 @@ Severity mapping:
 Deliverable:
 
 - Move the watcher contract into `docs/OPERATIONS.md`.
-- Keep `scripts/qdrant_sleep_consolidation.py` as the reference implementation.
-- Add `hermes qdrant watcher status/run` if CLI support lands.
+- Treat native `hermes qdrant watcher ...` lifecycle commands as the reference implementation for new installs.
+- Keep any external watcher script as legacy/manual compatibility only.
 
 ---
 
@@ -514,8 +519,13 @@ hermes qdrant store "Manual memory" --tag manual
 hermes qdrant search "Hermes Qdrant memory"
 hermes qdrant learning store "Procedural lesson" --tag manual
 hermes qdrant learning approve CANDIDATE_ID --dry-run
-hermes qdrant watcher status --json
-hermes qdrant watcher run --scope both --json
+hermes qdrant watcher status --verbose --json
+hermes qdrant watcher install --schedule "0 3 * * *" --json
+hermes qdrant watcher run --scope both --force-alert --json
+hermes qdrant watcher logs --tail 20 --json
+hermes qdrant watcher inspect-state --json
+hermes qdrant watcher reset-signature --approve --json
+hermes qdrant watcher uninstall --approve --json
 hermes qdrant consolidate --scope both --persist --dry-run
 # For apply, first generate a real persisted report and select one real proposal_id.
 # If no proposal exists, verify argument validation and dry-run refusal paths instead.
@@ -1015,17 +1025,19 @@ Keep manual writes ergonomic, but consider:
 - scanner/noise warnings before live store;
 - explicit `--approve` option for non-interactive scripts.
 
-### Priority 7: Watcher/cron management CLI
+### Priority 7: Watcher/cron management CLI — implemented in Unreleased
 
-Keep watcher report-only, but add lifecycle commands:
+Watcher remains report-only while lifecycle commands now cover:
 
 - `watcher install`;
-- `watcher uninstall`;
+- `watcher uninstall --approve`;
 - `watcher status --verbose`;
 - `watcher run --force-alert`;
 - `watcher logs`;
 - `watcher inspect-state`;
 - `watcher reset-signature --approve`.
+
+Safety boundary: install/uninstall edits only the sentinel-managed crontab block, local state/log commands do not construct the provider, and `watcher run` still maps only to report-only consolidation (`dry_run=true`, `persist=true`, `include_examples=false`).
 
 ### Priority 8: Integration and compatibility tests
 
@@ -1046,8 +1058,8 @@ Verify whether current Hermes core can discover user memory providers from `~/.h
 
 ## 14. Immediate next action
 
-1. Add watcher lifecycle commands only after inspection/report ergonomics are stable.
-2. Add optional `--dry-run` / duplicate-preview flows for explicit manual stores.
-3. Expand env-gated live-service coverage beyond search filters after watcher and manual-store ergonomics are stable.
+1. Add optional `--dry-run` / duplicate-preview flows for explicit manual stores.
+2. Expand env-gated live-service coverage beyond search filters now that watcher lifecycle ergonomics are stable.
+3. Verify installed-plugin `hermes qdrant --help` and scheduler behavior from a consumer checkout before the next release tag.
 
-This order keeps the project grounded: the published artifact and v0.7.0 search-filter integration path are verified first; the next work improves operator ergonomics and runtime confidence before adding stronger memory mutation capabilities.
+This order keeps the project grounded: watcher/cron lifecycle is now operable without expanding Qdrant mutation authority; the next work improves explicit-write ergonomics and runtime confidence before adding stronger memory mutation capabilities.

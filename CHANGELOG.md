@@ -8,11 +8,14 @@ This project is currently public beta / experimental. The format follows Keep a 
 
 ### Added
 
+- Watcher lifecycle CLI commands: `hermes qdrant watcher install`, `uninstall`, `status --verbose`, `logs`, `inspect-state`, `reset-signature --approve`, and `run --force-alert`.
 - Env-gated live integration tests for read-only search filters against real Qdrant plus an OpenAI-compatible embedding endpoint.
 - Documentation for `RUN_QDRANT_INTEGRATION` and `QDRANT_TEST_*` live test configuration in README and the operations runbook.
 
 ### Safety
 
+- Watcher lifecycle commands are local scheduler/state/log operations only, with approval gates for uninstalling, replacing an existing managed cron block, and resetting proposal signatures.
+- `watcher run` remains report-only consolidation with `dry_run=true`, `persist=true`, and no apply/proposal mutation; successful runs update only local watcher state/log artifacts.
 - Live integration tests skip by default, use uniquely named temporary collections, and delete only the exact collections created by the test fixture when names match the configured test prefix.
 
 ## [0.7.0]
