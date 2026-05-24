@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
 import re
+import shlex
+import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 from argparse import Namespace
 from collections.abc import Callable
 from pathlib import Path
@@ -170,22 +174,324 @@ def _redacted_config() -> dict[str, Any]:
     return redact_config(dict(config))
 
 
-def _watcher_status_payload() -> dict[str, Any]:
-    state_path = _hermes_home() / "qdrant_memory" / "consolidation" / "watcher_state.json"
-    state: dict[str, Any] = {}
-    exists = state_path.exists()
+_WATCHER_CRON_BEGIN = "# BEGIN HERMES_QDRANT_WATCHER"
+_WATCHER_CRON_END = "# END HERMES_QDRANT_WATCHER"
+_WATCHER_SIGNATURE_KEYS = {
+    "last_proposal_signature",
+    "last_alert_signature",
+    "last_alert_at",
+    "last_signature_changed",
+    "last_alerted",
+    "last_force_alert",
+}
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _watcher_dir() -> Path:
+    return _hermes_home() / "qdrant_memory" / "consolidation"
+
+
+def _watcher_state_path() -> Path:
+    return _watcher_dir() / "watcher_state.json"
+
+
+def _watcher_log_path() -> Path:
+    return _watcher_dir() / "watcher.log"
+
+
+def _read_watcher_state() -> tuple[dict[str, Any], bool, str | None]:
+    state_path = _watcher_state_path()
+    if not state_path.exists():
+        return {}, False, None
+    try:
+        parsed = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"error": f"failed to read watcher state: {exc}"}, True, str(exc)
+    return (parsed if isinstance(parsed, dict) else {"raw": parsed}), True, None
+
+
+def _write_watcher_state(state: dict[str, Any]) -> None:
+    state_path = _watcher_state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _append_watcher_log(event: dict[str, Any]) -> None:
+    log_path = _watcher_log_path()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, sort_keys=True) + "\n")
+
+
+def _read_watcher_log_tail(limit: int = 20) -> dict[str, Any]:
+    log_path = _watcher_log_path()
+    events: list[Any] = []
+    exists = log_path.exists()
     if exists:
         try:
-            parsed = json.loads(state_path.read_text(encoding="utf-8"))
-            state = parsed if isinstance(parsed, dict) else {"raw": parsed}
+            lines = log_path.read_text(encoding="utf-8").splitlines()
         except Exception as exc:
-            state = {"error": f"failed to read watcher state: {exc}"}
+            return {"log_path": str(log_path), "log_exists": True, "count": 0, "events": [], "error": str(exc)}
+        for line in lines[-max(1, int(limit or 20)) :]:
+            if not line.strip():
+                continue
+            try:
+                parsed = json.loads(line)
+            except Exception:
+                parsed = {"raw": line}
+            events.append(redact_config(parsed) if isinstance(parsed, dict) else parsed)
+    return {"log_path": str(log_path), "log_exists": exists, "count": len(events), "events": events}
+
+
+def _read_user_crontab() -> str:
+    result = subprocess.run(["crontab", "-l"], capture_output=True, text=True, check=False)
+    if result.returncode == 0:
+        return result.stdout
+    if result.returncode == 1:
+        return ""
+    raise RuntimeError((result.stderr or "failed to read crontab").strip())
+
+
+def _write_user_crontab(text: str) -> None:
+    result = subprocess.run(["crontab", "-"], input=text, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or "failed to write crontab").strip())
+
+
+def _extract_managed_cron_block(crontab_text: str) -> tuple[str | None, str]:
+    lines = crontab_text.splitlines(keepends=True)
+    begin_index: int | None = None
+    for index, line in enumerate(lines):
+        if line.strip() == _WATCHER_CRON_BEGIN:
+            begin_index = index
+            break
+    if begin_index is None:
+        return None, crontab_text
+    end_index: int | None = None
+    for index in range(begin_index + 1, len(lines)):
+        if lines[index].strip() == _WATCHER_CRON_END:
+            end_index = index
+            break
+    if end_index is None:
+        raise CliUsageError("managed watcher crontab block is missing its END sentinel")
+    block = "".join(lines[begin_index : end_index + 1]).rstrip("\n")
+    remaining = "".join(lines[:begin_index] + lines[end_index + 1 :])
+    return block, remaining
+
+
+def _watcher_schedule_status() -> dict[str, Any]:
+    try:
+        crontab_text = _read_user_crontab()
+    except Exception as exc:
+        return {"installed": False, "error": str(exc)}
+    block, _ = _extract_managed_cron_block(crontab_text)
+    return {"installed": block is not None, "block": block or ""}
+
+
+def _validate_cron_schedule(schedule: str) -> str:
+    text = str(schedule or "").strip()
+    if "\n" in text or "\r" in text:
+        raise CliUsageError("schedule must be one line")
+    parts = text.split()
+    if len(parts) != 5:
+        raise CliUsageError("schedule must contain exactly five cron fields")
+    return " ".join(parts)
+
+
+def _watcher_run_command(args: Namespace) -> str:
+    parts = [
+        "hermes",
+        "qdrant",
+        "watcher",
+        "run",
+        "--scope",
+        args.scope,
+        "--max-points",
+        str(args.max_points),
+        "--max-groups",
+        str(args.max_groups),
+        "--reconsolidation-max-candidates",
+        str(args.reconsolidation_max_candidates),
+    ]
+    if not getattr(args, "include_reconsolidation", True):
+        parts.append("--no-include-reconsolidation")
+    parts.append("--json")
+    return " ".join(shlex.quote(str(part)) for part in parts)
+
+
+def _managed_cron_block(args: Namespace) -> str:
+    schedule = _validate_cron_schedule(args.schedule)
+    log_path = _watcher_log_path()
+    command = _watcher_run_command(args)
+    return "\n".join(
+        [
+            _WATCHER_CRON_BEGIN,
+            f"# schedule: {schedule}",
+            f"{schedule} {command} >> {shlex.quote(str(log_path))} 2>&1",
+            _WATCHER_CRON_END,
+        ]
+    )
+
+
+def _install_watcher(args: Namespace) -> dict[str, Any]:
+    new_block = _managed_cron_block(args)
+    crontab_text = _read_user_crontab()
+    existing_block, remaining = _extract_managed_cron_block(crontab_text)
+    changed = existing_block != new_block
+    if existing_block and changed and not getattr(args, "approve", False):
+        raise CliUsageError("--approve is required to replace an existing managed watcher entry")
+    if changed:
+        prefix = remaining.rstrip("\n")
+        updated = (prefix + "\n" if prefix else "") + new_block + "\n"
+        _write_user_crontab(updated)
+    state, _, _ = _read_watcher_state()
+    if state.get("error"):
+        state = {}
+    timestamp = _now_iso()
+    state.update(
+        {
+            "installed": True,
+            "schedule": _validate_cron_schedule(args.schedule),
+            "command": _watcher_run_command(args),
+            "installed_at": timestamp,
+            "updated_at": timestamp,
+        }
+    )
+    _write_watcher_state(state)
     return {
-        "configured": True,
-        "state_path": str(state_path),
-        "state_exists": exists,
-        "state": state,
+        "installed": True,
+        "changed": changed,
+        "schedule": state["schedule"],
+        "command": state["command"],
+        "state_path": str(_watcher_state_path()),
+        "log_path": str(_watcher_log_path()),
     }
+
+
+def _uninstall_watcher(args: Namespace) -> dict[str, Any]:
+    if not getattr(args, "approve", False):
+        raise CliUsageError("--approve is required to uninstall the managed watcher entry")
+    crontab_text = _read_user_crontab()
+    existing_block, remaining = _extract_managed_cron_block(crontab_text)
+    changed = existing_block is not None
+    if changed:
+        _write_user_crontab(remaining.rstrip("\n") + ("\n" if remaining.strip() else ""))
+    state, _, _ = _read_watcher_state()
+    if state.get("error"):
+        state = {}
+    timestamp = _now_iso()
+    state.update({"installed": False, "uninstalled_at": timestamp, "updated_at": timestamp})
+    _write_watcher_state(state)
+    return {"installed": False, "changed": changed, "state_path": str(_watcher_state_path()), "log_path": str(_watcher_log_path())}
+
+
+def _inspect_watcher_state_payload() -> dict[str, Any]:
+    state, exists, error = _read_watcher_state()
+    payload = {"state_path": str(_watcher_state_path()), "state_exists": exists, "state": redact_config(state)}
+    if error:
+        payload["error"] = error
+    return payload
+
+
+def _reset_watcher_signature(args: Namespace) -> dict[str, Any]:
+    if not getattr(args, "approve", False):
+        raise CliUsageError("--approve is required to reset watcher signatures")
+    state, exists, _ = _read_watcher_state()
+    if state.get("error"):
+        state = {}
+    removed = sorted(key for key in _WATCHER_SIGNATURE_KEYS if key in state)
+    for key in removed:
+        state.pop(key, None)
+    state["signature_reset_at"] = _now_iso()
+    _write_watcher_state(state)
+    return {"reset": True, "removed_keys": removed, "state_exists_before": exists, "state_path": str(_watcher_state_path())}
+
+
+def _proposal_signature(report: dict[str, Any]) -> str:
+    proposals = report.get("proposals")
+    proposal_list = proposals if isinstance(proposals, list) else []
+    normalized: list[dict[str, Any]] = []
+    for proposal in proposal_list:
+        if not isinstance(proposal, dict):
+            continue
+        affected = proposal.get("affected_ids")
+        affected_list = affected if isinstance(affected, list) else []
+        normalized.append(
+            {
+                "proposal_id": proposal.get("proposal_id"),
+                "proposal_type": proposal.get("proposal_type"),
+                "suggested_action": proposal.get("suggested_action"),
+                "affected_ids": sorted(str(item) for item in affected_list),
+            }
+        )
+    normalized.sort(key=lambda item: json.dumps(item, sort_keys=True))
+    encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _record_watcher_run(args: Namespace, report: dict[str, Any]) -> None:
+    if getattr(args, "qdrant_subcommand", None) != "watcher" or getattr(args, "watcher_subcommand", None) != "run":
+        return
+    state, _, _ = _read_watcher_state()
+    if state.get("error"):
+        state = {}
+    signature = _proposal_signature(report)
+    previous_signature = state.get("last_proposal_signature")
+    signature_changed = previous_signature != signature
+    force_alert = bool(getattr(args, "force_alert", False))
+    alerted = bool(signature_changed or force_alert)
+    proposals = report.get("proposals")
+    proposal_list = proposals if isinstance(proposals, list) else []
+    timestamp = _now_iso()
+    state.update(
+        {
+            "last_run_at": timestamp,
+            "last_report_id": report.get("report_id"),
+            "last_scope": report.get("scope") or getattr(args, "scope", None),
+            "last_proposal_count": len(proposal_list),
+            "last_proposal_signature": signature,
+            "last_signature_changed": signature_changed,
+            "last_alerted": alerted,
+            "last_force_alert": force_alert,
+            "updated_at": timestamp,
+        }
+    )
+    if alerted:
+        state["last_alert_signature"] = signature
+        state["last_alert_at"] = timestamp
+    _write_watcher_state(state)
+    _append_watcher_log(
+        {
+            "event": "watcher_run",
+            "timestamp": timestamp,
+            "report_id": report.get("report_id"),
+            "scope": report.get("scope") or getattr(args, "scope", None),
+            "proposal_count": len(proposal_list),
+            "signature_changed": signature_changed,
+            "force_alert": force_alert,
+            "alerted": alerted,
+        }
+    )
+
+
+def _watcher_status_payload(*, verbose: bool = False) -> dict[str, Any]:
+    state, exists, error = _read_watcher_state()
+    payload: dict[str, Any] = {
+        "configured": True,
+        "state_path": str(_watcher_state_path()),
+        "state_exists": exists,
+        "state": redact_config(state),
+    }
+    if error:
+        payload["state_error"] = error
+    if verbose:
+        payload["log_path"] = str(_watcher_log_path())
+        payload["schedule"] = _watcher_schedule_status()
+        payload["recent_log_events"] = _read_watcher_log_tail(5).get("events", [])
+    return payload
 
 
 def _configured_artifact_dir(config: dict[str, Any], hermes_home: Path) -> Path:
@@ -893,11 +1199,67 @@ def _format_watcher_status_summary(payload: dict[str, Any]) -> str:
     lines.append(f"configured: {payload.get('configured')}")
     lines.append(f"state_exists: {payload.get('state_exists')}")
     lines.append(f"state_path: {payload.get('state_path')}")
+    if payload.get("log_path"):
+        lines.append(f"log_path: {payload.get('log_path')}")
+    schedule = payload.get("schedule") if isinstance(payload.get("schedule"), dict) else {}
+    if schedule:
+        lines.append(f"installed: {schedule.get('installed')}")
+        if schedule.get("error"):
+            lines.append(f"schedule_error: {_one_line(schedule.get('error'))}")
     state = payload.get("state") if isinstance(payload.get("state"), dict) else {}
     if state.get("last_report_id"):
         lines.append(f"last_report_id: {state.get('last_report_id')}")
+    if state.get("last_proposal_signature"):
+        lines.append(f"last_proposal_signature: {state.get('last_proposal_signature')}")
     if state.get("error"):
         lines.append(f"state_error: {_one_line(state.get('error'))}")
+    events = payload.get("recent_log_events") if isinstance(payload.get("recent_log_events"), list) else []
+    if events:
+        lines.append(f"recent_log_events: {len(events)}")
+    return "\n".join(lines)
+
+
+def _format_watcher_logs_summary(payload: dict[str, Any]) -> str:
+    lines = [f"Watcher log events: {payload.get('count', 0)}", f"log_path: {payload.get('log_path')}"]
+    if not payload.get("log_exists"):
+        lines.append("log_exists: False")
+    events = payload.get("events") if isinstance(payload.get("events"), list) else []
+    for index, event in enumerate(events, start=1):
+        if isinstance(event, dict):
+            summary = event.get("event") or event.get("report_id") or event
+            lines.append(f"{index}. {_safe_scalar(summary)}")
+    if payload.get("error"):
+        lines.append(f"error: {_one_line(payload.get('error'))}")
+    return "\n".join(lines)
+
+
+def _format_watcher_inspect_summary(payload: dict[str, Any]) -> str:
+    lines = ["Watcher state inspect", f"state_exists: {payload.get('state_exists')}", f"state_path: {payload.get('state_path')}"]
+    state = payload.get("state") if isinstance(payload.get("state"), dict) else {}
+    for key in sorted(state):
+        lines.append(f"{key}: {_safe_scalar(state.get(key))}")
+    if payload.get("error"):
+        lines.append(f"error: {_one_line(payload.get('error'))}")
+    return "\n".join(lines)
+
+
+def _format_watcher_install_summary(payload: dict[str, Any]) -> str:
+    action = "installed" if payload.get("installed") else "uninstalled"
+    lines = [f"Watcher {action}: changed={payload.get('changed')}"]
+    if payload.get("schedule"):
+        lines.append(f"schedule: {payload.get('schedule')}")
+    if payload.get("state_path"):
+        lines.append(f"state_path: {payload.get('state_path')}")
+    if payload.get("log_path"):
+        lines.append(f"log_path: {payload.get('log_path')}")
+    return "\n".join(lines)
+
+
+def _format_watcher_reset_summary(payload: dict[str, Any]) -> str:
+    removed = payload.get("removed_keys") if isinstance(payload.get("removed_keys"), list) else []
+    lines = [f"Watcher signature reset: {payload.get('reset')}", f"removed_keys: {', '.join(str(key) for key in removed)}"]
+    if payload.get("state_path"):
+        lines.append(f"state_path: {payload.get('state_path')}")
     return "\n".join(lines)
 
 
@@ -1236,9 +1598,26 @@ def _execute_local_command(args: Namespace, stdout) -> int | None:
     if subcommand == "config" and getattr(args, "config_subcommand", None) == "show":
         _print_payload(_redacted_config(), args, stdout, _format_config_summary)
         return 0
-    if subcommand == "watcher" and getattr(args, "watcher_subcommand", None) == "status":
-        _print_payload(_watcher_status_payload(), args, stdout, _format_watcher_status_summary)
-        return 0
+    if subcommand == "watcher":
+        watcher_subcommand = getattr(args, "watcher_subcommand", None)
+        if watcher_subcommand == "status":
+            _print_payload(_watcher_status_payload(verbose=getattr(args, "verbose", False)), args, stdout, _format_watcher_status_summary)
+            return 0
+        if watcher_subcommand == "logs":
+            _print_payload(_read_watcher_log_tail(getattr(args, "tail", 20)), args, stdout, _format_watcher_logs_summary)
+            return 0
+        if watcher_subcommand == "inspect-state":
+            _print_payload(_inspect_watcher_state_payload(), args, stdout, _format_watcher_inspect_summary)
+            return 0
+        if watcher_subcommand == "install":
+            _print_payload(_install_watcher(args), args, stdout, _format_watcher_install_summary)
+            return 0
+        if watcher_subcommand == "uninstall":
+            _print_payload(_uninstall_watcher(args), args, stdout, _format_watcher_install_summary)
+            return 0
+        if watcher_subcommand == "reset-signature":
+            _print_payload(_reset_watcher_signature(args), args, stdout, _format_watcher_reset_summary)
+            return 0
     return None
 
 
@@ -1454,6 +1833,7 @@ def execute_command(
         else:
             print(f"Error: {_provider_error_message(parsed)}", file=stderr)
         return 1
+    _record_watcher_run(args, parsed)
     if _json_flag(args):
         print(result, file=stdout)
     else:

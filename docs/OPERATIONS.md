@@ -4,7 +4,7 @@ This runbook describes how to operate `hermes-qdrant-memory` safely in a live He
 
 Canonical policy: `docs/SAFETY.md`.
 
-Use this document for status checks, smoke tests, watcher runs, consolidation report review, approved apply flow, post-apply verification, gateway/process restarts, and troubleshooting.
+Use this document for status checks, smoke tests, watcher lifecycle/cron management, watcher logs/state handling, consolidation report review, approved apply flow, post-apply verification, gateway/process restarts, and troubleshooting.
 
 ---
 
@@ -43,6 +43,7 @@ Before operating the plugin, keep these invariants intact:
 - Reconsolidation is draft-only; no automatic fact rewrite.
 - `quality_warning` is manual-review only.
 - Cron/watcher jobs may observe, report, and persist redacted local artifacts only; they must not mutate Qdrant.
+- Watcher lifecycle commands may edit only local watcher state/log artifacts and the sentinel-managed crontab block; uninstall, signature reset, and replacing an existing different watcher block require explicit approval.
 - Local artifacts are allowed when redacted and review-oriented.
 - Do not add literal fake secrets to docs, tests, reports, or examples.
 
@@ -59,7 +60,7 @@ Before using this runbook, confirm:
 - The embedding endpoint is reachable and OpenAI-compatible.
 - The configured embedding vector size matches the target Qdrant collection.
 - The operator has a way to call Hermes tools in the active session.
-- If using watcher flows, the watcher script exists and is executable.
+- If using watcher lifecycle flows, the Hermes CLI is available, `$HERMES_HOME` is writable, and `crontab` is available for install/uninstall. External watcher scripts are legacy/manual compatibility only.
 
 ---
 
@@ -183,9 +184,11 @@ hermes qdrant search "Hermes Qdrant memory" --top-k 3 --include-metadata
 hermes qdrant search "Hermes Qdrant memory" --top-k 3 --include-metadata --json
 hermes qdrant learning preview
 hermes qdrant consolidate --scope both --persist --include-reconsolidation
-hermes qdrant watcher status
-hermes qdrant watcher status --json
-hermes qdrant watcher run --scope both
+hermes qdrant watcher status --verbose
+hermes qdrant watcher status --verbose --json
+hermes qdrant watcher logs --tail 20
+hermes qdrant watcher inspect-state --json
+hermes qdrant watcher run --scope both --force-alert
 hermes qdrant reports list
 hermes qdrant reports list --json
 hermes qdrant reports show REPORT_ID
@@ -211,8 +214,10 @@ Expected behavior:
 - `consolidate --persist` creates a local report artifact under `$HERMES_HOME/qdrant_memory/consolidation/` and performs no Qdrant mutation.
 - `reports list/show` and `proposals show` inspect persisted consolidation artifacts by exact ID only; they do not contact Qdrant or apply proposals.
 - `show POINT_ID --collection memory|learning` is an exact-ID Qdrant read. It omits payloads and vectors unless `--include-payload` or `--include-vector` is explicit.
-- `watcher status` reads local watcher state only; missing state is not an error.
-- `watcher run` maps to report-only consolidation (`dry_run=true`, `persist=true`, `include_examples=false`) and performs no Qdrant mutation.
+- `watcher status`, `watcher logs`, and `watcher inspect-state` read local watcher artifacts only; missing state/log files are not errors.
+- `watcher run` maps to report-only consolidation (`dry_run=true`, `persist=true`, `include_examples=false`) and performs no Qdrant mutation. Successful runs update only local watcher state/log artifacts.
+- `watcher install` / `watcher uninstall --approve` edit only the sentinel-managed crontab block; replacing an existing different watcher block requires `--approve`.
+- `watcher reset-signature --approve` clears only local signature fields and does not remove reports or mutate Qdrant.
 
 For automation, add `--json` where available, keep stdout/stderr separate, and always check the process exit code. Exit `2` means usage/safety validation failure; exit `1` means provider/service/runtime failure or failed diagnostics. Do not parse default human summaries; see [CLI_OUTPUT_CONTRACT.md](CLI_OUTPUT_CONTRACT.md).
 
@@ -289,37 +294,37 @@ The v0.2.0 tag correctly refused the mutation but returned process exit status `
 
 ---
 
-## 6. Watcher force-run
+## 6. Watcher lifecycle and report-only runs
 
-The reference watcher script may be installed outside this repository, usually under `$HOME/.hermes/scripts/`.
+The native watcher CLI is the primary operator interface. It manages one sentinel-delimited user crontab block and local artifacts under `$HERMES_HOME/qdrant_memory/consolidation/`. Legacy external scripts may still exist in older deployments, but new installs should schedule `hermes qdrant watcher run ...` directly.
 
-Check that the watcher script exists before running it:
+Lifecycle commands:
 
 ```bash
-test -x "$HOME/.hermes/scripts/qdrant_sleep_consolidation.py"
+hermes qdrant watcher status --verbose
+hermes qdrant watcher install --schedule "0 3 * * *" --scope both --max-points 300 --max-groups 20 --reconsolidation-max-candidates 10
+hermes qdrant watcher logs --tail 20
+hermes qdrant watcher inspect-state --json
+hermes qdrant watcher reset-signature --approve
+hermes qdrant watcher uninstall --approve
 ```
 
-Native report-only watcher checks are available through the CLI:
+Manual report-only run:
 
 ```bash
-hermes qdrant watcher status --json
-hermes qdrant watcher run --scope both --max-points 300 --max-groups 20 --reconsolidation-max-candidates 10 --json
-```
-
-If using the external reference script, force a watcher/report run:
-
-```bash
-QDRANT_SLEEP_FORCE_ALERT=1 "$HOME/.hermes/scripts/qdrant_sleep_consolidation.py"
+hermes qdrant watcher run --scope both --max-points 300 --max-groups 20 --reconsolidation-max-candidates 10 --force-alert --json
 ```
 
 Expected behavior:
 
-- it checks/generates consolidation proposals;
-- it may persist local redacted report artifacts;
-- CLI `watcher status` may report missing watcher state without error;
-- external script runs may update watcher signature state;
-- it must not apply proposals;
-- it must not upsert, delete, or update Qdrant points.
+- `install` writes or updates only the `BEGIN/END HERMES_QDRANT_WATCHER` crontab block and records local state; replacing an existing different managed block requires `--approve`;
+- `uninstall --approve` removes only that managed block and preserves unrelated crontab lines;
+- `status --verbose`, `logs`, and `inspect-state` read local artifacts only and do not construct the provider;
+- `run` calls report-only consolidation with `dry_run=true`, `persist=true`, and `include_examples=false`;
+- successful `run` stores a stable proposal signature in watcher state and appends one JSONL log event;
+- `--force-alert` records an alert event even when the proposal signature is unchanged;
+- `reset-signature --approve` clears only local signature fields;
+- no watcher command applies proposals, approves learnings, or upserts/deletes/updates Qdrant points.
 
 Recommended watcher consolidation parameters:
 
@@ -529,7 +534,7 @@ Post-restart minimum checks:
 2. `embedding_ok: true`
 3. active provider is Qdrant memory
 4. known harmless marker search works, if a marker exists
-5. watcher force-run only if validating report/watcher behavior
+5. `watcher status --verbose` after scheduler changes; `watcher run --force-alert` only if validating report generation
 
 ---
 
@@ -547,7 +552,9 @@ Post-restart minimum checks:
 | action mismatch | Use only the action matching the proposal type; do not force mismatched actions. |
 | `quality_warning` proposals | Manual review only; never automatic apply. |
 | `reconsolidation_candidate` proposals | Use `draft_review` only; no automatic rewrite. |
-| watcher too noisy | Check watcher signature state, `include_examples=false`, `max_groups`, `max_points`, and severity filtering. |
+| watcher too noisy | Check `hermes qdrant watcher inspect-state`, `watcher logs --tail 20`, `include_examples=false`, `max_groups`, `max_points`, and severity filtering. Use `watcher reset-signature --approve` only when intentionally re-baselining alerts. |
+| watcher not firing | Run `watcher status --verbose`, verify the managed crontab block, log path, executable `hermes` command, and Qdrant/embedding service availability during the scheduled window. |
+| expected alert suppressed | Compare `watcher inspect-state` signature fields with the latest persisted report; use `watcher run --force-alert` for debug and `reset-signature --approve` only after confirming the baseline is stale. |
 | local artifact contains unexpected sensitive material | Stop live operations, inspect/redact/remove local artifact according to local policy, and do not apply the related proposal. |
 
 ---
@@ -562,6 +569,7 @@ Do not automate:
 - broad live indexing;
 - query-based deletion;
 - learning approval;
-- active skill installation from promotion candidates.
+- active skill installation from promotion candidates;
+- watcher signature resets or cron replacement without explicit operator approval.
 
 Automation may report. It must not decide.

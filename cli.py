@@ -218,6 +218,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     watcher_subcommands = watcher.add_subparsers(dest="watcher_subcommand", required=True)
     watcher_status = watcher_subcommands.add_parser("status", help="Show local watcher state without contacting services.")
     watcher_status.set_defaults(qdrant_subcommand="watcher")
+    watcher_status.add_argument("--verbose", action="store_true", help="Include schedule, log, and recent event details.")
     watcher_status.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
     watcher_run = watcher_subcommands.add_parser("run", help="Run report-only watcher consolidation. No Qdrant mutation.")
     watcher_run.set_defaults(qdrant_subcommand="watcher")
@@ -230,7 +231,42 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     except AttributeError:  # pragma: no cover - Python < 3.9 compatibility
         watcher_run.add_argument("--include-reconsolidation", action="store_true", default=True, help="Include reconsolidation candidates. Default: enabled.")
         watcher_run.add_argument("--no-include-reconsolidation", dest="include_reconsolidation", action="store_false", help="Disable reconsolidation candidates.")
+    watcher_run.add_argument("--force-alert", action="store_true", help="Record an alert event even when the proposal signature is unchanged.")
     watcher_run.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
+
+    watcher_install = watcher_subcommands.add_parser("install", help="Install or update the managed crontab watcher entry.")
+    watcher_install.set_defaults(qdrant_subcommand="watcher")
+    watcher_install.add_argument("--schedule", default="0 3 * * *", help="Five-field cron schedule. Default: 0 3 * * *.")
+    watcher_install.add_argument("--scope", choices=["memory", "learning", "both"], default="both", help="Report scope for scheduled runs. Default: both.")
+    watcher_install.add_argument("--max-points", type=_positive_int, default=300, help="Maximum points to inspect per collection. Default: 300.")
+    watcher_install.add_argument("--max-groups", type=_positive_int, default=20, help="Maximum proposals to return. Default: 20.")
+    watcher_install.add_argument("--reconsolidation-max-candidates", type=_positive_int, default=10, help="Maximum reconsolidation candidates. Default: 10.")
+    try:
+        watcher_install.add_argument("--include-reconsolidation", action=argparse.BooleanOptionalAction, default=True, help="Include reconsolidation candidates. Default: enabled.")
+    except AttributeError:  # pragma: no cover - Python < 3.9 compatibility
+        watcher_install.add_argument("--include-reconsolidation", action="store_true", default=True, help="Include reconsolidation candidates. Default: enabled.")
+        watcher_install.add_argument("--no-include-reconsolidation", dest="include_reconsolidation", action="store_false", help="Disable reconsolidation candidates.")
+    watcher_install.add_argument("--approve", action="store_true", help="Required to replace an existing different managed watcher entry.")
+    watcher_install.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
+
+    watcher_uninstall = watcher_subcommands.add_parser("uninstall", help="Remove the managed crontab watcher entry. Requires --approve.")
+    watcher_uninstall.set_defaults(qdrant_subcommand="watcher")
+    watcher_uninstall.add_argument("--approve", action="store_true", help="Required to remove the managed watcher entry.")
+    watcher_uninstall.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
+
+    watcher_logs = watcher_subcommands.add_parser("logs", help="Read local watcher JSONL log events.")
+    watcher_logs.set_defaults(qdrant_subcommand="watcher")
+    watcher_logs.add_argument("--tail", type=_positive_int, default=20, help="Number of events to show. Default: 20.")
+    watcher_logs.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
+
+    watcher_inspect = watcher_subcommands.add_parser("inspect-state", help="Inspect local watcher state with sensitive fields redacted.")
+    watcher_inspect.set_defaults(qdrant_subcommand="watcher")
+    watcher_inspect.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
+
+    watcher_reset = watcher_subcommands.add_parser("reset-signature", help="Clear stored watcher proposal signatures. Requires --approve.")
+    watcher_reset.set_defaults(qdrant_subcommand="watcher")
+    watcher_reset.add_argument("--approve", action="store_true", help="Required to reset local watcher signatures.")
+    watcher_reset.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
 
 
 def qdrant_command(args) -> None:
