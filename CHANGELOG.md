@@ -6,8 +6,13 @@ This project is currently public beta / experimental. The format follows Keep a 
 
 ## [Unreleased]
 
+## [0.8.0]
+
+Eighth public beta release of the Hermes Qdrant Memory Provider. This release focuses on operator safety and release confidence: watcher lifecycle CLI commands, live integration coverage, and dry-run-first manual memory store previews with optional non-destructive duplicate detection.
+
 ### Added
 
+- Plugin metadata version bumped to `0.8.0`.
 - Watcher lifecycle CLI commands: `hermes qdrant watcher install`, `uninstall`, `status --verbose`, `logs`, `inspect-state`, `reset-signature --approve`, and `run --force-alert`.
 - Env-gated live integration tests for read-only search filters, provider store writes, file indexing upsert/stale-delete behavior, and gated consolidation report/apply paths against real Qdrant plus an OpenAI-compatible embedding endpoint.
 - Documentation for `RUN_QDRANT_INTEGRATION` and `QDRANT_TEST_*` live test configuration in README and the operations runbook.
@@ -215,6 +220,7 @@ Second public beta release of the Hermes Qdrant Memory Provider.
 
 Initial public beta tag. The v0.1.0 tag predates the learning, consolidation, reconsolidation, scanner guard, and native CLI MVP work documented in later releases.
 
+[0.8.0]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.8.0
 [0.7.0]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.7.0
 [0.6.0]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.6.0
 [0.5.0]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.5.0

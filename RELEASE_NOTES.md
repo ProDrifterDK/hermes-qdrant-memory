@@ -1,74 +1,95 @@
-# Release Notes: v0.7.0 Public Beta
+# Release Notes: v0.8.0 Public Beta
 
-Hermes Qdrant Memory Provider v0.7.0 is a public beta release focused on read-only search ergonomics. It adds structured filters for memory and learning search across both Hermes tools and the native `hermes qdrant ...` CLI while preserving the conservative mutation boundary established in earlier releases.
+Hermes Qdrant Memory Provider v0.8.0 is a public beta release focused on safer operator workflows and stronger release confidence. It adds watcher lifecycle CLI commands, env-gated live integration coverage, and dry-run-first manual memory store previews with optional non-destructive semantic duplicate detection.
 
 The plugin remains experimental/pre-1.0: it requires external Qdrant and embedding services, retrieved memories are context rather than instructions, and all broad/destructive maintenance paths remain dry-run/review-gated.
 
 ## Highlights
 
-- New read-only filters for `qdrant_memory_search`:
-  - `tags`
-  - `source`
-  - `file_path`
-  - `project_path`
-  - `since`
-  - `until`
-  - `collection` (`memory` or `learning`)
-- New read-only filters for `qdrant_learning_search`:
-  - `tags`
-  - `source`
-  - `file_path`
-  - `project_path`
-  - `since`
-  - `until`
-- Native CLI parity for search filters:
-  - `--tag`
-  - `--source`
-  - `--file-path` / `--path`
-  - `--project-path`
-  - `--since`
-  - `--until`
-  - `--collection memory|learning` on base search
-- `qdrant_memory_search(collection="learning")` routes through the learning collection search path for cross-collection operator workflows.
-- Documentation now covers filter behavior in README, changelog, roadmap, and release notes.
+- Manual memory store is now dry-run-first:
+  - `qdrant_memory_store` defaults to `dry_run=true`;
+  - live writes require explicit `dry_run=false` plus `approve=true`;
+  - native CLI exposes `hermes qdrant store --dry-run|--no-dry-run --approve`.
+- Optional manual-store duplicate preview:
+  - `--preview-duplicates` / `duplicate_preview=true` searches for semantic duplicates before live store;
+  - duplicate hits return candidate details and skip the upsert;
+  - duplicate preview never deletes, merges, or rewrites existing memories.
+- Watcher lifecycle CLI commands:
+  - `hermes qdrant watcher install`;
+  - `hermes qdrant watcher uninstall --approve`;
+  - `hermes qdrant watcher status --verbose`;
+  - `hermes qdrant watcher logs`;
+  - `hermes qdrant watcher inspect-state`;
+  - `hermes qdrant watcher reset-signature --approve`;
+  - `hermes qdrant watcher run --force-alert`.
+- Env-gated live integration tests now cover real Qdrant plus an OpenAI-compatible embedding endpoint for:
+  - read-only search filters;
+  - provider store writes;
+  - file indexing upsert/stale-delete behavior;
+  - gated consolidation report/apply paths.
+- README and operations docs now document `RUN_QDRANT_INTEGRATION` and `QDRANT_TEST_*` live test configuration.
 
-## Filter commands
+## Manual store commands
 
-Default mode is for humans:
+Preview a memory without embedding or upserting:
 
 ```bash
-hermes qdrant search "agent memory" --tag docs --source-type project_doc
-hermes qdrant search "agent memory" --source docs/api.md --file-path /repo/docs/api.md
-hermes qdrant search "agent memory" --project-path /repo --since 2026-01-01T00:00:00Z --until 2026-01-31T23:59:59Z
-hermes qdrant search "tool failure" --collection learning --tag pytest
-hermes qdrant learning search "tool failure" --learning-type workflow_lesson --tag pytest
+hermes qdrant store "Remember this explicit memory" --source-type manual --importance 5 --tag manual
+```
+
+Preview and check for semantic duplicates:
+
+```bash
+hermes qdrant store "Remember this explicit memory" --source-type manual --importance 5 --tag manual --preview-duplicates
+```
+
+Perform an approved live store:
+
+```bash
+hermes qdrant store "Remember this explicit memory" --source-type manual --importance 5 --tag manual --preview-duplicates --no-dry-run --approve
 ```
 
 Automation should use `--json` and check exit status:
 
 ```bash
-hermes qdrant search "agent memory" --tag docs --source-type project_doc --json
-hermes qdrant search "tool failure" --collection learning --tag pytest --json
-hermes qdrant learning search "tool failure" --learning-type workflow_lesson --tag pytest --json
+hermes qdrant store "Remember this explicit memory" --preview-duplicates --json
+hermes qdrant store "Remember this explicit memory" --preview-duplicates --no-dry-run --approve --json
 ```
 
-Behavior summary:
+## Watcher lifecycle commands
 
-- Repeated `--tag` values and comma-separated tags are combined into `tags` filter conditions.
-- `--source`, `--file-path` / `--path`, and `--project-path` are exact payload-field filters.
-- `--since` and `--until` apply inclusive `created_at` range filters.
-- `--collection learning` on base search routes through the learning collection. Use `hermes qdrant learning search` when `--learning-type` is also needed.
-- Human output remains bounded and intended for operators, not parsers.
-- `--json` remains the stable machine-readable mode.
+Inspect watcher state without contacting Qdrant:
+
+```bash
+hermes qdrant watcher status --verbose
+hermes qdrant watcher inspect-state --json
+hermes qdrant watcher logs --tail 20
+```
+
+Install or run the report-only watcher:
+
+```bash
+hermes qdrant watcher install --schedule "0 3 * * *" --json
+hermes qdrant watcher run --scope both --force-alert --json
+```
+
+Approval-gated local scheduler/state mutations:
+
+```bash
+hermes qdrant watcher reset-signature --approve --json
+hermes qdrant watcher uninstall --approve --json
+```
 
 ## Safety behavior
 
 The safety contract remains conservative:
 
-- Search filters only narrow read results.
-- Filters do not add query-based deletion, broad mutation, automatic reconsolidation, or any new write authority.
-- Existing profile/platform scope filters are preserved and combined with the new Qdrant `must` conditions.
-- Tool schemas keep strict `additionalProperties: false` behavior while adding the new filter parameters.
+- Default manual store calls do not mutate Qdrant.
+- Live manual store requires explicit `dry_run=false` plus `approve=true`.
+- Duplicate preview can skip an upsert but never deletes, merges, or rewrites existing memories.
+- `watcher run` remains report-only consolidation with `dry_run=true`, `persist=true`, and no apply/proposal mutation.
+- Watcher lifecycle commands mutate only local scheduler/state/log artifacts, never Qdrant collections.
+- Live integration tests skip by default and use uniquely named temporary collections.
 - Mutating maintenance commands still default to dry-run.
 - Live maintenance mutation still requires explicit approval gates.
 - `quality_warning` proposals remain manual-review only.
@@ -79,7 +100,7 @@ The safety contract remains conservative:
 ```bash
 cd ~/.hermes/plugins/qdrant
 git fetch --tags origin
-git checkout v0.7.0
+git checkout v0.8.0
 ```
 
 Start a fresh Hermes CLI process after upgrading. Restart the gateway only if gateway sessions should load the updated plugin code.
@@ -95,44 +116,35 @@ python -m compileall -q qdrant_memory __init__.py cli.py scripts/check_no_litera
 git diff --check
 ```
 
-Recommended targeted search-filter verification:
+Recommended targeted verification:
 
 ```bash
-python -m pytest tests/test_retriever_search_filters.py tests/test_learning.py tests/test_cli.py -q
+python -m pytest tests/test_tools_retriever_writer.py tests/test_cli.py tests/test_watcher_cli.py tests/integration/test_live_search_filters.py -q
 ```
 
 Recommended consumer smoke after checking out the release tag:
 
 ```bash
 hermes qdrant --help
-hermes qdrant search --help
-hermes qdrant learning search --help
-hermes qdrant search "agent memory" --tag docs --json
-hermes qdrant search "tool failure" --collection learning --tag pytest --json
-hermes qdrant learning search "tool failure" --learning-type workflow_lesson --tag pytest --json
-hermes qdrant doctor
-hermes qdrant doctor --json
+hermes qdrant store --help
+hermes qdrant store "release smoke memory" --preview-duplicates --json
+hermes qdrant store "release smoke memory" --preview-duplicates --no-dry-run
 hermes qdrant watcher status
 hermes qdrant watcher status --json
+hermes qdrant doctor
+hermes qdrant doctor --json
 ```
 
-Verify the CLI process-exit gate for live mutation without approval:
+For the unapproved live store check, expected behavior is:
 
-```bash
-hermes qdrant forget 00000000-0000-0000-0000-000000000000 --no-dry-run
-```
-
-Expected:
-
-- output contains `--approve is required when using --no-dry-run`;
+- output contains `--approve is required when using --no-dry-run` or an equivalent approval-gate error;
 - process exit status is non-zero;
-- no Qdrant deletion occurs.
+- no Qdrant upsert occurs.
 
 ## Not included yet
 
 The following remain future work:
 
-- optional `--dry-run`/duplicate-preview flows for explicit manual stores;
-- env-gated live-service integration tests;
-- watcher install/uninstall/log management commands;
-- formal Python packaging beyond the Hermes plugin clone workflow.
+- formal Python packaging beyond the Hermes plugin clone workflow;
+- verification of whether current Hermes core can discover providers from `~/.hermes/plugins/memory/<name>` without the compatibility symlink;
+- optional broader live-service stress tests beyond the current env-gated integration suite.

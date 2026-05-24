@@ -12,11 +12,11 @@
 
 ## 1. Current state
 
-The project is published as `v0.7.0 Public Beta` and is functional as a Hermes Qdrant-backed memory provider. The latest release URL is:
+The project is published as `v0.8.0 Public Beta` and is functional as a Hermes Qdrant-backed memory provider. The latest release URL is:
 
-- <https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.7.0>
+- <https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.8.0>
 
-Implemented capabilities through v0.7.0:
+Implemented capabilities through v0.8.0:
 
 - Hermes `MemoryProvider` subclass: `QdrantMemoryProvider`.
 - Plugin registration through `register(ctx)`.
@@ -56,7 +56,8 @@ Post-release validation status:
 - v0.4.0 consumer install/runtime smoke for backup/export/restore passed before release preparation.
 - v0.5.0 local and CI verification covered the CLI output contract and human-readable default surface.
 - v0.6.0 release preparation covered read-only point/report/proposal inspection helpers.
-- v0.7.0 release preparation covers read-only search filters; consumer smoke remains the next step after tagging.
+- v0.7.0 release preparation covered read-only search filters; post-tag consumer smoke passed before v0.8.0 release preparation.
+- v0.8.0 release preparation covers watcher lifecycle commands, env-gated live integration tests, and manual-store dry-run/duplicate preview; consumer smoke passed before tagging.
 - Still verify whether current Hermes core can discover providers from `~/.hermes/plugins/memory/<name>` without the compatibility symlink.
 
 ---
@@ -1030,7 +1031,7 @@ Keep manual writes ergonomic, but consider:
 - scanner/noise warnings before live store;
 - explicit `--approve` option for non-interactive scripts.
 
-### Priority 7: Watcher/cron management CLI — implemented in Unreleased
+### Priority 7: Watcher/cron management CLI — implemented in v0.8.0
 
 Watcher remains report-only while lifecycle commands now cover:
 

@@ -178,14 +178,14 @@ Call qdrant_memory_forget with ids=["<POINT_ID>"] and dry_run=false.
 
 Never delete by query.
 
-### Step 5: Native CLI smoke for current output-contract builds
+### Step 5: Native CLI smoke for current release builds
 
-For v0.5.0 and later output-contract validation, verify the installed plugin as a user would run it:
+For current release validation, verify the installed plugin as a user would run it:
 
 ```bash
 cd ~/.hermes/plugins/qdrant
 git fetch --tags origin
-git checkout v0.5.0
+git checkout v0.8.0
 hermes qdrant config show
 hermes qdrant config show --json
 hermes qdrant status
