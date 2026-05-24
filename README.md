@@ -8,7 +8,7 @@ This plugin turns Hermes memory into an external associative substrate: conversa
 
 ## Status
 
-Public beta / experimental. Current published release: `v0.7.0 Public Beta`. The plugin is functional and tested, but it depends on external Qdrant and embedding services. Learning, origin-time fact metadata, sleep consolidation, manual-review reconsolidation, native Hermes CLI commands with human-readable defaults, backup/export/restore recovery primitives, and read-only inspection helpers are implemented with conservative gates. Filtered search ergonomics are implemented without widening mutation authority; automatic reconsolidation remains disabled by design.
+Public beta / experimental. Current published release: `v0.7.0 Public Beta`. The plugin is functional and tested, but it depends on external Qdrant and embedding services. Learning, origin-time fact metadata, sleep consolidation, manual-review reconsolidation, native Hermes CLI commands with human-readable defaults, backup/export/restore recovery primitives, manual-store dry-run/duplicate-preview flows, and read-only inspection helpers are implemented with conservative gates. Filtered search ergonomics are implemented without widening mutation authority; automatic reconsolidation remains disabled by design.
 
 ## What it does
 
@@ -42,6 +42,7 @@ Public beta / experimental. Current published release: `v0.7.0 Public Beta`. The
 | Hermes MemoryProvider auto-recall | Implemented |
 | Completed-turn write-through indexing | Implemented |
 | Manual memory store/search/status tools | Implemented |
+| Manual store dry-run and duplicate preview | Implemented |
 | Markdown/text file indexing | Implemented |
 | Dry-run index preview | Implemented |
 | File-level manifest sync / stale chunk deletion | Implemented |
@@ -484,6 +485,8 @@ qdrant_memory:
   index_exclude_dirs: [".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", "target", ".next", ".cache"]
   index_max_files: 500
   index_dry_run_default: true
+  manual_store_duplicate_threshold: 0.92
+  manual_store_duplicate_top_k: 3
 ```
 
 ### Chunk-size note
@@ -544,6 +547,23 @@ Filter behavior:
 - `--collection learning` on `hermes qdrant search` routes through the learning collection search path. Use `hermes qdrant learning search` when you also need `--learning-type`.
 - These filters only restrict reads; they do not enable query-based deletion or broad mutation.
 
+## Native CLI manual store preview
+
+Manual store is dry-run-first. The default command previews the point ID and high-level store metadata without embedding or upserting. Live writes require both `--no-dry-run` and `--approve`.
+
+```bash
+hermes qdrant store "Remember this explicit memory" --source-type manual --importance 5 --tag manual
+hermes qdrant store "Remember this explicit memory" --preview-duplicates
+hermes qdrant store "Remember this explicit memory" --preview-duplicates --no-dry-run --approve
+```
+
+Behavior:
+
+- `--dry-run` is the default and performs no Qdrant mutation.
+- `--no-dry-run` without `--approve` is rejected before the provider call.
+- `--preview-duplicates` runs a semantic search scoped to the configured memory collection/profile/source type. If a candidate meets `manual_store_duplicate_threshold`, the live path returns the duplicate details and skips the upsert.
+- Duplicate preview is an explicit operator aid; it does not delete, merge, or rewrite existing memories.
+
 ## Tools exposed to Hermes
 
 ### `qdrant_memory_status`
@@ -570,7 +590,48 @@ Useful arguments:
 
 ### `qdrant_memory_store`
 
-Manually stores a memory chunk with optional metadata.
+Manually stores a memory chunk with optional metadata. Safe default: `dry_run` is true unless overridden, so ordinary calls return the deterministic point ID and metadata preview without embedding or upserting.
+
+Useful arguments:
+
+- `text`
+- `source_type`
+- `importance`
+- `tags`
+- `dry_run`: defaults to true.
+- `approve`: required when `dry_run` is false.
+- `duplicate_preview`: when true, searches for a semantic duplicate before storing.
+- `duplicate_threshold`: optional per-call duplicate threshold.
+- `duplicate_top_k`: optional candidate count for duplicate preview.
+
+Example dry run:
+
+```text
+Call qdrant_memory_store with:
+{
+  "text": "Project X uses pnpm and deploys on Railway.",
+  "source_type": "manual",
+  "tags": ["project-x", "railway"],
+  "dry_run": true,
+  "duplicate_preview": true
+}
+```
+
+Example live store after reviewing the preview:
+
+```text
+Call qdrant_memory_store with:
+{
+  "text": "Project X uses pnpm and deploys on Railway.",
+  "source_type": "manual",
+  "tags": ["project-x", "railway"],
+  "dry_run": false,
+  "approve": true,
+  "duplicate_preview": true
+}
+```
+
+If `duplicate_preview` finds a duplicate above threshold, live mode returns `duplicate_found: true`, `saved: false`, and does not upsert. It never deletes or merges the existing point.
 
 ### `qdrant_memory_index`
 

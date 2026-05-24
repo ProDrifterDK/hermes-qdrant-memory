@@ -287,7 +287,8 @@ Implemented command namespace:
 hermes qdrant config show --json
 hermes qdrant status
 hermes qdrant doctor
-hermes qdrant store "Remember this explicit memory" --source-type manual --importance 5 --tag manual
+hermes qdrant store "Remember this explicit memory" --source-type manual --importance 5 --tag manual --preview-duplicates
+hermes qdrant store "Remember this explicit memory" --source-type manual --importance 5 --tag manual --preview-duplicates --no-dry-run --approve
 hermes qdrant search "query text" --top-k 5 --json
 hermes qdrant index docs README.md --dry-run
 hermes qdrant forget POINT_ID --dry-run
@@ -309,7 +310,9 @@ hermes qdrant watcher uninstall --approve --json
 CLI rules:
 
 - `config show`, `watcher status`, `watcher logs`, `watcher inspect-state`, `watcher install`, `watcher uninstall`, and `watcher reset-signature` are local provider-free operations.
-- `store` and `learning store` are explicit live writes by design.
+- `store` previews by default and requires `--no-dry-run --approve` for live manual writes.
+- `store --preview-duplicates` can refuse an upsert when a semantic duplicate is found, but it never deletes, merges, or rewrites existing points.
+- `learning store` remains an explicit live write by design.
 - Maintenance mutations default to `--dry-run`.
 - Live maintenance mutation requires both `--no-dry-run` and `--approve`.
 - Apply commands require exact `report_id` and `proposal_id`.
@@ -505,6 +508,7 @@ Completed tasks:
 4. Added M18 parity commands in v0.3.0: `config show`, `store`, `learning store`, `learning approve`, `watcher status`, and report-only `watcher run`.
 5. Preserved dry-run defaults and live-mutation approval gates.
 6. Added CLI tests for parsing, command-to-tool mapping, import isolation, exit codes, config redaction/no-provider behavior, watcher state reads, and safety gates.
+7. Added manual store dry-run defaults, live approval gating, and duplicate-preview mapping for `hermes qdrant store`.
 
 Deferred to post-v0.3.0 CLI roadmap:
 
@@ -515,7 +519,8 @@ Verification:
 ```bash
 hermes qdrant config show --json
 hermes qdrant status
-hermes qdrant store "Manual memory" --tag manual
+hermes qdrant store "Manual memory" --tag manual --preview-duplicates
+hermes qdrant store "Manual memory" --tag manual --preview-duplicates --no-dry-run --approve
 hermes qdrant search "Hermes Qdrant memory"
 hermes qdrant learning store "Procedural lesson" --tag manual
 hermes qdrant learning approve CANDIDATE_ID --dry-run
@@ -1058,8 +1063,8 @@ Verify whether current Hermes core can discover user memory providers from `~/.h
 
 ## 14. Immediate next action
 
-1. Add optional `--dry-run` / duplicate-preview flows for explicit manual stores.
-2. Verify installed-plugin `hermes qdrant --help` and scheduler behavior from a consumer checkout before the next release tag.
+1. Verify installed-plugin `hermes qdrant --help` and manual store preview behavior from a consumer checkout before the next release tag.
+2. Verify scheduler behavior from a consumer checkout before the next release tag.
 3. Continue expanding live-service coverage for installed-plugin and real-subprocess compatibility paths.
 
-This order keeps the project grounded: watcher/cron lifecycle is now operable without expanding Qdrant mutation authority; the next work improves explicit-write ergonomics and runtime confidence before adding stronger memory mutation capabilities.
+This order keeps the project grounded: watcher/cron lifecycle is now operable without expanding Qdrant mutation authority; explicit manual store ergonomics now remain dry-run-first, and the next work improves runtime confidence before adding stronger memory mutation capabilities.

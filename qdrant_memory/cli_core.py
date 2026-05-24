@@ -1427,11 +1427,32 @@ def _format_result_list(payload: dict[str, Any], *, label: str, plural_label: st
 def _format_store_summary(payload: dict[str, Any], *, learning: bool = False) -> str:
     label = "learning" if learning else "memory"
     item_id = payload.get("id") or "<unknown>"
-    lines = [f"Saved {label}: {item_id}" if payload.get("saved") else f"{label.capitalize()} not saved"]
+    if payload.get("saved"):
+        lines = [f"Saved {label}: {item_id}"]
+    elif payload.get("dry_run", False):
+        lines = [f"{label.capitalize()} store dry-run: {item_id}"]
+        if payload.get("would_store") is not None:
+            lines.append(f"would_store: {str(bool(payload.get('would_store'))).lower()}")
+    elif payload.get("duplicate_found"):
+        lines = [f"{label.capitalize()} not saved: duplicate found"]
+    else:
+        lines = [f"{label.capitalize()} not saved"]
     if payload.get("source_type"):
         lines.append(f"source_type: {payload.get('source_type')}")
     if payload.get("collection_name"):
         lines.append(f"collection: {payload.get('collection_name')}")
+    if payload.get("duplicate_preview") is not None:
+        lines.append(f"duplicate_preview: {str(bool(payload.get('duplicate_preview'))).lower()}")
+    if payload.get("duplicate_found") is not None:
+        lines.append(f"duplicate_found: {str(bool(payload.get('duplicate_found'))).lower()}")
+    duplicate = payload.get("duplicate") if isinstance(payload.get("duplicate"), dict) else None
+    if duplicate:
+        if duplicate.get("id"):
+            lines.append(f"duplicate_id: {duplicate.get('id')}")
+        try:
+            lines.append(f"duplicate_score: {float(duplicate.get('score', 0.0)):.3f}")
+        except Exception:
+            pass
     return "\n".join(lines)
 
 
@@ -1635,13 +1656,19 @@ def build_tool_call(args: Namespace) -> tuple[str, dict[str, Any]]:
         raise CliUsageError("unsupported qdrant config command")
 
     if subcommand == "store":
+        _require_live_approval(args)
         text = _non_empty(args.text, "text")
-        return "qdrant_memory_store", {
+        tool_args = {
             "text": text,
             "source_type": args.source_type or "manual",
             "importance": args.importance,
             "tags": _split_tags(getattr(args, "tag", [])),
+            "dry_run": args.dry_run,
+            "duplicate_preview": bool(getattr(args, "preview_duplicates", False)),
         }
+        if getattr(args, "approve", False):
+            tool_args["approve"] = True
+        return "qdrant_memory_store", tool_args
 
     if subcommand == "search":
         tool_args = {

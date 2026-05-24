@@ -79,6 +79,17 @@ def test_register_cli_adds_mvp_subcommands_and_safe_defaults():
     assert search.top_k == 3
     assert search.json is True
 
+    store = parser.parse_args(["qdrant", "store", "manual memory"])
+    assert store.text == "manual memory"
+    assert store.dry_run is True
+    assert store.approve is False
+    assert store.preview_duplicates is False
+
+    live_store = parser.parse_args(["qdrant", "store", "manual memory", "--preview-duplicates", "--no-dry-run", "--approve"])
+    assert live_store.dry_run is False
+    assert live_store.approve is True
+    assert live_store.preview_duplicates is True
+
     index = parser.parse_args(["qdrant", "index", "docs", "README.md"])
     assert index.paths == ["docs", "README.md"]
     assert index.dry_run is True
@@ -217,6 +228,27 @@ def test_build_tool_call_preserves_dry_run_and_approval_gates():
         "qdrant_memory_index",
         {"paths": ["docs"], "dry_run": True, "force": False, "max_files": 10},
     )
+
+    store = parser.parse_args(["qdrant", "store", "manual memory", "--preview-duplicates"])
+    assert build_tool_call(store) == (
+        "qdrant_memory_store",
+        {
+            "text": "manual memory",
+            "source_type": "manual",
+            "importance": 5,
+            "tags": [],
+            "dry_run": True,
+            "duplicate_preview": True,
+        },
+    )
+
+    unapproved_store = parser.parse_args(["qdrant", "store", "manual memory", "--no-dry-run"])
+    with pytest.raises(CliUsageError, match="--approve is required"):
+        build_tool_call(unapproved_store)
+
+    live_store = parser.parse_args(["qdrant", "store", "manual memory", "--no-dry-run", "--approve"])
+    assert build_tool_call(live_store)[1]["dry_run"] is False
+    assert build_tool_call(live_store)[1]["approve"] is True
 
     live_index = parser.parse_args(["qdrant", "index", "docs", "--no-dry-run", "--approve"])
     assert build_tool_call(live_index)[1]["dry_run"] is False
@@ -487,6 +519,18 @@ def test_provider_backed_commands_default_to_human_summaries_and_json_can_remain
             "qdrant_memory_store",
             '{"saved":true,"id":"m1","source_type":"manual"}',
             ["Saved memory: m1", "source_type: manual"],
+        ),
+        (
+            ["qdrant", "store", "alpha memory"],
+            "qdrant_memory_store",
+            '{"dry_run":true,"saved":false,"would_store":true,"id":"m-dry","source_type":"manual","duplicate_preview":true,"duplicate_found":false}',
+            ["Memory store dry-run: m-dry", "would_store: true", "duplicate_preview: true", "duplicate_found: false"],
+        ),
+        (
+            ["qdrant", "store", "alpha memory"],
+            "qdrant_memory_store",
+            '{"dry_run":false,"saved":false,"would_store":false,"id":"m-new","source_type":"manual","duplicate_preview":true,"duplicate_found":true,"duplicate":{"id":"m-existing","score":0.93}}',
+            ["Memory not saved: duplicate found", "duplicate_id: m-existing", "duplicate_score: 0.930"],
         ),
         (
             ["qdrant", "learning", "preview"],
@@ -801,7 +845,14 @@ def test_build_tool_call_maps_store_with_comma_friendly_tags():
     args = parser.parse_args(["qdrant", "store", "remember this", "--source-type", "manual", "--importance", "8", "--tag", "alpha,beta", "--tag", "gamma"])
     assert build_tool_call(args) == (
         "qdrant_memory_store",
-        {"text": "remember this", "source_type": "manual", "importance": 8, "tags": ["alpha", "beta", "gamma"]},
+        {
+            "text": "remember this",
+            "source_type": "manual",
+            "importance": 8,
+            "tags": ["alpha", "beta", "gamma"],
+            "dry_run": True,
+            "duplicate_preview": False,
+        },
     )
 
     with pytest.raises(CliUsageError, match="text is required"):
