@@ -783,7 +783,7 @@ python -m compileall -q qdrant_memory __init__.py cli.py scripts/check_no_litera
 
 ### Live Qdrant/embedding integration tests
 
-The live integration suite verifies memory search filters, learning search filters, and `qdrant_memory_search` routing to the learning collection against real Qdrant and a real OpenAI-compatible embedding endpoint.
+The live integration suite verifies memory search filters, learning search filters, `qdrant_memory_search` routing to the learning collection, explicit memory/learning store writes, file indexing upsert/stale-delete behavior, and consolidation report/apply gates against real Qdrant and a real OpenAI-compatible embedding endpoint.
 
 Run only against disposable test collections. The tests create unique collection names from `QDRANT_TEST_COLLECTION_PREFIX` plus a random token and delete only those exact names during teardown, but you should still never point the integration environment at production-only services or use a prefix that overlaps production collection names.
 

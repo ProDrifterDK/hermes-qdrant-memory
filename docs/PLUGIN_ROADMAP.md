@@ -1041,7 +1041,7 @@ Safety boundary: install/uninstall edits only the sentinel-managed crontab block
 
 ### Priority 8: Integration and compatibility tests
 
-Add optional live-service tests gated by explicit environment variables, e.g. `RUN_QDRANT_INTEGRATION=1`, so CI remains hermetic by default but maintainers can validate real Qdrant + embedding behavior before releases.
+Add optional live-service tests gated by explicit environment variables, e.g. `RUN_QDRANT_INTEGRATION=1`, so CI remains hermetic by default but maintainers can validate real Qdrant + embedding behavior before releases. Current live coverage includes search filters, provider store writes, file indexing upsert/stale-delete behavior, and gated consolidation report/apply paths over disposable collections.
 
 Also verify:
 
@@ -1059,7 +1059,7 @@ Verify whether current Hermes core can discover user memory providers from `~/.h
 ## 14. Immediate next action
 
 1. Add optional `--dry-run` / duplicate-preview flows for explicit manual stores.
-2. Expand env-gated live-service coverage beyond search filters now that watcher lifecycle ergonomics are stable.
-3. Verify installed-plugin `hermes qdrant --help` and scheduler behavior from a consumer checkout before the next release tag.
+2. Verify installed-plugin `hermes qdrant --help` and scheduler behavior from a consumer checkout before the next release tag.
+3. Continue expanding live-service coverage for installed-plugin and real-subprocess compatibility paths.
 
 This order keeps the project grounded: watcher/cron lifecycle is now operable without expanding Qdrant mutation authority; the next work improves explicit-write ergonomics and runtime confidence before adding stronger memory mutation capabilities.
