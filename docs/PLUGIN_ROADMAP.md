@@ -12,11 +12,11 @@
 
 ## 1. Current state
 
-The project is preparing `v0.6.0 Public Beta` and is functional as a Hermes Qdrant-backed memory provider. The latest published release remains:
+The project is published as `v0.6.0 Public Beta` and is functional as a Hermes Qdrant-backed memory provider. The latest release URL is:
 
-- <https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.5.0>
+- <https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.6.0>
 
-Implemented capabilities through the v0.6.0 release candidate:
+Implemented capabilities through v0.6.0:
 
 - Hermes `MemoryProvider` subclass: `QdrantMemoryProvider`.
 - Plugin registration through `register(ctx)`.
@@ -633,7 +633,7 @@ Recommended execution order:
 | 5 | Plugin metadata tests | Completed | Release | Locks formal plugin shape. |
 | 6 | Scanner-safe fixture guard | Completed | More tests/docs | Prevents repeat GitGuardian incidents. |
 | 7 | CLI feasibility spike | Completed | CLI MVP | Determines whether commands are Hermes-native or standalone wrapper. |
-| 8 | CLI MVP | Completed | Release candidate | Adds human operation surface after safety gates. |
+| 8 | CLI MVP | Completed | Public beta release | Adds human operation surface after safety gates. |
 | 9 | Release documentation update | Completed | Release | Packages everything for public users. |
 
 Verification categories:

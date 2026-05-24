@@ -8,7 +8,7 @@ This plugin turns Hermes memory into an external associative substrate: conversa
 
 ## Status
 
-Public beta / experimental. Current release candidate: `v0.6.0 Public Beta`. The plugin is functional and tested, but it depends on external Qdrant and embedding services. Learning, origin-time fact metadata, sleep consolidation, manual-review reconsolidation, native Hermes CLI commands with human-readable defaults, backup/export/restore recovery primitives, and read-only inspection helpers are implemented with conservative gates; automatic reconsolidation remains disabled by design.
+Public beta / experimental. Current release: `v0.6.0 Public Beta`. The plugin is functional and tested, but it depends on external Qdrant and embedding services. Learning, origin-time fact metadata, sleep consolidation, manual-review reconsolidation, native Hermes CLI commands with human-readable defaults, backup/export/restore recovery primitives, and read-only inspection helpers are implemented with conservative gates; automatic reconsolidation remains disabled by design.
 
 ## What it does
 
@@ -241,7 +241,7 @@ cd ~/.hermes/plugins/qdrant
 git pull --ff-only origin main
 ```
 
-Use the prepared `v0.6.0` tag instead of `main` when you want the next stable beta snapshot after it is published:
+Use the published `v0.6.0` tag instead of `main` when you want a stable beta snapshot:
 
 ```bash
 cd ~/.hermes/plugins/qdrant
