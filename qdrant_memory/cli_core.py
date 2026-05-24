@@ -51,6 +51,16 @@ def _non_empty(value: Any, name: str) -> str:
     return text
 
 
+_ARTIFACT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+
+
+def _safe_artifact_id(value: Any, name: str) -> str:
+    text = _non_empty(value, name)
+    if text in {".", ".."} or "/" in text or "\\" in text or not _ARTIFACT_ID_RE.match(text):
+        raise CliUsageError(f"invalid {name}")
+    return text
+
+
 def _hermes_home() -> Path:
     return Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
 
@@ -152,6 +162,79 @@ def _watcher_status_payload() -> dict[str, Any]:
         "state_path": str(state_path),
         "state_exists": exists,
         "state": state,
+    }
+
+
+def _configured_artifact_dir(config: dict[str, Any], hermes_home: Path) -> Path:
+    configured = str(config.get("consolidation_artifact_dir") or "").strip()
+    return Path(configured).expanduser() if configured else hermes_home / "qdrant_memory" / "consolidation"
+
+
+def _safe_report_path(config: dict[str, Any], hermes_home: Path, report_id: str) -> Path:
+    safe_id = _safe_artifact_id(report_id, "report_id")
+    root = _configured_artifact_dir(config, hermes_home).resolve()
+    path = (root / f"report-{safe_id}.json").resolve()
+    if path.parent != root:
+        raise CliUsageError("invalid report_id path")
+    return path
+
+
+def _load_report_artifact(config: dict[str, Any], hermes_home: Path, report_id: str) -> dict[str, Any]:
+    path = _safe_report_path(config, hermes_home, report_id)
+    if not path.exists() or not path.is_file():
+        raise CliUsageError(f"consolidation report not found: {_safe_artifact_id(report_id, 'report_id')}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise CliUsageError(f"failed to read consolidation report: {exc}") from exc
+    if not isinstance(data, dict):
+        raise CliUsageError("invalid consolidation report")
+    return data
+
+
+def _report_proposal_count(report: dict[str, Any]) -> int:
+    proposals = report.get("proposals")
+    if isinstance(proposals, list):
+        return len(proposals)
+    artifact_raw = report.get("artifact")
+    artifact = artifact_raw if isinstance(artifact_raw, dict) else {}
+    try:
+        return int(artifact.get("proposal_count", 0))
+    except Exception:
+        return 0
+
+
+def _report_summary_item(path: Path, report: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "report_id": str(report.get("report_id") or path.stem.removeprefix("report-")),
+        "created_at": report.get("created_at"),
+        "scope": report.get("scope"),
+        "proposal_count": _report_proposal_count(report),
+        "summary": report.get("summary") if isinstance(report.get("summary"), dict) else {},
+        "path": str(path),
+    }
+
+
+def _list_report_artifacts(config: dict[str, Any], hermes_home: Path, *, limit: int = 20) -> dict[str, Any]:
+    root = _configured_artifact_dir(config, hermes_home)
+    reports: list[dict[str, Any]] = []
+    if root.exists() and root.is_dir():
+        for path in root.glob("report-*.json"):
+            if not path.is_file():
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    reports.append(_report_summary_item(path, data))
+            except Exception:
+                continue
+    reports.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+    max_reports = max(1, int(limit or 20))
+    return {
+        "artifact_root": str(root),
+        "count": len(reports),
+        "reports": reports[:max_reports],
+        "truncated": len(reports) > max_reports,
     }
 
 
@@ -289,7 +372,7 @@ def _local_service_error_message(exc: RuntimeError) -> str:
         return f"Qdrant service request failed (HTTP {http_match.group(1)})"
     if "qdrant" in message.lower():
         return "Qdrant service request failed"
-    return "Local qdrant backup/export/restore command failed"
+    return "Local qdrant command failed"
 
 
 def _local_config() -> tuple[Path, dict[str, Any]]:
@@ -297,6 +380,134 @@ def _local_config() -> tuple[Path, dict[str, Any]]:
 
     hermes_home = _hermes_home()
     return hermes_home, load_config(hermes_home=str(hermes_home))
+
+
+def _redact_for_output(value: Any) -> Any:
+    from qdrant_memory.consolidation import redact_secrets
+
+    return redact_secrets(value)
+
+
+def _collection_name_for_cli_scope(config: dict[str, Any], scope: str) -> str:
+    if scope == "memory":
+        return str(config.get("collection_name") or "hermes_memory")
+    if scope == "learning":
+        return str(config.get("learning_collection_name") or "hermes_learnings")
+    raise CliUsageError("collection must be one of: memory, learning")
+
+
+def _point_vector(point: dict[str, Any]) -> Any:
+    if "vector" in point:
+        return point.get("vector")
+    if "vectors" in point:
+        return point.get("vectors")
+    return None
+
+
+def _point_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    keys = ("source_type", "created_at", "updated_at", "importance", "confidence", "learning_type", "file_path", "source", "session_id", "tags")
+    return {key: payload.get(key) for key in keys if payload.get(key) not in (None, "")}
+
+
+def _point_snippet(payload: dict[str, Any]) -> str:
+    text = payload.get("text") or payload.get("lesson") or ""
+    return _one_line(_redact_for_output(text), max_chars=180) if text else ""
+
+
+def _build_point_payload(raw_point: dict[str, Any] | None, *, point_id: str, collection: str, collection_name: str, include_payload: bool, include_vector: bool) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "found": raw_point is not None,
+        "point_id": point_id,
+        "collection": collection,
+        "collection_name": collection_name,
+        "payload_included": bool(include_payload),
+        "vector_included": bool(include_vector),
+    }
+    if raw_point is None:
+        return result
+    payload_raw = raw_point.get("payload") if isinstance(raw_point.get("payload"), dict) else {}
+    payload = _redact_for_output(payload_raw)
+    payload = payload if isinstance(payload, dict) else {}
+    result["metadata"] = _point_metadata(payload)
+    if include_payload:
+        snippet = _point_snippet(payload)
+        if snippet:
+            result["snippet"] = snippet
+        result["payload"] = payload
+    if include_vector:
+        vector = _point_vector(raw_point)
+        if vector is not None:
+            result["vector"] = vector
+    return result
+
+
+def _execute_inspection_command(args: Namespace, stdout) -> int | None:
+    subcommand = getattr(args, "qdrant_subcommand", None)
+    if subcommand not in {"show", "reports", "proposals"}:
+        return None
+
+    hermes_home, config = _local_config()
+    if subcommand == "show":
+        from qdrant_memory.backup import qdrant_client_from_config
+
+        point_id = _non_empty(getattr(args, "point_id", ""), "point_id")
+        collection = str(getattr(args, "collection", ""))
+        collection_name = _collection_name_for_cli_scope(config, collection)
+        include_vector = bool(getattr(args, "include_vector", False))
+        qdrant = qdrant_client_from_config(config)
+        points = qdrant.retrieve(collection_name, [point_id], with_payload=True, with_vector=include_vector)
+        raw_point = points[0] if points else None
+        payload = _build_point_payload(
+            raw_point,
+            point_id=point_id,
+            collection=collection,
+            collection_name=collection_name,
+            include_payload=bool(getattr(args, "include_payload", False)),
+            include_vector=include_vector,
+        )
+        _print_payload(payload, args, stdout, _format_point_summary)
+        return 0
+
+    if subcommand == "reports":
+        reports_subcommand = getattr(args, "reports_subcommand", None)
+        if reports_subcommand == "list":
+            payload = _list_report_artifacts(config, hermes_home, limit=int(getattr(args, "limit", 20) or 20))
+            payload = _redact_for_output(payload)
+            _print_payload(payload if isinstance(payload, dict) else {}, args, stdout, _format_reports_list_summary)
+            return 0
+        if reports_subcommand == "show":
+            report_id = _safe_artifact_id(getattr(args, "report_id", ""), "report_id")
+            report = _load_report_artifact(config, hermes_home, report_id)
+            payload = _redact_for_output(report)
+            _print_payload(payload if isinstance(payload, dict) else {}, args, stdout, _format_report_show_summary)
+            return 0
+        raise CliUsageError("unsupported qdrant reports command")
+
+    if subcommand == "proposals":
+        proposals_subcommand = getattr(args, "proposals_subcommand", None)
+        if proposals_subcommand == "show":
+            from qdrant_memory.consolidation import expected_action_for_proposal, find_proposal
+
+            report_id = _safe_artifact_id(getattr(args, "report_id", ""), "report_id")
+            proposal_id = _safe_artifact_id(getattr(args, "proposal_id", ""), "proposal_id")
+            report = _load_report_artifact(config, hermes_home, report_id)
+            try:
+                proposal = find_proposal(report, proposal_id)
+            except KeyError as exc:
+                raise CliUsageError(f"proposal_id not found: {proposal_id}") from exc
+            proposal = _redact_for_output(proposal)
+            proposal = proposal if isinstance(proposal, dict) else {}
+            payload = {
+                "report_id": report_id,
+                "proposal_id": proposal_id,
+                "expected_action": expected_action_for_proposal(str(proposal.get("proposal_type") or "")),
+                "proposal": proposal,
+            }
+            _print_payload(payload, args, stdout, _format_proposal_show_summary)
+            return 0
+        raise CliUsageError("unsupported qdrant proposals command")
+
+    return None
 
 
 def _execute_backup_export_restore_command(args: Namespace, stdout) -> int | None:
@@ -667,6 +878,96 @@ def _format_watcher_status_summary(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_point_summary(payload: dict[str, Any]) -> str:
+    found = bool(payload.get("found"))
+    point_id = payload.get("point_id") or "<unknown>"
+    lines = [f"Point: {point_id}" if found else f"Point not found: {point_id}"]
+    lines.append(f"collection: {payload.get('collection')} ({payload.get('collection_name')})")
+    lines.append(f"payload_included: {payload.get('payload_included')}")
+    lines.append(f"vector_included: {payload.get('vector_included')}")
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    for key in ("source_type", "created_at", "updated_at", "importance", "confidence", "learning_type", "file_path", "session_id"):
+        if metadata.get(key) not in (None, ""):
+            lines.append(f"{key}: {_safe_scalar(metadata.get(key))}")
+    if payload.get("snippet"):
+        lines.append(f"snippet: {_one_line(payload.get('snippet'), max_chars=180)}")
+    vector = payload.get("vector")
+    if isinstance(vector, list):
+        lines.append(f"vector_size: {len(vector)}")
+    elif isinstance(vector, dict):
+        lines.append(f"vector_names: {', '.join(sorted(str(key) for key in vector))}")
+    payload_data = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+    if payload_data:
+        lines.append("payload:")
+        for key in sorted(payload_data)[:20]:
+            lines.append(f"  {key}: {_safe_scalar(payload_data.get(key))}")
+        if len(payload_data) > 20:
+            lines.append(f"  ... {len(payload_data) - 20} more payload fields not shown")
+    return "\n".join(lines)
+
+
+def _format_reports_list_summary(payload: dict[str, Any]) -> str:
+    reports = payload.get("reports") if isinstance(payload.get("reports"), list) else []
+    lines = [f"Reports: {payload.get('count', len(reports))}", f"artifact_root: {payload.get('artifact_root')}"]
+    for index, report in enumerate(reports, start=1):
+        if not isinstance(report, dict):
+            continue
+        line = f"{index}. {report.get('report_id')} proposals={report.get('proposal_count')} scope={report.get('scope')}"
+        if report.get("created_at"):
+            line += f" created_at={report.get('created_at')}"
+        lines.append(line)
+        summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+        for key in sorted(summary):
+            lines.append(f"   {key}: {summary.get(key)}")
+    if payload.get("truncated"):
+        lines.append("... additional reports not shown")
+    return "\n".join(lines)
+
+
+def _format_report_show_summary(payload: dict[str, Any]) -> str:
+    lines = [f"Report: {payload.get('report_id')}"]
+    if payload.get("created_at"):
+        lines.append(f"created_at: {payload.get('created_at')}")
+    if payload.get("scope"):
+        lines.append(f"scope: {payload.get('scope')}")
+    lines.append(f"proposal_count: {_proposal_count(payload)}")
+    artifact = payload.get("artifact") if isinstance(payload.get("artifact"), dict) else {}
+    if artifact.get("path"):
+        lines.append(f"artifact: {artifact.get('path')}")
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    for key in sorted(summary):
+        lines.append(f"{key}: {summary.get(key)}")
+    proposals = payload.get("proposals") if isinstance(payload.get("proposals"), list) else []
+    for index, proposal in enumerate(proposals[:20], start=1):
+        if not isinstance(proposal, dict):
+            continue
+        lines.append(
+            f"{index}. {proposal.get('proposal_id')} [{proposal.get('proposal_type')}] action={proposal.get('suggested_action')} affected={len(proposal.get('affected_ids') or [])}"
+        )
+    if len(proposals) > 20:
+        lines.append(f"... {len(proposals) - 20} more proposals not shown")
+    return "\n".join(lines)
+
+
+def _format_proposal_show_summary(payload: dict[str, Any]) -> str:
+    proposal = payload.get("proposal") if isinstance(payload.get("proposal"), dict) else {}
+    affected = proposal.get("affected_ids") if isinstance(proposal.get("affected_ids"), list) else []
+    lines = [f"Proposal: {payload.get('proposal_id')}", f"report_id: {payload.get('report_id')}"]
+    lines.append(f"type: {proposal.get('proposal_type')}")
+    lines.append(f"expected_action: {payload.get('expected_action')}")
+    lines.append(f"suggested_action: {proposal.get('suggested_action')}")
+    lines.append(f"risk: {proposal.get('risk')}")
+    lines.append(f"confidence: {_format_score(proposal.get('confidence'))}")
+    lines.append(f"affected_ids: {', '.join(str(item) for item in affected)}")
+    evidence = proposal.get("evidence") if isinstance(proposal.get("evidence"), list) else []
+    for item in evidence[:10]:
+        if isinstance(item, dict):
+            lines.append(f"evidence: {_safe_scalar(item)}")
+    if len(evidence) > 10:
+        lines.append(f"... {len(evidence) - 10} more evidence items not shown")
+    return "\n".join(lines)
+
+
 def _format_doctor_summary(report: dict[str, Any]) -> str:
     summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
     total = summary.get("total_checks", 0)
@@ -902,6 +1203,9 @@ def _print_cli_error(message: str, args: Namespace, stderr) -> None:
 
 
 def _execute_local_command(args: Namespace, stdout) -> int | None:
+    inspection_exit = _execute_inspection_command(args, stdout)
+    if inspection_exit is not None:
+        return inspection_exit
     backup_exit = _execute_backup_export_restore_command(args, stdout)
     if backup_exit is not None:
         return backup_exit
@@ -1075,7 +1379,7 @@ def execute_command(
         _print_cli_error(str(exc), args, stderr)
         return 2
     except RuntimeError as exc:
-        if getattr(args, "qdrant_subcommand", None) in {"export", "backup", "restore"}:
+        if getattr(args, "qdrant_subcommand", None) in {"show", "export", "backup", "restore"}:
             _print_cli_error(_local_service_error_message(exc), args, stderr)
             return 1
         raise

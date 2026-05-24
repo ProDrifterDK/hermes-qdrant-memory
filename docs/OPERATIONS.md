@@ -186,6 +186,10 @@ hermes qdrant consolidate --scope both --persist --include-reconsolidation
 hermes qdrant watcher status
 hermes qdrant watcher status --json
 hermes qdrant watcher run --scope both
+hermes qdrant reports list
+hermes qdrant reports list --json
+hermes qdrant reports show REPORT_ID
+hermes qdrant proposals show REPORT_ID PROPOSAL_ID
 ```
 
 Optional explicit-write smoke, only when you intentionally want harmless test records in Qdrant:
@@ -205,6 +209,8 @@ Expected behavior:
 - `search` returns a bounded human result summary by default; zero results is acceptable on a fresh install. Use `--json` for scripts.
 - `learning preview` and `learning approve --dry-run` return bounded human summaries by default and perform no mutation; use `--json` for scripts.
 - `consolidate --persist` creates a local report artifact under `$HERMES_HOME/qdrant_memory/consolidation/` and performs no Qdrant mutation.
+- `reports list/show` and `proposals show` inspect persisted consolidation artifacts by exact ID only; they do not contact Qdrant or apply proposals.
+- `show POINT_ID --collection memory|learning` is an exact-ID Qdrant read. It omits payloads and vectors unless `--include-payload` or `--include-vector` is explicit.
 - `watcher status` reads local watcher state only; missing state is not an error.
 - `watcher run` maps to report-only consolidation (`dry_run=true`, `persist=true`, `include_examples=false`) and performs no Qdrant mutation.
 
@@ -331,6 +337,23 @@ When reviewing a report, inspect:
 - `manual_review_required` flags.
 
 Do not apply anything directly from a report without the approved apply flow below.
+
+Native CLI review helpers:
+
+```bash
+hermes qdrant reports list
+hermes qdrant reports show REPORT_ID
+hermes qdrant proposals show REPORT_ID PROPOSAL_ID
+```
+
+Use these before any apply attempt. `reports` and `proposals` are local artifact reads only; `proposals show` also reports the expected live action for the proposal type. To inspect the exact affected Qdrant records, use explicit point lookup:
+
+```bash
+hermes qdrant show POINT_ID --collection memory
+hermes qdrant show POINT_ID --collection learning --include-payload --json
+```
+
+Keep `--include-vector` off unless vector debugging or recovery requires it.
 
 ---
 
