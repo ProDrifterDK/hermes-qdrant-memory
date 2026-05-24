@@ -1,50 +1,54 @@
-# Release Notes: v0.4.0 Public Beta
+# Release Notes: v0.5.0 Public Beta
 
-Hermes Qdrant Memory Provider v0.4.0 is a public beta release focused on operator recovery: export, backup, inspection, and restore for the Qdrant-backed Hermes `MemoryProvider`.
+Hermes Qdrant Memory Provider v0.5.0 is a public beta release focused on the native `hermes qdrant ...` operator experience: deterministic human-readable default output, stable machine-readable `--json`, and a documented CLI output contract.
 
 The plugin remains experimental/pre-1.0: it requires external Qdrant and embedding services, retrieved memories are context rather than instructions, and all broad/destructive maintenance paths remain dry-run/review-gated.
 
 ## Highlights
 
-- New CLI recovery primitives for Qdrant memory and learning collections.
-- Private local backup/export artifacts with checksums and manifests.
-- Restore planning is dry-run by default and validates artifacts before mutation.
-- Live restore requires explicit approval and automatically creates a pre-restore backup.
-- Backup/export/restore errors are sanitized JSON CLI errors rather than raw tracebacks.
-- v0.3.0 CLI parity and doctor diagnostics remain available.
+- Default CLI output is now concise human-readable text for status, diagnostics, config, search/list-style commands, watcher helpers, and recovery commands.
+- `--json` is the machine-readable mode for scripts and automation.
+- `hermes qdrant status` now supports `--json`.
+- JSON mode emits exactly one JSON object on success; JSON errors are written as one JSON object to stderr.
+- Provider-backed `--json` mode fails closed when a provider returns invalid JSON or non-object JSON.
+- Backup/export/restore human summaries remain sanitized: no raw memory payload text, vectors, or credentials are printed.
+- The canonical output rules are documented in `docs/CLI_OUTPUT_CONTRACT.md`.
 
-## New CLI commands
+## CLI output contract
 
-v0.4.0 adds the recovery layer:
-
-```bash
-hermes qdrant export memory --out memory.jsonl --json
-hermes qdrant export learning --out learning.jsonl --json
-hermes qdrant backup create --scope both --json
-hermes qdrant backup list --json
-hermes qdrant backup inspect BACKUP_ID --json
-hermes qdrant restore --backup BACKUP_ID --dry-run --json
-```
-
-Existing CLI commands remain available:
+Default mode is for humans:
 
 ```bash
-hermes qdrant config show --json
 hermes qdrant status
-hermes qdrant doctor --json
-hermes qdrant search "agent memory" --top-k 5 --json
-hermes qdrant index docs README.md --dry-run
-hermes qdrant forget POINT_ID --dry-run
-hermes qdrant store "Remember this explicit memory" --source-type manual --importance 5 --tag manual
-hermes qdrant learning search "tool failure" --top-k 5 --json
-hermes qdrant learning preview --json
-hermes qdrant learning store "Prefer dry-run before broad indexing" --learning-type workflow_lesson --confidence 0.8 --tag cli
-hermes qdrant learning approve CANDIDATE_ID --dry-run --json
-hermes qdrant consolidate --scope both --persist --dry-run --json
-hermes qdrant apply --report-id REPORT_ID --proposal-id PROPOSAL_ID --action merge --dry-run --json
-hermes qdrant watcher status --json
-hermes qdrant watcher run --scope both --json
+hermes qdrant doctor
+hermes qdrant config show
+hermes qdrant search "agent memory" --top-k 5
+hermes qdrant learning preview
+hermes qdrant watcher status
+hermes qdrant backup list
 ```
+
+Automation should use `--json` and check exit status:
+
+```bash
+hermes qdrant status --json
+hermes qdrant doctor --json
+hermes qdrant config show --json
+hermes qdrant search "agent memory" --top-k 5 --json
+hermes qdrant learning preview --json
+hermes qdrant watcher status --json
+hermes qdrant backup list --json
+```
+
+Contract summary:
+
+- Success in default mode prints bounded, deterministic human text on stdout.
+- Success in `--json` mode prints one parseable JSON object on stdout.
+- Usage/safety errors exit `2`.
+- Provider/service/runtime errors exit `1`.
+- Human errors print text to stderr.
+- JSON errors print one parseable JSON object to stderr.
+- Default human summaries are not a stable API and should not be parsed by scripts.
 
 ## Safety behavior
 
@@ -77,20 +81,12 @@ Explicit manual write commands are intentionally live writes:
 
 Use them only for content you deliberately want to store.
 
-## Fixed and hardened
-
-- Restore correctly matches existing points with numeric IDs as well as string IDs.
-- Backup metadata URL redaction fails closed and re-redacts stored manifest URLs during list/inspect.
-- Malformed backup artifacts are reported as controlled backup errors.
-- Qdrant service failures during local CLI operations are reported as sanitized JSON errors.
-- Restore live preflights all affected collections before the first upsert.
-
 ## Upgrade
 
 ```bash
 cd ~/.hermes/plugins/qdrant
 git fetch --tags origin
-git checkout v0.4.0
+git checkout v0.5.0
 ```
 
 Start a fresh Hermes CLI process after upgrading. Restart the gateway only if gateway sessions should load the updated plugin code.
@@ -109,14 +105,20 @@ git diff --check
 Recommended consumer smoke after checking out the release tag:
 
 ```bash
+hermes qdrant config show
 hermes qdrant config show --json
 hermes qdrant status
+hermes qdrant status --json
+hermes qdrant doctor
 hermes qdrant doctor --json
+hermes qdrant search "Hermes Qdrant memory" --top-k 3
 hermes qdrant search "Hermes Qdrant memory" --top-k 3 --json
+hermes qdrant learning preview
 hermes qdrant learning preview --json
-hermes qdrant consolidate --scope both --persist --include-reconsolidation --json
+hermes qdrant consolidate --scope both --persist --include-reconsolidation
+hermes qdrant watcher status
 hermes qdrant watcher status --json
-hermes qdrant watcher run --scope both --json
+hermes qdrant watcher run --scope both
 hermes qdrant export memory --out /tmp/qdrant-memory-export.jsonl --json
 hermes qdrant backup create --scope both --json
 hermes qdrant backup list --json
@@ -140,9 +142,9 @@ Expected:
 
 The following remain future work:
 
-- human-friendly non-JSON formatting as the default CLI output;
-- stable documented JSON schemas for automation;
+- point/report inspection ergonomics such as `show`, `reports list`, `reports show`, and `proposals show`;
+- richer search filters by tag, source/path, date range, and collection;
+- optional `--dry-run`/duplicate-preview flows for explicit manual stores;
 - env-gated live-service integration tests;
 - watcher install/uninstall/log management commands;
-- point/report inspection ergonomics such as `show`, `reports list`, and `reports show`;
 - formal Python packaging beyond the Hermes plugin clone workflow.

@@ -167,18 +167,24 @@ Never delete by query.
 
 ### Step 5: Native CLI smoke for current output-contract builds
 
-For current `main` / post-v0.4.0 output-contract validation, verify the installed plugin as a user would run it:
+For v0.5.0 and later output-contract validation, verify the installed plugin as a user would run it:
 
 ```bash
 cd ~/.hermes/plugins/qdrant
-git pull --ff-only origin main
+git fetch --tags origin
+git checkout v0.5.0
 hermes qdrant config show
+hermes qdrant config show --json
 hermes qdrant status
+hermes qdrant status --json
 hermes qdrant doctor
+hermes qdrant doctor --json
 hermes qdrant search "Hermes Qdrant memory" --top-k 3 --include-metadata
+hermes qdrant search "Hermes Qdrant memory" --top-k 3 --include-metadata --json
 hermes qdrant learning preview
 hermes qdrant consolidate --scope both --persist --include-reconsolidation
 hermes qdrant watcher status
+hermes qdrant watcher status --json
 hermes qdrant watcher run --scope both
 ```
 
@@ -229,7 +235,7 @@ Verify the CLI process exit gate for live mutation without approval:
 hermes qdrant forget 00000000-0000-0000-0000-000000000000 --no-dry-run
 ```
 
-Expected behavior in v0.4.0:
+Expected behavior in v0.2.1 and later:
 
 - output contains `--approve is required when using --no-dry-run`;
 - process exit status is non-zero;

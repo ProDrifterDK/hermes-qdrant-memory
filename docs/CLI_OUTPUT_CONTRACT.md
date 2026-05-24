@@ -1,6 +1,6 @@
 # CLI Output Contract
 
-This document describes the post-v0.4.0 `hermes qdrant ...` command-line output contract.
+This document describes the `v0.5.0` and later `hermes qdrant ...` command-line output contract.
 
 ## Modes
 

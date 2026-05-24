@@ -6,16 +6,23 @@ This project is currently public beta / experimental. The format follows Keep a 
 
 ## [Unreleased]
 
+## [0.5.0]
+
+Fifth public beta release of the Hermes Qdrant Memory Provider. This release makes the native `hermes qdrant ...` CLI a dependable operator interface with human-readable defaults, stable `--json` mode, and documented stdout/stderr/error semantics.
+
 ### Added
 
+- Plugin metadata version bumped to `0.5.0`.
 - Canonical CLI output contract documentation for `hermes qdrant ...`.
 - Human-readable default CLI output for status, doctor, config, provider-backed commands, watcher helpers, and recovery commands.
 - `--json` support for `hermes qdrant status`.
+- Fail-closed handling when provider-backed `--json` mode receives invalid JSON or non-object JSON.
 
 ### Changed
 
 - `--json` is now the machine-readable mode; default success output is deterministic human text.
 - Provider/service/safety errors print human text to stderr by default and JSON error objects to stderr when `--json` is set.
+- CLI help now describes `--json` as machine-readable output rather than raw output.
 
 ### Safety
 
@@ -157,6 +164,7 @@ Second public beta release of the Hermes Qdrant Memory Provider.
 
 Initial public beta tag. The v0.1.0 tag predates the learning, consolidation, reconsolidation, scanner guard, and native CLI MVP work documented in later releases.
 
+[0.5.0]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.5.0
 [0.4.0]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.4.0
 [0.3.0]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.3.0
 [0.2.1]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.2.1

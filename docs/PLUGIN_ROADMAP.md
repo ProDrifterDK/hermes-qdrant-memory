@@ -12,11 +12,11 @@
 
 ## 1. Current state
 
-The project is published as `v0.4.0 Public Beta` and is functional as a Hermes Qdrant-backed memory provider. The latest release URL is:
+The project is published as `v0.5.0 Public Beta` and is functional as a Hermes Qdrant-backed memory provider. The latest release URL is:
 
-- <https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.4.0>
+- <https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.5.0>
 
-Implemented capabilities through v0.4.0:
+Implemented capabilities through v0.5.0:
 
 - Hermes `MemoryProvider` subclass: `QdrantMemoryProvider`.
 - Plugin registration through `register(ctx)`.
@@ -36,6 +36,7 @@ Implemented capabilities through v0.4.0:
 - Conservative no-agent watcher script.
 - Native Hermes memory-provider CLI beta surface: `hermes qdrant ...`.
 - Backup/export/restore recovery primitives with private local artifacts, dry-run restore default, live approval gate, and automatic pre-restore backup.
+- Human-readable default CLI output with `--json` as the stable machine-readable mode, documented in `docs/CLI_OUTPUT_CONTRACT.md`.
 - GitHub Actions test workflow with pytest, compileall, and scanner guard.
 - Release documentation: `CHANGELOG.md`, `RELEASE_NOTES.md`, install/update/remove/rollback notes.
 
@@ -51,6 +52,7 @@ Post-release validation status:
 - The fix was released in `v0.2.1`: `qdrant_command()` raises `SystemExit(execute_command(args))` so usage/safety/provider errors propagate as non-zero CLI exits.
 - v0.3.0 release validation covered the added CLI parity commands.
 - v0.4.0 consumer install/runtime smoke for backup/export/restore passed before release preparation.
+- v0.5.0 local and CI verification covered the CLI output contract and human-readable default surface.
 - Still verify whether current Hermes core can discover providers from `~/.hermes/plugins/memory/<name>` without the compatibility symlink.
 
 ---
@@ -908,39 +910,50 @@ Status after v0.2.0: most criteria are satisfied by the published beta. The rema
 | Publish v0.2.0 as prerelease | Accepted | Honest beta label while the plugin remains experimental and externally service-dependent. |
 | Publish v0.3.0 as prerelease | Accepted | CLI parity was useful enough for public beta while backup/export and doctor diagnostics remained follow-up work. |
 | Publish v0.4.0 as prerelease | Accepted | Backup/export/restore recovery primitives passed real install smoke and are substantial enough for a new beta release. |
+| Publish v0.5.0 as prerelease | Accepted | CLI output contract makes the operator surface human-friendly by default while preserving stable `--json` automation output. |
 
 ---
 
-## 13. Post-v0.4.0 CLI and operations roadmap
+## 13. Post-v0.5.0 CLI and operations roadmap
 
-Recommended next phase: post-v0.4.0 should focus on making the CLI a dependable operator interface rather than expanding memory mutation authority. The plugin already has the MemoryProvider core, safe CLI beta surface, doctor diagnostics, and backup/restore recovery primitives; the next work should improve formatting, watcher operations, inspection/search ergonomics, and integration confidence.
+Recommended next phase: post-v0.5.0 should focus on inspection/search ergonomics, watcher operations, and integration confidence rather than expanding memory mutation authority. The plugin already has the MemoryProvider core, safe CLI beta surface, doctor diagnostics, backup/restore recovery primitives, and a documented CLI output contract.
 
 ### Priority 1: Consumer install/runtime smoke
 
-Status: completed for v0.4.0 backup/export/restore smoke before release preparation. Future releases should repeat this from the published tag.
+Status: completed for v0.5.0 output-contract smoke before release preparation. Future releases should repeat this from the published tag.
 
 Verify from the installed plugin outside the development checkout:
 
-- `git checkout v0.4.0`
+- `git checkout v0.5.0`
+- `hermes qdrant config show`
 - `hermes qdrant config show --json`
 - `hermes qdrant status`
+- `hermes qdrant status --json`
 - `hermes qdrant doctor`
+- `hermes qdrant doctor --json`
+- `hermes qdrant search ...`
 - `hermes qdrant search ... --json`
+- `hermes qdrant learning preview`
 - `hermes qdrant learning preview --json`
-- `hermes qdrant consolidate --scope both --persist --include-reconsolidation --json`
+- `hermes qdrant consolidate --scope both --persist --include-reconsolidation`
+- `hermes qdrant watcher status`
 - `hermes qdrant watcher status --json`
+- `hermes qdrant watcher run --scope both`
 - `hermes qdrant watcher run --scope both --json`
 - safety-gated `forget`, `apply`, and `learning approve` without `--approve`, all returning non-zero exit status and performing no mutation.
 
-### Priority 2: CLI UX and output contract
+### Priority 2: CLI UX and output contract (implemented in v0.5.0)
 
-The v0.4.0 CLI intentionally remains close to provider JSON. The next design pass should define:
+The v0.5.0 CLI defines the operator output contract:
 
 - concise human-readable default output;
 - `--json` as stable machine-readable output;
-- optional `--pretty` / `--quiet` modes;
-- stable JSON schemas for automation;
-- consistent exit-code semantics for usage, provider, and service errors.
+- one JSON object on successful `--json` stdout;
+- JSON error objects on `--json` stderr;
+- consistent exit-code semantics for usage/safety, provider, and service errors;
+- sanitized human summaries for backup/export/restore.
+
+Optional `--pretty` / `--quiet` modes remain future ergonomic enhancements, not release blockers.
 
 ### Priority 3: Real `doctor` diagnostics (implemented)
 
@@ -1019,9 +1032,9 @@ Verify whether current Hermes core can discover user memory providers from `~/.h
 
 ## 14. Immediate next action
 
-1. Publish and verify the `v0.4.0` GitHub prerelease tag against the release commit.
-2. Design the remaining post-v0.4.0 CLI UX contract: human default output, formatter rules, and stable schemas beyond the current doctor JSON.
-3. Add inspection/report commands (`show`, `reports list/show`, `proposals show`) on top of the now-available backup/export/restore recovery layer.
-4. Add watcher lifecycle commands only after CLI output contracts are stable.
+1. Publish and verify the `v0.5.0` GitHub prerelease tag against the release commit.
+2. Add inspection/report commands (`show`, `reports list/show`, `proposals show`) on top of the now-available backup/export/restore recovery layer.
+3. Add richer search filters by tag, source/path, date range, and collection.
+4. Add watcher lifecycle commands only after inspection/report ergonomics are stable.
 
 This order keeps the project grounded: the published artifact is verified first; the next work improves operator ergonomics and runtime confidence before adding stronger memory mutation capabilities.
