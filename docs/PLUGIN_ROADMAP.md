@@ -37,6 +37,7 @@ Implemented capabilities through v0.5.0:
 - Native Hermes memory-provider CLI beta surface: `hermes qdrant ...`.
 - Backup/export/restore recovery primitives with private local artifacts, dry-run restore default, live approval gate, and automatic pre-restore backup.
 - Human-readable default CLI output with `--json` as the stable machine-readable mode, documented in `docs/CLI_OUTPUT_CONTRACT.md`.
+- Read-only CLI inspection helpers for exact point lookup, persisted report listing/showing, and proposal inspection.
 - GitHub Actions test workflow with pytest, compileall, and scanner guard.
 - Release documentation: `CHANGELOG.md`, `RELEASE_NOTES.md`, install/update/remove/rollback notes.
 
@@ -983,12 +984,22 @@ Operator recovery primitives now exist before any broader cleanup/rewrite workfl
 
 ### Priority 5: Inspection/search ergonomics
 
-Add point/report inspection commands:
+Point/report inspection commands are implemented for the first ergonomics pass:
 
-- `hermes qdrant show POINT_ID`;
+- `hermes qdrant show POINT_ID --collection memory|learning`;
 - `hermes qdrant reports list`;
 - `hermes qdrant reports show REPORT_ID`;
-- `hermes qdrant proposals show REPORT_ID PROPOSAL_ID`;
+- `hermes qdrant proposals show REPORT_ID PROPOSAL_ID`.
+
+Safety shape:
+
+- `show` is exact-ID only and omits payloads/vectors unless explicitly requested;
+- `reports` and `proposals` inspect local persisted artifacts only;
+- report/proposal IDs are validated and path traversal inputs are rejected;
+- no provider construction, embeddings, upserts, deletes, collection creation, or apply shortcut is introduced.
+
+Remaining ergonomics work:
+
 - search filters by tag, source type, path/source, date range, and collection.
 
 ### Priority 6: Safer explicit write workflows
@@ -1032,9 +1043,8 @@ Verify whether current Hermes core can discover user memory providers from `~/.h
 
 ## 14. Immediate next action
 
-1. Publish and verify the `v0.5.0` GitHub prerelease tag against the release commit.
-2. Add inspection/report commands (`show`, `reports list/show`, `proposals show`) on top of the now-available backup/export/restore recovery layer.
-3. Add richer search filters by tag, source/path, date range, and collection.
-4. Add watcher lifecycle commands only after inspection/report ergonomics are stable.
+1. Repeat consumer install/runtime smoke for the next published tag.
+2. Add richer search filters by tag, source/path, date range, and collection.
+3. Add watcher lifecycle commands only after inspection/report ergonomics are stable.
 
 This order keeps the project grounded: the published artifact is verified first; the next work improves operator ergonomics and runtime confidence before adding stronger memory mutation capabilities.

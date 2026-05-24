@@ -6,6 +6,18 @@ This project is currently public beta / experimental. The format follows Keep a 
 
 ## [Unreleased]
 
+### Added
+
+- Read-only CLI inspection helpers:
+  - `hermes qdrant show POINT_ID --collection memory|learning` for exact point metadata/payload/vector inspection.
+  - `hermes qdrant reports list` and `hermes qdrant reports show REPORT_ID` for persisted consolidation artifacts.
+  - `hermes qdrant proposals show REPORT_ID PROPOSAL_ID` for exact proposal review and expected-action display.
+
+### Safety
+
+- Inspection commands preserve the CLI output contract: human-readable defaults, stable `--json`, explicit payload/vector flags, exact IDs, local artifact validation, and no new mutation authority.
+- Report/proposal IDs reject path traversal inputs; report/proposal inspection never contacts Qdrant or applies proposals.
+
 ## [0.5.0]
 
 Fifth public beta release of the Hermes Qdrant Memory Provider. This release makes the native `hermes qdrant ...` CLI a dependable operator interface with human-readable defaults, stable `--json` mode, and documented stdout/stderr/error semantics.

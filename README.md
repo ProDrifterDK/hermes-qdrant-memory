@@ -52,8 +52,9 @@ Public beta / experimental. Current release: `v0.5.0 Public Beta`. The plugin is
 | Origin-time fact metadata | Implemented conservatively from explicit tags, clear fact statements, file headings, and structured learning context |
 | Sleep consolidation | M9 gated report persistence and apply-by-proposal-id implemented |
 | Reconsolidation | M10 report-only conflict candidates + local review drafts implemented; no automatic memory rewrites |
-| Native Hermes CLI beta | Implemented for active memory provider (`hermes qdrant ...`) with v0.5.0 human-readable defaults, stable `--json`, CLI parity, and recovery commands |
+| Native Hermes CLI beta | Implemented for active memory provider (`hermes qdrant ...`) with human-readable defaults, stable `--json`, CLI parity, recovery commands, and read-only inspection helpers |
 | Backup/export/restore recovery | Implemented with private local artifacts, dry-run restore default, live approval gate, and automatic pre-restore backup |
+| CLI inspection/ergonomics | Implemented for exact point lookup, persisted report listing/showing, and proposal inspection without widening mutation authority |
 | Dashboard/UI | Not included |
 
 ## Requirements
@@ -494,6 +495,28 @@ hermes config set qdrant_memory.max_chunk_tokens 128
 ```
 
 Changing embedding model or vector size generally requires a new collection or full reindex.
+
+## Native CLI inspection helpers
+
+The native CLI includes read-only inspection commands for operator review. These commands preserve the v0.5.0 output contract: human-readable text by default, one JSON object with `--json`, errors on stderr, and no hidden mutation.
+
+```bash
+hermes qdrant show POINT_ID --collection memory
+hermes qdrant show POINT_ID --collection learning --include-payload --json
+hermes qdrant show POINT_ID --collection memory --include-vector --json
+hermes qdrant reports list
+hermes qdrant reports show REPORT_ID
+hermes qdrant proposals show REPORT_ID PROPOSAL_ID
+```
+
+Safety notes:
+
+- `show` retrieves exactly one explicit point ID from the configured `memory` or `learning` collection.
+- `show` does not construct the provider, call embeddings, write, delete, upsert, or ensure collections.
+- Payload fields are omitted by default. Use `--include-payload` only when inspecting sensitive memory text is intentional; secret-like fields are redacted before output.
+- Vectors are omitted by default in both human and `--json` modes. Use `--include-vector` only for exact-ID debugging or recovery work.
+- `reports list/show` and `proposals show` read persisted local consolidation artifacts only and do not contact Qdrant.
+- `reports show` and `proposals show` validate exact IDs and reject path traversal inputs.
 
 ## Tools exposed to Hermes
 
