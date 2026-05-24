@@ -212,6 +212,13 @@ Recommended install path for current Hermes user plugins:
 git clone https://github.com/ProDrifterDK/hermes-qdrant-memory ~/.hermes/plugins/qdrant
 ```
 
+Current Hermes core discovery still requires that flat compatibility path for user-installed memory providers. A category-only install at `~/.hermes/plugins/memory/qdrant` is detected by the general plugin scanner as `memory/qdrant`, but `memory.provider: qdrant` and the native `hermes qdrant ...` CLI do not activate from that path alone. If you keep the desired category layout, also create the compatibility symlink:
+
+```bash
+mkdir -p ~/.hermes/plugins
+ln -s ~/.hermes/plugins/memory/qdrant ~/.hermes/plugins/qdrant
+```
+
 Activate the provider:
 
 ```bash

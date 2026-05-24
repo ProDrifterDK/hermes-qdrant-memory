@@ -6,6 +6,10 @@ This project is currently public beta / experimental. The format follows Keep a 
 
 ## [Unreleased]
 
+### Documentation
+
+- Documented the Hermes core discovery result for category-path installs: current Hermes discovers `~/.hermes/plugins/memory/qdrant` in the general plugin list as `memory/qdrant`, but memory-provider activation and native `hermes qdrant ...` CLI discovery still require the flat `~/.hermes/plugins/qdrant` compatibility path or symlink.
+
 ## [0.8.0]
 
 Eighth public beta release of the Hermes Qdrant Memory Provider. This release focuses on operator safety and release confidence: watcher lifecycle CLI commands, live integration coverage, and dry-run-first manual memory store previews with optional non-destructive duplicate detection.

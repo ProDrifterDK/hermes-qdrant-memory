@@ -146,5 +146,5 @@ For the unapproved live store check, expected behavior is:
 The following remain future work:
 
 - formal Python packaging beyond the Hermes plugin clone workflow;
-- verification of whether current Hermes core can discover providers from `~/.hermes/plugins/memory/<name>` without the compatibility symlink;
+- Hermes core support for user memory-provider discovery from `~/.hermes/plugins/memory/<name>` without the compatibility symlink. Post-release validation confirmed current core's general plugin scanner sees `~/.hermes/plugins/memory/qdrant` as `memory/qdrant`, but memory-provider activation and native `hermes qdrant ...` CLI discovery still require the flat `~/.hermes/plugins/qdrant` path or symlink;
 - optional broader live-service stress tests beyond the current env-gated integration suite.

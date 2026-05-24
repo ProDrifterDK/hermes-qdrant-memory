@@ -90,7 +90,7 @@ Future fact rewriting, if ever added, should remain gated by:
 
 ## Current install path and CLI discovery caveat
 
-Current Hermes user memory-provider discovery is most compatible with:
+Current Hermes user memory-provider discovery requires the flat compatibility path:
 
 ```text
 ~/.hermes/plugins/qdrant
@@ -107,6 +107,8 @@ create a compatibility symlink:
 ```bash
 ln -s ~/.hermes/plugins/memory/qdrant ~/.hermes/plugins/qdrant
 ```
+
+This was verified against current Hermes core after the v0.8.0 release: a category-only install is visible to the general plugin scanner as `memory/qdrant` with `kind: exclusive`, but the memory-provider discovery code still scans user providers at `$HERMES_HOME/plugins/<name>`. In a temporary `HERMES_HOME` with only `plugins/memory/qdrant`, `hermes memory status` reported `Plugin: NOT installed` and `hermes qdrant --help` failed with an invalid-command exit. Adding `plugins/qdrant -> plugins/memory/qdrant` made `hermes qdrant --help` succeed.
 
 The native CLI MVP uses Hermes memory-provider CLI discovery. `hermes qdrant ...` is available only when this plugin is installed as the active `qdrant` memory provider and a fresh Hermes process has loaded that configuration. Top-level `hermes --help` may not list plugin commands because Hermes avoids eager plugin imports for startup performance; use `hermes qdrant --help` as the direct check.
 

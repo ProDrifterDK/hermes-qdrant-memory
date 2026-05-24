@@ -46,7 +46,8 @@ Known compatibility detail:
 
 - Desired category layout: `~/.hermes/plugins/memory/qdrant/`.
 - Current Hermes compatibility path: `~/.hermes/plugins/qdrant` or symlink from `plugins/qdrant` to `plugins/memory/qdrant`.
-- This is documented as a compatibility shim until Hermes core scans category paths for user memory providers.
+- Verified result: current Hermes core does **not** activate user memory providers from `~/.hermes/plugins/memory/<name>` alone. The general plugin scanner records `memory/qdrant` as an exclusive plugin, but the memory-provider discovery path still scans user providers at `$HERMES_HOME/plugins/<name>`.
+- Keep the compatibility shim until Hermes core memory-provider discovery is updated.
 
 Post-release validation status:
 
@@ -58,7 +59,7 @@ Post-release validation status:
 - v0.6.0 release preparation covered read-only point/report/proposal inspection helpers.
 - v0.7.0 release preparation covered read-only search filters; post-tag consumer smoke passed before v0.8.0 release preparation.
 - v0.8.0 release preparation covers watcher lifecycle commands, env-gated live integration tests, and manual-store dry-run/duplicate preview; consumer smoke passed before tagging.
-- Still verify whether current Hermes core can discover providers from `~/.hermes/plugins/memory/<name>` without the compatibility symlink.
+- v0.8.0 post-release compatibility smoke confirmed category-only install does not work yet: `hermes memory status` reports `Plugin: NOT installed` and `hermes qdrant --help` is unavailable until the flat `plugins/qdrant` symlink exists.
 
 ---
 
@@ -896,11 +897,11 @@ gh run list --repo ProDrifterDK/hermes-qdrant-memory --limit 5
 
 The plugin is ready to call “formal Hermes plugin beta” when:
 
-Status after v0.2.0: most criteria are satisfied by the published beta. The remaining operational checks are the post-release consumer install/runtime smoke and the category-path discovery verification.
+Status after v0.8.0: release smoke and category-path discovery verification are complete. The remaining compatibility work is a Hermes core change or wrapper fallback if the flat compatibility path ever needs to be removed.
 
 - README documents preferred install path and compatibility symlink.
 - Install, update, remove, and rollback docs exist for both preferred category path and current compatibility path.
-- A verification step exists for detecting whether Hermes core can load providers from `plugins/memory/<name>` without a symlink.
+- Category-path discovery verification is documented: current Hermes core cannot load user memory providers from `plugins/memory/<name>` without the flat `plugins/<name>` compatibility symlink.
 - `docs/SAFETY.md` exists and matches implemented behavior.
 - `docs/OPERATIONS.md` exists and covers watcher/report handling.
 - [LCM_BOUNDARY.md](LCM_BOUNDARY.md) or equivalent architecture section exists.
@@ -924,7 +925,7 @@ Status after v0.2.0: most criteria are satisfied by the published beta. The rema
 | Keep embeddings external/OpenAI-compatible | Accepted | Avoid coupling to one model/runtime; bge-m3 local is tested default. |
 | Keep reconsolidation draft-only | Accepted | Fact rewriting is high risk. |
 | Keep quality warnings manual-only | Accepted | False positives are safer than secret ingestion. |
-| Use compatibility symlink until Hermes scans category paths | Accepted | Avoid Hermes core patch while preserving desired layout. |
+| Use compatibility symlink until Hermes scans user memory-provider category paths | Accepted / verified required | Category-only smoke showed general plugin discovery sees `memory/qdrant`, but memory-provider activation and `hermes qdrant ...` require `plugins/qdrant`. |
 | Add CLI wrapper | Accepted | Implemented as native memory-provider CLI MVP in v0.2.0. |
 | Add safety/operations/LCM docs | Accepted | Implemented before widening the CLI/release surface. |
 | Publish v0.2.0 as prerelease | Accepted | Honest beta label while the plugin remains experimental and externally service-dependent. |
@@ -1058,14 +1059,20 @@ Also verify:
 
 ### Priority 9: Hermes core compatibility or wrapper fallback
 
-Verify whether current Hermes core can discover user memory providers from `~/.hermes/plugins/memory/<name>` without a symlink. If not, keep the shim documented, open a Hermes core issue/PR, or ship a standalone wrapper that reuses `qdrant_memory.cli_core`.
+Verified result: current Hermes core cannot activate user memory providers from `~/.hermes/plugins/memory/<name>` without a flat compatibility path. The general `PluginManager` can discover the category path as `memory/qdrant`, but `plugins/memory/__init__.py` still resolves user providers through `$HERMES_HOME/plugins/<name>`.
+
+Keep the shim documented. Future options:
+
+- patch Hermes core memory-provider discovery to also scan `$HERMES_HOME/plugins/memory/<name>`;
+- open a Hermes core issue/PR with the category-only smoke evidence;
+- ship a standalone wrapper that reuses `qdrant_memory.cli_core` if native provider CLI discovery changes.
 
 ---
 
 ## 14. Immediate next action
 
-1. Verify installed-plugin `hermes qdrant --help` and manual store preview behavior from a consumer checkout before the next release tag.
-2. Verify scheduler behavior from a consumer checkout before the next release tag.
-3. Continue expanding live-service coverage for installed-plugin and real-subprocess compatibility paths.
+1. Decide whether to patch Hermes core memory-provider discovery for `$HERMES_HOME/plugins/memory/<name>` or keep the flat symlink as the documented public install path for now.
+2. Continue expanding live-service coverage for installed-plugin and real-subprocess compatibility paths.
+3. Repeat consumer install/runtime smoke from the published tag before each future release.
 
 This order keeps the project grounded: watcher/cron lifecycle is now operable without expanding Qdrant mutation authority; explicit manual store ergonomics now remain dry-run-first, and the next work improves runtime confidence before adding stronger memory mutation capabilities.
