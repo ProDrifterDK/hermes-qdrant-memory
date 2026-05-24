@@ -6,8 +6,13 @@ This project is currently public beta / experimental. The format follows Keep a 
 
 ## [Unreleased]
 
+## [0.6.0]
+
+Sixth public beta release of the Hermes Qdrant Memory Provider. This release adds read-only inspection commands for exact point lookup, persisted consolidation report review, and proposal review without expanding mutation authority.
+
 ### Added
 
+- Plugin metadata version bumped to `0.6.0`.
 - Read-only CLI inspection helpers:
   - `hermes qdrant show POINT_ID --collection memory|learning` for exact point metadata/payload/vector inspection.
   - `hermes qdrant reports list` and `hermes qdrant reports show REPORT_ID` for persisted consolidation artifacts.
@@ -16,6 +21,7 @@ This project is currently public beta / experimental. The format follows Keep a 
 ### Safety
 
 - Inspection commands preserve the CLI output contract: human-readable defaults, stable `--json`, explicit payload/vector flags, exact IDs, local artifact validation, and no new mutation authority.
+- `show` performs exact-ID retrieval and does not call embeddings, upsert, delete, or collection creation paths.
 - Report/proposal IDs reject path traversal inputs; report/proposal inspection never contacts Qdrant or applies proposals.
 
 ## [0.5.0]
@@ -176,6 +182,7 @@ Second public beta release of the Hermes Qdrant Memory Provider.
 
 Initial public beta tag. The v0.1.0 tag predates the learning, consolidation, reconsolidation, scanner guard, and native CLI MVP work documented in later releases.
 
+[0.6.0]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.6.0
 [0.5.0]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.5.0
 [0.4.0]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.4.0
 [0.3.0]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.3.0

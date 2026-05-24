@@ -1,6 +1,6 @@
 name: qdrant
 description: Qdrant-backed semantic memory provider for Hermes Agent.
-version: 0.5.0
+version: 0.6.0
 kind: exclusive
 category: memory
 homepage: https://github.com/ProDrifterDK/hermes-qdrant-memory

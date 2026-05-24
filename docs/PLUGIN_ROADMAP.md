@@ -12,11 +12,11 @@
 
 ## 1. Current state
 
-The project is published as `v0.5.0 Public Beta` and is functional as a Hermes Qdrant-backed memory provider. The latest release URL is:
+The project is preparing `v0.6.0 Public Beta` and is functional as a Hermes Qdrant-backed memory provider. The latest published release remains:
 
 - <https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.5.0>
 
-Implemented capabilities through v0.5.0:
+Implemented capabilities through the v0.6.0 release candidate:
 
 - Hermes `MemoryProvider` subclass: `QdrantMemoryProvider`.
 - Plugin registration through `register(ctx)`.
@@ -54,6 +54,7 @@ Post-release validation status:
 - v0.3.0 release validation covered the added CLI parity commands.
 - v0.4.0 consumer install/runtime smoke for backup/export/restore passed before release preparation.
 - v0.5.0 local and CI verification covered the CLI output contract and human-readable default surface.
+- v0.6.0 release preparation covers read-only point/report/proposal inspection helpers; consumer smoke remains the next step after tagging.
 - Still verify whether current Hermes core can discover providers from `~/.hermes/plugins/memory/<name>` without the compatibility symlink.
 
 ---

@@ -8,7 +8,7 @@ This plugin turns Hermes memory into an external associative substrate: conversa
 
 ## Status
 
-Public beta / experimental. Current release: `v0.5.0 Public Beta`. The plugin is functional and tested, but it depends on external Qdrant and embedding services. Learning, origin-time fact metadata, sleep consolidation, manual-review reconsolidation, native Hermes CLI commands with human-readable defaults, and backup/export/restore recovery primitives are implemented with conservative gates; automatic reconsolidation remains disabled by design.
+Public beta / experimental. Current release candidate: `v0.6.0 Public Beta`. The plugin is functional and tested, but it depends on external Qdrant and embedding services. Learning, origin-time fact metadata, sleep consolidation, manual-review reconsolidation, native Hermes CLI commands with human-readable defaults, backup/export/restore recovery primitives, and read-only inspection helpers are implemented with conservative gates; automatic reconsolidation remains disabled by design.
 
 ## What it does
 
@@ -241,12 +241,12 @@ cd ~/.hermes/plugins/qdrant
 git pull --ff-only origin main
 ```
 
-Use the published `v0.5.0` tag instead of `main` when you want a stable beta snapshot:
+Use the prepared `v0.6.0` tag instead of `main` when you want the next stable beta snapshot after it is published:
 
 ```bash
 cd ~/.hermes/plugins/qdrant
 git fetch --tags origin
-git checkout v0.5.0
+git checkout v0.6.0
 ```
 
 Rollback plugin code:
@@ -734,7 +734,7 @@ No third-party Python package is required by the plugin runtime; it uses the Pyt
 ## Documentation
 
 - [CHANGELOG.md](CHANGELOG.md) — release history.
-- [RELEASE_NOTES.md](RELEASE_NOTES.md) — v0.5.0 public beta notes, upgrade command, CLI output-contract smoke checks, and remaining future work.
+- [RELEASE_NOTES.md](RELEASE_NOTES.md) — v0.6.0 public beta notes, upgrade command, inspection smoke checks, and remaining future work.
 - [docs/SAFETY.md](docs/SAFETY.md) — canonical safety contract for indexing, deletion, consolidation, reconsolidation, cron/reporting, and scanner-safe docs/tests.
 - [docs/OPERATIONS.md](docs/OPERATIONS.md) — operator runbook for status checks, smoke tests, watcher reports, approved apply flow, post-apply verification, gateway/process restarts, and troubleshooting.
 - [docs/LCM_BOUNDARY.md](docs/LCM_BOUNDARY.md) — boundary between active-session LCM recovery and cross-session Qdrant semantic memory.
