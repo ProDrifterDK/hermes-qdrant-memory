@@ -236,6 +236,32 @@ def test_export_memory_writes_jsonl_with_vectors_and_safe_stdout(monkeypatch, tm
     assert fake.ensure_calls == []
 
 
+def test_export_default_human_summary_includes_checksum_without_payload_leak(monkeypatch, tmp_path, capsys):
+    from qdrant_memory.cli_core import execute_command
+
+    raw_text = "raw export default text"
+    export_qdrant_url = "http://" + "export-user" + ":" + "export-pass" + "@local-qdrant.invalid:6333"
+    _write_config(monkeypatch, tmp_path, qdrant_url=export_qdrant_url)
+    _install_fake_qdrant(monkeypatch, FakeQdrant({"memory": [_point("m1", raw_text, [0.1, 0.2], source_type="manual")]}))
+    out_path = tmp_path / "memory-export.jsonl"
+    parser = _parser()
+    args = parser.parse_args(["qdrant", "export", "memory", "--out", str(out_path)])
+
+    exit_code = execute_command(args, provider_factory=lambda: pytest.fail("provider should not be constructed"))
+
+    stdout = capsys.readouterr().out
+    assert exit_code == 0
+    assert "Exported memory collection" in stdout
+    assert f"path: {out_path}" in stdout
+    assert "count: 1" in stdout
+    assert "sha256:" in stdout
+    assert raw_text not in stdout
+    assert "0.1" not in stdout
+    assert "export-pass" not in stdout
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(stdout)
+
+
 def test_export_refuses_existing_file_without_overwrite(monkeypatch, tmp_path, capsys):
     from qdrant_memory.cli_core import execute_command
 
@@ -317,6 +343,53 @@ def test_backup_create_list_inspect_use_safe_artifacts_and_redacted_summaries(mo
     assert inspected["checksum_ok"] is True
     assert inspected["collections"]["memory"]["count"] == 1
 
+def test_backup_default_human_summaries_include_safe_artifact_metadata(monkeypatch, tmp_path, capsys):
+    from qdrant_memory.cli_core import execute_command
+
+    raw_text = "raw default backup text"
+    qdrant_url = "http://" + "human-user" + ":" + "human-pass" + "@local-qdrant.invalid:6333"
+    hermes_home = _write_config(monkeypatch, tmp_path, qdrant_url=qdrant_url)
+    _install_fake_qdrant(monkeypatch, FakeQdrant({"memory": [_point("m1", raw_text, [0.1, 0.2])]}))
+    parser = _parser()
+
+    create_args = parser.parse_args(["qdrant", "backup", "create", "--scope", "memory"])
+    assert execute_command(create_args, provider_factory=lambda: pytest.fail("provider should not be constructed")) == 0
+    create_stdout = capsys.readouterr().out
+    assert "Created backup:" in create_stdout
+    assert "backup_id:" in create_stdout
+    assert "scope: memory" in create_stdout
+    assert "memory: 1 point" in create_stdout
+    assert "sha256:" in create_stdout
+    assert raw_text not in create_stdout
+    assert "0.1" not in create_stdout
+    assert "human-pass" not in create_stdout
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(create_stdout)
+
+    backup_id = next((hermes_home / "qdrant_memory" / "backups").iterdir()).name
+
+    list_args = parser.parse_args(["qdrant", "backup", "list"])
+    assert execute_command(list_args, provider_factory=lambda: pytest.fail("provider should not be constructed")) == 0
+    list_stdout = capsys.readouterr().out
+    assert "Backups: 1" in list_stdout
+    assert backup_id in list_stdout
+    assert "memory: 1 point" in list_stdout
+    assert "sha256:" in list_stdout
+    assert raw_text not in list_stdout
+    assert "human-pass" not in list_stdout
+
+    inspect_args = parser.parse_args(["qdrant", "backup", "inspect", backup_id])
+    assert execute_command(inspect_args, provider_factory=lambda: pytest.fail("provider should not be constructed")) == 0
+    inspect_stdout = capsys.readouterr().out
+    assert "Backup:" in inspect_stdout
+    assert backup_id in inspect_stdout
+    assert "checksum_ok: True" in inspect_stdout
+    assert "memory: 1 point" in inspect_stdout
+    assert "sha256:" in inspect_stdout
+    assert raw_text not in inspect_stdout
+    assert "human-pass" not in inspect_stdout
+
+
 
 def test_restore_dry_run_reports_same_changed_missing_without_mutation(monkeypatch, tmp_path, capsys):
     from qdrant_memory.cli_core import execute_command
@@ -360,6 +433,39 @@ def test_restore_dry_run_reports_same_changed_missing_without_mutation(monkeypat
     assert fake.deleted_ids == []
     assert fake.deleted_filters == []
     assert fake.ensure_calls == []
+
+
+def test_restore_default_human_summary_reports_counts_without_payload_leak(monkeypatch, tmp_path, capsys):
+    from qdrant_memory.cli_core import execute_command
+
+    restore_qdrant_url = "http://" + "restore-user" + ":" + "restore-pass" + "@local-qdrant.invalid:6333"
+    _write_config(monkeypatch, tmp_path, qdrant_url=restore_qdrant_url)
+    backup_points = {
+        "memory": [
+            _point("m1", "restore default alpha", [0.1, 0.2]),
+            _point("m2", "restore default beta", [0.2, 0.3]),
+        ]
+    }
+    fake = _install_fake_qdrant(monkeypatch, FakeQdrant(backup_points))
+    parser = _parser()
+    create_args = parser.parse_args(["qdrant", "backup", "create", "--scope", "memory", "--json"])
+    assert execute_command(create_args, provider_factory=lambda: pytest.fail("provider should not be constructed")) == 0
+    backup_id = json.loads(capsys.readouterr().out)["backup_id"]
+    fake.by_collection = {"memory": [_point("m1", "restore default alpha", [0.1, 0.2])]}
+
+    restore_args = parser.parse_args(["qdrant", "restore", "--backup", backup_id])
+    exit_code = execute_command(restore_args, provider_factory=lambda: pytest.fail("provider should not be constructed"))
+
+    stdout = capsys.readouterr().out
+    assert exit_code == 0
+    assert f"Restore dry-run: {backup_id}" in stdout
+    assert "memory: total=2 same=1 changed=0 missing=1 would_upsert=1" in stdout
+    assert "restore default" not in stdout
+    assert "0.1" not in stdout
+    assert "restore-pass" not in stdout
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(stdout)
+    assert fake.upserts == []
 
 
 def test_restore_dry_run_matches_numeric_point_ids(monkeypatch, tmp_path, capsys):

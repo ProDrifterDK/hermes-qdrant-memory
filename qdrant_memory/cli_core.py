@@ -155,11 +155,131 @@ def _watcher_status_payload() -> dict[str, Any]:
     }
 
 
-def _print_json_or_summary(payload: dict[str, Any], *, json_output: bool, stdout, summary: str) -> None:
-    if json_output:
+def _json_flag(args: Namespace) -> bool:
+    return bool(getattr(args, "json", False))
+
+
+def _one_line(value: Any, *, max_chars: int = 220) -> str:
+    text = " ".join(str(value if value is not None else "").split())
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def _plural(count: Any, singular: str, plural: str | None = None) -> str:
+    try:
+        return singular if int(count) == 1 else (plural or f"{singular}s")
+    except Exception:
+        return plural or f"{singular}s"
+
+
+def _safe_scalar(value: Any) -> str:
+    if isinstance(value, (dict, list, tuple)):
+        try:
+            return _one_line(json.dumps(value, sort_keys=True, default=str), max_chars=220)
+        except Exception:
+            return _one_line(value)
+    return _one_line(value)
+
+
+def _ordered_collections(collections: Any) -> list[tuple[str, dict[str, Any]]]:
+    if not isinstance(collections, dict):
+        return []
+    order = {"memory": 0, "learning": 1}
+    items: list[tuple[str, dict[str, Any]]] = []
+    for scope, details in collections.items():
+        if isinstance(details, dict):
+            items.append((str(scope), details))
+    return sorted(items, key=lambda item: (order.get(item[0], 99), item[0]))
+
+
+def _collection_count_line(scope: str, details: dict[str, Any], *, indent: str = "") -> str:
+    count = details.get("count")
+    try:
+        count_text = str(int(count))
+    except Exception:
+        count_text = "unknown"
+    line = f"{indent}{scope}: {count_text} {_plural(count, 'point')}"
+    sha = details.get("sha256")
+    if sha:
+        line += f" sha256: {_one_line(sha, max_chars=80)}"
+    return line
+
+
+def _format_export_summary(payload: dict[str, Any]) -> str:
+    lines = [f"Exported {payload.get('scope')} collection"]
+    if payload.get("collection_name"):
+        lines.append(f"collection: {payload.get('collection_name')}")
+    lines.append(f"path: {payload.get('path')}")
+    lines.append(f"count: {payload.get('count')}")
+    if payload.get("sha256"):
+        lines.append(f"sha256: {payload.get('sha256')}")
+    return "\n".join(lines)
+
+
+def _format_backup_create_summary(payload: dict[str, Any]) -> str:
+    lines = ["Created backup:", f"backup_id: {payload.get('backup_id')}", f"scope: {payload.get('scope')}"]
+    if payload.get("backup_dir"):
+        lines.append(f"path: {payload.get('backup_dir')}")
+    for scope, details in _ordered_collections(payload.get("collections")):
+        lines.append(_collection_count_line(scope, details))
+    return "\n".join(lines)
+
+
+def _format_backup_list_summary(payload: dict[str, Any]) -> str:
+    backups = payload.get("backups") if isinstance(payload.get("backups"), list) else []
+    lines = [f"Backups: {payload.get('count', len(backups))}", f"backup_root: {payload.get('backup_root')}"]
+    for index, backup in enumerate(backups[:20], start=1):
+        if not isinstance(backup, dict):
+            continue
+        line = f"{index}. {backup.get('backup_id')} scope={backup.get('scope')}"
+        if backup.get("backup_dir"):
+            line += f" path={backup.get('backup_dir')}"
+        lines.append(line)
+        for scope, details in _ordered_collections(backup.get("collections")):
+            lines.append(_collection_count_line(scope, details, indent="   "))
+    if len(backups) > 20:
+        lines.append(f"... {len(backups) - 20} more backups not shown")
+    return "\n".join(lines)
+
+
+def _format_backup_inspect_summary(payload: dict[str, Any]) -> str:
+    lines = [f"Backup: {payload.get('backup_id')}", f"scope: {payload.get('scope')}"]
+    if payload.get("backup_dir"):
+        lines.append(f"path: {payload.get('backup_dir')}")
+    if "checksum_ok" in payload:
+        lines.append(f"checksum_ok: {payload.get('checksum_ok')}")
+    for scope, details in _ordered_collections(payload.get("collections")):
+        lines.append(_collection_count_line(scope, details))
+    return "\n".join(lines)
+
+
+def _format_restore_summary(payload: dict[str, Any]) -> str:
+    mode = "dry-run" if payload.get("dry_run", True) else "applied"
+    lines = [f"Restore {mode}: {payload.get('backup_id')}"]
+    if "validated" in payload:
+        lines.append(f"validated: {payload.get('validated')}")
+    if payload.get("pre_restore_backup_id"):
+        lines.append(f"pre_restore_backup_id: {payload.get('pre_restore_backup_id')}")
+    for scope, details in _ordered_collections(payload.get("collections")):
+        parts = [
+            f"total={details.get('total')}",
+            f"same={details.get('same')}",
+            f"changed={details.get('changed')}",
+            f"missing={details.get('missing')}",
+            f"would_upsert={details.get('would_upsert')}",
+        ]
+        if not payload.get("dry_run", True) or details.get("upserted"):
+            parts.append(f"upserted={details.get('upserted')}")
+        lines.append(f"{scope}: " + " ".join(parts))
+    return "\n".join(lines)
+
+
+def _print_payload(payload: dict[str, Any], args: Namespace, stdout, formatter: Callable[[dict[str, Any]], str]) -> None:
+    if _json_flag(args):
         print(json.dumps(payload, sort_keys=True), file=stdout)
     else:
-        print(summary, file=stdout)
+        print(formatter(payload), file=stdout)
 
 
 def _local_service_error_message(exc: RuntimeError) -> str:
@@ -194,17 +314,10 @@ def _execute_backup_export_restore_command(args: Namespace, stdout) -> int | Non
     )
 
     hermes_home, config = _local_config()
-    json_output = bool(getattr(args, "json", False))
-
     if subcommand == "export":
         qdrant = qdrant_client_from_config(config)
         payload = export_collection(qdrant, config, scope=str(getattr(args, "export_scope", "")), out_file=getattr(args, "out", ""), overwrite=bool(getattr(args, "overwrite", False)))
-        _print_json_or_summary(
-            payload,
-            json_output=json_output,
-            stdout=stdout,
-            summary=f"Exported {payload.get('scope')} collection: {payload.get('count')} points -> {payload.get('path')}",
-        )
+        _print_payload(payload, args, stdout, _format_export_summary)
         return 0
 
     if subcommand == "backup":
@@ -212,25 +325,15 @@ def _execute_backup_export_restore_command(args: Namespace, stdout) -> int | Non
         if backup_subcommand == "create":
             qdrant = qdrant_client_from_config(config)
             payload = create_backup(qdrant, config, hermes_home=hermes_home, scope=str(getattr(args, "scope", "both")))
-            _print_json_or_summary(
-                payload,
-                json_output=json_output,
-                stdout=stdout,
-                summary=f"Created backup {payload.get('backup_id')} -> {payload.get('backup_dir')}",
-            )
+            _print_payload(payload, args, stdout, _format_backup_create_summary)
             return 0
         if backup_subcommand == "list":
             payload = list_backups(config, hermes_home=hermes_home)
-            _print_json_or_summary(payload, json_output=json_output, stdout=stdout, summary=f"Found {payload.get('count')} backups in {payload.get('backup_root')}")
+            _print_payload(payload, args, stdout, _format_backup_list_summary)
             return 0
         if backup_subcommand == "inspect":
             payload = inspect_backup(str(getattr(args, "backup_id", "")), config, hermes_home=hermes_home)
-            _print_json_or_summary(
-                payload,
-                json_output=json_output,
-                stdout=stdout,
-                summary=f"Backup {payload.get('backup_id')} checksum_ok={payload.get('checksum_ok')}",
-            )
+            _print_payload(payload, args, stdout, _format_backup_inspect_summary)
             return 0
         raise CliUsageError("unsupported qdrant backup command")
 
@@ -245,13 +348,7 @@ def _execute_backup_export_restore_command(args: Namespace, stdout) -> int | Non
             dry_run=bool(getattr(args, "dry_run", True)),
             backup_first=bool(getattr(args, "backup_first", False)),
         )
-        total = sum(int(item.get("would_upsert", 0)) for item in (payload.get("collections") or {}).values() if isinstance(item, dict))
-        _print_json_or_summary(
-            payload,
-            json_output=json_output,
-            stdout=stdout,
-            summary=f"Restore {'dry-run' if payload.get('dry_run') else 'applied'} for {payload.get('backup_id')}: {total} points need upsert",
-        )
+        _print_payload(payload, args, stdout, _format_restore_summary)
         return 0
 
     return None
@@ -550,16 +647,270 @@ def build_doctor_report(provider_factory: Callable[[], Any]) -> dict[str, Any]:
     }
 
 
+def _format_config_summary(payload: dict[str, Any]) -> str:
+    lines = ["Qdrant memory configuration"]
+    for key in sorted(payload):
+        lines.append(f"{key}: {_safe_scalar(payload.get(key))}")
+    return "\n".join(lines)
+
+
+def _format_watcher_status_summary(payload: dict[str, Any]) -> str:
+    lines = ["Watcher state"]
+    lines.append(f"configured: {payload.get('configured')}")
+    lines.append(f"state_exists: {payload.get('state_exists')}")
+    lines.append(f"state_path: {payload.get('state_path')}")
+    state = payload.get("state") if isinstance(payload.get("state"), dict) else {}
+    if state.get("last_report_id"):
+        lines.append(f"last_report_id: {state.get('last_report_id')}")
+    if state.get("error"):
+        lines.append(f"state_error: {_one_line(state.get('error'))}")
+    return "\n".join(lines)
+
+
+def _format_doctor_summary(report: dict[str, Any]) -> str:
+    summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+    total = summary.get("total_checks", 0)
+    passed = summary.get("passed", 0)
+    failed = summary.get("failed_critical", 0)
+    if failed:
+        lines = [f"Diagnostics: {passed}/{total} checks passed, {failed} critical failed"]
+    else:
+        lines = [f"Diagnostics: {passed}/{total} checks passed"]
+    checks = report.get("checks") if isinstance(report.get("checks"), list) else []
+    for check in checks:
+        if not isinstance(check, dict):
+            continue
+        ok = bool(check.get("ok"))
+        critical = bool(check.get("critical", True))
+        marker = "OK" if ok else ("FAIL" if critical else "WARN")
+        lines.append(f"[{marker}] {check.get('name')}: {_one_line(check.get('summary'))}")
+    return "\n".join(lines)
+
+
+def _format_status_summary(payload: dict[str, Any]) -> str:
+    active = "active" if payload.get("active") else "inactive"
+    lines = [f"Qdrant memory provider: {active}"]
+    qdrant_marker = "OK" if payload.get("qdrant_ok") else "WARN"
+    qdrant_text = "reachable" if payload.get("qdrant_ok") else "unavailable"
+    lines.append(f"[{qdrant_marker}] qdrant: {qdrant_text}")
+    embedding_marker = "OK" if payload.get("embedding_ok") else "WARN"
+    embedding_text = "reachable" if payload.get("embedding_ok") else "unavailable"
+    lines.append(f"[{embedding_marker}] embeddings: {embedding_text}")
+    if payload.get("collection_name"):
+        count = payload.get("point_count")
+        count_text = "unknown" if count is None else str(count)
+        lines.append(f"memory: {count_text} (collection: {payload.get('collection_name')})")
+    if payload.get("learning_collection_name"):
+        count = payload.get("learning_point_count")
+        count_text = "unknown" if count is None else str(count)
+        lines.append(f"learnings: {count_text} (collection: {payload.get('learning_collection_name')})")
+    if "pending_learning_candidate_count" in payload:
+        lines.append(f"pending_learning_candidates: {payload.get('pending_learning_candidate_count')}")
+    return "\n".join(lines)
+
+
+def _format_score(value: Any) -> str:
+    try:
+        return f"{float(value):.3f}"
+    except Exception:
+        return _one_line(value, max_chars=40)
+
+
+def _format_result_list(payload: dict[str, Any], *, label: str, plural_label: str | None = None) -> str:
+    results = payload.get("results") if isinstance(payload.get("results"), list) else []
+    count = payload.get("count", len(results))
+    noun = label if count == 1 else (plural_label or f"{label}s")
+    lines = [f"Found {count} {noun}"]
+    for index, item in enumerate(results[:10], start=1):
+        if not isinstance(item, dict):
+            continue
+        item_id = item.get("id") or "<unknown>"
+        score = _format_score(item.get("score")) if "score" in item else ""
+        text = _one_line(item.get("text") or item.get("lesson") or "", max_chars=180)
+        prefix = f"{index}. {item_id}"
+        if score:
+            prefix += f" score={score}"
+        if item.get("learning_type"):
+            prefix += f" [{item.get('learning_type')}]"
+        lines.append(f"{prefix} {text}".rstrip())
+    if len(results) > 10:
+        lines.append(f"... {len(results) - 10} more results not shown")
+    return "\n".join(lines)
+
+
+def _format_store_summary(payload: dict[str, Any], *, learning: bool = False) -> str:
+    label = "learning" if learning else "memory"
+    item_id = payload.get("id") or "<unknown>"
+    lines = [f"Saved {label}: {item_id}" if payload.get("saved") else f"{label.capitalize()} not saved"]
+    if payload.get("source_type"):
+        lines.append(f"source_type: {payload.get('source_type')}")
+    if payload.get("collection_name"):
+        lines.append(f"collection: {payload.get('collection_name')}")
+    return "\n".join(lines)
+
+
+def _format_index_summary(payload: dict[str, Any]) -> str:
+    mode = "dry-run" if payload.get("dry_run", True) else "applied"
+    lines = [f"Index {mode}: files={payload.get('files_indexed', 0)}/{payload.get('files_seen', 0)} chunks_prepared={payload.get('chunks_prepared', 0)}"]
+    if payload.get("chunks_upserted"):
+        lines.append(f"chunks_upserted: {payload.get('chunks_upserted')}")
+    if payload.get("stale_count"):
+        lines.append(f"stale_chunks: {payload.get('stale_count')} delete_mode={payload.get('delete_mode')}")
+    if payload.get("errors"):
+        lines.append(f"errors: {len(payload.get('errors') or [])}")
+    return "\n".join(lines)
+
+
+def _format_forget_summary(payload: dict[str, Any]) -> str:
+    ids = payload.get("ids") if isinstance(payload.get("ids"), list) else []
+    if payload.get("dry_run", True):
+        return f"Forget dry-run: {len(ids)} explicit {_plural(len(ids), 'id')}"
+    return f"Forgot memories: deleted={payload.get('deleted', 0)}"
+
+
+def _format_learning_preview_summary(payload: dict[str, Any]) -> str:
+    candidates = payload.get("candidates") if isinstance(payload.get("candidates"), list) else []
+    count = payload.get("count", len(candidates))
+    lines = [f"Pending learning candidates: {count}"]
+    for index, item in enumerate(candidates[:10], start=1):
+        if not isinstance(item, dict):
+            continue
+        candidate_id = item.get("candidate_id") or item.get("id") or "<unknown>"
+        learning_type = item.get("learning_type") or "learning"
+        lesson = _one_line(item.get("lesson") or item.get("text") or "", max_chars=180)
+        lines.append(f"{index}. {candidate_id} [{learning_type}] {lesson}".rstrip())
+    if len(candidates) > 10:
+        lines.append(f"... {len(candidates) - 10} more candidates not shown")
+    return "\n".join(lines)
+
+
+def _proposal_count(payload: dict[str, Any]) -> int:
+    proposals = payload.get("proposals")
+    if isinstance(proposals, list):
+        return len(proposals)
+    if isinstance(payload.get("artifact"), dict) and payload["artifact"].get("proposal_count") is not None:
+        try:
+            return int(payload["artifact"].get("proposal_count"))
+        except Exception:
+            return 0
+    if payload.get("proposal_count") is not None:
+        try:
+            return int(payload.get("proposal_count"))
+        except Exception:
+            return 0
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    total = 0
+    for value in summary.values():
+        try:
+            total += int(value)
+        except Exception:
+            pass
+    return total
+
+
+def _format_consolidate_summary(payload: dict[str, Any]) -> str:
+    count = _proposal_count(payload)
+    lines = [f"Report-only consolidation: {count} {_plural(count, 'proposal')}"]
+    if payload.get("report_id"):
+        lines.append(f"report_id: {payload.get('report_id')}")
+    if payload.get("scope"):
+        lines.append(f"scope: {payload.get('scope')}")
+    if payload.get("persisted") is not None:
+        lines.append(f"persisted: {payload.get('persisted')}")
+    artifact = payload.get("artifact") if isinstance(payload.get("artifact"), dict) else {}
+    if artifact.get("path"):
+        lines.append(f"artifact: {artifact.get('path')}")
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    for key in sorted(summary):
+        lines.append(f"{key}: {summary.get(key)}")
+    return "\n".join(lines)
+
+
+def _format_apply_summary(payload: dict[str, Any]) -> str:
+    affected = payload.get("affected_ids") if isinstance(payload.get("affected_ids"), list) else []
+    if not affected and isinstance(payload.get("delete_ids"), list):
+        affected = payload.get("delete_ids")
+    mode = "dry-run" if payload.get("dry_run", True) else "applied"
+    lines = [f"Apply {mode}: action={payload.get('action')} proposal={payload.get('proposal_id')} affected={len(affected)}"]
+    if payload.get("report_id"):
+        lines.append(f"report_id: {payload.get('report_id')}")
+    if payload.get("application_id"):
+        lines.append(f"application_id: {payload.get('application_id')}")
+    if payload.get("pre_apply_backup_id"):
+        lines.append(f"pre_apply_backup_id: {payload.get('pre_apply_backup_id')}")
+    return "\n".join(lines)
+
+
+def _format_learning_approve_summary(payload: dict[str, Any]) -> str:
+    if payload.get("dry_run", True):
+        candidate = payload.get("candidate") if isinstance(payload.get("candidate"), dict) else {}
+        return f"Learning approval dry-run: candidate={candidate.get('candidate_id') or candidate.get('id') or '<unknown>'}"
+    return _format_store_summary(payload, learning=True)
+
+
+def _format_generic_summary(payload: Any, args: Namespace, tool_name: str = "") -> str:
+    subcommand = getattr(args, "qdrant_subcommand", None) or tool_name or "command"
+    if isinstance(payload, dict):
+        keys = ", ".join(sorted(str(key) for key in payload.keys())[:12])
+        return f"{subcommand}: completed" + (f" ({keys})" if keys else "")
+    return f"{subcommand}: completed"
+
+
+def _format_human_payload(payload: Any, args: Namespace, tool_name: str) -> str:
+    if not isinstance(payload, dict):
+        return _format_generic_summary(payload, args, tool_name)
+    if tool_name == "qdrant_memory_status":
+        return _format_status_summary(payload)
+    if tool_name == "qdrant_memory_search":
+        return _format_result_list(payload, label="memory", plural_label="memories")
+    if tool_name == "qdrant_learning_search":
+        return _format_result_list(payload, label="learning", plural_label="learnings")
+    if tool_name == "qdrant_memory_store":
+        return _format_store_summary(payload)
+    if tool_name == "qdrant_learning_store":
+        return _format_store_summary(payload, learning=True)
+    if tool_name == "qdrant_memory_index":
+        return _format_index_summary(payload)
+    if tool_name == "qdrant_memory_forget":
+        return _format_forget_summary(payload)
+    if tool_name == "qdrant_learning_preview":
+        return _format_learning_preview_summary(payload)
+    if tool_name == "qdrant_learning_approve":
+        return _format_learning_approve_summary(payload)
+    if tool_name == "qdrant_memory_consolidate":
+        return _format_consolidate_summary(payload)
+    if tool_name == "qdrant_memory_consolidation_apply":
+        return _format_apply_summary(payload)
+    return _format_generic_summary(payload, args, tool_name)
+
+
+def _provider_error_message(payload: Any) -> str:
+    if isinstance(payload, dict):
+        message = payload.get("message")
+        if not message:
+            error = payload.get("error")
+            message = error if error is not True else "Provider returned an error"
+        return _one_line(message or "Provider returned an error")
+    return "Provider returned an error"
+
+
+def _print_cli_error(message: str, args: Namespace, stderr) -> None:
+    if _json_flag(args):
+        print(json.dumps({"error": True, "message": message}, sort_keys=True), file=stderr)
+    else:
+        print(f"Error: {message}", file=stderr)
+
+
 def _execute_local_command(args: Namespace, stdout) -> int | None:
     backup_exit = _execute_backup_export_restore_command(args, stdout)
     if backup_exit is not None:
         return backup_exit
     subcommand = getattr(args, "qdrant_subcommand", None)
     if subcommand == "config" and getattr(args, "config_subcommand", None) == "show":
-        print(json.dumps(_redacted_config(), sort_keys=True), file=stdout)
+        _print_payload(_redacted_config(), args, stdout, _format_config_summary)
         return 0
     if subcommand == "watcher" and getattr(args, "watcher_subcommand", None) == "status":
-        print(json.dumps(_watcher_status_payload(), sort_keys=True), file=stdout)
+        _print_payload(_watcher_status_payload(), args, stdout, _format_watcher_status_summary)
         return 0
     return None
 
@@ -721,16 +1072,16 @@ def execute_command(
     try:
         local_exit = _execute_local_command(args, stdout)
     except CliUsageError as exc:
-        print(json.dumps({"error": True, "message": str(exc)}), file=stderr)
+        _print_cli_error(str(exc), args, stderr)
         return 2
     except RuntimeError as exc:
         if getattr(args, "qdrant_subcommand", None) in {"export", "backup", "restore"}:
-            print(json.dumps({"error": True, "message": _local_service_error_message(exc)}), file=stderr)
+            _print_cli_error(_local_service_error_message(exc), args, stderr)
             return 1
         raise
     except ValueError as exc:
         if exc.__class__.__name__ == "BackupError":
-            print(json.dumps({"error": True, "message": str(exc)}), file=stderr)
+            _print_cli_error(str(exc), args, stderr)
             return 2
         raise
     if local_exit is not None:
@@ -738,20 +1089,42 @@ def execute_command(
 
     if getattr(args, "qdrant_subcommand", None) == "doctor":
         report = build_doctor_report(provider_factory)
-        print(json.dumps(report, sort_keys=True), file=stdout)
+        if _json_flag(args):
+            print(json.dumps(report, sort_keys=True), file=stdout)
+        else:
+            print(_format_doctor_summary(report), file=stdout)
         return 0 if report.get("ok") else 1
 
     try:
         tool_name, tool_args = build_tool_call(args)
     except CliUsageError as exc:
-        print(json.dumps({"error": True, "message": str(exc)}), file=stderr)
+        _print_cli_error(str(exc), args, stderr)
         return 2
 
     provider = provider_factory()
     result = provider.handle_tool_call(tool_name, tool_args)
-    print(result, file=stdout)
     try:
         parsed = json.loads(result)
     except Exception:
+        if _json_flag(args):
+            _print_cli_error("Provider returned invalid JSON; expected a JSON object", args, stderr)
+            return 1
+        print(_format_generic_summary(None, args, tool_name), file=stdout)
         return 0
-    return 1 if isinstance(parsed, dict) and parsed.get("error") else 0
+    if not isinstance(parsed, dict):
+        if _json_flag(args):
+            _print_cli_error("Provider returned non-object JSON; expected a JSON object", args, stderr)
+            return 1
+        print(_format_generic_summary(parsed, args, tool_name), file=stdout)
+        return 0
+    if parsed.get("error"):
+        if _json_flag(args):
+            print(result, file=stderr)
+        else:
+            print(f"Error: {_provider_error_message(parsed)}", file=stderr)
+        return 1
+    if _json_flag(args):
+        print(result, file=stdout)
+    else:
+        print(_format_human_payload(parsed, args, tool_name), file=stdout)
+    return 0

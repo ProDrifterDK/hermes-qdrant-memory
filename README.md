@@ -643,31 +643,33 @@ For operational checks and approved maintenance procedures, see [docs/OPERATIONS
 When the plugin is installed as the active Hermes memory provider, Hermes can discover the native provider CLI from the top-level `cli.py` file:
 
 ```bash
-hermes qdrant config show --json
+hermes qdrant config show
 hermes qdrant status
 hermes qdrant doctor
 hermes qdrant store "Remember this explicit memory" --source-type manual --importance 5 --tag manual
-hermes qdrant search "agent memory" --top-k 5 --json
+hermes qdrant search "agent memory" --top-k 5
 hermes qdrant index docs README.md --dry-run
 hermes qdrant forget POINT_ID --dry-run
-hermes qdrant learning search "tool failure" --top-k 5 --json
-hermes qdrant learning preview --json
+hermes qdrant learning search "tool failure" --top-k 5
+hermes qdrant learning preview
 hermes qdrant learning store "Prefer dry-run before broad indexing" --learning-type workflow_lesson --confidence 0.8 --tag cli
-hermes qdrant learning approve CANDIDATE_ID --dry-run --json
-hermes qdrant consolidate --scope both --persist --dry-run --json
-hermes qdrant watcher status --json
-hermes qdrant watcher run --scope both --json
-hermes qdrant apply --report-id REPORT_ID --proposal-id PROPOSAL_ID --action merge --dry-run --json
-hermes qdrant export memory --out memory.jsonl --json
-hermes qdrant backup create --scope both --json
-hermes qdrant backup list --json
-hermes qdrant backup inspect BACKUP_ID --json
-hermes qdrant restore --backup BACKUP_ID --dry-run --json
+hermes qdrant learning approve CANDIDATE_ID --dry-run
+hermes qdrant consolidate --scope both --persist --dry-run
+hermes qdrant watcher status
+hermes qdrant watcher run --scope both
+hermes qdrant apply --report-id REPORT_ID --proposal-id PROPOSAL_ID --action merge --dry-run
+hermes qdrant export memory --out memory.jsonl
+hermes qdrant backup create --scope both
+hermes qdrant backup list
+hermes qdrant backup inspect BACKUP_ID
+hermes qdrant restore --backup BACKUP_ID --dry-run
 ```
+
+Default output is human-readable text. Use `--json` for scripts and automation; JSON success output is one parseable object, and JSON errors are written to stderr with a non-zero exit code. Do not parse default human summaries in automation. See [docs/CLI_OUTPUT_CONTRACT.md](docs/CLI_OUTPUT_CONTRACT.md) for the stdout/stderr, redaction, and per-command contract.
 
 Mutation safety mirrors the tool surface:
 
-- `config show` and `watcher status` are local JSON reads and do not instantiate the provider or contact Qdrant/embedding services; secret-like API key fields are redacted;
+- `config show` and `watcher status` are local reads and do not instantiate the provider or contact Qdrant/embedding services; secret-like API key fields are redacted;
 - `store` and `learning store` are explicit live storage commands by design and require non-empty positional text/lesson;
 - mutating maintenance commands default to `--dry-run`;
 - live maintenance mutation requires both `--no-dry-run` and `--approve`;
@@ -713,6 +715,7 @@ No third-party Python package is required by the plugin runtime; it uses the Pyt
 - [docs/SAFETY.md](docs/SAFETY.md) — canonical safety contract for indexing, deletion, consolidation, reconsolidation, cron/reporting, and scanner-safe docs/tests.
 - [docs/OPERATIONS.md](docs/OPERATIONS.md) — operator runbook for status checks, smoke tests, watcher reports, approved apply flow, post-apply verification, gateway/process restarts, and troubleshooting.
 - [docs/LCM_BOUNDARY.md](docs/LCM_BOUNDARY.md) — boundary between active-session LCM recovery and cross-session Qdrant semantic memory.
+- [docs/CLI_OUTPUT_CONTRACT.md](docs/CLI_OUTPUT_CONTRACT.md) — human/default and `--json` machine-output contract for `hermes qdrant ...`.
 - [docs/CLI_SPIKE.md](docs/CLI_SPIKE.md) — feasibility findings for native `hermes qdrant ...` CLI integration and fallback wrapper strategy.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md)

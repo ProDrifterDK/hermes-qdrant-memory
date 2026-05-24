@@ -4,6 +4,24 @@ All notable changes to this project are documented here.
 
 This project is currently public beta / experimental. The format follows Keep a Changelog style, but the repository is still pre-1.0 and the public API may change.
 
+## [Unreleased]
+
+### Added
+
+- Canonical CLI output contract documentation for `hermes qdrant ...`.
+- Human-readable default CLI output for status, doctor, config, provider-backed commands, watcher helpers, and recovery commands.
+- `--json` support for `hermes qdrant status`.
+
+### Changed
+
+- `--json` is now the machine-readable mode; default success output is deterministic human text.
+- Provider/service/safety errors print human text to stderr by default and JSON error objects to stderr when `--json` is set.
+
+### Safety
+
+- Backup/export/restore human summaries remain sanitized and do not print raw memory payloads, vectors, or credentials.
+- Existing dry-run and explicit-approval gates are unchanged.
+
 ## [0.4.0]
 
 Fourth public beta release of the Hermes Qdrant Memory Provider. This release adds operator recovery primitives for export, backup, and restore after the v0.3.0 CLI parity and doctor diagnostics work.

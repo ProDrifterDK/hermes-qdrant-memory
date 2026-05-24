@@ -165,22 +165,21 @@ Call qdrant_memory_forget with ids=["<POINT_ID>"] and dry_run=false.
 
 Never delete by query.
 
-### Step 5: Native CLI smoke after installing a release tag
+### Step 5: Native CLI smoke for current output-contract builds
 
-For release-tag validation, verify the installed plugin as a user would run it. For the latest published beta release:
+For current `main` / post-v0.4.0 output-contract validation, verify the installed plugin as a user would run it:
 
 ```bash
 cd ~/.hermes/plugins/qdrant
-git fetch --tags origin
-git checkout v0.4.0
-hermes qdrant config show --json
+git pull --ff-only origin main
+hermes qdrant config show
 hermes qdrant status
 hermes qdrant doctor
-hermes qdrant search "Hermes Qdrant memory" --top-k 3 --include-metadata --json
-hermes qdrant learning preview --json
-hermes qdrant consolidate --scope both --persist --include-reconsolidation --json
-hermes qdrant watcher status --json
-hermes qdrant watcher run --scope both --json
+hermes qdrant search "Hermes Qdrant memory" --top-k 3 --include-metadata
+hermes qdrant learning preview
+hermes qdrant consolidate --scope both --persist --include-reconsolidation
+hermes qdrant watcher status
+hermes qdrant watcher run --scope both
 ```
 
 Optional explicit-write smoke, only when you intentionally want harmless test records in Qdrant:
@@ -193,15 +192,17 @@ hermes qdrant learning approve CANDIDATE_ID --dry-run --json
 
 Expected behavior:
 
-- `config show` prints effective JSON config with `qdrant_api_key` and `embedding_api_key` redacted, without provider construction or service contact.
-- `status` prints raw JSON provider status and reports `qdrant_ok: true` and `embedding_ok: true` when services are reachable.
-- `doctor` prints structured JSON diagnostics with top-level `ok`, `summary`, and `checks`; a healthy install exits `0`, while any failed critical check exits non-zero.
+- `config show` prints a redacted human key/value summary by default, without provider construction or service contact; `--json` prints the same redacted config as one JSON object.
+- `status` prints human provider/service status by default and reports Qdrant/embedding reachability; `--json` prints raw structured provider status.
+- `doctor` prints a human checklist by default; `--json` prints structured diagnostics with top-level `ok`, `summary`, and `checks`. A healthy install exits `0`, while any failed critical check exits non-zero.
 - `store` and `learning store` are explicit live writes; use only harmless smoke text and remove later by explicit point ID if needed.
-- `search` returns valid JSON; zero results is acceptable on a fresh install.
-- `learning preview` and `learning approve --dry-run` return valid JSON and perform no mutation.
+- `search` returns a bounded human result summary by default; zero results is acceptable on a fresh install. Use `--json` for scripts.
+- `learning preview` and `learning approve --dry-run` return bounded human summaries by default and perform no mutation; use `--json` for scripts.
 - `consolidate --persist` creates a local report artifact under `$HERMES_HOME/qdrant_memory/consolidation/` and performs no Qdrant mutation.
 - `watcher status` reads local watcher state only; missing state is not an error.
 - `watcher run` maps to report-only consolidation (`dry_run=true`, `persist=true`, `include_examples=false`) and performs no Qdrant mutation.
+
+For automation, add `--json` where available, keep stdout/stderr separate, and always check the process exit code. Exit `2` means usage/safety validation failure; exit `1` means provider/service/runtime failure or failed diagnostics. Do not parse default human summaries; see [CLI_OUTPUT_CONTRACT.md](CLI_OUTPUT_CONTRACT.md).
 
 Backup/export/restore smoke for v0.4.0 and later:
 

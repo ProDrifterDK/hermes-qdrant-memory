@@ -48,11 +48,27 @@ class FakeStatusProvider:
         return json.dumps(self.status)
 
 
+class StaticJsonProvider:
+    def __init__(self, payloads):
+        self.payloads = payloads
+        self.calls = []
+
+    def handle_tool_call(self, tool_name, args):
+        self.calls.append((tool_name, args))
+        payload = self.payloads[tool_name]
+        return payload if isinstance(payload, str) else json.dumps(payload)
+
+
 def test_register_cli_adds_mvp_subcommands_and_safe_defaults():
     parser = _parser()
 
     status = parser.parse_args(["qdrant", "status"])
     assert status.qdrant_subcommand == "status"
+    assert getattr(status, "json", False) is False
+
+    status_json = parser.parse_args(["qdrant", "status", "--json"])
+    assert status_json.qdrant_subcommand == "status"
+    assert status_json.json is True
 
     doctor = parser.parse_args(["qdrant", "doctor", "--json"])
     assert doctor.qdrant_subcommand == "doctor"
@@ -176,6 +192,86 @@ def test_execute_command_invokes_provider_and_prints_json(capsys):
     assert output["tool"] == "qdrant_memory_search"
 
 
+def test_status_defaults_to_human_output_and_json_preserves_raw_payload(capsys):
+    from qdrant_memory.cli_core import execute_command
+
+    parser = _parser()
+    raw_status = json.dumps(
+        {
+            "provider": "qdrant",
+            "active": True,
+            "qdrant_ok": True,
+            "embedding_ok": False,
+            "collection_name": "memory",
+            "collection_exists": True,
+            "point_count": 2,
+            "learning_collection_name": "learnings",
+            "learning_collection_exists": True,
+            "learning_point_count": 1,
+            "qdrant_url": "http://status-user:status-pass@example.local:6333",
+            "embedding_url": "https://embed-user:embed-pass@example.local/v1",
+        }
+    )
+    provider = StaticJsonProvider({"qdrant_memory_status": raw_status})
+
+    human_args = parser.parse_args(["qdrant", "status"])
+    assert execute_command(human_args, provider_factory=lambda: provider) == 0
+    human = capsys.readouterr().out
+    assert "Qdrant memory provider: active" in human
+    assert "[OK] qdrant" in human
+    assert "[WARN] embeddings" in human
+    assert "memory: 2" in human
+    assert "learnings: 1" in human
+    assert "status-pass" not in human
+    assert "embed-pass" not in human
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(human)
+
+    json_args = parser.parse_args(["qdrant", "status", "--json"])
+    assert execute_command(json_args, provider_factory=lambda: provider) == 0
+    assert capsys.readouterr().out == raw_status + "\n"
+
+
+def test_config_show_defaults_to_redacted_human_output_without_provider(monkeypatch, tmp_path, capsys):
+    from qdrant_memory.cli_core import execute_command
+
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    qdrant_url = "http://" + "config-user" + ":" + "config-pass" + "@example.local:6333"
+    sensitive_query_key = "_".join(["api", "key"])
+    query_marker = "secret" + "-query"
+    embedding_url = "https://" + "embed-user" + ":" + "embed-pass" + f"@example.local/v1?{sensitive_query_key}={query_marker}"
+    (hermes_home / "qdrant_memory.json").write_text(
+        json.dumps(
+            {
+                "qdrant_url": qdrant_url,
+                "embedding_url": embedding_url,
+                "qdrant_api_key": "real-qdrant-key",
+                "embedding_api_key": "real-embedding-key",
+                "collection_name": "custom",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    parser = _parser()
+    args = parser.parse_args(["qdrant", "config", "show"])
+
+    exit_code = execute_command(args, provider_factory=lambda: pytest.fail("provider should not be constructed"))
+
+    assert exit_code == 0
+    human = capsys.readouterr().out
+    assert "Qdrant memory configuration" in human
+    assert "collection_name: custom" in human
+    assert "qdrant_api_key: <redacted>" in human
+    assert "embedding_api_key: <redacted>" in human
+    assert "config-pass" not in human
+    assert "embed-pass" not in human
+    assert "secret-query" not in human
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(human)
+
+
 def test_execute_command_reports_usage_errors_without_provider(capsys):
     from qdrant_memory.cli_core import execute_command
 
@@ -183,6 +279,14 @@ def test_execute_command_reports_usage_errors_without_provider(capsys):
     args = parser.parse_args(["qdrant", "forget", "point-1", "--no-dry-run"])
 
     exit_code = execute_command(args, provider_factory=lambda: pytest.fail("provider should not be constructed"))
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.out == ""
+    assert "Error: --approve is required" in captured.err
+
+    json_args = parser.parse_args(["qdrant", "forget", "point-1", "--no-dry-run", "--json"])
+    exit_code = execute_command(json_args, provider_factory=lambda: pytest.fail("provider should not be constructed"))
 
     assert exit_code == 2
     error = json.loads(capsys.readouterr().err)
@@ -228,21 +332,127 @@ def test_default_provider_factory_initializes_provider(monkeypatch):
     assert provider.initialized_with == ("cli", {"platform": "cli", "agent_context": "cli"})
 
 
-def test_execute_command_returns_nonzero_when_provider_returns_json_error(capsys):
+def test_execute_command_formats_provider_json_errors_by_output_mode(capsys):
     from qdrant_memory.cli_core import execute_command
+
+    raw_error = json.dumps({"error": "Qdrant memory provider is not initialized"})
 
     class ErrorProvider:
         def handle_tool_call(self, tool_name, args):
-            return json.dumps({"error": "Qdrant memory provider is not initialized"})
+            return raw_error
 
     parser = _parser()
-    args = parser.parse_args(["qdrant", "search", "agent memory"])
+    human_args = parser.parse_args(["qdrant", "search", "agent memory"])
 
-    exit_code = execute_command(args, provider_factory=ErrorProvider)
+    exit_code = execute_command(human_args, provider_factory=ErrorProvider)
 
+    captured = capsys.readouterr()
     assert exit_code == 1
-    assert json.loads(capsys.readouterr().out)["error"] == "Qdrant memory provider is not initialized"
+    assert captured.out == ""
+    assert "Error: Qdrant memory provider is not initialized" in captured.err
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(captured.err)
 
+    json_args = parser.parse_args(["qdrant", "search", "agent memory", "--json"])
+    exit_code = execute_command(json_args, provider_factory=ErrorProvider)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.out == ""
+    assert captured.err == raw_error + "\n"
+    assert json.loads(captured.err)["error"] == "Qdrant memory provider is not initialized"
+
+
+def test_execute_command_json_mode_fails_closed_on_non_object_provider_payload(capsys):
+    from qdrant_memory.cli_core import execute_command
+
+    class BadProvider:
+        def __init__(self, result):
+            self.result = result
+
+        def handle_tool_call(self, tool_name, args):
+            return self.result
+
+    parser = _parser()
+    cases = ["not-json", "[]"]
+    for result in cases:
+        args = parser.parse_args(["qdrant", "search", "agent memory", "--json"])
+        exit_code = execute_command(args, provider_factory=lambda result=result: BadProvider(result))
+
+        captured = capsys.readouterr()
+        assert exit_code == 1
+        assert captured.out == ""
+        error = json.loads(captured.err)
+        assert error["error"] is True
+        assert "JSON object" in error["message"]
+
+
+def test_provider_backed_commands_default_to_human_summaries_and_json_can_remain_raw(capsys):
+    from qdrant_memory.cli_core import execute_command
+
+    parser = _parser()
+    cases = [
+        (
+            ["qdrant", "search", "alpha"],
+            "qdrant_memory_search",
+            '{"results":[{"id":"m1","text":"alpha memory","score":0.988}],"count":1}',
+            ["Found 1 memory", "1. m1 score=0.988 alpha memory"],
+        ),
+        (
+            ["qdrant", "store", "alpha memory"],
+            "qdrant_memory_store",
+            '{"saved":true,"id":"m1","source_type":"manual"}',
+            ["Saved memory: m1", "source_type: manual"],
+        ),
+        (
+            ["qdrant", "learning", "preview"],
+            "qdrant_learning_preview",
+            '{"candidates":[{"candidate_id":"c1","learning_type":"workflow","lesson":"Prefer exact IDs"}],"count":1,"dry_run":true}',
+            ["Pending learning candidates: 1", "1. c1 [workflow] Prefer exact IDs"],
+        ),
+        (
+            ["qdrant", "watcher", "run", "--scope", "memory"],
+            "qdrant_memory_consolidate",
+            '{"dry_run":true,"report_only":true,"report_id":"r1","scope":"memory","proposals":[{"proposal_id":"p1"},{"proposal_id":"p2"}],"summary":{"duplicate_cluster":2}}',
+            ["Report-only consolidation: 2 proposals", "report_id: r1", "scope: memory"],
+        ),
+        (
+            ["qdrant", "apply", "--report-id", "r1", "--proposal-id", "p1", "--action", "merge"],
+            "qdrant_memory_consolidation_apply",
+            '{"dry_run":true,"would_apply":true,"report_id":"r1","proposal_id":"p1","action":"merge","affected_ids":["m1","m2"]}',
+            ["Apply dry-run: action=merge proposal=p1 affected=2", "report_id: r1"],
+        ),
+    ]
+
+    for argv, tool_name, raw_payload, expected_lines in cases:
+        provider = StaticJsonProvider({tool_name: raw_payload})
+        args = parser.parse_args(argv)
+        assert execute_command(args, provider_factory=lambda provider=provider: provider) == 0
+        human = capsys.readouterr().out
+        for expected in expected_lines:
+            assert expected in human
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(human)
+
+    raw_store = '{"saved":true,"id":"m-json","source_type":"manual"}'
+    json_provider = StaticJsonProvider({"qdrant_memory_store": raw_store})
+    json_args = parser.parse_args(["qdrant", "store", "alpha memory", "--json"])
+    assert execute_command(json_args, provider_factory=lambda: json_provider) == 0
+    assert capsys.readouterr().out == raw_store + "\n"
+
+
+def test_search_human_summary_uses_memories_plural(capsys):
+    from qdrant_memory.cli_core import execute_command
+
+    parser = _parser()
+    raw_payload = '{"results":[{"id":"m1","text":"alpha","score":0.1},{"id":"m2","text":"beta","score":0.2}],"count":2}'
+    provider = StaticJsonProvider({"qdrant_memory_search": raw_payload})
+    args = parser.parse_args(["qdrant", "search", "alpha"])
+
+    assert execute_command(args, provider_factory=lambda: provider) == 0
+    human = capsys.readouterr().out
+    assert "Found 2 memories" in human
+    assert "memorys" not in human
 
 def test_qdrant_command_exits_with_execute_command_code(monkeypatch):
     cli = _load_plugin_cli_module()
@@ -415,6 +625,56 @@ def test_doctor_returns_structured_checks_and_success_exit(monkeypatch, tmp_path
         "config_redaction",
     }:
         assert checks[name]["ok"] is True
+
+
+def test_doctor_defaults_to_human_checklist_and_nonzero_failures(monkeypatch, tmp_path, capsys):
+    from qdrant_memory.cli_core import execute_command
+
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "qdrant_memory.json").write_text(
+        json.dumps(
+            {
+                "qdrant_url": "http://doctor-user:doctor-pass@example.local:6333",
+                "embedding_url": "https://embed-user:embed-pass@example.local/v1",
+                "collection_name": "memory",
+                "learning_collection_name": "learnings",
+                "vector_size": 1024,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    provider = FakeStatusProvider(
+        {
+            "provider": "qdrant",
+            "active": False,
+            "qdrant_ok": False,
+            "embedding_ok": True,
+            "collection_name": "memory",
+            "collection_exists": True,
+            "collection_vector_size": 1024,
+            "learning_collection_name": "learnings",
+            "learning_collection_exists": True,
+            "learning_collection_vector_size": 1024,
+            "vector_size": 1024,
+        }
+    )
+    parser = _parser()
+    args = parser.parse_args(["qdrant", "doctor"])
+
+    exit_code = execute_command(args, provider_factory=lambda: provider)
+
+    assert exit_code == 1
+    human = capsys.readouterr().out
+    assert "Diagnostics:" in human
+    assert "[OK] plugin_discovery" in human
+    assert "[FAIL] active_provider" in human
+    assert "[FAIL] qdrant_reachable" in human
+    assert "doctor-pass" not in human
+    assert "embed-pass" not in human
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(human)
 
 
 def test_doctor_returns_nonzero_for_critical_failures(monkeypatch, tmp_path, capsys):
