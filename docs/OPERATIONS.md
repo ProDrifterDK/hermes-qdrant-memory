@@ -203,6 +203,25 @@ Expected behavior:
 - `watcher status` reads local watcher state only; missing state is not an error.
 - `watcher run` maps to report-only consolidation (`dry_run=true`, `persist=true`, `include_examples=false`) and performs no Qdrant mutation.
 
+Backup/export/restore smoke for current `main` / post-v0.3.0 candidates:
+
+```bash
+hermes qdrant export memory --out /tmp/qdrant-memory-export.jsonl --json
+hermes qdrant backup create --scope both --json
+hermes qdrant backup list --json
+hermes qdrant backup inspect BACKUP_ID --json
+hermes qdrant restore --backup BACKUP_ID --dry-run --json
+```
+
+Expected behavior:
+
+- export and backup artifacts are local files only; they contain raw memory payload text and vectors and should be treated as private recovery material;
+- artifact directories are private (`0700`) and artifact files are private (`0600`) where the filesystem supports POSIX modes;
+- stdout JSON prints counts, IDs, paths, and checksums only — not raw payload text or vectors;
+- `backup list` and `backup inspect` do not contact Qdrant and re-redact any stored Qdrant URL before printing;
+- restore dry-run validates artifact checksums, compares existing points, and performs no upsert/delete;
+- live restore requires `--no-dry-run --approve`, validates all target collection vector sizes before mutation, automatically creates a pre-restore backup, and performs additive/update-only upserts.
+
 Verify the CLI process exit gate for live mutation without approval:
 
 ```bash

@@ -49,6 +49,7 @@ Dry-run-first applies to:
 - `qdrant_memory_forget`;
 - `qdrant_learning_approve`;
 - `qdrant_memory_consolidation_apply`;
+- `hermes qdrant restore`;
 - any future CLI wrapper for index, forget, learning approval, consolidation/apply, or watcher operations.
 
 Defaults must remain conservative:
@@ -57,6 +58,7 @@ Defaults must remain conservative:
 - forgetting defaults to dry-run;
 - learning approval defaults to dry-run;
 - consolidation apply defaults to dry-run;
+- restore defaults to dry-run;
 - report generation is report-only and must reject live apply behavior.
 
 Live mutation requires an explicit operator decision after reviewing the dry-run output.
@@ -222,13 +224,15 @@ Persisting local artifacts is allowed when the artifact is redacted and review-o
 
 Allowed local artifacts include:
 
+- export JSONL artifacts that intentionally contain raw payload text and vectors;
+- backup manifests plus collection JSONL artifacts stored in private local directories;
 - consolidation JSON reports;
 - application audit records;
 - skill draft artifacts;
 - reconsolidation markdown review drafts;
 - watcher state used to suppress duplicate alerts.
 
-Local artifact persistence is not the same as a Qdrant memory mutation.
+Local artifact persistence is not the same as a Qdrant memory mutation. Export and backup artifacts are an explicit exception to the usual redacted-report rule: they are recovery artifacts and therefore contain raw memory text and vectors. They must be written with private filesystem permissions and their CLI stdout summaries must not print raw payloads, vectors, or credentials.
 
 Qdrant mutations remain gated by dry-run-first, explicit IDs/proposal handles, and approval requirements.
 
@@ -312,7 +316,14 @@ Audit material should include:
 - timestamp;
 - dry-run plan reviewed before live approval.
 
-Before adding broader mutation surfaces, add export/backup/restore tooling or an equivalent operator rollback story.
+Backup/export/restore tooling now provides the rollback story for broader operator maintenance:
+
+- `export memory|learning` writes one collection to JSONL and performs no Qdrant mutation;
+- `backup create` writes a private local manifest plus JSONL collection files and performs no Qdrant mutation;
+- `backup list` and `backup inspect` read local artifacts only and must re-redact stored URLs before printing;
+- `restore` validates checksums and target vector compatibility before mutation;
+- live `restore` requires `dry_run=false` plus `approve=true` and automatically creates a pre-restore backup;
+- restore is additive/update-only through upsert and must not delete by query or filter.
 
 ---
 

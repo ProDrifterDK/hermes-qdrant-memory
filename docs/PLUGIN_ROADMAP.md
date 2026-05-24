@@ -953,16 +953,17 @@ The v0.3.0 CLI intentionally remains close to provider JSON. The next design pas
 - watcher state/artifact directory are readable/writable;
 - config redaction catches API-key fields and credentialed URLs.
 
-### Priority 4: Backup/export/rollback before broader mutation
+### Priority 4: Backup/export/rollback before broader mutation (implemented)
 
-Before adding stronger cleanup/rewrite workflows, add operator recovery primitives:
+Operator recovery primitives now exist before any broader cleanup/rewrite workflow is added:
 
 - `hermes qdrant export memory|learning --out FILE`;
 - `hermes qdrant backup create`;
 - `hermes qdrant backup list`;
 - `hermes qdrant backup inspect ID`;
 - `hermes qdrant restore --backup ID --dry-run`;
-- optional `--backup-first` for live `apply`.
+- live `restore` requires `--no-dry-run --approve`, preflights target vector compatibility, and automatically creates a pre-restore backup;
+- optional `--backup-first` exists for live `apply`.
 
 ### Priority 5: Inspection/search ergonomics
 

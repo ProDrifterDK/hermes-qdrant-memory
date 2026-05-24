@@ -657,6 +657,11 @@ hermes qdrant consolidate --scope both --persist --dry-run --json
 hermes qdrant watcher status --json
 hermes qdrant watcher run --scope both --json
 hermes qdrant apply --report-id REPORT_ID --proposal-id PROPOSAL_ID --action merge --dry-run --json
+hermes qdrant export memory --out memory.jsonl --json
+hermes qdrant backup create --scope both --json
+hermes qdrant backup list --json
+hermes qdrant backup inspect BACKUP_ID --json
+hermes qdrant restore --backup BACKUP_ID --dry-run --json
 ```
 
 Mutation safety mirrors the tool surface:
@@ -668,7 +673,10 @@ Mutation safety mirrors the tool surface:
 - `learning approve` follows the same live approval gate;
 - `forget` only accepts explicit point IDs;
 - `watcher run` is report-only consolidation with `dry_run=true`, `persist=true`, and no apply/proposal mutation;
-- `apply` requires explicit report/proposal IDs and expected action.
+- `apply` requires explicit report/proposal IDs and expected action;
+- `export memory|learning` and `backup create` write private JSONL artifacts that contain raw memory payloads and vectors, but stdout only returns summaries;
+- `backup list` and `backup inspect` are local artifact reads and re-redact stored Qdrant URLs before printing;
+- `restore` is dry-run by default; live restore requires `--no-dry-run --approve`, validates all backup checksums and target vector sizes before mutation, and automatically creates a pre-restore backup.
 
 The CLI is a thin wrapper over existing `qdrant_memory_*` and `qdrant_learning_*` tool calls. See [docs/CLI_SPIKE.md](docs/CLI_SPIKE.md) for feasibility findings and caveats.
 

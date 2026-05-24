@@ -29,6 +29,7 @@ except Exception:  # pragma: no cover - used only for standalone tests without H
         pass
 
 from qdrant_memory.client import QdrantClient
+from qdrant_memory.backup import create_backup
 from qdrant_memory.config import load_config
 from qdrant_memory.consolidation import (
     artifact_root,
@@ -680,18 +681,22 @@ class QdrantMemoryProvider(MemoryProvider):
             plan = self._proposal_apply_plan(report, proposal, action, points)
             if dry_run:
                 return json.dumps({"dry_run": True, "would_apply": True, **plan})
+            pre_apply: dict[str, Any] = {}
+            if parse_bool_arg(args.get("backup_first"), default=False):
+                backup = create_backup(self._qdrant, self._config, hermes_home=self._hermes_home, scope="both")
+                pre_apply["pre_apply_backup_id"] = backup.get("backup_id")
             if action == "draft_review":
                 draft_root = artifact_root(self._hermes_home, str(self._config.get("consolidation_artifact_dir") or "")) / "reconsolidation_drafts"
                 draft_root.mkdir(parents=True, exist_ok=True)
                 draft_path = draft_root / f"{proposal_id}.md"
                 draft_text = build_reconsolidation_draft_text(points, proposal=proposal, report_id=report_id)
                 draft_path.write_text(draft_text, encoding="utf-8")
-                record = persist_application_record({"applied": True, **plan, "reconsolidation_draft_path": str(draft_path)}, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))
-                return json.dumps({"dry_run": False, "applied": True, **plan, "reconsolidation_draft_path": str(draft_path), "application_id": record.get("application_id"), "application_artifact": record.get("artifact_path")})
+                record = persist_application_record({"applied": True, **plan, **pre_apply, "reconsolidation_draft_path": str(draft_path)}, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))
+                return json.dumps({"dry_run": False, "applied": True, **plan, **pre_apply, "reconsolidation_draft_path": str(draft_path), "application_id": record.get("application_id"), "application_artifact": record.get("artifact_path")})
             if action == "delete":
                 self._qdrant.delete_ids(collection_name, affected_ids)
-                record = persist_application_record({"applied": True, **plan, "deleted_ids": affected_ids}, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))
-                return json.dumps({"dry_run": False, "applied": True, **plan, "deleted_ids": affected_ids, "application_id": record.get("application_id"), "application_artifact": record.get("artifact_path")})
+                record = persist_application_record({"applied": True, **plan, **pre_apply, "deleted_ids": affected_ids}, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))
+                return json.dumps({"dry_run": False, "applied": True, **plan, **pre_apply, "deleted_ids": affected_ids, "application_id": record.get("application_id"), "application_artifact": record.get("artifact_path")})
             if action == "merge":
                 if len(points) < 2:
                     return _json_error("merge requires at least two affected points")
@@ -709,8 +714,8 @@ class QdrantMemoryProvider(MemoryProvider):
                 self._qdrant.update_payload(collection_name, canonical.id, payload_update)
                 if delete_ids:
                     self._qdrant.delete_ids(collection_name, delete_ids)
-                record = persist_application_record({"applied": True, **plan, "canonical_id": canonical.id, "deleted_ids": delete_ids}, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))
-                return json.dumps({"dry_run": False, "applied": True, **plan, "canonical_id": canonical.id, "deleted_ids": delete_ids, "application_id": record.get("application_id"), "application_artifact": record.get("artifact_path")})
+                record = persist_application_record({"applied": True, **plan, **pre_apply, "canonical_id": canonical.id, "deleted_ids": delete_ids}, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))
+                return json.dumps({"dry_run": False, "applied": True, **plan, **pre_apply, "canonical_id": canonical.id, "deleted_ids": delete_ids, "application_id": record.get("application_id"), "application_artifact": record.get("artifact_path")})
             if action == "promote_to_skill":
                 if collection_name != self._config["learning_collection_name"]:
                     return _json_error("promote_to_skill requires a learning collection proposal")
@@ -732,8 +737,8 @@ class QdrantMemoryProvider(MemoryProvider):
                         "consolidation_proposal_id": proposal_id,
                     },
                 )
-                record = persist_application_record({"applied": True, **plan, "skill_draft_path": str(draft_path)}, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))
-                return json.dumps({"dry_run": False, "applied": True, **plan, "skill_draft_path": str(draft_path), "application_id": record.get("application_id"), "application_artifact": record.get("artifact_path")})
+                record = persist_application_record({"applied": True, **plan, **pre_apply, "skill_draft_path": str(draft_path)}, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))
+                return json.dumps({"dry_run": False, "applied": True, **plan, **pre_apply, "skill_draft_path": str(draft_path), "application_id": record.get("application_id"), "application_artifact": record.get("artifact_path")})
             return _json_error("unsupported consolidation action")
         except Exception as exc:
             return _json_error(f"Consolidation apply failed: {exc}")

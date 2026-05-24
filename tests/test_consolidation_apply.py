@@ -31,6 +31,7 @@ class FakeQdrant:
         self.deleted_ids = []
         self.deleted_filters = []
         self.searches = []
+        self.ensure_calls = []
 
     def scroll_by_filter(self, name, filter, *, limit=256, with_payload=True, with_vector=False, max_total=None):
         self.scrolls.append(
@@ -62,13 +63,22 @@ class FakeQdrant:
     def delete_filter(self, name, filter):
         self.deleted_filters.append((name, filter))
 
+    def ensure_collection(self, name, vector_size, distance):
+        self.ensure_calls.append((name, vector_size, distance))
+
+    def collection_vector_size(self, name):
+        return 2
+
+    def collection_info(self, name):
+        return {"config": {"params": {"vectors": {"size": 2, "distance": "Cosine"}}}}
+
     def search(self, *args, **kwargs):
         self.searches.append((args, kwargs))
         return []
 
 
-def _point(point_id, text, **payload):
-    return {"id": point_id, "payload": {"text": text, **payload}}
+def _point(point_id, text, vector=None, **payload):
+    return {"id": point_id, "vector": vector or [0.1, 0.2], "payload": {"text": text, **payload}}
 
 
 def _persist_duplicate_report(provider):
@@ -286,3 +296,35 @@ def test_apply_promote_live_creates_skill_draft_and_marks_learning(tmp_path):
     assert provider._qdrant.payload_updates[0][0:2] == ("learnings", "l1")
     assert provider._qdrant.payload_updates[0][2]["promoted_to_skill_draft"] is True
     assert provider._qdrant.deleted_ids == []
+
+
+def test_apply_backup_first_creates_backup_before_live_mutation(tmp_path):
+    provider = _provider(tmp_path)
+    old = (datetime.now(timezone.utc) - timedelta(days=200)).isoformat()
+    provider._qdrant = FakeQdrant(
+        {"memory": [_point("m1", "old weak memory for backup-first", source_type="conversation", importance=1, confidence=0.3, access_count=0, created_at=old)], "learnings": []}
+    )
+    report, proposal = _persist_stale_report(provider)
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_consolidation_apply",
+            {
+                "report_id": report["report_id"],
+                "proposal_id": proposal["proposal_id"],
+                "action": "delete",
+                "dry_run": False,
+                "approve": True,
+                "backup_first": True,
+            },
+        )
+    )
+
+    assert result["applied"] is True
+    assert result["pre_apply_backup_id"]
+    backup_dir = tmp_path / "qdrant_memory" / "backups" / result["pre_apply_backup_id"]
+    assert (backup_dir / "manifest.json").exists()
+    assert (backup_dir / "memory.jsonl").exists()
+    assert provider._qdrant.deleted_ids == [("memory", ["m1"])]
+    assert provider._qdrant.deleted_filters == []
+    assert provider._qdrant.ensure_calls == []

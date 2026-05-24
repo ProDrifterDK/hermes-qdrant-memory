@@ -92,6 +92,35 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     _add_dry_run_flags(forget)
     forget.add_argument("--json", action="store_true", help="Emit raw JSON output.")
 
+    export = subcommands.add_parser("export", help="Export a Qdrant collection to a private JSONL artifact.")
+    export_subcommands = export.add_subparsers(dest="export_scope", required=True)
+    for scope_name in ("memory", "learning"):
+        export_scope = export_subcommands.add_parser(scope_name, help=f"Export the {scope_name} collection.")
+        export_scope.set_defaults(qdrant_subcommand="export")
+        export_scope.add_argument("--out", required=True, help="Output JSONL artifact path.")
+        export_scope.add_argument("--overwrite", action="store_true", help="Replace an existing output file.")
+        export_scope.add_argument("--json", action="store_true", help="Emit raw JSON output.")
+
+    backup = subcommands.add_parser("backup", help="Create, list, or inspect private Qdrant backup artifacts.")
+    backup_subcommands = backup.add_subparsers(dest="backup_subcommand", required=True)
+    backup_create = backup_subcommands.add_parser("create", help="Create a private backup artifact. No Qdrant mutation.")
+    backup_create.set_defaults(qdrant_subcommand="backup")
+    backup_create.add_argument("--scope", choices=["memory", "learning", "both"], default="both", help="Backup scope. Default: both.")
+    backup_create.add_argument("--json", action="store_true", help="Emit raw JSON output.")
+    backup_list = backup_subcommands.add_parser("list", help="List local backup artifacts without contacting Qdrant.")
+    backup_list.set_defaults(qdrant_subcommand="backup")
+    backup_list.add_argument("--json", action="store_true", help="Emit raw JSON output.")
+    backup_inspect = backup_subcommands.add_parser("inspect", help="Inspect and verify one backup artifact without contacting Qdrant.")
+    backup_inspect.set_defaults(qdrant_subcommand="backup")
+    backup_inspect.add_argument("backup_id", help="Backup ID to inspect.")
+    backup_inspect.add_argument("--json", action="store_true", help="Emit raw JSON output.")
+
+    restore = subcommands.add_parser("restore", help="Plan or explicitly restore a private Qdrant backup. Dry-run by default.")
+    restore.add_argument("--backup", dest="backup_id", required=True, help="Backup ID to restore.")
+    _add_dry_run_flags(restore)
+    restore.add_argument("--backup-first", action="store_true", help="Create a fresh backup before live restore.")
+    restore.add_argument("--json", action="store_true", help="Emit raw JSON output.")
+
     learning = subcommands.add_parser("learning", help="Search or preview procedural learnings.")
     learning_subcommands = learning.add_subparsers(dest="learning_subcommand", required=True)
 
@@ -142,6 +171,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     apply_parser.add_argument("--proposal-id", required=True, help="Proposal ID to preview/apply.")
     apply_parser.add_argument("--action", required=True, choices=["merge", "delete", "promote_to_skill", "draft_review"], help="Expected proposal action.")
     _add_dry_run_flags(apply_parser)
+    apply_parser.add_argument("--backup-first", action="store_true", help="Create a fresh backup before live apply.")
     apply_parser.add_argument("--json", action="store_true", help="Emit raw JSON output.")
 
     watcher = subcommands.add_parser("watcher", help="Inspect or run report-only watcher consolidation helpers.")

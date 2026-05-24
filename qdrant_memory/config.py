@@ -40,6 +40,7 @@ DEFAULTS: dict[str, Any] = {
     "consolidation_persist_reports": True,
     "consolidation_artifact_dir": "",
     "consolidation_apply_dry_run_default": True,
+    "backup_artifact_dir": "",
     "reconsolidation_enabled": False,
     "reconsolidation_report_only": True,
     "reconsolidation_include_by_default": False,

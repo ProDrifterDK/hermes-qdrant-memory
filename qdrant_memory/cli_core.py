@@ -155,6 +155,108 @@ def _watcher_status_payload() -> dict[str, Any]:
     }
 
 
+def _print_json_or_summary(payload: dict[str, Any], *, json_output: bool, stdout, summary: str) -> None:
+    if json_output:
+        print(json.dumps(payload, sort_keys=True), file=stdout)
+    else:
+        print(summary, file=stdout)
+
+
+def _local_service_error_message(exc: RuntimeError) -> str:
+    message = str(exc)
+    http_match = re.search(r"\bQdrant HTTP\s+([0-9]{3})\b", message)
+    if http_match:
+        return f"Qdrant service request failed (HTTP {http_match.group(1)})"
+    if "qdrant" in message.lower():
+        return "Qdrant service request failed"
+    return "Local qdrant backup/export/restore command failed"
+
+
+def _local_config() -> tuple[Path, dict[str, Any]]:
+    from qdrant_memory.config import load_config
+
+    hermes_home = _hermes_home()
+    return hermes_home, load_config(hermes_home=str(hermes_home))
+
+
+def _execute_backup_export_restore_command(args: Namespace, stdout) -> int | None:
+    subcommand = getattr(args, "qdrant_subcommand", None)
+    if subcommand not in {"export", "backup", "restore"}:
+        return None
+
+    from qdrant_memory.backup import (
+        create_backup,
+        export_collection,
+        inspect_backup,
+        list_backups,
+        qdrant_client_from_config,
+        restore_backup,
+    )
+
+    hermes_home, config = _local_config()
+    json_output = bool(getattr(args, "json", False))
+
+    if subcommand == "export":
+        qdrant = qdrant_client_from_config(config)
+        payload = export_collection(qdrant, config, scope=str(getattr(args, "export_scope", "")), out_file=getattr(args, "out", ""), overwrite=bool(getattr(args, "overwrite", False)))
+        _print_json_or_summary(
+            payload,
+            json_output=json_output,
+            stdout=stdout,
+            summary=f"Exported {payload.get('scope')} collection: {payload.get('count')} points -> {payload.get('path')}",
+        )
+        return 0
+
+    if subcommand == "backup":
+        backup_subcommand = getattr(args, "backup_subcommand", None)
+        if backup_subcommand == "create":
+            qdrant = qdrant_client_from_config(config)
+            payload = create_backup(qdrant, config, hermes_home=hermes_home, scope=str(getattr(args, "scope", "both")))
+            _print_json_or_summary(
+                payload,
+                json_output=json_output,
+                stdout=stdout,
+                summary=f"Created backup {payload.get('backup_id')} -> {payload.get('backup_dir')}",
+            )
+            return 0
+        if backup_subcommand == "list":
+            payload = list_backups(config, hermes_home=hermes_home)
+            _print_json_or_summary(payload, json_output=json_output, stdout=stdout, summary=f"Found {payload.get('count')} backups in {payload.get('backup_root')}")
+            return 0
+        if backup_subcommand == "inspect":
+            payload = inspect_backup(str(getattr(args, "backup_id", "")), config, hermes_home=hermes_home)
+            _print_json_or_summary(
+                payload,
+                json_output=json_output,
+                stdout=stdout,
+                summary=f"Backup {payload.get('backup_id')} checksum_ok={payload.get('checksum_ok')}",
+            )
+            return 0
+        raise CliUsageError("unsupported qdrant backup command")
+
+    if subcommand == "restore":
+        _require_live_approval(args)
+        qdrant = qdrant_client_from_config(config)
+        payload = restore_backup(
+            qdrant,
+            config,
+            hermes_home=hermes_home,
+            backup_id=str(getattr(args, "backup_id", "")),
+            dry_run=bool(getattr(args, "dry_run", True)),
+            backup_first=bool(getattr(args, "backup_first", False)),
+        )
+        total = sum(int(item.get("would_upsert", 0)) for item in (payload.get("collections") or {}).values() if isinstance(item, dict))
+        _print_json_or_summary(
+            payload,
+            json_output=json_output,
+            stdout=stdout,
+            summary=f"Restore {'dry-run' if payload.get('dry_run') else 'applied'} for {payload.get('backup_id')}: {total} points need upsert",
+        )
+        return 0
+
+    return None
+
+
 def _doctor_check(name: str, ok: bool, summary: str, *, critical: bool = True, details: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "name": name,
@@ -449,6 +551,9 @@ def build_doctor_report(provider_factory: Callable[[], Any]) -> dict[str, Any]:
 
 
 def _execute_local_command(args: Namespace, stdout) -> int | None:
+    backup_exit = _execute_backup_export_restore_command(args, stdout)
+    if backup_exit is not None:
+        return backup_exit
     subcommand = getattr(args, "qdrant_subcommand", None)
     if subcommand == "config" and getattr(args, "config_subcommand", None) == "show":
         print(json.dumps(_redacted_config(), sort_keys=True), file=stdout)
@@ -517,13 +622,16 @@ def build_tool_call(args: Namespace) -> tuple[str, dict[str, Any]]:
 
     if subcommand == "apply":
         _require_live_approval(args)
-        return "qdrant_memory_consolidation_apply", {
+        tool_args = {
             "report_id": args.report_id,
             "proposal_id": args.proposal_id,
             "action": args.action,
             "dry_run": args.dry_run,
             "approve": args.approve,
         }
+        if getattr(args, "backup_first", False):
+            tool_args["backup_first"] = True
+        return "qdrant_memory_consolidation_apply", tool_args
 
     if subcommand == "learning":
         learning_subcommand = getattr(args, "learning_subcommand", None)
@@ -610,7 +718,21 @@ def execute_command(
     stderr = stderr or sys.stderr
     provider_factory = provider_factory or default_provider_factory
 
-    local_exit = _execute_local_command(args, stdout)
+    try:
+        local_exit = _execute_local_command(args, stdout)
+    except CliUsageError as exc:
+        print(json.dumps({"error": True, "message": str(exc)}), file=stderr)
+        return 2
+    except RuntimeError as exc:
+        if getattr(args, "qdrant_subcommand", None) in {"export", "backup", "restore"}:
+            print(json.dumps({"error": True, "message": _local_service_error_message(exc)}), file=stderr)
+            return 1
+        raise
+    except ValueError as exc:
+        if exc.__class__.__name__ == "BackupError":
+            print(json.dumps({"error": True, "message": str(exc)}), file=stderr)
+            return 2
+        raise
     if local_exit is not None:
         return local_exit
 

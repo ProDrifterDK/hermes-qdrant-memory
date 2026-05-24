@@ -4,6 +4,23 @@ All notable changes to this project are documented here.
 
 This project is currently public beta / experimental. The format follows Keep a Changelog style, but the repository is still pre-1.0 and the public API may change.
 
+## [Unreleased]
+
+### Added
+
+- CLI recovery primitives for operators:
+  - `hermes qdrant export memory|learning --out FILE [--overwrite]` writes one collection to a private JSONL artifact with raw payloads and vectors.
+  - `hermes qdrant backup create [--scope memory|learning|both]` writes a private manifest plus collection JSONL files.
+  - `hermes qdrant backup list` and `hermes qdrant backup inspect BACKUP_ID` inspect local backup artifacts without contacting Qdrant.
+  - `hermes qdrant restore --backup BACKUP_ID` previews restore plans by default.
+
+### Safety
+
+- Live restore requires `--no-dry-run --approve`, validates backup checksums and target vector sizes before mutation, automatically creates a pre-restore backup, and performs additive/update-only upserts.
+- Backup/export/restore stdout returns summaries only; raw payloads and vectors are confined to private local artifacts.
+- Backup metadata URL redaction now fails closed and re-redacts stored manifest URLs during list/inspect.
+- Local backup/export/restore service failures are reported as sanitized JSON CLI errors instead of raw tracebacks.
+
 ## [0.3.0]
 
 Third public beta release of the Hermes Qdrant Memory Provider. This release broadens the native `hermes qdrant ...` CLI surface, keeps maintenance operations dry-run/review-gated, and tightens release hygiene for public users.
