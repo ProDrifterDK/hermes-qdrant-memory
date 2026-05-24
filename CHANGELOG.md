@@ -11,11 +11,14 @@ This project is currently public beta / experimental. The format follows Keep a 
 - Watcher lifecycle CLI commands: `hermes qdrant watcher install`, `uninstall`, `status --verbose`, `logs`, `inspect-state`, `reset-signature --approve`, and `run --force-alert`.
 - Env-gated live integration tests for read-only search filters, provider store writes, file indexing upsert/stale-delete behavior, and gated consolidation report/apply paths against real Qdrant plus an OpenAI-compatible embedding endpoint.
 - Documentation for `RUN_QDRANT_INTEGRATION` and `QDRANT_TEST_*` live test configuration in README and the operations runbook.
+- Manual memory store previews: `qdrant_memory_store` now defaults to `dry_run=true`, and native `hermes qdrant store` exposes `--dry-run`, `--no-dry-run`, `--approve`, and `--preview-duplicates`.
+- Optional semantic duplicate preview for manual stores, scoped to the configured memory collection/profile/source type, with configurable threshold and candidate count.
 
 ### Safety
 
 - Watcher lifecycle commands are local scheduler/state/log operations only, with approval gates for uninstalling, replacing an existing managed cron block, and resetting proposal signatures.
 - `watcher run` remains report-only consolidation with `dry_run=true`, `persist=true`, and no apply/proposal mutation; successful runs update only local watcher state/log artifacts.
+- Manual memory store live writes now require explicit `dry_run=false` plus `approve=true`; duplicate preview can skip an upsert but never deletes, merges, or rewrites existing memories.
 - Live integration tests skip by default, use uniquely named temporary collections, delete only the exact collections created by the test fixture when names match the configured test prefix, and place consolidation artifacts under pytest temporary directories.
 
 ## [0.7.0]

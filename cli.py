@@ -83,6 +83,8 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     store.add_argument("--source-type", default="manual", help="Memory source type. Default: manual.")
     store.add_argument("--importance", type=_importance, default=5, help="Importance, 1 to 10. Default: 5.")
     _add_tag_flags(store)
+    _add_dry_run_flags(store)
+    store.add_argument("--preview-duplicates", dest="preview_duplicates", action="store_true", help="Search for semantic duplicates before storing.")
     store.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
 
     search = subcommands.add_parser("search", help="Search semantic memories.")

@@ -69,6 +69,8 @@ DEFAULTS: dict[str, Any] = {
     ],
     "index_max_files": 500,
     "index_dry_run_default": True,
+    "manual_store_duplicate_threshold": 0.92,
+    "manual_store_duplicate_top_k": 3,
 }
 
 _BOOL_KEYS = {
@@ -102,8 +104,9 @@ _INT_KEYS = {
     "consolidation_stale_days",
     "consolidation_min_importance_for_keep",
     "reconsolidation_max_candidates",
+    "manual_store_duplicate_top_k",
 }
-_FLOAT_KEYS = {"decay_rate", "min_raw_score", "min_final_score", "learning_auto_extract_min_confidence", "learning_auto_extract_semantic_dedupe_threshold", "consolidation_duplicate_threshold", "reconsolidation_min_confidence"}
+_FLOAT_KEYS = {"decay_rate", "min_raw_score", "min_final_score", "learning_auto_extract_min_confidence", "learning_auto_extract_semantic_dedupe_threshold", "consolidation_duplicate_threshold", "reconsolidation_min_confidence", "manual_store_duplicate_threshold"}
 _LIST_KEYS = {"index_dirs", "index_extensions", "index_exclude_dirs"}
 
 

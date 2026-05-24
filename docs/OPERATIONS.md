@@ -125,13 +125,25 @@ Ask Hermes:
 Call qdrant_memory_status and summarize qdrant_ok, embedding_ok, collection_name, point_count, learning_enabled, and reconsolidation_report_only.
 ```
 
-### Step 2: Manual store
+### Step 2: Manual store preview
 
 Ask Hermes:
 
 ```text
-Call qdrant_memory_store with source_type=manual and text="Qdrant memory smoke test marker for this local install."
+Call qdrant_memory_store with source_type=manual, text="Qdrant memory smoke test marker for this local install.", dry_run=true, and duplicate_preview=true.
 ```
+
+Confirm the result includes `dry_run: true`, `saved: false`, `would_store: true`, and a point ID. This step must not call Qdrant upsert.
+
+### Step 2b: Optional approved live store
+
+Only if you intentionally want a harmless test record in Qdrant, repeat the same text with explicit live approval:
+
+```text
+Call qdrant_memory_store with source_type=manual, text="Qdrant memory smoke test marker for this local install.", dry_run=false, approve=true, and duplicate_preview=true.
+```
+
+If `duplicate_found: true`, the tool should return duplicate details and skip the upsert. Otherwise record the returned point ID for Step 4 cleanup.
 
 ### Step 3: Search
 
@@ -198,7 +210,8 @@ hermes qdrant proposals show REPORT_ID PROPOSAL_ID
 Optional explicit-write smoke, only when you intentionally want harmless test records in Qdrant:
 
 ```bash
-hermes qdrant store "Release smoke explicit memory" --source-type manual --importance 5 --tag smoke
+hermes qdrant store "Release smoke explicit memory" --source-type manual --importance 5 --tag smoke --preview-duplicates
+hermes qdrant store "Release smoke explicit memory" --source-type manual --importance 5 --tag smoke --preview-duplicates --no-dry-run --approve
 hermes qdrant learning store "Release smoke procedural lesson" --learning-type workflow_lesson --confidence 0.8 --tag smoke
 hermes qdrant learning approve CANDIDATE_ID --dry-run --json
 ```
@@ -208,7 +221,8 @@ Expected behavior:
 - `config show` prints a redacted human key/value summary by default, without provider construction or service contact; `--json` prints the same redacted config as one JSON object.
 - `status` prints human provider/service status by default and reports Qdrant/embedding reachability; `--json` prints raw structured provider status.
 - `doctor` prints a human checklist by default; `--json` prints structured diagnostics with top-level `ok`, `summary`, and `checks`. A healthy install exits `0`, while any failed critical check exits non-zero.
-- `store` and `learning store` are explicit live writes; use only harmless smoke text and remove later by explicit point ID if needed.
+- `store` previews by default (`--dry-run`) and performs no Qdrant mutation unless `--no-dry-run --approve` is supplied. Use `--preview-duplicates` before intentional live manual writes; duplicate hits skip the upsert and never merge/delete existing points.
+- `learning store` is an explicit live write; use only harmless smoke text and remove later by explicit point ID if needed.
 - `search` returns a bounded human result summary by default; zero results is acceptable on a fresh install. Use `--json` for scripts.
 - `learning preview` and `learning approve --dry-run` return bounded human summaries by default and perform no mutation; use `--json` for scripts.
 - `consolidate --persist` creates a local report artifact under `$HERMES_HOME/qdrant_memory/consolidation/` and performs no Qdrant mutation.

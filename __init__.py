@@ -460,9 +460,53 @@ class QdrantMemoryProvider(MemoryProvider):
         tags = args.get("tags") or []
         if not isinstance(tags, list):
             tags = []
+        tags = [str(t) for t in tags]
+        dry_run = parse_bool_arg(args.get("dry_run"), default=True)
+        approve = parse_bool_arg(args.get("approve"), default=False)
+        duplicate_preview = parse_bool_arg(args.get("duplicate_preview"), default=False)
         try:
-            point_id = self._writer.store_text(text, source_type=source_type, importance=importance, tags=[str(t) for t in tags])
-            return json.dumps({"saved": bool(point_id), "id": point_id, "source_type": source_type})
+            raw_threshold = args.get("duplicate_threshold")
+            if raw_threshold is None:
+                raw_threshold = self._config.get("manual_store_duplicate_threshold", 0.92)
+            duplicate_threshold = max(0.0, min(1.0, float(raw_threshold)))
+        except Exception:
+            duplicate_threshold = 0.92
+        try:
+            raw_top_k = args.get("duplicate_top_k")
+            if raw_top_k is None:
+                raw_top_k = self._config.get("manual_store_duplicate_top_k", 3)
+            duplicate_top_k = max(1, min(20, int(raw_top_k)))
+        except Exception:
+            duplicate_top_k = 3
+        try:
+            preview = self._writer.preview_text(text, source_type=source_type, importance=importance, tags=tags)
+            if not preview.get("id"):
+                return _json_error("text is required")
+            duplicate = None
+            if duplicate_preview:
+                duplicate = self._writer.find_semantic_duplicate(
+                    text,
+                    source_type=source_type,
+                    threshold=duplicate_threshold,
+                    top_k=duplicate_top_k,
+                )
+            base = {
+                "id": preview.get("id"),
+                "source_type": source_type,
+                "collection_name": self._config["collection_name"],
+                "duplicate_preview": duplicate_preview,
+                "duplicate_found": bool(duplicate),
+            }
+            if duplicate:
+                base["duplicate"] = duplicate
+            if dry_run:
+                return json.dumps({"dry_run": True, "saved": False, "would_store": not bool(duplicate), **base})
+            if not approve:
+                return _json_error("approve=true is required when dry_run=false")
+            if duplicate:
+                return json.dumps({"dry_run": False, "saved": False, "would_store": False, **base})
+            point_id = self._writer.store_text(text, source_type=source_type, importance=importance, tags=tags)
+            return json.dumps({"dry_run": False, "saved": bool(point_id), "id": point_id, "source_type": source_type, "collection_name": self._config["collection_name"]})
         except Exception as exc:
             return _json_error(f"Failed to store memory: {exc}")
 
