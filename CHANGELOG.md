@@ -6,17 +6,23 @@ This project is currently public beta / experimental. The format follows Keep a 
 
 ## [Unreleased]
 
+## [0.7.0]
+
+Seventh public beta release of the Hermes Qdrant Memory Provider. This release adds read-only search filters for memory and learning search, including native CLI parity, while preserving the existing dry-run/review-gated mutation boundary.
+
 ### Added
 
-- v0.7.0 search filter work:
-  - `qdrant_memory_search` now accepts `tags`, `source`, `file_path`, `project_path`, `since`, `until`, and `collection` filters.
-  - `qdrant_learning_search` now accepts `tags`, `source`, `file_path`, `project_path`, `since`, and `until` filters.
-  - Native CLI search commands now expose the same filters through `--tag`, `--source`, `--file-path` / `--path`, `--project-path`, `--since`, `--until`, and `--collection memory|learning` where applicable.
+- Plugin metadata version bumped to `0.7.0`.
+- `qdrant_memory_search` now accepts `tags`, `source`, `file_path`, `project_path`, `since`, `until`, and `collection` filters.
+- `qdrant_learning_search` now accepts `tags`, `source`, `file_path`, `project_path`, `since`, and `until` filters.
+- Native CLI search commands now expose the same filters through `--tag`, `--source`, `--file-path` / `--path`, `--project-path`, `--since`, `--until`, and `--collection memory|learning` where applicable.
+- `qdrant_memory_search(collection="learning")` routes through the learning collection search path for cross-collection operator workflows.
 
 ### Safety
 
 - Search filters only narrow read results. They do not add query-based deletion, broad mutation, automatic reconsolidation, or any new write authority.
 - Existing profile/platform scope filters are preserved and combined with the new Qdrant `must` conditions.
+- Tool schemas keep strict `additionalProperties: false` behavior while adding the new filter parameters.
 
 ## [0.6.0]
 
@@ -194,6 +200,7 @@ Second public beta release of the Hermes Qdrant Memory Provider.
 
 Initial public beta tag. The v0.1.0 tag predates the learning, consolidation, reconsolidation, scanner guard, and native CLI MVP work documented in later releases.
 
+[0.7.0]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.7.0
 [0.6.0]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.6.0
 [0.5.0]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.5.0
 [0.4.0]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.4.0

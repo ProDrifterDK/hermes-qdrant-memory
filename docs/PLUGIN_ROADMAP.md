@@ -12,11 +12,11 @@
 
 ## 1. Current state
 
-The project is published as `v0.6.0 Public Beta` and is functional as a Hermes Qdrant-backed memory provider. The latest release URL is:
+The project is published as `v0.7.0 Public Beta` and is functional as a Hermes Qdrant-backed memory provider. The latest release URL is:
 
-- <https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.6.0>
+- <https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.7.0>
 
-Implemented capabilities through v0.6.0 plus current unreleased v0.7.0 work:
+Implemented capabilities through v0.7.0:
 
 - Hermes `MemoryProvider` subclass: `QdrantMemoryProvider`.
 - Plugin registration through `register(ctx)`.
@@ -38,7 +38,7 @@ Implemented capabilities through v0.6.0 plus current unreleased v0.7.0 work:
 - Backup/export/restore recovery primitives with private local artifacts, dry-run restore default, live approval gate, and automatic pre-restore backup.
 - Human-readable default CLI output with `--json` as the stable machine-readable mode, documented in `docs/CLI_OUTPUT_CONTRACT.md`.
 - Read-only CLI inspection helpers for exact point lookup, persisted report listing/showing, and proposal inspection.
-- Unreleased v0.7.0 read-only search filters for memory and learning search by tag, source, file path, project path, creation date range, and collection routing.
+- Read-only search filters for memory and learning search by tag, source, file path, project path, creation date range, and collection routing.
 - GitHub Actions test workflow with pytest, compileall, and scanner guard.
 - Release documentation: `CHANGELOG.md`, `RELEASE_NOTES.md`, install/update/remove/rollback notes.
 
@@ -55,7 +55,8 @@ Post-release validation status:
 - v0.3.0 release validation covered the added CLI parity commands.
 - v0.4.0 consumer install/runtime smoke for backup/export/restore passed before release preparation.
 - v0.5.0 local and CI verification covered the CLI output contract and human-readable default surface.
-- v0.6.0 release preparation covers read-only point/report/proposal inspection helpers; consumer smoke remains the next step after tagging.
+- v0.6.0 release preparation covered read-only point/report/proposal inspection helpers.
+- v0.7.0 release preparation covers read-only search filters; consumer smoke remains the next step after tagging.
 - Still verify whether current Hermes core can discover providers from `~/.hermes/plugins/memory/<name>` without the compatibility symlink.
 
 ---
@@ -927,7 +928,7 @@ Status: completed for v0.5.0 output-contract smoke before release preparation. F
 
 Verify from the installed plugin outside the development checkout:
 
-- `git checkout v0.5.0`
+- `git checkout <release-tag>`
 - `hermes qdrant config show`
 - `hermes qdrant config show --json`
 - `hermes qdrant status`
@@ -1045,7 +1046,7 @@ Verify whether current Hermes core can discover user memory providers from `~/.h
 
 ## 14. Immediate next action
 
-1. Repeat consumer install/runtime smoke for the next published tag.
+1. Repeat consumer install/runtime smoke for v0.7.0 after tagging.
 2. Add watcher lifecycle commands only after inspection/report ergonomics are stable.
 3. Add env-gated live-service integration tests for real Qdrant plus embedding behavior.
 
