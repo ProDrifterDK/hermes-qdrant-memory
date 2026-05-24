@@ -172,7 +172,7 @@ For release-tag validation, verify the installed plugin as a user would run it. 
 ```bash
 cd ~/.hermes/plugins/qdrant
 git fetch --tags origin
-git checkout v0.3.0
+git checkout v0.4.0
 hermes qdrant config show --json
 hermes qdrant status
 hermes qdrant doctor
@@ -203,7 +203,7 @@ Expected behavior:
 - `watcher status` reads local watcher state only; missing state is not an error.
 - `watcher run` maps to report-only consolidation (`dry_run=true`, `persist=true`, `include_examples=false`) and performs no Qdrant mutation.
 
-Backup/export/restore smoke for current `main` / post-v0.3.0 candidates:
+Backup/export/restore smoke for v0.4.0 and later:
 
 ```bash
 hermes qdrant export memory --out /tmp/qdrant-memory-export.jsonl --json
@@ -228,7 +228,7 @@ Verify the CLI process exit gate for live mutation without approval:
 hermes qdrant forget 00000000-0000-0000-0000-000000000000 --no-dry-run
 ```
 
-Expected behavior in v0.3.0:
+Expected behavior in v0.4.0:
 
 - output contains `--approve is required when using --no-dry-run`;
 - process exit status is non-zero;

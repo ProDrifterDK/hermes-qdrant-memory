@@ -4,10 +4,13 @@ All notable changes to this project are documented here.
 
 This project is currently public beta / experimental. The format follows Keep a Changelog style, but the repository is still pre-1.0 and the public API may change.
 
-## [Unreleased]
+## [0.4.0]
+
+Fourth public beta release of the Hermes Qdrant Memory Provider. This release adds operator recovery primitives for export, backup, and restore after the v0.3.0 CLI parity and doctor diagnostics work.
 
 ### Added
 
+- Plugin metadata version bumped to `0.4.0`.
 - CLI recovery primitives for operators:
   - `hermes qdrant export memory|learning --out FILE [--overwrite]` writes one collection to a private JSONL artifact with raw payloads and vectors.
   - `hermes qdrant backup create [--scope memory|learning|both]` writes a private manifest plus collection JSONL files.
@@ -136,6 +139,7 @@ Second public beta release of the Hermes Qdrant Memory Provider.
 
 Initial public beta tag. The v0.1.0 tag predates the learning, consolidation, reconsolidation, scanner guard, and native CLI MVP work documented in later releases.
 
+[0.4.0]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.4.0
 [0.3.0]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.3.0
 [0.2.1]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.2.1
 [0.2.0]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.2.0

@@ -12,11 +12,11 @@
 
 ## 1. Current state
 
-The project is published as `v0.3.0 Public Beta` and is functional as a Hermes Qdrant-backed memory provider. The latest release URL is:
+The project is published as `v0.4.0 Public Beta` and is functional as a Hermes Qdrant-backed memory provider. The latest release URL is:
 
-- <https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.3.0>
+- <https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.4.0>
 
-Implemented capabilities through v0.3.0:
+Implemented capabilities through v0.4.0:
 
 - Hermes `MemoryProvider` subclass: `QdrantMemoryProvider`.
 - Plugin registration through `register(ctx)`.
@@ -35,6 +35,7 @@ Implemented capabilities through v0.3.0:
 - Reconsolidation candidates as review drafts only.
 - Conservative no-agent watcher script.
 - Native Hermes memory-provider CLI beta surface: `hermes qdrant ...`.
+- Backup/export/restore recovery primitives with private local artifacts, dry-run restore default, live approval gate, and automatic pre-restore backup.
 - GitHub Actions test workflow with pytest, compileall, and scanner guard.
 - Release documentation: `CHANGELOG.md`, `RELEASE_NOTES.md`, install/update/remove/rollback notes.
 
@@ -48,7 +49,8 @@ Post-release validation status:
 
 - Consumer install/runtime smoke from published `v0.2.0` completed and found one CLI process-exit propagation bug: unapproved live mutation was safely refused but exited with process status `0` under Hermes v0.13.
 - The fix was released in `v0.2.1`: `qdrant_command()` raises `SystemExit(execute_command(args))` so usage/safety/provider errors propagate as non-zero CLI exits.
-- v0.3.0 release validation should repeat the installed-plugin smoke from the published tag, including the added CLI parity commands.
+- v0.3.0 release validation covered the added CLI parity commands.
+- v0.4.0 consumer install/runtime smoke for backup/export/restore passed before release preparation.
 - Still verify whether current Hermes core can discover providers from `~/.hermes/plugins/memory/<name>` without the compatibility symlink.
 
 ---
@@ -904,21 +906,22 @@ Status after v0.2.0: most criteria are satisfied by the published beta. The rema
 | Add CLI wrapper | Accepted | Implemented as native memory-provider CLI MVP in v0.2.0. |
 | Add safety/operations/LCM docs | Accepted | Implemented before widening the CLI/release surface. |
 | Publish v0.2.0 as prerelease | Accepted | Honest beta label while the plugin remains experimental and externally service-dependent. |
-| Publish v0.3.0 as prerelease | Accepted | CLI parity is useful enough for public beta, while backup/export, deep doctor diagnostics, and formatter polish remain post-v0.3.0 work. |
+| Publish v0.3.0 as prerelease | Accepted | CLI parity was useful enough for public beta while backup/export and doctor diagnostics remained follow-up work. |
+| Publish v0.4.0 as prerelease | Accepted | Backup/export/restore recovery primitives passed real install smoke and are substantial enough for a new beta release. |
 
 ---
 
-## 13. Post-v0.3.0 CLI and operations roadmap
+## 13. Post-v0.4.0 CLI and operations roadmap
 
-Recommended next phase: post-v0.3.0 should focus on making the CLI a dependable operator interface rather than expanding memory mutation authority. The plugin already has the MemoryProvider core and a safe CLI beta surface; the next work should improve diagnostics, backup/rollback, formatting, watcher operations, and integration confidence.
+Recommended next phase: post-v0.4.0 should focus on making the CLI a dependable operator interface rather than expanding memory mutation authority. The plugin already has the MemoryProvider core, safe CLI beta surface, doctor diagnostics, and backup/restore recovery primitives; the next work should improve formatting, watcher operations, inspection/search ergonomics, and integration confidence.
 
 ### Priority 1: Consumer install/runtime smoke
 
-Status: required after publishing the v0.3.0 tag.
+Status: completed for v0.4.0 backup/export/restore smoke before release preparation. Future releases should repeat this from the published tag.
 
 Verify from the installed plugin outside the development checkout:
 
-- `git checkout v0.3.0`
+- `git checkout v0.4.0`
 - `hermes qdrant config show --json`
 - `hermes qdrant status`
 - `hermes qdrant doctor`
@@ -931,7 +934,7 @@ Verify from the installed plugin outside the development checkout:
 
 ### Priority 2: CLI UX and output contract
 
-The v0.3.0 CLI intentionally remains close to provider JSON. The next design pass should define:
+The v0.4.0 CLI intentionally remains close to provider JSON. The next design pass should define:
 
 - concise human-readable default output;
 - `--json` as stable machine-readable output;
@@ -1016,9 +1019,9 @@ Verify whether current Hermes core can discover user memory providers from `~/.h
 
 ## 14. Immediate next action
 
-1. Run consumer install/runtime smoke from the published `v0.3.0` tag on a clean machine.
-2. Design the remaining post-v0.3.0 CLI UX contract: human default output, formatter rules, and stable schemas beyond the current doctor JSON.
-3. Add backup/export/rollback primitives before widening any mutation surface.
-4. Add inspection/report commands (`show`, `reports list/show`, `proposals show`) once backup/export exists.
+1. Publish and verify the `v0.4.0` GitHub prerelease tag against the release commit.
+2. Design the remaining post-v0.4.0 CLI UX contract: human default output, formatter rules, and stable schemas beyond the current doctor JSON.
+3. Add inspection/report commands (`show`, `reports list/show`, `proposals show`) on top of the now-available backup/export/restore recovery layer.
+4. Add watcher lifecycle commands only after CLI output contracts are stable.
 
 This order keeps the project grounded: the published artifact is verified first; the next work improves operator ergonomics and runtime confidence before adding stronger memory mutation capabilities.
