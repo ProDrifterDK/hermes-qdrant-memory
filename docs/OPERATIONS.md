@@ -183,7 +183,7 @@ Never delete by query.
 For current release validation, verify the installed plugin as a user would run it:
 
 ```bash
-cd ~/.hermes/plugins/qdrant
+cd ~/.hermes/plugins/memory/qdrant
 git fetch --tags origin
 git checkout v0.8.0
 hermes qdrant config show

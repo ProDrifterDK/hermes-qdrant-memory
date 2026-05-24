@@ -98,7 +98,7 @@ The safety contract remains conservative:
 ## Upgrade
 
 ```bash
-cd ~/.hermes/plugins/qdrant
+cd ~/.hermes/plugins/memory/qdrant
 git fetch --tags origin
 git checkout v0.8.0
 ```
@@ -146,5 +146,5 @@ For the unapproved live store check, expected behavior is:
 The following remain future work:
 
 - formal Python packaging beyond the Hermes plugin clone workflow;
-- Hermes core support for user memory-provider discovery from `~/.hermes/plugins/memory/<name>` without the compatibility symlink. Post-release validation confirmed current core's general plugin scanner sees `~/.hermes/plugins/memory/qdrant` as `memory/qdrant`, but memory-provider activation and native `hermes qdrant ...` CLI discovery still require the flat `~/.hermes/plugins/qdrant` path or symlink;
+- Hermes core support for user memory-provider discovery from `~/.hermes/plugins/memory/<name>` without the compatibility symlink. Post-release validation confirmed current core's general plugin scanner sees `~/.hermes/plugins/memory/qdrant` as `memory/qdrant`, but memory-provider activation and native `hermes qdrant ...` CLI discovery still require the flat `~/.hermes/plugins/qdrant` path or symlink. The public install strategy keeps that symlink for now; a Hermes core PR is deferred until plugin adoption creates a strong reason for the core change;
 - optional broader live-service stress tests beyond the current env-gated integration suite.

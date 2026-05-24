@@ -93,24 +93,27 @@ Future fact rewriting, if ever added, should remain gated by:
 Current Hermes user memory-provider discovery requires the flat compatibility path:
 
 ```text
-~/.hermes/plugins/qdrant
+~/.hermes/plugins/qdrant -> ~/.hermes/plugins/memory/qdrant
 ```
 
-If you prefer category layout such as:
+The public install strategy is to keep the real checkout in the memory-plugin category layout:
 
 ```text
 ~/.hermes/plugins/memory/qdrant
 ```
 
-create a compatibility symlink:
+and expose it through the compatibility symlink:
 
 ```bash
+rm -f ~/.hermes/plugins/qdrant
 ln -s ~/.hermes/plugins/memory/qdrant ~/.hermes/plugins/qdrant
 ```
 
 This was verified against current Hermes core after the v0.8.0 release: a category-only install is visible to the general plugin scanner as `memory/qdrant` with `kind: exclusive`, but the memory-provider discovery code still scans user providers at `$HERMES_HOME/plugins/<name>`. In a temporary `HERMES_HOME` with only `plugins/memory/qdrant`, `hermes memory status` reported `Plugin: NOT installed` and `hermes qdrant --help` failed with an invalid-command exit. Adding `plugins/qdrant -> plugins/memory/qdrant` made `hermes qdrant --help` succeed.
 
 The native CLI MVP uses Hermes memory-provider CLI discovery. `hermes qdrant ...` is available only when this plugin is installed as the active `qdrant` memory provider and a fresh Hermes process has loaded that configuration. Top-level `hermes --help` may not list plugin commands because Hermes avoids eager plugin imports for startup performance; use `hermes qdrant --help` as the direct check.
+
+This is an intentional distribution trade-off, not a blocker. Keep the symlink as the public install path while the plugin is early. If the plugin gains meaningful adoption, that adoption becomes the reason to propose a Hermes core change for native `$HERMES_HOME/plugins/memory/<name>` user-provider discovery.
 
 `hermes qdrant doctor` now emits structured JSON diagnostics with `ok`, `summary`, and `checks`. It validates local plugin discovery/metadata, service reachability, collection shape, watcher artifact access, and config redaction. `status` remains the raw provider status command.
 

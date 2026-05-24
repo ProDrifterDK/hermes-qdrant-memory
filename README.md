@@ -206,18 +206,24 @@ POST /v1/embeddings
 
 ## Installation
 
-Recommended install path for current Hermes user plugins:
+Recommended public install layout for current Hermes versions:
 
 ```bash
-git clone https://github.com/ProDrifterDK/hermes-qdrant-memory ~/.hermes/plugins/qdrant
+PLUGIN_DIR="$HOME/.hermes/plugins/memory/qdrant"
+SHIM="$HOME/.hermes/plugins/qdrant"
+mkdir -p "$HOME/.hermes/plugins/memory"
+git clone https://github.com/ProDrifterDK/hermes-qdrant-memory "$PLUGIN_DIR"
+if [ -e "$SHIM" ] && [ ! -L "$SHIM" ]; then
+  echo "Refusing to overwrite non-symlink compatibility path: $SHIM" >&2
+  exit 1
+fi
+rm -f "$SHIM"
+ln -s "$PLUGIN_DIR" "$SHIM"
 ```
 
-Current Hermes core discovery still requires that flat compatibility path for user-installed memory providers. A category-only install at `~/.hermes/plugins/memory/qdrant` is detected by the general plugin scanner as `memory/qdrant`, but `memory.provider: qdrant` and the native `hermes qdrant ...` CLI do not activate from that path alone. If you keep the desired category layout, also create the compatibility symlink:
+The checkout lives in the category path because this is a memory plugin. The flat `~/.hermes/plugins/qdrant` symlink is the public compatibility entrypoint for current Hermes core: category-only installs are visible to the general plugin scanner as `memory/qdrant`, but `memory.provider: qdrant` and the native `hermes qdrant ...` CLI still activate through the flat path.
 
-```bash
-mkdir -p ~/.hermes/plugins
-ln -s ~/.hermes/plugins/memory/qdrant ~/.hermes/plugins/qdrant
-```
+Do not patch Hermes core just to remove this symlink while the plugin is still early. If the plugin gains enough adoption, that is the right time to upstream a Hermes core PR for native user memory-provider category discovery.
 
 Activate the provider:
 
@@ -245,14 +251,14 @@ If both backends are reachable, the status tool should report `qdrant_ok: true` 
 Update a cloned plugin:
 
 ```bash
-cd ~/.hermes/plugins/qdrant
+cd ~/.hermes/plugins/memory/qdrant
 git pull --ff-only origin main
 ```
 
 Use the published `v0.8.0` tag instead of `main` when you want a stable beta snapshot:
 
 ```bash
-cd ~/.hermes/plugins/qdrant
+cd ~/.hermes/plugins/memory/qdrant
 git fetch --tags origin
 git checkout v0.8.0
 ```
@@ -260,7 +266,7 @@ git checkout v0.8.0
 Rollback plugin code:
 
 ```bash
-cd ~/.hermes/plugins/qdrant
+cd ~/.hermes/plugins/memory/qdrant
 git log --oneline --max-count=10
 git checkout <previous-commit-or-tag>
 ```
@@ -269,7 +275,8 @@ Remove the plugin:
 
 ```bash
 hermes config set memory.provider ""
-rm -rf ~/.hermes/plugins/qdrant
+rm -f ~/.hermes/plugins/qdrant
+rm -rf ~/.hermes/plugins/memory/qdrant
 ```
 
 Start a fresh Hermes session or restart the gateway after install/update/rollback/remove. These commands affect plugin code/config only; they do not delete Qdrant collections or indexed memory.
@@ -282,7 +289,8 @@ This section is written for AI agents operating a user's machine. Follow it exac
 
 Install this plugin as the active Hermes memory provider using:
 
-- plugin path: `$HOME/.hermes/plugins/qdrant`
+- plugin checkout path: `$HOME/.hermes/plugins/memory/qdrant`
+- compatibility symlink: `$HOME/.hermes/plugins/qdrant -> $HOME/.hermes/plugins/memory/qdrant`
 - Qdrant URL: `http://127.0.0.1:6333`
 - embedding URL: `http://127.0.0.1:8080/v1`
 - embedding model name in Hermes: `bge-m3`
@@ -375,13 +383,21 @@ curl -fsS http://127.0.0.1:8080/v1/embeddings \
 ### Step 3: Install the plugin
 
 ```bash
-mkdir -p "$HOME/.hermes/plugins"
-if [ -d "$HOME/.hermes/plugins/qdrant/.git" ]; then
-  git -C "$HOME/.hermes/plugins/qdrant" pull --ff-only
+PLUGIN_DIR="$HOME/.hermes/plugins/memory/qdrant"
+SHIM="$HOME/.hermes/plugins/qdrant"
+mkdir -p "$HOME/.hermes/plugins/memory"
+if [ -d "$PLUGIN_DIR/.git" ]; then
+  git -C "$PLUGIN_DIR" pull --ff-only
 else
-  rm -rf "$HOME/.hermes/plugins/qdrant"
-  git clone https://github.com/ProDrifterDK/hermes-qdrant-memory "$HOME/.hermes/plugins/qdrant"
+  rm -rf "$PLUGIN_DIR"
+  git clone https://github.com/ProDrifterDK/hermes-qdrant-memory "$PLUGIN_DIR"
 fi
+if [ -e "$SHIM" ] && [ ! -L "$SHIM" ]; then
+  echo "Refusing to overwrite non-symlink compatibility path: $SHIM" >&2
+  exit 1
+fi
+rm -f "$SHIM"
+ln -s "$PLUGIN_DIR" "$SHIM"
 ```
 
 ### Step 4: Configure Hermes

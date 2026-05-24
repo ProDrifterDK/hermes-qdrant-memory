@@ -6,7 +6,7 @@ It is intentionally not a context engine. Context engines such as LCM recover de
 
 ## Runtime flow
 
-1. Hermes loads the provider from `~/.hermes/plugins/qdrant` when `memory.provider: qdrant` is configured.
+1. Hermes loads the provider through the `~/.hermes/plugins/qdrant` compatibility symlink when `memory.provider: qdrant` is configured; the public checkout path is `~/.hermes/plugins/memory/qdrant`.
 2. `QdrantMemoryProvider.initialize()` loads config, creates clients, and ensures Qdrant collections exist.
 3. On each turn, Hermes calls `prefetch()` or `queue_prefetch()` with the current query.
 4. The plugin embeds the query with the configured query prefix.

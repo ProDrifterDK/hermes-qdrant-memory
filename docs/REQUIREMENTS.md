@@ -4,7 +4,7 @@
 
 - Hermes Agent with user plugin support and memory-provider CLI discovery for `hermes qdrant ...`.
 - Configure `memory.provider: qdrant`.
-- Install this repository at `~/.hermes/plugins/qdrant` for current compatibility.
+- Install this repository at `~/.hermes/plugins/memory/qdrant` and expose `~/.hermes/plugins/qdrant` as a compatibility symlink to that checkout for current Hermes memory-provider discovery.
 
 ## Python
 
