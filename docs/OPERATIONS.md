@@ -42,7 +42,7 @@ Before operating the plugin, keep these invariants intact:
 - Deletes must use explicit Qdrant point IDs only.
 - Reconsolidation is draft-only; no automatic fact rewrite.
 - `quality_warning` is manual-review only.
-- Cron/watcher jobs may observe, report, and persist redacted local artifacts only; they must not mutate Qdrant.
+- Cron/watcher jobs default to observe/report and persist redacted local artifacts only. If explicitly configured with `--autonomy-mode guarded-auto`, a watcher may mutate Qdrant only for preauthorized low-risk exact-ID proposals, through `qdrant_memory_consolidation_apply`, with audit artifacts.
 - Watcher lifecycle commands may edit only local watcher state/log artifacts and the sentinel-managed crontab block; uninstall, signature reset, and replacing an existing different watcher block require explicit approval.
 - Local artifacts are allowed when redacted and review-oriented.
 - Do not add literal fake secrets to docs, tests, reports, or examples.
@@ -101,7 +101,7 @@ Expected healthy basics:
 - `collection_exists: true` after first use/index
 - `learning_collection_exists: true` if learnings are used
 - `reconsolidation_report_only: true`
-- supported apply actions remain narrow: `merge`, `delete`, `promote_to_skill`, and `draft_review`
+- supported apply actions remain narrow: `merge`, `delete`, `quarantine`, `promote_to_skill`, and `draft_review`
 
 You can also run the local install verifier when present:
 
@@ -229,7 +229,7 @@ Expected behavior:
 - `reports list/show` and `proposals show` inspect persisted consolidation artifacts by exact ID only; they do not contact Qdrant or apply proposals.
 - `show POINT_ID --collection memory|learning` is an exact-ID Qdrant read. It omits payloads and vectors unless `--include-payload` or `--include-vector` is explicit.
 - `watcher status`, `watcher logs`, and `watcher inspect-state` read local watcher artifacts only; missing state/log files are not errors.
-- `watcher run` maps to report-only consolidation (`dry_run=true`, `persist=true`, `include_examples=false`) and performs no Qdrant mutation. Successful runs update only local watcher state/log artifacts.
+- `watcher run` defaults to report-only consolidation (`dry_run=true`, `persist=true`, `include_examples=false`) and performs no Qdrant mutation. With explicit `--autonomy-mode guarded-auto`, it may apply only preauthorized low-risk exact-ID proposals and then records guarded-auto counts in local watcher state/log artifacts.
 - `watcher install` / `watcher uninstall --approve` edit only the sentinel-managed crontab block; replacing an existing different watcher block requires `--approve`.
 - `watcher reset-signature --approve` clears only local signature fields and does not remove reports or mutate Qdrant.
 
@@ -310,7 +310,7 @@ The v0.2.0 tag correctly refused the mutation but returned process exit status `
 
 ---
 
-## 6. Watcher lifecycle and report-only runs
+## 6. Watcher lifecycle and guarded-auto runs
 
 The native watcher CLI is the primary operator interface. It manages one sentinel-delimited user crontab block and local artifacts under `$HERMES_HOME/qdrant_memory/consolidation/`. Legacy external scripts may still exist in older deployments, but new installs should schedule `hermes qdrant watcher run ...` directly.
 
@@ -331,16 +331,23 @@ Manual report-only run:
 hermes qdrant watcher run --scope both --max-points 300 --max-groups 20 --reconsolidation-max-candidates 10 --force-alert --json
 ```
 
+Guarded-auto run, for preauthorized low-risk exact-ID proposals only:
+
+```bash
+hermes qdrant watcher run --scope both --autonomy-mode guarded-auto --max-auto-actions 10 --force-alert --json
+```
+
 Expected behavior:
 
 - `install` writes or updates only the `BEGIN/END HERMES_QDRANT_WATCHER` crontab block and records local state; replacing an existing different managed block requires `--approve`;
 - `uninstall --approve` removes only that managed block and preserves unrelated crontab lines;
 - `status --verbose`, `logs`, and `inspect-state` read local artifacts only and do not construct the provider;
-- `run` calls report-only consolidation with `dry_run=true`, `persist=true`, and `include_examples=false`;
+- `run` calls consolidation with `dry_run=true`, `persist=true`, and `include_examples=false`; default `--autonomy-mode report-only` does not mutate Qdrant;
+- `run --autonomy-mode guarded-auto` may apply only preauthorized low-risk exact-ID proposals via `qdrant_memory_consolidation_apply` and records guarded-auto apply/error counts;
 - successful `run` stores a stable proposal signature in watcher state and appends one JSONL log event;
 - `--force-alert` records an alert event even when the proposal signature is unchanged;
 - `reset-signature --approve` clears only local signature fields;
-- no watcher command applies proposals, approves learnings, or upserts/deletes/updates Qdrant points.
+- watcher commands never approve pending learning candidates or rewrite facts; guarded-auto cannot resolve `quality_warning` or reconsolidation candidates automatically.
 
 Recommended watcher consolidation parameters:
 

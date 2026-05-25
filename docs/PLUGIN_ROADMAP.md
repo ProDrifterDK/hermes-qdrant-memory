@@ -562,7 +562,7 @@ hermes cron list
 Expected:
 
 - Alert only when proposal signature changes or force flag is set.
-- No Qdrant mutations.
+- Default report-only runs do not mutate Qdrant; later guarded-auto runs must remain explicitly opt-in and exact-ID gated.
 
 ### M15: Safety hardening
 
@@ -1034,7 +1034,7 @@ Keep manual writes ergonomic, but consider:
 
 ### Priority 7: Watcher/cron management CLI — implemented in v0.8.0
 
-Watcher remains report-only while lifecycle commands now cover:
+Watcher defaults to report-only; `--autonomy-mode guarded-auto` enables preauthorized low-risk exact-ID apply paths. Lifecycle commands now cover:
 
 - `watcher install`;
 - `watcher uninstall --approve`;
@@ -1044,7 +1044,7 @@ Watcher remains report-only while lifecycle commands now cover:
 - `watcher inspect-state`;
 - `watcher reset-signature --approve`.
 
-Safety boundary: install/uninstall edits only the sentinel-managed crontab block, local state/log commands do not construct the provider, and `watcher run` still maps only to report-only consolidation (`dry_run=true`, `persist=true`, `include_examples=false`).
+Safety boundary: install/uninstall edits only the sentinel-managed crontab block, local state/log commands do not construct the provider, and `watcher run` maps to persisted consolidation (`dry_run=true`, `persist=true`, `include_examples=false`). Default autonomy mode is report-only; guarded-auto is explicit and limited to preauthorized low-risk exact-ID proposals routed through the gated apply path.
 
 ### Priority 8: Integration and compatibility tests
 

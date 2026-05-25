@@ -70,6 +70,6 @@ The output contract does not widen mutation authority:
 - Maintenance mutations default to `--dry-run`.
 - Live maintenance mutation requires `--no-dry-run --approve`.
 - `forget` accepts explicit point IDs only.
-- `consolidate` and `watcher run` are report-only.
+- `consolidate` is report-only; `watcher run` defaults to report-only but may apply only preauthorized low-risk exact-ID proposals when explicitly run with `--autonomy-mode guarded-auto`.
 - `apply` requires exact report ID, proposal ID, and expected action.
 - `restore` remains dry-run by default and validates checksums/vector sizes before live upsert.

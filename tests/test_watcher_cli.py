@@ -37,6 +37,20 @@ class StaticJsonProvider:
         return payload if isinstance(payload, str) else json.dumps(payload)
 
 
+class ApplyingProvider:
+    def __init__(self, report):
+        self.report = report
+        self.calls = []
+
+    def handle_tool_call(self, tool_name, args):
+        self.calls.append((tool_name, args))
+        if tool_name == "qdrant_memory_consolidate":
+            return json.dumps(self.report)
+        if tool_name == "qdrant_memory_consolidation_apply":
+            return json.dumps({"dry_run": False, "applied": True, "proposal_id": args["proposal_id"], "action": args["action"], "affected_ids": ["x"]})
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+
 @pytest.fixture
 def fake_crontab(monkeypatch):
     from qdrant_memory import cli_core
@@ -63,10 +77,11 @@ def test_register_cli_adds_watcher_lifecycle_subcommands():
     assert status.verbose is True
     assert status.json is True
 
-    run = parser.parse_args(["qdrant", "watcher", "run", "--force-alert", "--scope", "learning"])
+    run = parser.parse_args(["qdrant", "watcher", "run", "--force-alert", "--scope", "learning", "--autonomy-mode", "guarded-auto"])
     assert run.watcher_subcommand == "run"
     assert run.force_alert is True
     assert run.scope == "learning"
+    assert run.autonomy_mode == "guarded-auto"
 
     install = parser.parse_args(["qdrant", "watcher", "install", "--schedule", "0 3 * * *", "--json"])
     assert install.watcher_subcommand == "install"
@@ -425,3 +440,127 @@ def test_watcher_run_unchanged_signature_suppresses_alert_unless_forced(monkeypa
     assert state["last_signature_changed"] is False
     assert state["last_alerted"] is True
     assert state["last_force_alert"] is True
+
+
+def test_watcher_run_guarded_auto_applies_eligible_proposals_and_records_state(monkeypatch, tmp_path, capsys):
+    from qdrant_memory.cli_core import execute_command
+
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    report = {
+        "dry_run": True,
+        "report_only": True,
+        "report_id": "r-auto",
+        "scope": "both",
+        "proposals": [
+            {
+                "proposal_id": "dup1",
+                "proposal_type": "duplicate_cluster",
+                "suggested_action": "merge_review_only",
+                "affected_ids": ["a", "b"],
+                "confidence": 0.99,
+                "risk": "low",
+                "match_kind": "exact_normalized",
+                "guarded_auto_eligible": True,
+                "preauthorized_policy": "guarded-auto:exact-duplicate-merge",
+            },
+            {
+                "proposal_id": "secret1",
+                "proposal_type": "quality_warning",
+                "suggested_action": "manual_secret_review_only",
+                "affected_ids": ["s"],
+                "risk": "high",
+            },
+        ],
+    }
+    provider = ApplyingProvider(report)
+    parser = _parser()
+    args = parser.parse_args(["qdrant", "watcher", "run", "--autonomy-mode", "guarded-auto", "--json"])
+
+    assert execute_command(args, provider_factory=lambda: provider) == 0
+
+    assert provider.calls[0][0] == "qdrant_memory_consolidate"
+    assert provider.calls[1][0] == "qdrant_memory_consolidation_apply"
+    assert provider.calls[1][1]["proposal_id"] == "dup1"
+    assert provider.calls[1][1]["action"] == "merge"
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["guarded_auto"]["enabled"] is True
+    assert len(payload["guarded_auto"]["applied"]) == 1
+    state = json.loads((hermes_home / "qdrant_memory" / "consolidation" / "watcher_state.json").read_text(encoding="utf-8"))
+    assert state["last_guarded_auto_mode"] == "guarded-auto"
+    assert state["last_guarded_auto_applied_count"] == 1
+    assert state["last_alerted"] is True
+
+
+def test_watcher_guarded_auto_skips_near_duplicate_even_if_marked_eligible(monkeypatch, tmp_path, capsys):
+    from qdrant_memory.cli_core import execute_command
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    report = {
+        "dry_run": True,
+        "report_only": True,
+        "report_id": "r-near",
+        "scope": "memory",
+        "proposals": [
+            {
+                "proposal_id": "dup-near",
+                "proposal_type": "duplicate_cluster",
+                "affected_ids": ["a", "b"],
+                "confidence": 0.99,
+                "risk": "medium",
+                "match_kind": "near_duplicate",
+                "guarded_auto_eligible": True,
+                "preauthorized_policy": "guarded-auto:exact-duplicate-merge",
+            }
+        ],
+    }
+    provider = ApplyingProvider(report)
+    parser = _parser()
+    args = parser.parse_args(["qdrant", "watcher", "run", "--autonomy-mode", "guarded-auto", "--json"])
+
+    assert execute_command(args, provider_factory=lambda: provider) == 0
+
+    assert [call[0] for call in provider.calls] == ["qdrant_memory_consolidate"]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["guarded_auto"]["enabled"] is True
+    assert payload["guarded_auto"]["applied"] == []
+    assert payload["guarded_auto"]["skipped"][0]["proposal_id"] == "dup-near"
+
+
+def test_watcher_guarded_auto_skips_manual_review_and_reconsolidation(monkeypatch, tmp_path, capsys):
+    from qdrant_memory.cli_core import execute_command
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    report = {
+        "dry_run": True,
+        "report_only": True,
+        "report_id": "r-manual",
+        "scope": "memory",
+        "proposals": [
+            {
+                "proposal_id": "heading-generic",
+                "proposal_type": "heading_noise",
+                "affected_ids": ["h"],
+                "risk": "medium",
+                "guarded_auto_eligible": False,
+                "manual_review_required": True,
+            },
+            {
+                "proposal_id": "fact-conflict",
+                "proposal_type": "reconsolidation_candidate",
+                "affected_ids": ["a", "b"],
+                "risk": "high",
+                "manual_review_required": True,
+            },
+        ],
+    }
+    provider = ApplyingProvider(report)
+    parser = _parser()
+    args = parser.parse_args(["qdrant", "watcher", "run", "--autonomy-mode", "guarded-auto", "--json"])
+
+    assert execute_command(args, provider_factory=lambda: provider) == 0
+
+    assert [call[0] for call in provider.calls] == ["qdrant_memory_consolidate"]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["guarded_auto"]["applied"] == []
+    assert len(payload["guarded_auto"]["skipped"]) == 2

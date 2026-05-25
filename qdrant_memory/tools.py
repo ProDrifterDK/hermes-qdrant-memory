@@ -181,9 +181,10 @@ CONSOLIDATION_APPLY_SCHEMA = {
         "properties": {
             "report_id": {"type": "string", "description": "Persisted report id returned by qdrant_memory_consolidate."},
             "proposal_id": {"type": "string", "description": "Proposal id to preview/apply."},
-            "action": {"type": "string", "enum": ["merge", "delete", "promote_to_skill", "draft_review"], "description": "Expected action for the proposal type."},
+            "action": {"type": "string", "enum": ["merge", "delete", "quarantine", "promote_to_skill", "draft_review"], "description": "Expected action for the proposal type."},
             "dry_run": {"type": "boolean", "description": "When true, return the operation plan without mutating Qdrant or writing drafts. Defaults true."},
             "approve": {"type": "boolean", "description": "Required true when dry_run=false."},
+            "quarantine_days": {"type": "integer", "description": "For action=quarantine, days to keep a reversible quarantine marker before later hard deletion.", "minimum": 1, "maximum": 365},
         },
         "required": ["report_id", "proposal_id"],
         "additionalProperties": False,

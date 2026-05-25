@@ -73,6 +73,12 @@ hermes qdrant watcher install --schedule "0 3 * * *" --json
 hermes qdrant watcher run --scope both --force-alert --json
 ```
 
+Run guarded-auto only when you want preauthorized low-risk exact-ID proposals to apply through the gated apply path:
+
+```bash
+hermes qdrant watcher run --scope both --autonomy-mode guarded-auto --max-auto-actions 10 --force-alert --json
+```
+
 Approval-gated local scheduler/state mutations:
 
 ```bash
@@ -87,8 +93,9 @@ The safety contract remains conservative:
 - Default manual store calls do not mutate Qdrant.
 - Live manual store requires explicit `dry_run=false` plus `approve=true`.
 - Duplicate preview can skip an upsert but never deletes, merges, or rewrites existing memories.
-- `watcher run` remains report-only consolidation with `dry_run=true`, `persist=true`, and no apply/proposal mutation.
-- Watcher lifecycle commands mutate only local scheduler/state/log artifacts, never Qdrant collections.
+- `watcher run` defaults to report-only consolidation with `dry_run=true`, `persist=true`, and no apply/proposal mutation.
+- `watcher run --autonomy-mode guarded-auto` is opt-in and applies only preauthorized low-risk exact-ID proposals through `qdrant_memory_consolidation_apply`; generic headings, near duplicates, quality warnings, secret-bearing inputs, and reconsolidation remain manual/draft-only.
+- Watcher lifecycle commands mutate only local scheduler/state/log artifacts; guarded-auto mutations always produce application audit artifacts.
 - Live integration tests skip by default and use uniquely named temporary collections.
 - Mutating maintenance commands still default to dry-run.
 - Live maintenance mutation still requires explicit approval gates.

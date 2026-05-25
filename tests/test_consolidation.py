@@ -163,8 +163,57 @@ def test_consolidate_finds_duplicate_clusters_without_writing():
     assert set(duplicates[0]["affected_ids"]) == {"m1", "m2"}
     assert duplicates[0]["suggested_action"] == "merge_review_only"
     assert duplicates[0]["requires_explicit_approval"] is True
-    assert provider._qdrant.upserts == []
-    assert provider._qdrant.deleted_ids == []
+    assert duplicates[0]["match_kind"] == "exact_normalized"
+    assert duplicates[0]["guarded_auto_eligible"] is True
+    assert duplicates[0]["confidence"] >= 0.98
+
+
+def test_consolidate_blocks_guarded_auto_for_profile_duplicate_facts():
+    provider = _provider()
+    provider._qdrant = FakeQdrant(
+        {
+            "memory": [
+                _point("u1", "Alan prefers explicit reboot warnings", source_type="user_profile"),
+                _point("u2", "Alan prefers explicit reboot warnings", source_type="user_profile"),
+            ],
+            "learnings": [],
+        }
+    )
+
+    result = json.loads(provider.handle_tool_call("qdrant_memory_consolidate", {"scope": "memory"}))
+
+    duplicates = [p for p in result["proposals"] if p["proposal_type"] == "duplicate_cluster"]
+    assert duplicates
+    assert duplicates[0]["match_kind"] == "exact_normalized"
+    assert duplicates[0]["guarded_auto_eligible"] is False
+    assert duplicates[0]["manual_review_required"] is True
+    assert "preauthorized_policy" not in duplicates[0]
+
+
+def test_consolidate_blocks_guarded_auto_for_stale_secret_and_profile_facts():
+    provider = _provider()
+    old = (datetime.now(timezone.utc) - timedelta(days=200)).isoformat()
+    secret_like = "".join(["s", "k", "-", "abcdefghijklmnopqrstuvwxyz"])
+    provider._qdrant = FakeQdrant(
+        {
+            "memory": [
+                _point("secret", f"old weak memory containing {secret_like}", source_type="conversation", importance=1, confidence=0.3, access_count=0, created_at=old),
+                _point("profile", "old weak profile fact", source_type="user_profile", importance=1, confidence=0.3, access_count=0, created_at=old),
+            ],
+            "learnings": [],
+        }
+    )
+
+    result = json.loads(provider.handle_tool_call("qdrant_memory_consolidate", {"scope": "memory"}))
+
+    stale_by_id = {p["affected_ids"][0]: p for p in result["proposals"] if p["proposal_type"] == "stale_low_value"}
+    assert set(stale_by_id) == {"secret", "profile"}
+    for proposal in stale_by_id.values():
+        assert proposal["guarded_auto_eligible"] is False
+        assert proposal["suggested_action"] == "quarantine_review_only"
+        assert proposal["manual_review_required"] is True
+        assert "preauthorized_policy" not in proposal
+    assert stale_by_id["secret"]["contains_secret_text"]
 
 
 def test_consolidate_finds_stale_low_value_candidates():
@@ -184,8 +233,94 @@ def test_consolidate_finds_stale_low_value_candidates():
     stale = [p for p in result["proposals"] if p["proposal_type"] == "stale_low_value"]
     assert stale
     assert stale[0]["affected_ids"] == ["m1"]
-    assert stale[0]["suggested_action"] == "delete_review_only"
+    assert stale[0]["suggested_action"] == "quarantine_guarded_auto_eligible"
     assert stale[0]["requires_explicit_approval"] is True
+    assert stale[0]["guarded_auto_eligible"] is True
+    assert stale[0]["preauthorized_policy"] == "guarded-auto:stale-low-value-quarantine"
+
+
+def test_consolidate_finds_heading_noise_candidates_for_guarded_auto_cleanup():
+    provider = _provider()
+    provider._qdrant = FakeQdrant(
+        {
+            "memory": [
+                _point("m1", "## Tareas", source_type="vault_note"),
+                _point("m2", "Real durable memory body with enough content", source_type="manual"),
+            ],
+            "learnings": [],
+        }
+    )
+
+    result = json.loads(provider.handle_tool_call("qdrant_memory_consolidate", {"scope": "memory", "include_examples": True}))
+
+    headings = [p for p in result["proposals"] if p["proposal_type"] == "heading_noise"]
+    assert headings
+    assert headings[0]["affected_ids"] == ["m1"]
+    assert headings[0]["guarded_auto_eligible"] is True
+    assert headings[0]["suggested_action"] == "delete_guarded_auto_eligible"
+
+
+def test_consolidate_reports_generic_headings_but_blocks_guarded_auto_cleanup():
+    provider = _provider()
+    provider._qdrant = FakeQdrant(
+        {
+            "memory": [
+                _point("m1", "# Project Phoenix", source_type="manual"),
+            ],
+            "learnings": [],
+        }
+    )
+
+    result = json.loads(provider.handle_tool_call("qdrant_memory_consolidate", {"scope": "memory", "include_examples": True}))
+
+    headings = [p for p in result["proposals"] if p["proposal_type"] == "heading_noise"]
+    assert headings
+    assert headings[0]["affected_ids"] == ["m1"]
+    assert headings[0]["guarded_auto_eligible"] is False
+    assert headings[0]["suggested_action"] == "delete_review_only"
+    assert headings[0]["manual_review_required"] is True
+
+
+def test_consolidate_skips_already_quarantined_stale_candidates():
+    provider = _provider()
+    old = (datetime.now(timezone.utc) - timedelta(days=200)).isoformat()
+    provider._qdrant = FakeQdrant(
+        {
+            "memory": [
+                _point("m1", "old weak memory", source_type="conversation", importance=1, confidence=0.3, access_count=0, created_at=old, consolidation_quarantined=True),
+            ],
+            "learnings": [],
+        }
+    )
+
+    result = json.loads(provider.handle_tool_call("qdrant_memory_consolidate", {"scope": "memory"}))
+
+    assert [p for p in result["proposals"] if p["proposal_type"] == "stale_low_value"] == []
+
+
+def test_consolidate_skips_already_promoted_learning_candidates():
+    provider = _provider()
+    provider._qdrant = FakeQdrant(
+        {
+            "memory": [],
+            "learnings": [
+                _point(
+                    "l1",
+                    "Durable workflow lesson already drafted",
+                    source_type="learning",
+                    learning_type="workflow_lesson",
+                    confidence=0.95,
+                    importance=9,
+                    promote_to_skill_candidate=True,
+                    promoted_to_skill_draft=True,
+                )
+            ],
+        }
+    )
+
+    result = json.loads(provider.handle_tool_call("qdrant_memory_consolidate", {"scope": "learning"}))
+
+    assert [p for p in result["proposals"] if p["proposal_type"] == "learning_promotion_candidate"] == []
 
 
 def test_consolidate_finds_learning_promotion_candidates():
@@ -288,6 +423,6 @@ def test_status_includes_consolidation_report_flags():
     assert result["consolidation_report_only"] is False
     assert result["consolidation_persist_reports"] is True
     assert result["consolidation_apply_enabled"] is True
-    assert result["consolidation_supported_actions"] == ["merge", "delete", "promote_to_skill", "draft_review"]
+    assert result["consolidation_supported_actions"] == ["merge", "delete", "quarantine", "promote_to_skill", "draft_review"]
     assert result["reconsolidation_report_only"] is True
     assert result["reconsolidation_supported_actions"] == ["draft_review"]

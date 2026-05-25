@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +39,70 @@ def normalize_text_fingerprint(text: str) -> str:
     words = [word.strip(".,:;!?()[]{}'\"").lower() for word in text.split()]
     words = [word for word in words if word]
     return " ".join(words)
+
+
+_PROFILE_MEMORY_SOURCE_TYPES = {
+    "profile",
+    "profile_memory",
+    "user",
+    "user_memory",
+    "user_profile",
+}
+_PROFILE_TARGETS = {"profile", "user"}
+_FACT_METADATA_KEYS = ("entity", "fact_key", "reconsolidation_key", "subject")
+
+
+def _point_requires_manual_review(point: ConsolidationPoint) -> bool:
+    payload = point.payload or {}
+    source_type = str(payload.get("source_type") or "").strip().lower()
+    target = str(payload.get("target") or payload.get("memory_target") or "").strip().lower()
+    if source_type in _PROFILE_MEMORY_SOURCE_TYPES or target in _PROFILE_TARGETS:
+        return True
+    return any(str(payload.get(key) or "").strip() for key in _FACT_METADATA_KEYS)
+
+
+_HEADING_NOISE_FINGERPRINTS = {
+    "tareas",
+    "notas",
+    "reflexion",
+    "reflexión",
+    "contribution",
+    "implementation",
+    "files modified this turn",
+    "plan de implementacion",
+    "plan de implementación",
+    "risks doubts",
+    "next handoff",
+}
+
+
+def _heading_noise_details(text: str) -> tuple[bool, bool, str, str]:
+    """Return (is_noise, guarded_safe, normalized, reason) for heading-only chunks."""
+    stripped = " ".join(str(text or "").strip().split())
+    if not stripped or len(stripped) > 80:
+        return False, False, "", "not a short standalone heading"
+    had_markdown_hash = stripped.startswith("#")
+    while stripped.startswith("#"):
+        stripped = stripped[1:].strip()
+    normalized = normalize_text_fingerprint(stripped)
+    if normalized in _HEADING_NOISE_FINGERPRINTS:
+        return True, True, normalized, "known heading/indexer noise fingerprint"
+    # Generic all-heading chunks are useful report candidates, but not safe
+    # enough for unattended deletion. A legitimate memory such as
+    # "# Project Phoenix" looks exactly like a short markdown title.
+    if had_markdown_hash and len(normalized.split()) <= 4 and not any(char in stripped for char in ".!?;:"):
+        return True, False, normalized, "generic short markdown heading; manual review required"
+    return False, False, normalized, "not heading noise"
+
+
+def is_heading_noise_text(text: str) -> bool:
+    """Return True for standalone markdown headings that carry little memory value."""
+    return _heading_noise_details(text)[0]
+
+
+def is_guarded_auto_heading_noise_text(text: str) -> bool:
+    """Return True only for known heading-noise fingerprints safe for auto-delete."""
+    return _heading_noise_details(text)[1]
 
 
 def _snippet(text: str, *, max_chars: int = 160) -> str:
@@ -154,6 +218,7 @@ def find_proposal(report: dict[str, Any], proposal_id: str) -> dict[str, Any]:
 def expected_action_for_proposal(proposal_type: str) -> str | None:
     return {
         "duplicate_cluster": "merge",
+        "heading_noise": "delete",
         "stale_low_value": "delete",
         "learning_promotion_candidate": "promote_to_skill",
         "reconsolidation_candidate": "draft_review",
@@ -176,7 +241,8 @@ def persist_application_record(record: dict[str, Any], *, hermes_home: str, conf
 
 def build_skill_draft_text(point: ConsolidationPoint, *, proposal_id: str, report_id: str) -> str:
     payload = redact_secrets(point.payload)
-    lesson = str(payload.get("lesson") or payload.get("text") or point.text).strip()
+    safe_text = redact_secrets(point.text)
+    lesson = str(payload.get("lesson") or payload.get("text") or safe_text).strip()
     trigger = str(payload.get("trigger") or "").strip()
     correction = str(payload.get("correction") or "").strip()
     evidence = str(payload.get("evidence") or "").strip()
@@ -303,6 +369,33 @@ def _similarity(a: str, b: str) -> float:
     return len(a_words & b_words) / len(a_words | b_words)
 
 
+def _heading_noise_proposals(points: list[ConsolidationPoint], *, include_examples: bool, max_groups: int) -> list[dict[str, Any]]:
+    candidates = [point for point in points if is_heading_noise_text(point.text) and not point.payload.get("consolidation_quarantined")]
+    proposals: list[dict[str, Any]] = []
+    for point in candidates[:max_groups]:
+        _, guarded_safe, _normalized, reason = _heading_noise_details(point.text)
+        proposal: dict[str, Any] = {
+            "proposal_id": _proposal_id("heading_noise", [point.id]),
+            "proposal_type": "heading_noise",
+            "collection_name": point.collection_name,
+            "affected_ids": [point.id],
+            "suggested_action": "delete_guarded_auto_eligible" if guarded_safe else "delete_review_only",
+            "confidence": 0.99 if guarded_safe else 0.70,
+            "risk": "low" if guarded_safe else "medium",
+            "evidence": [{"id": point.id, "reason": reason}],
+            "requires_explicit_approval": True,
+            "guarded_auto_eligible": guarded_safe,
+        }
+        if guarded_safe:
+            proposal["preauthorized_policy"] = "guarded-auto:heading-noise"
+        else:
+            proposal["manual_review_required"] = True
+        if include_examples:
+            proposal["examples"] = [{"id": point.id, "text": _snippet(point.text)}]
+        proposals.append(proposal)
+    return proposals
+
+
 def _duplicate_proposals(points: list[ConsolidationPoint], *, max_groups: int, include_examples: bool, threshold: float = 0.92) -> list[dict[str, Any]]:
     fingerprints = [(point, normalize_text_fingerprint(point.text)) for point in points]
     used: set[str] = set()
@@ -321,17 +414,31 @@ def _duplicate_proposals(points: list[ConsolidationPoint], *, max_groups: int, i
         for member in group:
             used.add(member.id)
         affected_ids = [point.id for point in group if point.id]
+        group_fingerprints = {fp for member, fp in fingerprints if member.id in set(affected_ids)}
+        exact_normalized = len(group_fingerprints) == 1
+        contains_secret_text = any(contains_secret(member.text) or contains_secret(json.dumps(member.payload or {}, sort_keys=True, default=str)) for member in group)
+        manual_review_point = any(_point_requires_manual_review(member) for member in group)
+        guarded_auto_safe = exact_normalized and not contains_secret_text and not manual_review_point
         proposal: dict[str, Any] = {
             "proposal_id": _proposal_id("duplicate_cluster", affected_ids),
             "proposal_type": "duplicate_cluster",
             "collection_name": group[0].collection_name,
             "affected_ids": affected_ids,
             "suggested_action": "merge_review_only",
-            "confidence": 0.95,
-            "risk": "medium",
-            "evidence": [{"id": point.id, "reason": "identical normalized text"} for point in group],
+            "confidence": 0.99 if exact_normalized else 0.95,
+            "risk": "low" if guarded_auto_safe else "medium",
+            "evidence": [{"id": point.id, "reason": "identical normalized text" if exact_normalized else "high normalized text overlap"} for point in group],
             "requires_explicit_approval": True,
+            "match_kind": "exact_normalized" if exact_normalized else "near_duplicate",
+            "guarded_auto_eligible": guarded_auto_safe,
         }
+        if contains_secret_text:
+            proposal["contains_secret_text"] = True
+        if manual_review_point:
+            proposal["manual_review_required"] = True
+            proposal["manual_review_reason"] = "profile or fact-like memory requires manual review"
+        if proposal.get("guarded_auto_eligible"):
+            proposal["preauthorized_policy"] = "guarded-auto:exact-duplicate-merge"
         if include_examples:
             proposal["examples"] = [{"id": point.id, "text": _snippet(point.text)} for point in group]
         proposals.append(proposal)
@@ -352,6 +459,8 @@ def _stale_low_value_proposals(
     proposals: list[dict[str, Any]] = []
     for point in points:
         payload = point.payload
+        if payload.get("consolidation_quarantined"):
+            continue
         created = _parse_datetime(payload.get("created_at") or payload.get("last_accessed"))
         if not created:
             continue
@@ -361,14 +470,17 @@ def _stale_low_value_proposals(
         confidence = _as_float(payload.get("confidence"), 1.0)
         if age_days < stale_days or importance >= min_importance_for_keep or access_count > 0 or confidence > 0.5:
             continue
+        stale_manual_review = _point_requires_manual_review(point)
+        contains_secret_text = contains_secret(point.text) or contains_secret(json.dumps(point.payload or {}, sort_keys=True, default=str))
+        guarded_auto_safe = not stale_manual_review and not contains_secret_text
         proposal: dict[str, Any] = {
             "proposal_id": _proposal_id("stale_low_value", [point.id]),
             "proposal_type": "stale_low_value",
             "collection_name": point.collection_name,
             "affected_ids": [point.id],
-            "suggested_action": "delete_review_only",
+            "suggested_action": "quarantine_guarded_auto_eligible" if guarded_auto_safe else "quarantine_review_only",
             "confidence": 0.75,
-            "risk": "high",
+            "risk": "low" if guarded_auto_safe else "medium",
             "evidence": [
                 {
                     "id": point.id,
@@ -379,7 +491,15 @@ def _stale_low_value_proposals(
                 }
             ],
             "requires_explicit_approval": True,
+            "guarded_auto_eligible": guarded_auto_safe,
         }
+        if guarded_auto_safe:
+            proposal["preauthorized_policy"] = "guarded-auto:stale-low-value-quarantine"
+        else:
+            proposal["manual_review_required"] = True
+            proposal["manual_review_reason"] = "secret-bearing, profile, or fact-like memory requires manual review"
+        if contains_secret_text:
+            proposal["contains_secret_text"] = True
         if include_examples:
             proposal["examples"] = [{"id": point.id, "text": _snippet(point.text)}]
         proposals.append(proposal)
@@ -393,6 +513,10 @@ def _learning_promotion_proposals(points: list[ConsolidationPoint], *, include_e
     for point in points:
         payload = point.payload
         if not payload.get("promote_to_skill_candidate"):
+            continue
+        if payload.get("promoted_to_skill_draft"):
+            continue
+        if contains_secret(point.text) or contains_secret(json.dumps(payload or {}, sort_keys=True, default=str)):
             continue
         if _as_float(payload.get("confidence"), 0.0) < 0.85 or _as_int(payload.get("importance"), 0) < 8:
             continue
@@ -413,6 +537,8 @@ def _learning_promotion_proposals(points: list[ConsolidationPoint], *, include_e
                 }
             ],
             "requires_explicit_approval": True,
+            "guarded_auto_eligible": True,
+            "preauthorized_policy": "guarded-auto:learning-skill-draft",
         }
         if include_examples:
             proposal["examples"] = [{"id": point.id, "text": _snippet(point.text)}]
@@ -557,12 +683,17 @@ def build_consolidation_report(
     reconsolidation_min_confidence: float = 0.6,
 ) -> dict[str, Any]:
     proposals: list[dict[str, Any]] = []
+    memory_heading_noise = [point for point in memory_points if is_heading_noise_text(point.text)]
+    learning_heading_noise = [point for point in learning_points if is_heading_noise_text(point.text)]
+    memory_non_heading = [point for point in memory_points if not is_heading_noise_text(point.text)]
+    learning_non_heading = [point for point in learning_points if not is_heading_noise_text(point.text)]
     proposals.extend(_quality_warning_proposals(memory_points + learning_points, max_groups=max_groups))
-    proposals.extend(_duplicate_proposals(memory_points, max_groups=max_groups, include_examples=include_examples, threshold=duplicate_threshold))
-    proposals.extend(_duplicate_proposals(learning_points, max_groups=max_groups, include_examples=include_examples, threshold=duplicate_threshold))
+    proposals.extend(_heading_noise_proposals(memory_heading_noise + learning_heading_noise, include_examples=include_examples, max_groups=max_groups))
+    proposals.extend(_duplicate_proposals(memory_non_heading, max_groups=max_groups, include_examples=include_examples, threshold=duplicate_threshold))
+    proposals.extend(_duplicate_proposals(learning_non_heading, max_groups=max_groups, include_examples=include_examples, threshold=duplicate_threshold))
     proposals.extend(
         _stale_low_value_proposals(
-            memory_points,
+            memory_non_heading,
             stale_days=stale_days,
             min_importance_for_keep=min_importance_for_keep,
             include_examples=include_examples,

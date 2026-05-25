@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from qdrant_memory.guarded_auto import GuardedAutoPolicy, apply_guarded_auto
+
 
 class CliUsageError(ValueError):
     """Raised when CLI arguments violate the plugin safety contract."""
@@ -318,6 +320,10 @@ def _watcher_run_command(args: Namespace) -> str:
     ]
     if not getattr(args, "include_reconsolidation", True):
         parts.append("--no-include-reconsolidation")
+    if getattr(args, "autonomy_mode", "report-only") != "report-only":
+        parts.extend(["--autonomy-mode", args.autonomy_mode])
+        parts.extend(["--max-auto-actions", str(getattr(args, "max_auto_actions", 10))])
+        parts.extend(["--quarantine-days", str(getattr(args, "quarantine_days", 30))])
     parts.append("--json")
     return " ".join(shlex.quote(str(part)) for part in parts)
 
@@ -432,6 +438,14 @@ def _proposal_signature(report: dict[str, Any]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _guarded_auto_policy_from_args(args: Namespace) -> GuardedAutoPolicy:
+    return GuardedAutoPolicy(
+        mode=str(getattr(args, "autonomy_mode", "report-only") or "report-only"),
+        max_actions=int(getattr(args, "max_auto_actions", 10) or 10),
+        quarantine_days=int(getattr(args, "quarantine_days", 30) or 30),
+    )
+
+
 def _record_watcher_run(args: Namespace, report: dict[str, Any]) -> None:
     if getattr(args, "qdrant_subcommand", None) != "watcher" or getattr(args, "watcher_subcommand", None) != "run":
         return
@@ -446,6 +460,11 @@ def _record_watcher_run(args: Namespace, report: dict[str, Any]) -> None:
     proposals = report.get("proposals")
     proposal_list = proposals if isinstance(proposals, list) else []
     timestamp = _now_iso()
+    guarded_auto = report.get("guarded_auto") if isinstance(report.get("guarded_auto"), dict) else {}
+    guarded_auto_applied = len(guarded_auto.get("applied", []) or []) if guarded_auto else 0
+    guarded_auto_errors = len(guarded_auto.get("errors", []) or []) if guarded_auto else 0
+    if guarded_auto_applied or guarded_auto_errors:
+        alerted = True
     state.update(
         {
             "last_run_at": timestamp,
@@ -456,6 +475,9 @@ def _record_watcher_run(args: Namespace, report: dict[str, Any]) -> None:
             "last_signature_changed": signature_changed,
             "last_alerted": alerted,
             "last_force_alert": force_alert,
+            "last_guarded_auto_mode": guarded_auto.get("mode") if guarded_auto else getattr(args, "autonomy_mode", "report-only"),
+            "last_guarded_auto_applied_count": guarded_auto_applied,
+            "last_guarded_auto_error_count": guarded_auto_errors,
             "updated_at": timestamp,
         }
     )
@@ -473,6 +495,9 @@ def _record_watcher_run(args: Namespace, report: dict[str, Any]) -> None:
             "signature_changed": signature_changed,
             "force_alert": force_alert,
             "alerted": alerted,
+            "guarded_auto_mode": guarded_auto.get("mode") if guarded_auto else getattr(args, "autonomy_mode", "report-only"),
+            "guarded_auto_applied_count": guarded_auto_applied,
+            "guarded_auto_error_count": guarded_auto_errors,
         }
     )
 
@@ -1517,7 +1542,17 @@ def _proposal_count(payload: dict[str, Any]) -> int:
 
 def _format_consolidate_summary(payload: dict[str, Any]) -> str:
     count = _proposal_count(payload)
-    lines = [f"Report-only consolidation: {count} {_plural(count, 'proposal')}"]
+    guarded_auto = payload.get("guarded_auto") if isinstance(payload.get("guarded_auto"), dict) else {}
+    guarded_auto_applied = len(guarded_auto.get("applied", []) or []) if guarded_auto else 0
+    guarded_auto_errors = len(guarded_auto.get("errors", []) or []) if guarded_auto else 0
+    if guarded_auto:
+        mode = guarded_auto.get("mode", "report-only")
+        lines = [
+            f"Consolidation watcher ({mode}): {count} {_plural(count, 'proposal')}, "
+            f"guarded-auto applied={guarded_auto_applied}, errors={guarded_auto_errors}"
+        ]
+    else:
+        lines = [f"Report-only consolidation: {count} {_plural(count, 'proposal')}"]
     if payload.get("report_id"):
         lines.append(f"report_id: {payload.get('report_id')}")
     if payload.get("scope"):
@@ -1717,6 +1752,8 @@ def build_tool_call(args: Namespace) -> tuple[str, dict[str, Any]]:
         }
         if getattr(args, "backup_first", False):
             tool_args["backup_first"] = True
+        if getattr(args, "action", None) == "quarantine" and getattr(args, "quarantine_days", None):
+            tool_args["quarantine_days"] = args.quarantine_days
         return "qdrant_memory_consolidation_apply", tool_args
 
     if subcommand == "learning":
@@ -1860,6 +1897,10 @@ def execute_command(
         else:
             print(f"Error: {_provider_error_message(parsed)}", file=stderr)
         return 1
+    if getattr(args, "qdrant_subcommand", None) == "watcher" and getattr(args, "watcher_subcommand", None) == "run":
+        guarded_auto = apply_guarded_auto(provider, parsed, _guarded_auto_policy_from_args(args))
+        parsed["guarded_auto"] = guarded_auto
+        result = json.dumps(parsed, sort_keys=True)
     _record_watcher_run(args, parsed)
     if _json_flag(args):
         print(result, file=stdout)

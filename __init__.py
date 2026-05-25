@@ -6,7 +6,7 @@ import logging
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -32,6 +32,7 @@ from qdrant_memory.client import QdrantClient
 from qdrant_memory.backup import create_backup
 from qdrant_memory.config import load_config
 from qdrant_memory.consolidation import (
+    _point_requires_manual_review,
     artifact_root,
     build_consolidation_report,
     build_reconsolidation_draft_text,
@@ -48,7 +49,7 @@ from qdrant_memory.consolidation import (
 from qdrant_memory.embeddings import EmbeddingClient
 from qdrant_memory.indexer import FileIndexer
 from qdrant_memory.learning import LearningStore
-from qdrant_memory.lesson_extractor import LearningCandidate, candidate_to_learning_args, extract_learning_candidates_from_messages
+from qdrant_memory.lesson_extractor import LearningCandidate, candidate_to_learning_args, contains_secret, extract_learning_candidates_from_messages
 from qdrant_memory.retriever import MemoryRetriever, format_for_prompt
 from qdrant_memory.tools import TOOL_SCHEMAS
 from qdrant_memory.writer import ConversationWriter
@@ -436,7 +437,7 @@ class QdrantMemoryProvider(MemoryProvider):
             "consolidation_enabled": self._config.get("consolidation_enabled", False),
             "consolidation_persist_reports": self._config.get("consolidation_persist_reports", True),
             "consolidation_apply_enabled": True,
-            "consolidation_supported_actions": ["merge", "delete", "promote_to_skill", "draft_review"],
+            "consolidation_supported_actions": ["merge", "delete", "quarantine", "promote_to_skill", "draft_review"],
             "reconsolidation_enabled": self._config.get("reconsolidation_enabled", False),
             "reconsolidation_report_only": self._config.get("reconsolidation_report_only", True),
             "reconsolidation_supported_actions": ["draft_review"],
@@ -708,6 +709,8 @@ class QdrantMemoryProvider(MemoryProvider):
             plan.update({"canonical_id": canonical.id, "delete_ids": [p.id for p in points if p.id != canonical.id]})
         elif action == "delete":
             plan.update({"delete_ids": affected_ids})
+        elif action == "quarantine":
+            plan.update({"quarantine_ids": affected_ids})
         elif action == "promote_to_skill" and points:
             root = artifact_root(self._hermes_home, str(self._config.get("consolidation_artifact_dir") or "")) / "skill_drafts"
             plan.update({"skill_draft_path": str(root / f"{proposal.get('proposal_id')}.md")})
@@ -753,7 +756,10 @@ class QdrantMemoryProvider(MemoryProvider):
             if not expected_action:
                 return _json_error("proposal requires manual review and cannot be applied automatically")
             action = str(args.get("action") or expected_action).strip()
-            if action != expected_action:
+            allowed_actions = {expected_action}
+            if proposal_type == "stale_low_value":
+                allowed_actions.add("quarantine")
+            if action not in allowed_actions:
                 return _json_error("action mismatch for proposal type")
             affected_ids = [str(item) for item in proposal.get("affected_ids") or [] if str(item)]
             if not affected_ids:
@@ -762,6 +768,11 @@ class QdrantMemoryProvider(MemoryProvider):
             points = self._retrieve_consolidation_points(collection_name, affected_ids)
             if len(points) != len(set(affected_ids)):
                 return _json_error("affected point missing; rerun consolidation")
+            if str(proposal.get("preauthorized_policy") or "").startswith("guarded-auto:") and action in {"merge", "delete", "quarantine"}:
+                if any(contains_secret(p.text) or contains_secret(json.dumps(p.payload or {}, sort_keys=True, default=str)) for p in points):
+                    return _json_error("secret-bearing point requires manual review")
+                if any(_point_requires_manual_review(p) for p in points):
+                    return _json_error("profile or fact-like memory requires manual review")
             plan = self._proposal_apply_plan(report, proposal, action, points)
             if dry_run:
                 return json.dumps({"dry_run": True, "would_apply": True, **plan})
@@ -781,10 +792,29 @@ class QdrantMemoryProvider(MemoryProvider):
                 self._qdrant.delete_ids(collection_name, affected_ids)
                 record = persist_application_record({"applied": True, **plan, **pre_apply, "deleted_ids": affected_ids}, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))
                 return json.dumps({"dry_run": False, "applied": True, **plan, **pre_apply, "deleted_ids": affected_ids, "application_id": record.get("application_id"), "application_artifact": record.get("artifact_path")})
+            if action == "quarantine":
+                try:
+                    quarantine_days = max(1, min(365, int(args.get("quarantine_days", self._config.get("guarded_auto_quarantine_days", 30)))))
+                except Exception:
+                    quarantine_days = 30
+                quarantined_at = datetime.utcnow().isoformat() + "Z"
+                quarantine_until = (datetime.utcnow() + timedelta(days=quarantine_days)).isoformat() + "Z"
+                payload_update = {
+                    "consolidation_quarantined": True,
+                    "consolidation_quarantine_reason": "guarded-auto stale_low_value",
+                    "consolidation_quarantined_at": quarantined_at,
+                    "consolidation_quarantine_until": quarantine_until,
+                    "consolidation_proposal_id": proposal_id,
+                    "consolidation_report_id": report_id,
+                }
+                for point_id in affected_ids:
+                    self._qdrant.update_payload(collection_name, point_id, payload_update)
+                record = persist_application_record({"applied": True, **plan, **pre_apply, "quarantined_ids": affected_ids, "quarantine_until": quarantine_until}, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))
+                return json.dumps({"dry_run": False, "applied": True, **plan, **pre_apply, "quarantined_ids": affected_ids, "quarantine_until": quarantine_until, "application_id": record.get("application_id"), "application_artifact": record.get("artifact_path")})
             if action == "merge":
                 if len(points) < 2:
                     return _json_error("merge requires at least two affected points")
-                if any("bearer" in p.text.lower() or "secret" in p.text.lower() for p in points):
+                if any(contains_secret(p.text) for p in points):
                     return _json_error("secret-bearing duplicate cluster requires manual review")
                 canonical = self._select_canonical_point(points)
                 delete_ids = [p.id for p in points if p.id != canonical.id]
@@ -804,7 +834,7 @@ class QdrantMemoryProvider(MemoryProvider):
                 if collection_name != self._config["learning_collection_name"]:
                     return _json_error("promote_to_skill requires a learning collection proposal")
                 point = points[0]
-                if "bearer" in point.text.lower() or "secret" in point.text.lower():
+                if contains_secret(point.text) or contains_secret(json.dumps(point.payload or {}, sort_keys=True, default=str)):
                     return _json_error("secret-bearing learning requires manual review")
                 draft_root = artifact_root(self._hermes_home, str(self._config.get("consolidation_artifact_dir") or "")) / "skill_drafts"
                 draft_root.mkdir(parents=True, exist_ok=True)

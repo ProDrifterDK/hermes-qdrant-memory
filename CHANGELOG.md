@@ -6,6 +6,16 @@ This project is currently public beta / experimental. The format follows Keep a 
 
 ## [Unreleased]
 
+### Added
+
+- Implemented watcher `--autonomy-mode guarded-auto` for preauthorized low-risk exact-ID maintenance: known heading-noise cleanup, exact-normalized duplicate merge, stale-low-value quarantine, and learning-to-skill draft artifacts.
+- Added guarded-auto policy controls for max actions and quarantine days, plus state/log fields for applied action and error counts.
+
+### Safety
+
+- Guarded-auto still routes every live mutation through `qdrant_memory_consolidation_apply` with exact `report_id`, exact `proposal_id`, `dry_run=false`, and `approve=true`.
+- Generic short markdown headings, near-duplicate clusters, secret-bearing inputs, `quality_warning`, and reconsolidation/fact-conflict proposals remain manual-review/draft-only.
+
 ### Documentation
 
 - Documented the Hermes core discovery result for category-path installs: current Hermes discovers `~/.hermes/plugins/memory/qdrant` in the general plugin list as `memory/qdrant`, but memory-provider activation and native `hermes qdrant ...` CLI discovery still require the flat `~/.hermes/plugins/qdrant` compatibility path or symlink.
@@ -27,7 +37,7 @@ Eighth public beta release of the Hermes Qdrant Memory Provider. This release fo
 ### Safety
 
 - Watcher lifecycle commands are local scheduler/state/log operations only, with approval gates for uninstalling, replacing an existing managed cron block, and resetting proposal signatures.
-- `watcher run` remains report-only consolidation with `dry_run=true`, `persist=true`, and no apply/proposal mutation; successful runs update only local watcher state/log artifacts.
+- `watcher run` defaults to report-only consolidation with `dry_run=true`, `persist=true`, and no apply/proposal mutation; `--autonomy-mode guarded-auto` is opt-in and may apply only preauthorized low-risk exact-ID proposals through the gated apply path.
 - Manual memory store live writes now require explicit `dry_run=false` plus `approve=true`; duplicate preview can skip an upsert but never deletes, merges, or rewrites existing memories.
 - Live integration tests skip by default, use uniquely named temporary collections, delete only the exact collections created by the test fixture when names match the configured test prefix, and place consolidation artifacts under pytest temporary directories.
 
@@ -123,7 +133,7 @@ Third public beta release of the Hermes Qdrant Memory Provider. This release bro
   - `hermes qdrant learning store LESSON` maps to `qdrant_learning_store`.
   - `hermes qdrant learning approve CANDIDATE_ID` maps to `qdrant_learning_approve` with dry-run default and live approval gate.
   - `hermes qdrant watcher status` reads local watcher state without contacting services.
-  - `hermes qdrant watcher run` runs report-only persisted consolidation with no apply/proposal mutation.
+  - `hermes qdrant watcher run` runs persisted consolidation in report-only mode by default; `--autonomy-mode guarded-auto` is opt-in and limited to preauthorized low-risk exact-ID apply paths.
 
 ### Fixed
 

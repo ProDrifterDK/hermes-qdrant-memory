@@ -542,7 +542,7 @@ def test_provider_backed_commands_default_to_human_summaries_and_json_can_remain
             ["qdrant", "watcher", "run", "--scope", "memory"],
             "qdrant_memory_consolidate",
             '{"dry_run":true,"report_only":true,"report_id":"r1","scope":"memory","proposals":[{"proposal_id":"p1"},{"proposal_id":"p2"}],"summary":{"duplicate_cluster":2}}',
-            ["Report-only consolidation: 2 proposals", "report_id: r1", "scope: memory"],
+            ["Consolidation watcher (report-only): 2 proposals, guarded-auto applied=0, errors=0", "report_id: r1", "scope: memory"],
         ),
         (
             ["qdrant", "apply", "--report-id", "r1", "--proposal-id", "p1", "--action", "merge"],

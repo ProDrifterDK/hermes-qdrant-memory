@@ -8,7 +8,7 @@ This plugin turns Hermes memory into an external associative substrate: conversa
 
 ## Status
 
-Public beta / experimental. Current published release: `v0.8.0 Public Beta`. The plugin is functional and tested, but it depends on external Qdrant and embedding services. Learning, origin-time fact metadata, sleep consolidation, manual-review reconsolidation, native Hermes CLI commands with human-readable defaults, backup/export/restore recovery primitives, watcher lifecycle commands, env-gated live integration tests, manual-store dry-run/duplicate-preview flows, filtered search ergonomics, and read-only inspection helpers are implemented with conservative gates. Automatic reconsolidation remains disabled by design.
+Public beta / experimental. Current published release: `v0.8.0 Public Beta`. The plugin is functional and tested, but it depends on external Qdrant and embedding services. Learning, origin-time fact metadata, sleep consolidation, guarded-auto low-risk watcher apply, manual-review reconsolidation, native Hermes CLI commands with human-readable defaults, backup/export/restore recovery primitives, watcher lifecycle commands, env-gated live integration tests, manual-store dry-run/duplicate-preview flows, filtered search ergonomics, and read-only inspection helpers are implemented with conservative gates. Automatic fact reconsolidation remains disabled by design.
 
 ## What it does
 
@@ -51,8 +51,8 @@ Public beta / experimental. Current published release: `v0.8.0 Public Beta`. The
 | Safe forget by explicit point IDs | Implemented |
 | Manual procedural learning collection | Implemented |
 | Origin-time fact metadata | Implemented conservatively from explicit tags, clear fact statements, file headings, and structured learning context |
-| Sleep consolidation | M9 gated report persistence and apply-by-proposal-id implemented |
-| Reconsolidation | M10 report-only conflict candidates + local review drafts implemented; no automatic memory rewrites |
+| Sleep consolidation | M11 guarded-auto watcher policy implemented: report persistence plus preauthorized low-risk apply for heading noise, exact duplicate merges, stale quarantine, and learning-to-skill drafts |
+| Reconsolidation | M10 report-only conflict candidates + local review drafts implemented; no automatic fact rewrites |
 | Native Hermes CLI beta | Implemented for active memory provider (`hermes qdrant ...`) with human-readable defaults, stable `--json`, CLI parity, recovery commands, read-only inspection helpers, filtered search ergonomics, and watcher lifecycle management |
 | Backup/export/restore recovery | Implemented with private local artifacts, dry-run restore default, live approval gate, and automatic pre-restore backup |
 | CLI inspection/ergonomics | Implemented for exact point lookup, persisted report listing/showing, proposal inspection, and read-only search filters without widening mutation authority |
@@ -807,6 +807,7 @@ hermes qdrant consolidate --scope both --persist --dry-run
 hermes qdrant watcher status --verbose
 hermes qdrant watcher install --schedule "0 3 * * *"
 hermes qdrant watcher run --scope both --force-alert
+hermes qdrant watcher run --scope both --autonomy-mode guarded-auto --max-auto-actions 10 --force-alert
 hermes qdrant watcher logs --tail 20
 hermes qdrant watcher inspect-state
 hermes qdrant watcher reset-signature --approve
@@ -829,7 +830,7 @@ Mutation safety mirrors the tool surface:
 - live maintenance mutation requires both `--no-dry-run` and `--approve`;
 - `learning approve` follows the same live approval gate;
 - `forget` only accepts explicit point IDs;
-- `watcher run` is report-only consolidation with `dry_run=true`, `persist=true`, and no apply/proposal mutation; it updates only local watcher state/log artifacts and `--force-alert` does not widen Qdrant authority;
+- `watcher run` defaults to report-only consolidation with `dry_run=true`, `persist=true`, and no apply/proposal mutation; when explicitly run with `--autonomy-mode guarded-auto`, it may apply only preauthorized low-risk exact-ID proposals through the same exact `report_id` + `proposal_id` apply path and records guarded-auto counts in watcher state/logs; `--force-alert` only affects alerting and does not widen Qdrant authority;
 - `watcher install` / `watcher uninstall --approve` edit only the sentinel-managed crontab block; replacing an existing different watcher block requires `--approve`;
 - `watcher reset-signature --approve` clears only local watcher signature fields and preserves unrelated watcher state;
 - `apply` requires explicit report/proposal IDs and expected action;

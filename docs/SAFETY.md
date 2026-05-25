@@ -61,7 +61,7 @@ Defaults must remain conservative:
 - restore defaults to dry-run;
 - report generation is report-only and must reject live apply behavior.
 
-Live mutation requires an explicit operator decision after reviewing the dry-run output.
+Live mutation requires an explicit operator decision after reviewing the dry-run output, unless the watcher is running under a documented `guarded-auto` policy for a preauthorized low-risk action class. Guarded-auto still requires persisted reports, exact proposal IDs, explicit actions, and audit artifacts; it must not mutate by query or free text.
 
 Boolean parsing matters: string values such as `false`, `0`, `no`, and `off` must not accidentally become truthy. Any new dry-run or approval argument needs tests for string variants.
 
@@ -143,7 +143,8 @@ Live apply requires all of:
 
 Allowed live actions are intentionally narrow:
 
-- `delete`: only for stale low-value proposals, using explicit affected point IDs.
+- `delete`: only for stale low-value proposals or heading-noise cleanup, using explicit affected point IDs.
+- `quarantine`: only for stale low-value proposals; updates explicit affected IDs with reversible quarantine metadata instead of deleting them.
 - `merge`: only for duplicate clusters, preserving one canonical point and deleting explicit duplicate IDs.
 - `promote_to_skill`: creates a local draft skill artifact and may mark the learning as promoted-to-draft; it must not install an active skill automatically.
 - `draft_review`: only for reconsolidation candidates; creates a local markdown review draft.
@@ -240,7 +241,7 @@ Qdrant mutations remain gated by dry-run-first, explicit IDs/proposal handles, a
 
 ## 12. Cron and watcher safety
 
-Scheduled jobs may observe and report. They must not autonomously mutate Qdrant.
+Scheduled jobs default to observe/report mode. They may autonomously mutate Qdrant only when `guarded-auto` is explicitly enabled and the proposal class is preauthorized by this safety contract.
 
 Allowed cron/watcher behavior:
 
@@ -248,18 +249,19 @@ Allowed cron/watcher behavior:
 - dry-run consolidation reports;
 - persisted redacted report artifacts;
 - dry-run indexing audits;
-- alerts when proposal signatures change.
+- alerts when proposal signatures change;
+- under `guarded-auto`, exact-ID apply for low-risk `heading_noise`, exact normalized duplicate merges, stale-low-value quarantine, and high-confidence learning promotion to draft-only skill artifacts.
 
 Forbidden cron/watcher behavior:
 
-- automatic `qdrant_memory_consolidation_apply`;
 - automatic reconsolidation rewrite;
 - automatic quality-warning resolution;
 - automatic broad live indexing;
 - automatic query-based deletion;
-- automatic learning approval.
+- automatic learning approval from volatile pending candidates without high-confidence policy gates;
+- automatic user/profile fact rewrite.
 
-Cron jobs may persist local reports. They must not upsert, delete, update payloads, approve learnings, install skills, or apply proposals.
+Cron jobs may persist local reports and watcher state. Guarded-auto mutations must still go through `qdrant_memory_consolidation_apply`, exact `report_id` + `proposal_id`, `approve=true`, and application audit artifacts.
 
 ---
 
@@ -340,6 +342,6 @@ The plugin must not:
 - auto-apply `quality_warning`;
 - auto-rewrite facts through reconsolidation;
 - install promoted skills automatically;
-- let cron mutate Qdrant;
+- let cron mutate Qdrant outside the explicit guarded-auto exact-ID policy and gated apply path;
 - add literal fake secrets to docs or tests;
 - persist unredacted scanner-sensitive examples in local reports.
