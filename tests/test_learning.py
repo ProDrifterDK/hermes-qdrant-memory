@@ -293,6 +293,7 @@ def test_provider_learning_tools_and_status_use_learning_collection():
     status = json.loads(provider.handle_tool_call("qdrant_memory_status", {}))
 
     assert saved["saved"] is True
+    assert saved["write_decision"]["decision"] == "learning_candidate"
     assert provider._qdrant.upserts[0][0] == "learnings"
     assert searched["count"] == 1
     assert provider._qdrant.searches[0][0] == "learnings"
@@ -352,6 +353,42 @@ def test_memory_search_collection_learning_routes_to_learning_collection_with_fi
     assert {"key": "file_path", "match": {"value": "/repo/lessons.md"}} in must
     assert {"key": "project_path", "match": {"value": "/repo"}} in must
     assert {"key": "created_at", "range": {"gte": "2026-02-01T00:00:00Z", "lte": "2026-02-28T23:59:59Z"}} in must
+
+
+def test_learning_store_write_gate_skips_low_information_lessons():
+    from __init__ import QdrantMemoryProvider
+
+    provider = QdrantMemoryProvider()
+    provider._qdrant = FakeQdrant()
+    provider._embeddings = FakeEmbedding()
+    provider._config.update({"learning_collection_name": "learnings", "learning_enabled": True})
+
+    stored = json.loads(provider.handle_tool_call("qdrant_learning_store", {"lesson": "ok"}))
+
+    assert stored["saved"] is False
+    assert stored["write_decision"]["decision"] == "skip"
+    assert provider._qdrant.upserts == []
+
+
+def test_learning_store_write_gate_rejects_secrets_in_persisted_fields():
+    from __init__ import QdrantMemoryProvider
+
+    provider = QdrantMemoryProvider()
+    provider._qdrant = FakeQdrant()
+    provider._embeddings = FakeEmbedding()
+    provider._config.update({"learning_collection_name": "learnings", "learning_enabled": True})
+    secret_value = "".join(["abc", "def", "ghi", "jkl", "mnop"])
+
+    stored = json.loads(
+        provider.handle_tool_call(
+            "qdrant_learning_store",
+            {"lesson": "Use dry-run before live writes", "evidence": "Authorization: " + "Bearer " + secret_value},
+        )
+    )
+
+    assert "error" in stored
+    assert "rejected" in stored["error"]
+    assert provider._qdrant.upserts == []
 
 
 def test_provider_learning_tools_respect_learning_enabled_flag():

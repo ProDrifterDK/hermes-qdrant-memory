@@ -120,6 +120,26 @@ def test_register_cli_adds_inspection_subcommands():
     assert show.include_payload is True
     assert show.json is True
 
+    inspect = parser.parse_args(["qdrant", "inspect", "point-1", "--json"])
+    assert inspect.qdrant_subcommand == "inspect"
+    assert inspect.point_id == "point-1"
+    assert inspect.collection == "memory"
+    assert inspect.json is True
+
+    trace = parser.parse_args(["qdrant", "trace", "point-1", "--direction", "both", "--collection", "learning"])
+    assert trace.qdrant_subcommand == "trace"
+    assert trace.direction == "both"
+    assert trace.collection == "learning"
+
+    expand = parser.parse_args(["qdrant", "expand", "point-1", "--mode", "source", "--max-chars", "42"])
+    assert expand.qdrant_subcommand == "expand"
+    assert expand.mode == "source"
+    assert expand.max_chars == 42
+
+    source_status = parser.parse_args(["qdrant", "source-status", "point-1"])
+    assert source_status.qdrant_subcommand == "source-status"
+    assert source_status.point_id == "point-1"
+
     reports_list = parser.parse_args(["qdrant", "reports", "list", "--limit", "5"])
     assert reports_list.qdrant_subcommand == "reports"
     assert reports_list.reports_subcommand == "list"
@@ -242,6 +262,46 @@ def test_show_point_missing_returns_found_false(monkeypatch, tmp_path, capsys):
     assert payload["found"] is False
     assert payload["point_id"] == "missing"
     assert payload["collection_name"] == "hermes_memory_test"
+
+
+def test_show_point_rejects_mismatched_retrieve_result(monkeypatch, tmp_path, capsys):
+    from qdrant_memory.cli_core import execute_command
+    import qdrant_memory.backup as backup
+
+    class MismatchedQdrant(FakeQdrant):
+        def retrieve(self, name, ids, *, with_payload=True, with_vector=False):
+            self.retrieve_calls.append(
+                {
+                    "name": name,
+                    "ids": ids,
+                    "with_payload": with_payload,
+                    "with_vector": with_vector,
+                }
+            )
+            return self.points
+
+    hermes_home = tmp_path / "hermes"
+    _write_config(hermes_home)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    fake_qdrant = MismatchedQdrant(
+        [
+            {
+                "id": "other-point",
+                "payload": {"text": "wrong point text", "source_type": "manual"},
+            }
+        ]
+    )
+    monkeypatch.setattr(backup, "qdrant_client_from_config", lambda config: fake_qdrant)
+    parser = _parser()
+    args = parser.parse_args(["qdrant", "show", "requested-point", "--collection", "memory", "--include-payload", "--json"])
+
+    assert execute_command(args, provider_factory=lambda: pytest.fail("provider should not be constructed")) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["found"] is False
+    assert payload["point_id"] == "requested-point"
+    assert "payload" not in payload
+    assert "wrong point text" not in json.dumps(payload)
 
 
 def test_reports_list_and_show_are_local_read_only(monkeypatch, tmp_path, capsys):

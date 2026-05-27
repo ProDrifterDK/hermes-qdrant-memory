@@ -5,6 +5,7 @@ import os
 import re
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -58,6 +59,9 @@ class FileChunk:
     chunk_count: int
     chunk_hash: str
     heading: str = ""
+    line_start: int | None = None
+    line_end: int | None = None
+    source_uri: str = ""
     tags: list[str] = field(default_factory=list)
 
     def payload(
@@ -80,6 +84,13 @@ class FileChunk:
             file_path=self.file_path,
             project_path=project_path,
         )
+        locator: dict[str, Any] = {}
+        if self.line_start is not None:
+            locator["line_start"] = self.line_start
+        if self.line_end is not None:
+            locator["line_end"] = self.line_end
+        if self.heading:
+            locator["heading"] = self.heading
         payload = build_payload(
             text=self.text,
             source=self.source,
@@ -95,6 +106,14 @@ class FileChunk:
             project_path=project_path,
             model=model,
             fact_metadata=fact_metadata,
+            source_uri=self.source_uri or file_uri(self.file_path),
+            locator=locator,
+            content_hash=f"sha256:{self.chunk_hash}",
+            source_modified_at=source_modified_at_iso(self.file_mtime),
+            derivation_type="indexed_chunk",
+            canonical=True,
+            stale=False,
+            requires_review=False,
         )
         payload.update(
             {
@@ -137,6 +156,60 @@ def make_file_chunk_id(file_path: str, chunk_index: int) -> str:
 def sha256_hex(value: bytes | str) -> str:
     data = value.encode("utf-8") if isinstance(value, str) else value
     return hashlib.sha256(data).hexdigest()
+
+
+def source_modified_at_iso(mtime: float) -> str:
+    return datetime.fromtimestamp(float(mtime), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def file_uri(file_path: str) -> str:
+    try:
+        return Path(file_path).resolve().as_uri()
+    except Exception:
+        return ""
+
+
+def _locate_text_span_whitespace_tolerant(source_text: str, clean: str, *, start_at: int = 0) -> tuple[int, int] | None:
+    pattern = "".join(
+        r"\s+" if part.isspace() else re.escape(part)
+        for part in re.split(r"(\s+)", clean)
+        if part
+    )
+    if not pattern:
+        return None
+    try:
+        compiled = re.compile(pattern)
+    except re.error:
+        return None
+    match = compiled.search(source_text, max(0, start_at)) or compiled.search(source_text)
+    if not match:
+        return None
+    return match.start(), match.end()
+
+
+def locate_text_lines(source_text: str, chunk_text_value: str, *, start_at: int = 0) -> tuple[int | None, int | None, int]:
+    clean = (chunk_text_value or "").strip()
+    if not clean:
+        return None, None, start_at
+    start = source_text.find(clean, max(0, start_at))
+    if start >= 0:
+        end = start + len(clean)
+    else:
+        start = source_text.find(clean)
+        if start >= 0:
+            end = start + len(clean)
+        else:
+            span = _locate_text_span_whitespace_tolerant(source_text, clean, start_at=start_at)
+            if not span:
+                return None, None, start_at
+            start, end = span
+    line_start = source_text.count("\n", 0, start) + 1
+    line_end = line_start + source_text.count("\n", start, end)
+    return line_start, line_end, end
+
+
+def normalize_newlines(text: str) -> str:
+    return (text or "").replace("\r\n", "\n").replace("\r", "\n")
 
 
 def file_path_filter(file_path: str) -> dict[str, Any]:
@@ -194,11 +267,6 @@ def classify_source_type(path: Path) -> str:
     path_s = str(path).lower()
     if "skills" in parts or "/.hermes/skills/" in path_s:
         return "skill_doc"
-    # Obsidian vault names often contain spaces (e.g. "Example Vault"), so check
-    # substrings in the normalized full path as well as exact path components.
-    # Vault classification wins over generic docs/plans/project folders inside a vault.
-    if ".obsidian" in parts or "vault" in path_s or "obsidian" in path_s:
-        return "vault_note"
     if any(p in parts for p in ("docs", "plans", "project", "projects")):
         return "project_doc"
     return "indexed_file"
@@ -383,7 +451,7 @@ class FileIndexer:
     def prepare_file(self, path: Path) -> list[FileChunk]:
         path = path.resolve()
         raw = path.read_bytes()
-        text = raw.decode("utf-8", errors="replace")
+        text = normalize_newlines(raw.decode("utf-8", errors="replace"))
         tags = extract_tags(text)
         max_chars = self.max_chars
         if path.suffix.lower() == ".md":
@@ -398,10 +466,13 @@ class FileIndexer:
         file_sha256 = sha256_hex(raw)
         count = len(raw_chunks)
         chunks: list[FileChunk] = []
+        search_offset = 0
+        source_uri = path.as_uri()
         for index, (heading, chunk_text_value) in enumerate(raw_chunks):
             clean = chunk_text_value.strip()
             if not clean:
                 continue
+            line_start, line_end, search_offset = locate_text_lines(text, clean, start_at=search_offset)
             chunks.append(
                 FileChunk(
                     id=make_file_chunk_id(source, index),
@@ -416,6 +487,9 @@ class FileIndexer:
                     chunk_count=count,
                     chunk_hash=sha256_hex(clean),
                     heading=heading,
+                    line_start=line_start,
+                    line_end=line_end,
+                    source_uri=source_uri,
                     tags=tags,
                 )
             )

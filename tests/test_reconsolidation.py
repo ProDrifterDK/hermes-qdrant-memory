@@ -206,7 +206,10 @@ def test_reconsolidation_draft_review_dry_run_has_no_mutation_or_file(tmp_path):
     assert result["dry_run"] is True
     assert result["would_apply"] is True
     assert result["action"] == "draft_review"
-    assert "reconsolidation_draft_path" in result
+    assert result["proposal_draft_path"]
+    assert result["reconsolidation_draft_path"] == result["proposal_draft_path"]
+    assert result["write_decision"]["decision"] == "draft_review"
+    assert Path(result["proposal_draft_path"]).parent == tmp_path / "qdrant_memory" / "proposals"
     assert not Path(result["reconsolidation_draft_path"]).exists()
     assert provider._qdrant.upserts == []
     assert provider._qdrant.payload_updates == []

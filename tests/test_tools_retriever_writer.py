@@ -4,7 +4,7 @@ import json
 
 from qdrant_memory.retriever import RetrievedMemory, format_for_prompt
 from qdrant_memory.schema import make_point_id
-from qdrant_memory.tools import SEARCH_SCHEMA, STATUS_SCHEMA, STORE_SCHEMA
+from qdrant_memory.tools import EXPAND_SCHEMA, INSPECT_SCHEMA, SEARCH_SCHEMA, SOURCE_STATUS_SCHEMA, STATUS_SCHEMA, STORE_SCHEMA, TRACE_SCHEMA
 from qdrant_memory.writer import ConversationWriter, strip_injected_context
 
 
@@ -40,6 +40,11 @@ def test_tool_schemas_have_required_names():
     assert STATUS_SCHEMA["name"] == "qdrant_memory_status"
     assert STORE_SCHEMA["parameters"]["required"] == ["text"]
     assert SEARCH_SCHEMA["parameters"]["required"] == ["query"]
+    assert INSPECT_SCHEMA["name"] == "qdrant_memory_inspect"
+    assert INSPECT_SCHEMA["parameters"]["required"] == ["point_id"]
+    assert TRACE_SCHEMA["parameters"]["properties"]["direction"]["enum"] == ["upstream", "downstream", "both"]
+    assert EXPAND_SCHEMA["parameters"]["properties"]["mode"]["enum"] == ["excerpt", "source", "neighbors"]
+    assert SOURCE_STATUS_SCHEMA["name"] == "qdrant_memory_source_status"
     props = STORE_SCHEMA["parameters"]["properties"]
     assert props["dry_run"]["type"] == "boolean"
     assert props["approve"]["type"] == "boolean"
@@ -161,6 +166,7 @@ def test_provider_memory_store_dry_run_approval_and_duplicate_preview():
     assert dry_run["saved"] is False
     assert dry_run["would_store"] is True
     assert dry_run["id"] == make_point_id("hermes_tool", "TeamForge MCP binary is teamforge-mcp")
+    assert dry_run["write_decision"]["decision"] == "store"
     assert q.points == []
     assert emb.documents == []
 
@@ -183,6 +189,7 @@ def test_provider_memory_store_dry_run_approval_and_duplicate_preview():
     assert dry_run_duplicate["saved"] is False
     assert dry_run_duplicate["would_store"] is False
     assert dry_run_duplicate["duplicate_found"] is True
+    assert dry_run_duplicate["write_decision"]["decision"] == "skip"
     assert q.points == []
     q.search_results = []
 
@@ -193,6 +200,7 @@ def test_provider_memory_store_dry_run_approval_and_duplicate_preview():
     live = json.loads(provider.handle_tool_call("qdrant_memory_store", {"text": "TeamForge MCP binary is teamforge-mcp", "dry_run": False, "approve": True}))
     assert live["dry_run"] is False
     assert live["saved"] is True
+    assert live["write_decision"]["decision"] == "store"
     assert len(q.points) == 1
 
     q.points.clear()
@@ -213,6 +221,27 @@ def test_provider_memory_store_dry_run_approval_and_duplicate_preview():
     assert duplicate["saved"] is False
     assert duplicate["duplicate_found"] is True
     assert duplicate["duplicate"]["id"] == "memory-1"
+    assert duplicate["write_decision"]["decision"] == "skip"
+    assert q.points == []
+
+
+def test_provider_memory_store_write_gate_blocks_review_only_live_store():
+    from __init__ import QdrantMemoryProvider
+
+    emb = FakeEmbedding()
+    q = FakeQdrant()
+    provider = QdrantMemoryProvider()
+    provider._qdrant = q
+    provider._embeddings = emb
+    provider._writer = ConversationWriter(qdrant=q, embeddings=emb, collection_name="test_collection", profile_id="coder")
+    provider._config.update({"collection_name": "test_collection"})
+
+    dry_run = json.loads(provider.handle_tool_call("qdrant_memory_store", {"text": "Summarized memory that needs provenance before storage", "source_type": "summary"}))
+    live = json.loads(provider.handle_tool_call("qdrant_memory_store", {"text": "Summarized memory that needs provenance before storage", "source_type": "summary", "dry_run": False, "approve": True}))
+
+    assert dry_run["write_decision"]["decision"] == "draft_review"
+    assert dry_run["would_store"] is False
+    assert "review" in live["error"]
     assert q.points == []
 
 

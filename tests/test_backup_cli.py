@@ -4,7 +4,6 @@ import argparse
 import importlib.util
 import json
 import stat
-import sys
 from pathlib import Path
 from typing import Any
 

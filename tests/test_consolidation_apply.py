@@ -284,6 +284,61 @@ def test_apply_refuses_quality_warning_manual_only(tmp_path):
     assert provider._qdrant.deleted_ids == []
 
 
+def test_apply_draft_review_creates_neutral_proposal_draft(tmp_path):
+    from qdrant_memory.consolidation import persist_consolidation_report
+
+    provider = _provider(tmp_path)
+    provider._qdrant = FakeQdrant(
+        {
+            "memory": [
+                _point("m1", "Alan prefers concise status summaries", source_type="manual", confidence=0.9, importance=8),
+                _point("m2", "Alan prefers detailed status summaries", source_type="conversation", confidence=0.7, importance=5),
+            ],
+            "learnings": [],
+        }
+    )
+    report = persist_consolidation_report(
+        {
+            "dry_run": True,
+            "report_only": True,
+            "scope": "memory",
+            "profile_id": "architect",
+            "proposals": [
+                {
+                    "proposal_id": "recon-review",
+                    "proposal_type": "reconsolidation_candidate",
+                    "collection_name": "memory",
+                    "affected_ids": ["m1", "m2"],
+                    "suggested_action": "reconsolidate_review_only",
+                    "risk": "high",
+                    "confidence": 0.8,
+                    "manual_review_required": True,
+                }
+            ],
+        },
+        hermes_home=str(tmp_path),
+    )
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_consolidation_apply",
+            {"report_id": report["report_id"], "proposal_id": "recon-review", "action": "draft_review", "dry_run": False, "approve": True},
+        )
+    )
+
+    assert result["applied"] is True
+    assert result["proposal_draft_path"]
+    assert result["reconsolidation_draft_path"] == result["proposal_draft_path"]
+    assert result["write_decision"]["decision"] == "draft_review"
+    draft_path = tmp_path / "qdrant_memory" / "proposals" / result["proposal_draft_path"].split("/")[-1]
+    assert draft_path.exists()
+    text = draft_path.read_text()
+    assert "recon-review" in text
+    assert "m1" in text and "m2" in text
+    assert provider._qdrant.payload_updates == []
+    assert provider._qdrant.deleted_ids == []
+
+
 def test_apply_promote_live_creates_skill_draft_and_marks_learning(tmp_path):
     provider = _provider(tmp_path)
     provider._qdrant = FakeQdrant(
@@ -311,11 +366,17 @@ def test_apply_promote_live_creates_skill_draft_and_marks_learning(tmp_path):
 
     assert result["applied"] is True
     assert result["action"] == "promote_to_skill"
-    draft_path = tmp_path / "qdrant_memory" / "consolidation" / "skill_drafts" / f"{proposal['proposal_id']}.md"
+    assert result["proposal_draft_path"]
+    assert result["skill_draft_path"] == result["proposal_draft_path"]
+    draft_path = tmp_path / "qdrant_memory" / "proposals" / result["proposal_draft_path"].split("/")[-1]
     assert draft_path.exists()
     assert "Always run pytest" in draft_path.read_text()
+    assert result["write_decision"]["decision"] == "skill_candidate"
     assert provider._qdrant.payload_updates[0][0:2] == ("learnings", "l1")
-    assert provider._qdrant.payload_updates[0][2]["promoted_to_skill_draft"] is True
+    update = provider._qdrant.payload_updates[0][2]
+    assert update["promoted_to_skill_draft"] is True
+    assert update["proposal_draft_path"] == result["proposal_draft_path"]
+    assert update["skill_draft_path"] == result["skill_draft_path"]
     assert provider._qdrant.deleted_ids == []
 
 

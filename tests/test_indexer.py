@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 
 from qdrant_memory.config import load_config
 from qdrant_memory.indexer import FileChunk, FileIndexer, chunk_markdown, chunk_text, classify_source_type, make_file_chunk_id
@@ -71,6 +72,8 @@ def test_config_index_defaults_and_list_coercion(tmp_path):
 def test_tool_schemas_include_index_and_forget():
     assert INDEX_SCHEMA["name"] == "qdrant_memory_index"
     assert INDEX_SCHEMA["parameters"]["properties"]["dry_run"]["type"] == "boolean"
+    assert "markdown/text files or source folders" in INDEX_SCHEMA["description"]
+    assert "vault" not in INDEX_SCHEMA["description"].lower()
     assert FORGET_SCHEMA["name"] == "qdrant_memory_forget"
     assert FORGET_SCHEMA["parameters"]["required"] == ["ids"]
 
@@ -146,12 +149,52 @@ def test_prepare_file_metadata_classification_tags_and_idempotent_ids(tmp_path):
     assert first[0].payload()["file_path"] == str(path.resolve())
 
 
+def test_prepare_file_records_source_derivation_metadata_for_markdown_chunks(tmp_path):
+    path = tmp_path / "plan.md"
+    path.write_text("# Intro\nhello\n\n## Details\nline one\nline two\n", encoding="utf-8")
+    indexer = FileIndexer(config={"max_chunk_tokens": 128})
+
+    chunks = indexer.prepare_file(path)
+    chunks_by_heading = {chunk.heading: chunk for chunk in chunks}
+
+    intro_payload = chunks_by_heading["Intro"].payload()
+    details_payload = chunks_by_heading["Details"].payload()
+    assert intro_payload["source_uri"] == path.resolve().as_uri()
+    assert intro_payload["locator"] == {"line_start": 1, "line_end": 2, "heading": "Intro"}
+    assert details_payload["locator"] == {"line_start": 4, "line_end": 6, "heading": "Details"}
+    assert intro_payload["content_hash"] == f"sha256:{chunks_by_heading['Intro'].chunk_hash}"
+    datetime.fromisoformat(intro_payload["source_modified_at"].replace("Z", "+00:00"))
+    assert intro_payload["derivation_type"] == "indexed_chunk"
+    assert intro_payload["canonical"] is True
+    assert intro_payload["stale"] is False
+    assert intro_payload["requires_review"] is False
+
+
+def test_prepare_file_locates_text_chunks_with_whitespace_only_blank_lines(tmp_path):
+    para_one = "A" * 180
+    para_two = "B" * 180
+    para_three = "C" * 180
+    path = tmp_path / "notes.txt"
+    path.write_text(f"{para_one}\n   \n{para_two}\n\t \n{para_three}", encoding="utf-8")
+    indexer = FileIndexer(config={"max_chunk_tokens": 1})
+
+    chunks = indexer.prepare_file(path)
+
+    assert len(chunks) == 2
+    assert chunks[0].text == f"{para_one}\n\n{para_two}"
+    assert chunks[0].line_start == 1
+    assert chunks[0].line_end == 3
+    assert chunks[0].payload()["locator"] == {"line_start": 1, "line_end": 3}
+    assert chunks[1].line_start == 5
+    assert chunks[1].line_end == 5
+
+
 def test_file_chunk_payload_adds_fact_metadata_from_explicit_fact_tag():
     chunk = FileChunk(
         id="chunk-1",
         text="The production API endpoint is /api/v2.",
         source="test.md",
-        source_type="vault_note",
+        source_type="indexed_file",
         file_path="/vault/test.md",
         file_mtime=1.0,
         file_size=12,
@@ -175,7 +218,7 @@ def test_file_chunk_payload_uses_heading_as_topic_not_fact_key_when_weak():
         id="chunk-1",
         text="General notes and loose ideas.",
         source="notes.md",
-        source_type="vault_note",
+        source_type="indexed_file",
         file_path="/vault/notes.md",
         file_mtime=1.0,
         file_size=12,
@@ -216,11 +259,11 @@ def test_file_chunk_payload_extracts_fact_key_from_clear_chunk_statement():
     assert payload["reconsolidation_key"] == "production.api.endpoint"
 
 
-def test_classify_source_type_skill_and_vault_paths(tmp_path):
+def test_classify_source_type_uses_generic_file_types_for_vault_named_paths(tmp_path):
     assert classify_source_type(tmp_path / "skills" / "agent" / "README.md") == "skill_doc"
-    assert classify_source_type(tmp_path / "vault" / "Daily.md") == "vault_note"
-    assert classify_source_type(tmp_path / "Example Vault" / "Daily.md") == "vault_note"
-    assert classify_source_type(tmp_path / "Example Vault" / "docs" / "Project.md") == "vault_note"
+    assert classify_source_type(tmp_path / "vault" / "Daily.md") == "indexed_file"
+    assert classify_source_type(tmp_path / "Example Vault" / "Daily.md") == "indexed_file"
+    assert classify_source_type(tmp_path / "Example Vault" / "docs" / "Project.md") == "project_doc"
     assert classify_source_type(tmp_path / "misc" / "note.txt") == "indexed_file"
 
 

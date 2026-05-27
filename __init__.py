@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# ruff: noqa: E402 - user plugins patch sys.path before importing Hermes/runtime modules.
+
 import hashlib
 import json
 import logging
@@ -33,10 +35,7 @@ from qdrant_memory.backup import create_backup
 from qdrant_memory.config import load_config
 from qdrant_memory.consolidation import (
     _point_requires_manual_review,
-    artifact_root,
     build_consolidation_report,
-    build_reconsolidation_draft_text,
-    build_skill_draft_text,
     expected_action_for_proposal,
     find_proposal,
     load_consolidation_report,
@@ -48,9 +47,12 @@ from qdrant_memory.consolidation import (
 )
 from qdrant_memory.embeddings import EmbeddingClient
 from qdrant_memory.indexer import FileIndexer
-from qdrant_memory.learning import LearningStore
+from qdrant_memory.learning import LearningStore, build_learning_payload, classify_learning_type
 from qdrant_memory.lesson_extractor import LearningCandidate, candidate_to_learning_args, contains_secret, extract_learning_candidates_from_messages
 from qdrant_memory.retriever import MemoryRetriever, format_for_prompt
+from qdrant_memory.sources import expand_point, inspect_point, source_status_for_point, trace_point
+from qdrant_memory.proposals import proposal_draft_metadata, write_proposal_draft
+from qdrant_memory.write_gate import evaluate_write_candidate
 from qdrant_memory.tools import TOOL_SCHEMAS
 from qdrant_memory.writer import ConversationWriter
 
@@ -219,8 +221,10 @@ class QdrantMemoryProvider(MemoryProvider):
         return (
             "# Qdrant Memory\n"
             "Active local long-term semantic memory. Use qdrant_memory_search, "
-            "qdrant_memory_store, qdrant_memory_index, qdrant_learning_search, "
-            "qdrant_learning_store, and qdrant_memory_status for explicit memory operations."
+            "qdrant_memory_inspect, qdrant_memory_trace, qdrant_memory_expand, "
+            "qdrant_memory_source_status, qdrant_memory_store, qdrant_memory_index, "
+            "qdrant_learning_search, qdrant_learning_store, and qdrant_memory_status "
+            "for explicit memory operations."
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
@@ -500,14 +504,27 @@ class QdrantMemoryProvider(MemoryProvider):
             }
             if duplicate:
                 base["duplicate"] = duplicate
+            write_decision = evaluate_write_candidate(
+                text=text,
+                target="memory",
+                source_type=source_type,
+                confidence=1.0,
+                duplicate=duplicate,
+                metadata={"importance": importance},
+            )
+            base["write_decision"] = write_decision.to_dict()
             if dry_run:
-                return json.dumps({"dry_run": True, "saved": False, "would_store": not bool(duplicate), **base})
+                return json.dumps({"dry_run": True, "saved": False, "would_store": write_decision.decision == "store", **base})
             if not approve:
                 return _json_error("approve=true is required when dry_run=false")
-            if duplicate:
+            if write_decision.decision == "reject":
+                return _json_error("write gate rejected memory candidate")
+            if write_decision.decision == "skip":
                 return json.dumps({"dry_run": False, "saved": False, "would_store": False, **base})
+            if write_decision.decision != "store":
+                return _json_error("write gate requires review before storing memory candidate")
             point_id = self._writer.store_text(text, source_type=source_type, importance=importance, tags=tags)
-            return json.dumps({"dry_run": False, "saved": bool(point_id), "id": point_id, "source_type": source_type, "collection_name": self._config["collection_name"]})
+            return json.dumps({"dry_run": False, "saved": bool(point_id), "id": point_id, "source_type": source_type, "collection_name": self._config["collection_name"], "write_decision": write_decision.to_dict()})
         except Exception as exc:
             return _json_error(f"Failed to store memory: {exc}")
 
@@ -595,6 +612,95 @@ class QdrantMemoryProvider(MemoryProvider):
             return json.dumps({"dry_run": False, "ids": ids, "deleted": len(ids)})
         except Exception as exc:
             return _json_error(f"Forget failed: {exc}")
+
+    def _collection_name_from_tool_args(self, args: dict[str, Any]) -> tuple[str, str] | None:
+        collection = str(args.get("collection") or "memory").strip().lower()
+        if collection not in {"memory", "learning"}:
+            return None
+        collection_name = self._config["learning_collection_name"] if collection == "learning" else self._config["collection_name"]
+        return collection, collection_name
+
+    def _tool_inspect(self, args: dict[str, Any]) -> str:
+        point_id = str(args.get("point_id") or "").strip()
+        if not point_id:
+            return _json_error("point_id is required")
+        if not self._qdrant:
+            return _json_error("Qdrant memory provider is not initialized")
+        collection_pair = self._collection_name_from_tool_args(args)
+        if not collection_pair:
+            return _json_error("collection must be one of: memory, learning")
+        collection, collection_name = collection_pair
+        try:
+            payload = inspect_point(self._qdrant, collection_name, point_id, collection=collection)
+            if not payload.get("found"):
+                return _json_error("Point not found")
+            return json.dumps(payload)
+        except Exception as exc:
+            return _json_error(f"Inspect failed: {exc}")
+
+    def _tool_trace(self, args: dict[str, Any]) -> str:
+        point_id = str(args.get("point_id") or "").strip()
+        if not point_id:
+            return _json_error("point_id is required")
+        if not self._qdrant:
+            return _json_error("Qdrant memory provider is not initialized")
+        collection_pair = self._collection_name_from_tool_args(args)
+        if not collection_pair:
+            return _json_error("collection must be one of: memory, learning")
+        collection, collection_name = collection_pair
+        direction = str(args.get("direction") or "upstream").strip().lower()
+        if direction not in {"upstream", "downstream", "both"}:
+            return _json_error("direction must be one of: upstream, downstream, both")
+        try:
+            payload = trace_point(self._qdrant, collection_name, point_id, collection=collection, direction=direction, config=self._config)
+            if not payload.get("found"):
+                return _json_error("Point not found")
+            return json.dumps(payload)
+        except Exception as exc:
+            return _json_error(f"Trace failed: {exc}")
+
+    def _tool_expand(self, args: dict[str, Any]) -> str:
+        point_id = str(args.get("point_id") or "").strip()
+        if not point_id:
+            return _json_error("point_id is required")
+        if not self._qdrant:
+            return _json_error("Qdrant memory provider is not initialized")
+        collection_pair = self._collection_name_from_tool_args(args)
+        if not collection_pair:
+            return _json_error("collection must be one of: memory, learning")
+        collection, collection_name = collection_pair
+        mode = str(args.get("mode") or "excerpt").strip().lower()
+        if mode not in {"excerpt", "source", "neighbors"}:
+            return _json_error("mode must be one of: excerpt, source, neighbors")
+        try:
+            max_chars = max(1, min(100000, int(args.get("max_chars") or 8000)))
+        except Exception:
+            max_chars = 8000
+        try:
+            payload = expand_point(self._qdrant, collection_name, point_id, collection=collection, mode=mode, max_chars=max_chars, config=self._config)
+            if not payload.get("found", True):
+                return _json_error("Point not found")
+            return json.dumps(payload)
+        except Exception as exc:
+            return _json_error(f"Expand failed: {exc}")
+
+    def _tool_source_status(self, args: dict[str, Any]) -> str:
+        point_id = str(args.get("point_id") or "").strip()
+        if not point_id:
+            return _json_error("point_id is required")
+        if not self._qdrant:
+            return _json_error("Qdrant memory provider is not initialized")
+        collection_pair = self._collection_name_from_tool_args(args)
+        if not collection_pair:
+            return _json_error("collection must be one of: memory, learning")
+        collection, collection_name = collection_pair
+        try:
+            payload = source_status_for_point(self._qdrant, collection_name, point_id, collection=collection, config=self._config)
+            if not payload.get("found", True):
+                return _json_error("Point not found")
+            return json.dumps(payload)
+        except Exception as exc:
+            return _json_error(f"Source status failed: {exc}")
 
     def _tool_consolidate(self, args: dict) -> str:
         if not parse_bool_arg(args.get("dry_run", True), default=True):
@@ -694,6 +800,29 @@ class QdrantMemoryProvider(MemoryProvider):
         raw = self._qdrant.retrieve(collection_name, ids, with_payload=True, with_vector=False)
         return points_from_qdrant(raw, collection_name=collection_name)
 
+    def _proposal_write_decision(self, proposal: dict[str, Any], action: str, points: list[Any]) -> Any:
+        proposal_type = str(proposal.get("proposal_type") or "")
+        confidence = proposal.get("confidence")
+        if action == "draft_review":
+            return evaluate_write_candidate(
+                text="\n".join(str(getattr(point, "text", "") or "") for point in points),
+                derivation_type="reconsolidation",
+                confidence=confidence,
+                metadata={"proposal_type": proposal_type},
+            )
+        if action == "promote_to_skill" and points:
+            point = points[0]
+            payload = getattr(point, "payload", {}) or {}
+            return evaluate_write_candidate(
+                text=str(getattr(point, "text", "") or ""),
+                target="learning",
+                source_type=str(payload.get("source_type") or "learning"),
+                confidence=payload.get("confidence", confidence),
+                promote_to_skill_candidate=True,
+                metadata={"importance": payload.get("importance"), "proposal_type": proposal_type},
+            )
+        return None
+
     def _proposal_apply_plan(self, report: dict[str, Any], proposal: dict[str, Any], action: str, points: list[Any]) -> dict[str, Any]:
         affected_ids = [str(item) for item in proposal.get("affected_ids") or [] if str(item)]
         plan = {
@@ -712,11 +841,13 @@ class QdrantMemoryProvider(MemoryProvider):
         elif action == "quarantine":
             plan.update({"quarantine_ids": affected_ids})
         elif action == "promote_to_skill" and points:
-            root = artifact_root(self._hermes_home, str(self._config.get("consolidation_artifact_dir") or "")) / "skill_drafts"
-            plan.update({"skill_draft_path": str(root / f"{proposal.get('proposal_id')}.md")})
+            write_decision = self._proposal_write_decision(proposal, action, points)
+            draft = proposal_draft_metadata(report=report, proposal=proposal, points=[points[0]], hermes_home=self._hermes_home, config=self._config, write_decision=write_decision)
+            plan.update({"proposal_draft_path": draft["path"], "skill_draft_path": draft["path"], "write_decision": write_decision.to_dict() if write_decision else None})
         elif action == "draft_review" and points:
-            root = artifact_root(self._hermes_home, str(self._config.get("consolidation_artifact_dir") or "")) / "reconsolidation_drafts"
-            plan.update({"reconsolidation_draft_path": str(root / f"{proposal.get('proposal_id')}.md")})
+            write_decision = self._proposal_write_decision(proposal, action, points)
+            draft = proposal_draft_metadata(report=report, proposal=proposal, points=points, hermes_home=self._hermes_home, config=self._config, write_decision=write_decision)
+            plan.update({"proposal_draft_path": draft["path"], "reconsolidation_draft_path": draft["path"], "write_decision": write_decision.to_dict() if write_decision else None})
         return plan
 
     def _select_canonical_point(self, points: list[Any]) -> Any:
@@ -781,13 +912,23 @@ class QdrantMemoryProvider(MemoryProvider):
                 backup = create_backup(self._qdrant, self._config, hermes_home=self._hermes_home, scope="both")
                 pre_apply["pre_apply_backup_id"] = backup.get("backup_id")
             if action == "draft_review":
-                draft_root = artifact_root(self._hermes_home, str(self._config.get("consolidation_artifact_dir") or "")) / "reconsolidation_drafts"
-                draft_root.mkdir(parents=True, exist_ok=True)
-                draft_path = draft_root / f"{proposal_id}.md"
-                draft_text = build_reconsolidation_draft_text(points, proposal=proposal, report_id=report_id)
-                draft_path.write_text(draft_text, encoding="utf-8")
-                record = persist_application_record({"applied": True, **plan, **pre_apply, "reconsolidation_draft_path": str(draft_path)}, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))
-                return json.dumps({"dry_run": False, "applied": True, **plan, **pre_apply, "reconsolidation_draft_path": str(draft_path), "application_id": record.get("application_id"), "application_artifact": record.get("artifact_path")})
+                write_decision = evaluate_write_candidate(
+                    text="\n".join(point.text for point in points),
+                    derivation_type="reconsolidation",
+                    confidence=proposal.get("confidence"),
+                    metadata={"proposal_type": proposal_type},
+                )
+                draft = write_proposal_draft(
+                    report=report,
+                    proposal=proposal,
+                    points=points,
+                    hermes_home=self._hermes_home,
+                    config=self._config,
+                    write_decision=write_decision,
+                )
+                draft_path = str(draft["path"])
+                record = persist_application_record({"applied": True, **plan, **pre_apply, "proposal_draft_path": draft_path, "reconsolidation_draft_path": draft_path, "write_decision": write_decision.to_dict()}, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))
+                return json.dumps({"dry_run": False, "applied": True, **plan, **pre_apply, "proposal_draft_path": draft_path, "reconsolidation_draft_path": draft_path, "write_decision": write_decision.to_dict(), "application_id": record.get("application_id"), "application_artifact": record.get("artifact_path")})
             if action == "delete":
                 self._qdrant.delete_ids(collection_name, affected_ids)
                 record = persist_application_record({"applied": True, **plan, **pre_apply, "deleted_ids": affected_ids}, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))
@@ -836,23 +977,38 @@ class QdrantMemoryProvider(MemoryProvider):
                 point = points[0]
                 if contains_secret(point.text) or contains_secret(json.dumps(point.payload or {}, sort_keys=True, default=str)):
                     return _json_error("secret-bearing learning requires manual review")
-                draft_root = artifact_root(self._hermes_home, str(self._config.get("consolidation_artifact_dir") or "")) / "skill_drafts"
-                draft_root.mkdir(parents=True, exist_ok=True)
-                draft_path = draft_root / f"{proposal_id}.md"
-                draft_text = build_skill_draft_text(point, proposal_id=proposal_id, report_id=report_id)
-                draft_path.write_text(draft_text, encoding="utf-8")
+                write_decision = evaluate_write_candidate(
+                    text=point.text,
+                    target="learning",
+                    source_type=str((point.payload or {}).get("source_type") or "learning"),
+                    confidence=(point.payload or {}).get("confidence", proposal.get("confidence")),
+                    promote_to_skill_candidate=True,
+                    metadata={"importance": (point.payload or {}).get("importance"), "proposal_type": proposal_type},
+                )
+                if write_decision.decision not in {"skill_candidate", "draft_review"}:
+                    return _json_error("learning promotion requires review before drafting")
+                draft = write_proposal_draft(
+                    report=report,
+                    proposal=proposal,
+                    points=[point],
+                    hermes_home=self._hermes_home,
+                    config=self._config,
+                    write_decision=write_decision,
+                )
+                draft_path = str(draft["path"])
                 self._qdrant.update_payload(
                     collection_name,
                     point.id,
                     {
                         "promoted_to_skill_draft": True,
-                        "skill_draft_path": str(draft_path),
+                        "proposal_draft_path": draft_path,
+                        "skill_draft_path": draft_path,
                         "promoted_at": datetime.utcnow().isoformat() + "Z",
                         "consolidation_proposal_id": proposal_id,
                     },
                 )
-                record = persist_application_record({"applied": True, **plan, **pre_apply, "skill_draft_path": str(draft_path)}, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))
-                return json.dumps({"dry_run": False, "applied": True, **plan, **pre_apply, "skill_draft_path": str(draft_path), "application_id": record.get("application_id"), "application_artifact": record.get("artifact_path")})
+                record = persist_application_record({"applied": True, **plan, **pre_apply, "proposal_draft_path": draft_path, "skill_draft_path": draft_path, "write_decision": write_decision.to_dict()}, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))
+                return json.dumps({"dry_run": False, "applied": True, **plan, **pre_apply, "proposal_draft_path": draft_path, "skill_draft_path": draft_path, "write_decision": write_decision.to_dict(), "application_id": record.get("application_id"), "application_artifact": record.get("artifact_path")})
             return _json_error("unsupported consolidation action")
         except Exception as exc:
             return _json_error(f"Consolidation apply failed: {exc}")
@@ -900,7 +1056,41 @@ class QdrantMemoryProvider(MemoryProvider):
             confidence = max(0.0, min(1.0, float(args.get("confidence", 0.8))))
         except Exception:
             confidence = 0.8
+        learning_type = str(args.get("learning_type") or "")
+        trigger = str(args.get("trigger") or "")
+        mistake = str(args.get("mistake") or "")
+        correction = str(args.get("correction") or "")
+        evidence = str(args.get("evidence") or "")
+        tool_name = str(args.get("tool_name") or "")
+        command = str(args.get("command") or "")
+        gate_text = "\n".join(
+            part
+            for part in (
+                f"Lesson: {lesson}",
+                f"Trigger: {trigger}" if trigger else "",
+                f"Mistake: {mistake}" if mistake else "",
+                f"Correction: {correction}" if correction else "",
+                f"Evidence: {evidence}" if evidence else "",
+                f"Tool: {tool_name}" if tool_name else "",
+                f"Command: {command}" if command else "",
+            )
+            if part
+        )
         try:
+            write_decision = evaluate_write_candidate(
+                text=gate_text,
+                target="learning",
+                source_type="learning",
+                confidence=confidence,
+                promote_to_skill_candidate=bool(args.get("promote_to_skill_candidate", False)),
+                metadata={"importance": importance, "learning_type": learning_type, "trigger": trigger, "mistake": mistake, "correction": correction, "evidence": evidence, "tool_name": tool_name, "command": command, "tags": [str(t) for t in tags]},
+            )
+            if write_decision.decision == "reject":
+                return _json_error("write gate rejected learning candidate")
+            if write_decision.decision == "skip":
+                return json.dumps({"saved": False, "id": None, "collection_name": self._config["learning_collection_name"], "write_decision": write_decision.to_dict()})
+            if write_decision.decision not in {"learning_candidate", "store", "skill_candidate"}:
+                return _json_error("learning candidate requires manual draft review before storing")
             point_id = store.store(
                 lesson=lesson,
                 learning_type=str(args.get("learning_type") or ""),
@@ -915,7 +1105,7 @@ class QdrantMemoryProvider(MemoryProvider):
                 tags=[str(t) for t in tags],
                 promote_to_skill_candidate=bool(args.get("promote_to_skill_candidate", False)),
             )
-            return json.dumps({"saved": bool(point_id), "id": point_id, "collection_name": self._config["learning_collection_name"]})
+            return json.dumps({"saved": bool(point_id), "id": point_id, "collection_name": self._config["learning_collection_name"], "write_decision": write_decision.to_dict()})
         except Exception as exc:
             return _json_error(f"Failed to store learning: {exc}")
 
@@ -965,15 +1155,55 @@ class QdrantMemoryProvider(MemoryProvider):
             return _json_error(f"Unknown learning candidate: {candidate_id}")
         dry_run = bool(args.get("dry_run", True))
         learning_args = candidate_to_learning_args(candidate)
-        if dry_run:
-            return json.dumps({"dry_run": True, "saved": False, "candidate": candidate.to_dict(include_metadata=True), "learning_args": learning_args})
         store = self._ensure_learning_store()
+        learning_type = str(learning_args.get("learning_type") or "")
+        if not learning_type:
+            learning_type = classify_learning_type(
+                str(learning_args.get("trigger") or ""),
+                str(learning_args.get("correction") or ""),
+                tool_name=str(learning_args.get("tool_name") or ""),
+            )
+        persisted_payload = build_learning_payload(
+            lesson=str(learning_args.get("lesson") or ""),
+            learning_type=learning_type,
+            trigger=str(learning_args.get("trigger") or ""),
+            mistake=str(learning_args.get("mistake") or ""),
+            correction=str(learning_args.get("correction") or ""),
+            evidence=str(learning_args.get("evidence") or ""),
+            tool_name=str(learning_args.get("tool_name") or ""),
+            command=str(learning_args.get("command") or ""),
+            project_path=store.project_path if store else "",
+            profile_id=store.profile_id if store else self._profile_id,
+            platform=store.platform if store else self._platform,
+            user_id_hash=store.user_id_hash if store else self._user_id_hash,
+            chat_id_hash=store.chat_id_hash if store else self._chat_id_hash,
+            session_id=store.session_id if store else self._session_id,
+            model=store.model if store else self._config.get("embedding_model", ""),
+            importance=int(learning_args.get("importance") or 7),
+            confidence=float(learning_args.get("confidence") or 0.8),
+            tags=[str(t) for t in learning_args.get("tags") or []],
+            promote_to_skill_candidate=bool(learning_args.get("promote_to_skill_candidate", False)),
+        )
+        write_decision = evaluate_write_candidate(
+            text=str(persisted_payload.get("text") or ""),
+            target="learning",
+            source_type=str(persisted_payload.get("source_type") or "learning"),
+            confidence=learning_args.get("confidence"),
+            promote_to_skill_candidate=bool(learning_args.get("promote_to_skill_candidate", False)),
+            metadata=persisted_payload,
+        )
+        if dry_run:
+            return json.dumps({"dry_run": True, "saved": False, "candidate": candidate.to_dict(include_metadata=True), "learning_args": learning_args, "write_decision": write_decision.to_dict()})
         if not store:
             return _json_error("Qdrant learning store is not initialized")
         try:
+            if write_decision.decision == "reject":
+                return _json_error("write gate rejected learning candidate")
+            if write_decision.decision not in {"learning_candidate", "store", "skill_candidate"}:
+                return _json_error("learning candidate requires manual draft review before storing")
             point_id = store.store(**learning_args)
             self._pending_learning_candidates.pop(candidate_id, None)
-            return json.dumps({"dry_run": False, "saved": bool(point_id), "id": point_id, "collection_name": self._config["learning_collection_name"]})
+            return json.dumps({"dry_run": False, "saved": bool(point_id), "id": point_id, "collection_name": self._config["learning_collection_name"], "write_decision": write_decision.to_dict()})
         except Exception as exc:
             return _json_error(f"Learning approval failed: {exc}")
 
@@ -989,6 +1219,14 @@ class QdrantMemoryProvider(MemoryProvider):
             return self._tool_index(args)
         if tool_name == "qdrant_memory_forget":
             return self._tool_forget(args)
+        if tool_name == "qdrant_memory_inspect":
+            return self._tool_inspect(args)
+        if tool_name == "qdrant_memory_trace":
+            return self._tool_trace(args)
+        if tool_name == "qdrant_memory_expand":
+            return self._tool_expand(args)
+        if tool_name == "qdrant_memory_source_status":
+            return self._tool_source_status(args)
         if tool_name == "qdrant_memory_consolidate":
             return self._tool_consolidate(args)
         if tool_name == "qdrant_memory_consolidation_apply":

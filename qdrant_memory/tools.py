@@ -52,7 +52,7 @@ SEARCH_SCHEMA = {
 
 INDEX_SCHEMA = {
     "name": "qdrant_memory_index",
-    "description": "Safely index markdown/text files or vault folders into local Qdrant memory. Dry-run defaults to true.",
+    "description": "Safely index markdown/text files or source folders into local Qdrant memory. Dry-run defaults to true.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -75,6 +75,65 @@ FORGET_SCHEMA = {
             "dry_run": {"type": "boolean", "description": "When true, only report what would be deleted. Defaults to true."},
         },
         "required": ["ids"],
+        "additionalProperties": False,
+    },
+}
+
+INSPECT_SCHEMA = {
+    "name": "qdrant_memory_inspect",
+    "description": "Read-only exact inspection of one Qdrant memory point by explicit ID. No semantic search or mutation.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "point_id": {"type": "string", "description": "Explicit Qdrant point ID to inspect."},
+            "collection": {"type": "string", "enum": ["memory", "learning"], "description": "Collection to inspect. Defaults to memory.", "default": "memory"},
+        },
+        "required": ["point_id"],
+        "additionalProperties": False,
+    },
+}
+
+TRACE_SCHEMA = {
+    "name": "qdrant_memory_trace",
+    "description": "Read-only provenance trace for one point. Shows direct upstream derived_from links; downstream is reported unsupported unless enabled later.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "point_id": {"type": "string", "description": "Explicit Qdrant point ID to trace."},
+            "direction": {"type": "string", "enum": ["upstream", "downstream", "both"], "description": "Trace direction. Defaults to upstream.", "default": "upstream"},
+            "collection": {"type": "string", "enum": ["memory", "learning"], "description": "Collection to trace. Defaults to memory.", "default": "memory"},
+        },
+        "required": ["point_id"],
+        "additionalProperties": False,
+    },
+}
+
+EXPAND_SCHEMA = {
+    "name": "qdrant_memory_expand",
+    "description": "Read-only bounded expansion of one point's source using source_uri and locator metadata when available.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "point_id": {"type": "string", "description": "Explicit Qdrant point ID to expand."},
+            "mode": {"type": "string", "enum": ["excerpt", "source", "neighbors"], "description": "Expansion mode. Defaults to excerpt.", "default": "excerpt"},
+            "max_chars": {"type": "integer", "description": "Maximum characters to return. Defaults to 8000.", "minimum": 1, "maximum": 100000},
+            "collection": {"type": "string", "enum": ["memory", "learning"], "description": "Collection to expand from. Defaults to memory.", "default": "memory"},
+        },
+        "required": ["point_id"],
+        "additionalProperties": False,
+    },
+}
+
+SOURCE_STATUS_SCHEMA = {
+    "name": "qdrant_memory_source_status",
+    "description": "Read-only source existence/staleness check for one point's source_uri and locator metadata.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "point_id": {"type": "string", "description": "Explicit Qdrant point ID whose source should be checked."},
+            "collection": {"type": "string", "enum": ["memory", "learning"], "description": "Collection to inspect. Defaults to memory.", "default": "memory"},
+        },
+        "required": ["point_id"],
         "additionalProperties": False,
     },
 }
@@ -197,6 +256,10 @@ TOOL_SCHEMAS = [
     SEARCH_SCHEMA,
     INDEX_SCHEMA,
     FORGET_SCHEMA,
+    INSPECT_SCHEMA,
+    TRACE_SCHEMA,
+    EXPAND_SCHEMA,
+    SOURCE_STATUS_SCHEMA,
     LEARNING_STORE_SCHEMA,
     LEARNING_SEARCH_SCHEMA,
     LEARNING_PREVIEW_SCHEMA,

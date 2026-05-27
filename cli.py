@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# ruff: noqa: E402 - standalone CLI ensures plugin root is importable before loading command core.
+
 import argparse
 import sys
 from pathlib import Path
@@ -101,6 +103,29 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     show.add_argument("--include-payload", action="store_true", help="Include redacted payload fields in output. Raw memory text may be sensitive.")
     show.add_argument("--include-vector", action="store_true", help="Include vector data. Omitted by default because vectors are large.")
     show.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
+
+    inspect = subcommands.add_parser("inspect", help="Inspect one explicit point payload and source metadata. Read-only.")
+    inspect.add_argument("point_id", help="Explicit Qdrant point ID to inspect.")
+    inspect.add_argument("--collection", choices=["memory", "learning"], default="memory", help="Configured collection scope. Default: memory.")
+    inspect.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
+
+    trace = subcommands.add_parser("trace", help="Trace one point's derivation links. Read-only.")
+    trace.add_argument("point_id", help="Explicit Qdrant point ID to trace.")
+    trace.add_argument("--direction", choices=["upstream", "downstream", "both"], default="upstream", help="Trace direction. Default: upstream.")
+    trace.add_argument("--collection", choices=["memory", "learning"], default="memory", help="Configured collection scope. Default: memory.")
+    trace.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
+
+    expand = subcommands.add_parser("expand", help="Expand one point's source context with bounded output. Read-only.")
+    expand.add_argument("point_id", help="Explicit Qdrant point ID to expand.")
+    expand.add_argument("--mode", choices=["excerpt", "source", "neighbors"], default="excerpt", help="Expansion mode. Default: excerpt.")
+    expand.add_argument("--max-chars", type=_positive_int, default=8000, help="Maximum characters to return. Default: 8000.")
+    expand.add_argument("--collection", choices=["memory", "learning"], default="memory", help="Configured collection scope. Default: memory.")
+    expand.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
+
+    source_status = subcommands.add_parser("source-status", help="Report one point's source existence/staleness. Read-only.")
+    source_status.add_argument("point_id", help="Explicit Qdrant point ID whose source should be checked.")
+    source_status.add_argument("--collection", choices=["memory", "learning"], default="memory", help="Configured collection scope. Default: memory.")
+    source_status.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
 
     index = subcommands.add_parser("index", help="Index files or directories into memory. Dry-run by default.")
     index.add_argument("paths", nargs="+", help="Files or directories to index.")

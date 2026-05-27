@@ -133,6 +133,24 @@ def test_build_tool_call_maps_read_only_commands():
     preview = parser.parse_args(["qdrant", "learning", "preview", "--include-metadata"])
     assert build_tool_call(preview) == ("qdrant_learning_preview", {"include_metadata": True})
 
+    inspect = parser.parse_args(["qdrant", "inspect", "point-1"])
+    assert build_tool_call(inspect) == ("qdrant_memory_inspect", {"point_id": "point-1", "collection": "memory"})
+
+    trace = parser.parse_args(["qdrant", "trace", "point-1", "--direction", "both", "--collection", "learning"])
+    assert build_tool_call(trace) == (
+        "qdrant_memory_trace",
+        {"point_id": "point-1", "direction": "both", "collection": "learning"},
+    )
+
+    expand = parser.parse_args(["qdrant", "expand", "point-1", "--mode", "source", "--max-chars", "123"])
+    assert build_tool_call(expand) == (
+        "qdrant_memory_expand",
+        {"point_id": "point-1", "mode": "source", "max_chars": 123, "collection": "memory"},
+    )
+
+    source_status = parser.parse_args(["qdrant", "source-status", "point-1"])
+    assert build_tool_call(source_status) == ("qdrant_memory_source_status", {"point_id": "point-1", "collection": "memory"})
+
 
 def test_build_tool_call_maps_richer_search_filters_and_collection():
     from qdrant_memory.cli_core import build_tool_call
@@ -549,6 +567,30 @@ def test_provider_backed_commands_default_to_human_summaries_and_json_can_remain
             "qdrant_memory_consolidation_apply",
             '{"dry_run":true,"would_apply":true,"report_id":"r1","proposal_id":"p1","action":"merge","affected_ids":["m1","m2"]}',
             ["Apply dry-run: action=merge proposal=p1 affected=2", "report_id: r1"],
+        ),
+        (
+            ["qdrant", "inspect", "m1"],
+            "qdrant_memory_inspect",
+            '{"found":true,"point_id":"m1","collection":"memory","collection_name":"mem","payload":{"text":"alpha","source_uri":"file:///tmp/a.md"},"source":{"source_uri":"file:///tmp/a.md"}}',
+            ["Point: m1", "collection: memory (mem)", "source_uri: file:///tmp/a.md"],
+        ),
+        (
+            ["qdrant", "trace", "m1"],
+            "qdrant_memory_trace",
+            '{"point_id":"m1","direction":"upstream","upstream":[{"source_uri":"memory://point/root","status":"exists"}]}',
+            ["Trace: m1", "upstream: 1", "memory://point/root"],
+        ),
+        (
+            ["qdrant", "expand", "m1", "--max-chars", "20"],
+            "qdrant_memory_expand",
+            '{"point_id":"m1","mode":"excerpt","status":"exists","source_uri":"file:///tmp/a.md","text":"expanded source","truncated":false}',
+            ["Expansion: m1", "status: exists", "expanded source"],
+        ),
+        (
+            ["qdrant", "source-status", "m1"],
+            "qdrant_memory_source_status",
+            '{"point_id":"m1","status":"changed","source_uri":"file:///tmp/a.md","changed":true}',
+            ["Source status: m1", "status: changed", "changed: True"],
         ),
     ]
 

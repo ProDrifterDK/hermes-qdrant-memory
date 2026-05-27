@@ -149,6 +149,7 @@ def test_learning_approve_dry_run_default_does_not_upsert():
 
     assert approved["dry_run"] is True
     assert approved["saved"] is False
+    assert approved["write_decision"]["decision"] == "learning_candidate"
     assert provider._qdrant.upserts == []
 
 
@@ -164,7 +165,31 @@ def test_learning_approve_live_stores_to_learning_collection_only():
 
     assert approved["dry_run"] is False
     assert approved["saved"] is True
+    assert approved["write_decision"]["decision"] == "learning_candidate"
     assert provider._qdrant.upserts[0][0] == "learnings"
+
+
+def test_learning_approve_rejects_secret_in_persisted_non_lesson_field_before_upsert():
+    from qdrant_memory.lesson_extractor import LearningCandidate
+
+    provider = _provider_with_auto_extract()
+    secret_value = "".join(["abc", "def", "ghi", "jkl", "mnop"])
+    candidate = LearningCandidate(
+        lesson="Use dry-run before live Qdrant writes.",
+        learning_type="user_correction",
+        trigger="Authorization: " + "Bearer " + secret_value,
+        correction="Keep live writes gated.",
+        evidence="Synthetic regression candidate with unsafe trigger metadata.",
+        confidence=0.9,
+        importance=8,
+    )
+    provider._pending_learning_candidates[candidate.candidate_id] = candidate
+
+    approved = json.loads(provider.handle_tool_call("qdrant_learning_approve", {"candidate_id": candidate.candidate_id, "dry_run": False}))
+
+    assert "error" in approved
+    assert "rejected" in approved["error"]
+    assert provider._qdrant.upserts == []
 
 
 def test_on_session_switch_reset_clears_pending_learning_candidates():

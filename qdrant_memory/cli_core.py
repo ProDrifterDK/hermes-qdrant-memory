@@ -803,14 +803,14 @@ def _execute_inspection_command(args: Namespace, stdout) -> int | None:
     hermes_home, config = _local_config()
     if subcommand == "show":
         from qdrant_memory.backup import qdrant_client_from_config
+        from qdrant_memory.sources import retrieve_point
 
         point_id = _non_empty(getattr(args, "point_id", ""), "point_id")
         collection = str(getattr(args, "collection", ""))
         collection_name = _collection_name_for_cli_scope(config, collection)
         include_vector = bool(getattr(args, "include_vector", False))
         qdrant = qdrant_client_from_config(config)
-        points = qdrant.retrieve(collection_name, [point_id], with_payload=True, with_vector=include_vector)
-        raw_point = points[0] if points else None
+        raw_point = retrieve_point(qdrant, collection_name, point_id, with_payload=True, with_vector=include_vector)
         payload = _build_point_payload(
             raw_point,
             point_id=point_id,
@@ -1316,6 +1316,73 @@ def _format_point_summary(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_inspect_summary(payload: dict[str, Any]) -> str:
+    found = bool(payload.get("found", True))
+    point_id = payload.get("point_id") or "<unknown>"
+    lines = [f"Point: {point_id}" if found else f"Point not found: {point_id}"]
+    if payload.get("collection") or payload.get("collection_name"):
+        lines.append(f"collection: {payload.get('collection')} ({payload.get('collection_name')})")
+    source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+    for key in ("source_uri", "source_type", "derivation_type", "canonical", "stale", "requires_review"):
+        if source.get(key) not in (None, "", [], {}):
+            lines.append(f"{key}: {_safe_scalar(source.get(key))}")
+    derived = source.get("derived_from") if isinstance(source.get("derived_from"), list) else []
+    if derived:
+        lines.append(f"derived_from: {len(derived)}")
+    if payload.get("snippet"):
+        lines.append(f"snippet: {_one_line(payload.get('snippet'), max_chars=220)}")
+    return "\n".join(lines)
+
+
+def _format_trace_summary(payload: dict[str, Any]) -> str:
+    point_id = payload.get("point_id") or "<unknown>"
+    lines = [f"Trace: {point_id}"]
+    if payload.get("direction"):
+        lines.append(f"direction: {payload.get('direction')}")
+    upstream = payload.get("upstream") if isinstance(payload.get("upstream"), list) else []
+    if "upstream" in payload:
+        lines.append(f"upstream: {len(upstream)}")
+        for edge in upstream[:10]:
+            if isinstance(edge, dict):
+                source_uri = edge.get("source_uri") or edge.get("point_id") or "<unknown>"
+                status = edge.get("status") or "unknown"
+                lines.append(f"  - {_safe_scalar(source_uri)} status={_safe_scalar(status)}")
+    downstream = payload.get("downstream") if isinstance(payload.get("downstream"), dict) else None
+    if downstream is not None:
+        lines.append(f"downstream: {downstream.get('status', 'unknown')}")
+        if downstream.get("message"):
+            lines.append(f"downstream_message: {_one_line(downstream.get('message'))}")
+    return "\n".join(lines)
+
+
+def _format_expand_summary(payload: dict[str, Any]) -> str:
+    point_id = payload.get("point_id") or "<unknown>"
+    lines = [f"Expansion: {point_id}"]
+    for key in ("mode", "status", "source_uri", "fallback", "reason"):
+        if payload.get(key) not in (None, "", [], {}):
+            lines.append(f"{key}: {_safe_scalar(payload.get(key))}")
+    if payload.get("truncated") is not None:
+        lines.append(f"truncated: {payload.get('truncated')}")
+    text = str(payload.get("text") or "")
+    if text:
+        lines.append("text:")
+        lines.append(text)
+    elif payload.get("message"):
+        lines.append(f"message: {_one_line(payload.get('message'))}")
+    return "\n".join(lines)
+
+
+def _format_source_status_summary(payload: dict[str, Any]) -> str:
+    point_id = payload.get("point_id") or "<unknown>"
+    lines = [f"Source status: {point_id}"]
+    for key in ("status", "source_uri", "exists", "changed", "reason"):
+        if payload.get(key) not in (None, "", [], {}):
+            lines.append(f"{key}: {_safe_scalar(payload.get(key))}")
+    if payload.get("message"):
+        lines.append(f"message: {_one_line(payload.get('message'))}")
+    return "\n".join(lines)
+
+
 def _format_reports_list_summary(payload: dict[str, Any]) -> str:
     reports = payload.get("reports") if isinstance(payload.get("reports"), list) else []
     lines = [f"Reports: {payload.get('count', len(reports))}", f"artifact_root: {payload.get('artifact_root')}"]
@@ -1605,6 +1672,14 @@ def _format_human_payload(payload: Any, args: Namespace, tool_name: str) -> str:
         return _format_status_summary(payload)
     if tool_name == "qdrant_memory_search":
         return _format_result_list(payload, label="memory", plural_label="memories")
+    if tool_name == "qdrant_memory_inspect":
+        return _format_inspect_summary(payload)
+    if tool_name == "qdrant_memory_trace":
+        return _format_trace_summary(payload)
+    if tool_name == "qdrant_memory_expand":
+        return _format_expand_summary(payload)
+    if tool_name == "qdrant_memory_source_status":
+        return _format_source_status_summary(payload)
     if tool_name == "qdrant_learning_search":
         return _format_result_list(payload, label="learning", plural_label="learnings")
     if tool_name == "qdrant_memory_store":
@@ -1714,6 +1789,27 @@ def build_tool_call(args: Namespace) -> tuple[str, dict[str, Any]]:
         }
         tool_args.update(_search_filter_tool_args(args, include_collection=True))
         return "qdrant_memory_search", tool_args
+
+    if subcommand == "inspect":
+        return "qdrant_memory_inspect", {"point_id": _non_empty(args.point_id, "point_id"), "collection": getattr(args, "collection", "memory") or "memory"}
+
+    if subcommand == "trace":
+        return "qdrant_memory_trace", {
+            "point_id": _non_empty(args.point_id, "point_id"),
+            "direction": getattr(args, "direction", "upstream") or "upstream",
+            "collection": getattr(args, "collection", "memory") or "memory",
+        }
+
+    if subcommand == "expand":
+        return "qdrant_memory_expand", {
+            "point_id": _non_empty(args.point_id, "point_id"),
+            "mode": getattr(args, "mode", "excerpt") or "excerpt",
+            "max_chars": int(getattr(args, "max_chars", 8000) or 8000),
+            "collection": getattr(args, "collection", "memory") or "memory",
+        }
+
+    if subcommand == "source-status":
+        return "qdrant_memory_source_status", {"point_id": _non_empty(args.point_id, "point_id"), "collection": getattr(args, "collection", "memory") or "memory"}
 
     if subcommand == "index":
         _require_live_approval(args)
