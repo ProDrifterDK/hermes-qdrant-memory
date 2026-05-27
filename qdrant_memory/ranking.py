@@ -16,7 +16,7 @@ _REVIEW_HISTORY_TERMS = (
     "audit",
     "provenance",
 )
-_PENALIZED_FACT_STATUSES = {"disputed", "superseded", "deprecated"}
+_PENALIZED_FACT_STATUSES = {"stale", "review_required", "disputed", "superseded", "deprecated"}
 
 
 @dataclass(frozen=True)

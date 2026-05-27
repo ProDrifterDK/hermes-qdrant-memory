@@ -63,17 +63,28 @@ def test_policy_penalizes_stale_review_and_inactive_status_by_default():
 
     stale = rank_memory_candidate(base_score=0.8, vector_score=0.91, payload=_payload(stale=True), context=context)
     review = rank_memory_candidate(base_score=0.8, vector_score=0.91, payload=_payload(requires_review=True), context=context)
+    status_stale = rank_memory_candidate(base_score=0.8, vector_score=0.91, payload=_payload(fact_status="stale"), context=context)
+    status_review = rank_memory_candidate(
+        base_score=0.8,
+        vector_score=0.91,
+        payload=_payload(fact_status="review_required"),
+        context=context,
+    )
     disputed = rank_memory_candidate(base_score=0.8, vector_score=0.91, payload=_payload(fact_status="disputed"), context=context)
     superseded = rank_memory_candidate(base_score=0.8, vector_score=0.91, payload=_payload(fact_status="superseded"), context=context)
     deprecated = rank_memory_candidate(base_score=0.8, vector_score=0.91, payload=_payload(fact_status="deprecated"), context=context)
 
     assert stale.score < clean.score
     assert review.score < clean.score
+    assert status_stale.score < clean.score
+    assert status_review.score < clean.score
     assert disputed.score < clean.score
     assert superseded.score < clean.score
     assert deprecated.score < clean.score
     assert "stale" in stale.debug["penalties"]
     assert "requires_review" in review.debug["penalties"]
+    assert "fact_status:stale" in status_stale.debug["penalties"]
+    assert "fact_status:review_required" in status_review.debug["penalties"]
     assert "fact_status:disputed" in disputed.debug["penalties"]
 
 
@@ -101,6 +112,26 @@ def test_policy_does_not_penalize_review_or_history_queries():
     assert query_history.score == clean.score
     assert explicit_history.debug["penalties"] == {}
     assert query_history.debug["review_history_requested"] is True
+
+    for fact_status in ("stale", "review_required"):
+        explicit_status_history = rank_memory_candidate(
+            base_score=0.8,
+            vector_score=0.91,
+            payload=_payload(fact_status=fact_status),
+            context=RankingContext(query="current TeamForge MCP binary", include_fact_history=True),
+        )
+        query_status_history = rank_memory_candidate(
+            base_score=0.8,
+            vector_score=0.91,
+            payload=_payload(fact_status=fact_status),
+            context=RankingContext(query="review TeamForge MCP binary history"),
+        )
+
+        assert explicit_status_history.score == clean.score
+        assert query_status_history.score == clean.score
+        assert explicit_status_history.debug["penalties"] == {}
+        assert query_status_history.debug["penalties"] == {}
+        assert query_status_history.debug["review_history_requested"] is True
 
 
 def test_policy_boosts_canonical_fresh_filters_and_exact_fact_matches():
