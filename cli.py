@@ -95,6 +95,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     search.add_argument("--source-type", default=None, help="Optional source_type filter.")
     _add_search_filter_flags(search, include_collection=True)
     search.add_argument("--include-metadata", action="store_true", help="Include full payload metadata.")
+    search.add_argument("--include-fact-history", action="store_true", help="Include deprecated or superseded fact assertions in search results.")
     search.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
 
     show = subcommands.add_parser("show", help="Inspect one explicit Qdrant point by ID. Read-only.")

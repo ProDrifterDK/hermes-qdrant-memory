@@ -7,6 +7,7 @@ import pytest
 
 from qdrant_memory.schema import (
     DerivationEdge,
+    FACT_STATUSES,
     MEMORY_KINDS,
     RELATION_TYPES,
     SourceLocator,
@@ -208,6 +209,14 @@ def test_memory_grammar_values_include_phase_6_terms():
         "PREFERS",
         "BLOCKS",
     }
+    assert set(FACT_STATUSES) == {
+        "active",
+        "stale",
+        "deprecated",
+        "disputed",
+        "superseded",
+        "review_required",
+    }
 
 
 def test_build_payload_accepts_valid_memory_kind():
@@ -288,6 +297,67 @@ def test_build_assertion_payload_creates_review_required_noncanonical_assertion(
             "relation_type": "SUPPORTS",
         }
     ]
+
+
+def test_build_assertion_payload_accepts_temporal_validity_and_fact_status_metadata():
+    payload = build_assertion_payload(
+        claim_text="The production endpoint is /api/v2.",
+        subject="production endpoint",
+        predicate="is",
+        object="/api/v2",
+        confidence=0.72,
+        source_uri="file:///tmp/source.md",
+        observed_at="2026-05-20T10:00:00Z",
+        valid_from="2026-05-21T00:00:00Z",
+        valid_until=None,
+        fact_status="active",
+        supersedes=["old-point-1"],
+        superseded_by=["new-point-1"],
+        invalidated_by=["review-point-1"],
+    )
+
+    assert payload["created_at"]
+    assert payload["observed_at"] == "2026-05-20T10:00:00Z"
+    assert payload["valid_from"] == "2026-05-21T00:00:00Z"
+    assert "valid_until" not in payload
+    assert payload["fact_status"] == "active"
+    assert payload["supersedes"] == ["old-point-1"]
+    assert payload["superseded_by"] == ["new-point-1"]
+    assert payload["invalidated_by"] == ["review-point-1"]
+
+
+def test_build_assertion_payload_rejects_invalid_fact_status_and_non_explicit_point_links():
+    with pytest.raises(ValueError, match="fact_status"):
+        build_assertion_payload(
+            claim_text="The production endpoint is /api/v2.",
+            subject="production endpoint",
+            predicate="is",
+            object="/api/v2",
+            source_uri="file:///tmp/source.md",
+            fact_status="retired",
+        )
+
+    with pytest.raises(ValueError, match="explicit point ID"):
+        build_assertion_payload(
+            claim_text="The production endpoint is /api/v2.",
+            subject="production endpoint",
+            predicate="is",
+            object="/api/v2",
+            source_uri="file:///tmp/source.md",
+            fact_status="active",
+            supersedes=["memory://point/old-point-1"],
+        )
+
+    with pytest.raises(ValueError, match="explicit point ID"):
+        build_assertion_payload(
+            claim_text="The production endpoint is /api/v2.",
+            subject="production endpoint",
+            predicate="is",
+            object="/api/v2",
+            source_uri="file:///tmp/source.md",
+            fact_status="active",
+            supersedes=[123],
+        )
 
 
 def test_build_assertion_payload_rejects_missing_provenance():

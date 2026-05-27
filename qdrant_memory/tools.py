@@ -43,6 +43,7 @@ SEARCH_SCHEMA = {
             "since": {"type": "string", "description": "Optional inclusive created_at lower bound (ISO timestamp)."},
             "until": {"type": "string", "description": "Optional inclusive created_at upper bound (ISO timestamp)."},
             "collection": {"type": "string", "enum": ["memory", "learning"], "description": "Collection to search. Defaults to memory.", "default": "memory"},
+            "include_fact_history": {"type": "boolean", "description": "When true, include fact_status=deprecated or superseded assertions. Defaults to false."},
             "include_metadata": {"type": "boolean", "description": "Include full payload metadata. Defaults to false."},
         },
         "required": ["query"],

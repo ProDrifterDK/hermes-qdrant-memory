@@ -124,6 +124,12 @@ def test_build_tool_call_maps_read_only_commands():
         {"query": "agent memory", "top_k": 5, "source_type": "manual", "include_metadata": True},
     )
 
+    history_search = parser.parse_args(["qdrant", "search", "agent memory", "--include-fact-history"])
+    assert build_tool_call(history_search) == (
+        "qdrant_memory_search",
+        {"query": "agent memory", "top_k": 5, "source_type": None, "include_metadata": False, "include_fact_history": True},
+    )
+
     learning = parser.parse_args(["qdrant", "learning", "search", "tool failure", "--top-k", "2"])
     assert build_tool_call(learning) == (
         "qdrant_learning_search",

@@ -1322,10 +1322,28 @@ def _format_inspect_summary(payload: dict[str, Any]) -> str:
     lines = [f"Point: {point_id}" if found else f"Point not found: {point_id}"]
     if payload.get("collection") or payload.get("collection_name"):
         lines.append(f"collection: {payload.get('collection')} ({payload.get('collection_name')})")
-    source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
-    for key in ("memory_kind", "source_uri", "source_type", "derivation_type", "canonical", "stale", "requires_review"):
+    source_raw = payload.get("source")
+    source: dict[str, Any] = source_raw if isinstance(source_raw, dict) else {}
+    for key in (
+        "memory_kind",
+        "source_uri",
+        "source_type",
+        "derivation_type",
+        "canonical",
+        "stale",
+        "requires_review",
+        "fact_status",
+        "observed_at",
+        "valid_from",
+        "valid_until",
+    ):
         if source.get(key) not in (None, "", [], {}):
             lines.append(f"{key}: {_safe_scalar(source.get(key))}")
+    for key in ("supersedes", "superseded_by", "invalidated_by"):
+        raw_values = source.get(key)
+        values = raw_values if isinstance(raw_values, list) else []
+        if values:
+            lines.append(f"{key}: {len(values)}")
     derived = source.get("derived_from") if isinstance(source.get("derived_from"), list) else []
     if derived:
         lines.append(f"derived_from: {len(derived)}")
@@ -1339,6 +1357,21 @@ def _format_trace_summary(payload: dict[str, Any]) -> str:
     lines = [f"Trace: {point_id}"]
     if payload.get("direction"):
         lines.append(f"direction: {payload.get('direction')}")
+    for key in ("fact_status", "observed_at", "valid_from", "valid_until"):
+        if payload.get(key) not in (None, "", [], {}):
+            lines.append(f"{key}: {_safe_scalar(payload.get(key))}")
+    supersession_raw = payload.get("supersession")
+    supersession: dict[str, Any] = supersession_raw if isinstance(supersession_raw, dict) else {}
+    for key in ("supersedes", "superseded_by", "invalidated_by"):
+        raw_links = supersession.get(key)
+        links = raw_links if isinstance(raw_links, list) else []
+        if links:
+            lines.append(f"{key}: {len(links)}")
+            for link in links[:5]:
+                if isinstance(link, dict):
+                    status = link.get("status") or "unknown"
+                    fact_status = f" fact_status={_safe_scalar(link.get('fact_status'))}" if link.get("fact_status") else ""
+                    lines.append(f"  - {_safe_scalar(link.get('point_id') or '<unknown>')} status={_safe_scalar(status)}{fact_status}")
     upstream = payload.get("upstream") if isinstance(payload.get("upstream"), list) else []
     if "upstream" in payload:
         lines.append(f"upstream: {len(upstream)}")
@@ -1788,6 +1821,8 @@ def build_tool_call(args: Namespace) -> tuple[str, dict[str, Any]]:
             "source_type": args.source_type,
             "include_metadata": args.include_metadata,
         }
+        if getattr(args, "include_fact_history", False):
+            tool_args["include_fact_history"] = True
         tool_args.update(_search_filter_tool_args(args, include_collection=True))
         return "qdrant_memory_search", tool_args
 

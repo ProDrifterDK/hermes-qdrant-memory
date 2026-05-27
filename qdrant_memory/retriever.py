@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .schema import now_iso, valid_memory_kind
+from .schema import now_iso, valid_fact_status, valid_memory_kind
 from .scoring import final_memory_score, normalize_minmax
 
 
@@ -14,6 +14,9 @@ class RetrievedMemory:
     payload: dict[str, Any]
     qdrant_score: float
     final_score: float
+
+
+_HIDDEN_FACT_STATUSES = {"deprecated", "superseded"}
 
 
 def _filter_value(value: Any) -> str:
@@ -79,6 +82,7 @@ def _scope_filter(
     project_path: Any = None,
     since: Any = None,
     until: Any = None,
+    include_fact_history: bool = False,
 ) -> dict[str, Any] | None:
     must = []
     if scope:
@@ -96,7 +100,17 @@ def _scope_filter(
         since=since,
         until=until,
     )
-    return {"must": must} if must else None
+    result: dict[str, Any] = {}
+    if must:
+        result["must"] = must
+    if not include_fact_history:
+        result["must_not"] = [
+            {"key": "fact_status", "match": {"value": status}}
+            for status in sorted(_HIDDEN_FACT_STATUSES)
+        ]
+    if include_fact_history and not result:
+        return {}
+    return result or None
 
 
 def format_for_prompt(chunks: list[RetrievedMemory], display_tokens: int = 300) -> str:
@@ -116,6 +130,7 @@ def format_for_prompt(chunks: list[RetrievedMemory], display_tokens: int = 300) 
         importance = payload.get("importance", "?")
         source_type = payload.get("source_type", "unknown")
         memory_kind = valid_memory_kind(payload.get("memory_kind"))
+        fact_status = valid_fact_status(payload.get("fact_status"))
         file_path = str(payload.get("file_path") or payload.get("source") or "")
         heading = str(payload.get("heading") or "")
         source_bits = [source_type]
@@ -126,6 +141,8 @@ def format_for_prompt(chunks: list[RetrievedMemory], display_tokens: int = 300) 
         meta_bits = [f"importance={importance}", f"score={chunk.final_score:.3f}"]
         if memory_kind:
             meta_bits.append(f"kind={memory_kind}")
+        if fact_status:
+            meta_bits.append(f"fact_status={fact_status}")
         text = " ".join((chunk.text or "").split())
         entry = f"{idx}. [{created} | {' | '.join(meta_bits)} | source={' | '.join(source_bits)}]\n   {text}\n"
         if used + len(entry) > char_cap:
@@ -159,6 +176,7 @@ class MemoryRetriever:
         project_path: str | None = None,
         since: str | None = None,
         until: str | None = None,
+        include_fact_history: bool = False,
     ) -> list[RetrievedMemory]:
         vector = self.embeddings.embed_query(query)
         active_scope = self.scope.copy()
@@ -177,6 +195,7 @@ class MemoryRetriever:
                 project_path=project_path,
                 since=since,
                 until=until,
+                include_fact_history=include_fact_history,
             ),
             with_payload=True,
             with_vector=False,
@@ -188,6 +207,8 @@ class MemoryRetriever:
             if raw_score < self.min_raw_score:
                 continue
             payload = item.get("payload") or {}
+            if not include_fact_history and valid_fact_status(payload.get("fact_status")) in _HIDDEN_FACT_STATUSES:
+                continue
             text = str(payload.get("text") or "")
             final = final_memory_score(norm_score, payload.get("importance", 5), payload.get("created_at", ""), self.decay_rate)
             if final < self.min_final_score:

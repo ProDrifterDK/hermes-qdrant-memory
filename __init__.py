@@ -547,9 +547,16 @@ class QdrantMemoryProvider(MemoryProvider):
         except Exception:
             top_k = 5
         include_metadata = bool(args.get("include_metadata", False))
+        include_fact_history = parse_bool_arg(args.get("include_fact_history"), default=False)
         source_type = args.get("source_type") or None
         try:
-            chunks = self._retriever.search(query, top_k=top_k, source_type=source_type, **_tool_search_filters(args))
+            chunks = self._retriever.search(
+                query,
+                top_k=top_k,
+                source_type=source_type,
+                include_fact_history=include_fact_history,
+                **_tool_search_filters(args),
+            )
             results = []
             for chunk in chunks:
                 item: dict[str, Any] = {"id": chunk.id, "text": chunk.text, "score": round(chunk.final_score, 6)}

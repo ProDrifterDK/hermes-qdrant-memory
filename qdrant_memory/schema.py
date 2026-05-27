@@ -51,10 +51,22 @@ class RelationType(str, Enum):
     BLOCKS = "BLOCKS"
 
 
+class FactStatus(str, Enum):
+    ACTIVE = "active"
+    STALE = "stale"
+    DEPRECATED = "deprecated"
+    DISPUTED = "disputed"
+    SUPERSEDED = "superseded"
+    REVIEW_REQUIRED = "review_required"
+
 MEMORY_KINDS = tuple(kind.value for kind in MemoryKind)
 RELATION_TYPES = tuple(relation.value for relation in RelationType)
+FACT_STATUSES = tuple(status.value for status in FactStatus)
 _MEMORY_KIND_SET = set(MEMORY_KINDS)
 _RELATION_TYPE_SET = set(RELATION_TYPES)
+_FACT_STATUS_SET = set(FACT_STATUSES)
+_POINT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$")
+
 
 
 def _grammar_value(value: Any) -> str:
@@ -85,6 +97,59 @@ def validate_relation_type(value: Any) -> str:
     if text not in _RELATION_TYPE_SET:
         raise ValueError(f"unknown relation_type: {text or '<empty>'}")
     return text
+
+
+def valid_fact_status(value: Any) -> str | None:
+    text = _grammar_value(value)
+    return text if text in _FACT_STATUS_SET else None
+
+
+def validate_fact_status(value: Any) -> str:
+    text = _grammar_value(value)
+    if text not in _FACT_STATUS_SET:
+        raise ValueError(f"unknown fact_status: {text or '<empty>'}")
+    return text
+
+
+def valid_point_id_link(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or "://" in text or "/" in text or "\\" in text or not _POINT_ID_RE.match(text):
+        return None
+    if contains_secret(text):
+        return None
+    return text
+
+
+def sanitize_point_id_links(value: Any, *, max_links: int = 32) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    links: list[str] = []
+    seen: set[str] = set()
+    for item in value[:max_links]:
+        point_id = valid_point_id_link(item)
+        if point_id and point_id not in seen:
+            links.append(point_id)
+            seen.add(point_id)
+    return links
+
+
+def validate_point_id_links(value: Any, field_name: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"{field_name} must be a list of explicit point IDs")
+    links: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        point_id = valid_point_id_link(item)
+        if not point_id:
+            raise ValueError(f"{field_name} entries must be explicit point IDs")
+        if point_id not in seen:
+            links.append(point_id)
+            seen.add(point_id)
+    return links
 
 
 @dataclass
@@ -251,6 +316,13 @@ _SOURCE_REF_PAYLOAD_KEYS = {
     "canonical",
     "stale",
     "requires_review",
+    "observed_at",
+    "valid_from",
+    "valid_until",
+    "fact_status",
+    "supersedes",
+    "superseded_by",
+    "invalidated_by",
 }
 
 
@@ -311,6 +383,12 @@ def _add_source_metadata(payload: dict[str, Any], key: str, value: Any) -> None:
         payload[key] = sanitized
 
 
+def _add_temporal_string(payload: dict[str, Any], key: str, value: Any) -> None:
+    sanitized = _sanitize_source_metadata(value)
+    if isinstance(sanitized, str) and sanitized:
+        payload[key] = sanitized
+
+
 def build_payload(
     *,
     text: str,
@@ -341,6 +419,13 @@ def build_payload(
     canonical: bool | None = None,
     stale: bool | None = None,
     requires_review: bool | None = None,
+    observed_at: str | None = None,
+    valid_from: str | None = None,
+    valid_until: str | None = None,
+    fact_status: str | FactStatus | None = None,
+    supersedes: list[Any] | None = None,
+    superseded_by: list[Any] | None = None,
+    invalidated_by: list[Any] | None = None,
 ) -> dict[str, Any]:
     created = created_at or now_iso()
     imp = importance if importance is not None else score_importance(text, source_type)
@@ -376,7 +461,17 @@ def build_payload(
         sanitized_ref = _sanitize_source_metadata(source_ref)
         if isinstance(sanitized_ref, dict):
             for key in _SOURCE_REF_PAYLOAD_KEYS:
-                if key in sanitized_ref:
+                if key not in sanitized_ref:
+                    continue
+                if key == "fact_status":
+                    payload[key] = validate_fact_status(sanitized_ref[key])
+                elif key in {"supersedes", "superseded_by", "invalidated_by"}:
+                    links = validate_point_id_links(sanitized_ref[key], key)
+                    if links:
+                        payload[key] = links
+                elif key in {"observed_at", "valid_from", "valid_until"}:
+                    _add_temporal_string(payload, key, sanitized_ref[key])
+                else:
                     payload[key] = sanitized_ref[key]
     _add_source_metadata(payload, "source_uri", source_uri)
     _add_source_metadata(payload, "locator", locator)
@@ -387,6 +482,19 @@ def build_payload(
     _add_source_metadata(payload, "canonical", canonical)
     _add_source_metadata(payload, "stale", stale)
     _add_source_metadata(payload, "requires_review", requires_review)
+    _add_temporal_string(payload, "observed_at", observed_at)
+    _add_temporal_string(payload, "valid_from", valid_from)
+    _add_temporal_string(payload, "valid_until", valid_until)
+    if not _metadata_is_empty(fact_status):
+        payload["fact_status"] = validate_fact_status(fact_status)
+    for key, value in (
+        ("supersedes", supersedes),
+        ("superseded_by", superseded_by),
+        ("invalidated_by", invalidated_by),
+    ):
+        links = validate_point_id_links(value, key)
+        if links:
+            payload[key] = links
     return payload
 
 
@@ -418,6 +526,13 @@ def build_assertion_payload(
     model: str = "",
     provider: str = "qdrant",
     created_at: str | None = None,
+    observed_at: str | None = None,
+    valid_from: str | None = None,
+    valid_until: str | None = None,
+    fact_status: str | FactStatus | None = None,
+    supersedes: list[Any] | None = None,
+    superseded_by: list[Any] | None = None,
+    invalidated_by: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Build a review-gated assertion payload without writing it anywhere.
 
@@ -449,6 +564,13 @@ def build_assertion_payload(
         derived_from=derived_from,
         canonical=False,
         requires_review=True,
+        observed_at=observed_at,
+        valid_from=valid_from,
+        valid_until=valid_until,
+        fact_status=fact_status,
+        supersedes=supersedes,
+        superseded_by=superseded_by,
+        invalidated_by=invalidated_by,
     )
     payload.update(
         {

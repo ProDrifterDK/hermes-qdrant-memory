@@ -710,6 +710,91 @@ def test_inspect_point_surfaces_assertion_derived_from_string_source_chain():
     assert inspected["source"]["derived_from"] == [{"source_uri": "memory://point/source-1"}]
 
 
+def test_inspect_point_surfaces_temporal_status_and_supersession_metadata_compactly():
+    payload = build_assertion_payload(
+        claim_text="The production endpoint is /api/v2.",
+        subject="production endpoint",
+        predicate="is",
+        object="/api/v2",
+        source_uri="file:///tmp/source.md",
+        observed_at="2026-05-20T10:00:00Z",
+        valid_from="2026-05-21T00:00:00Z",
+        valid_until="2026-06-01T00:00:00Z",
+        fact_status="superseded",
+        supersedes=["old-point-1"],
+        superseded_by=["new-point-1"],
+        invalidated_by=["review-point-1"],
+    )
+    point = {"id": "assertion-temporal", "payload": payload}
+
+    inspected = inspect_point(_FakeQdrant(point), "memory", "assertion-temporal")
+    source = inspected["source"]
+
+    assert source["fact_status"] == "superseded"
+    assert source["observed_at"] == "2026-05-20T10:00:00Z"
+    assert source["valid_from"] == "2026-05-21T00:00:00Z"
+    assert source["valid_until"] == "2026-06-01T00:00:00Z"
+    assert source["supersedes"] == ["old-point-1"]
+    assert source["superseded_by"] == ["new-point-1"]
+    assert source["invalidated_by"] == ["review-point-1"]
+
+
+def test_inspect_point_omits_invalid_legacy_fact_status_and_supersession_links():
+    point = {
+        "id": "legacy-temporal",
+        "payload": {
+            "text": "legacy temporal metadata should not crash inspect",
+            "memory_kind": "assertion",
+            "fact_status": "retired",
+            "observed_at": "2026-05-20T10:00:00Z",
+            "supersedes": ["memory://point/not-explicit", {"point_id": "dict-point"}, ""],
+            "superseded_by": "not-a-list",
+        },
+    }
+
+    inspected = inspect_point(_FakeQdrant(point), "memory", "legacy-temporal")
+    source = inspected.get("source", {})
+
+    assert source["observed_at"] == "2026-05-20T10:00:00Z"
+    assert "fact_status" not in source
+    assert "supersedes" not in source
+    assert "superseded_by" not in source
+
+
+def test_trace_point_surfaces_supersession_history_from_explicit_point_ids():
+    assertion = {
+        "id": "assertion-temporal",
+        "payload": {
+            "text": "The production endpoint is /api/v2.",
+            "memory_kind": "assertion",
+            "fact_status": "superseded",
+            "supersedes": ["old-point-1"],
+            "superseded_by": ["new-point-1"],
+            "invalidated_by": ["review-point-1"],
+            "derived_from": [{"source_uri": "memory://point/source-1", "relation_type": "SUPPORTS"}],
+        },
+    }
+    old = {"id": "old-point-1", "payload": {"text": "old endpoint", "fact_status": "deprecated"}}
+    new = {"id": "new-point-1", "payload": {"text": "new endpoint", "fact_status": "active"}}
+
+    class _MultiPointQdrant:
+        def retrieve(self, collection_name, ids, *, with_payload=True, with_vector=False):
+            points = {"assertion-temporal": assertion, "old-point-1": old, "new-point-1": new}
+            return [points[point_id] for point_id in ids if point_id in points]
+
+    traced = trace_point(_MultiPointQdrant(), "memory", "assertion-temporal", direction="both")
+
+    assert traced["fact_status"] == "superseded"
+    assert traced["supersession"]["supersedes"] == [
+        {"point_id": "old-point-1", "status": "exists", "fact_status": "deprecated"}
+    ]
+    assert traced["supersession"]["superseded_by"] == [
+        {"point_id": "new-point-1", "status": "exists", "fact_status": "active"}
+    ]
+    assert traced["supersession"]["invalidated_by"] == [{"point_id": "review-point-1", "status": "missing"}]
+    assert traced["upstream"][0]["relation_type"] == "SUPPORTS"
+
+
 def test_trace_point_surfaces_valid_relation_type_and_omits_invalid_legacy_relation_type():
     child = {
         "id": "child",

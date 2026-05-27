@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 from urllib.parse import unquote, urlsplit
 
-from .schema import valid_memory_kind, valid_relation_type
+from .schema import sanitize_point_id_links, valid_fact_status, valid_memory_kind, valid_relation_type
 
 
 DEFAULT_MAX_CHARS = 8000
@@ -791,6 +791,10 @@ def _compact_status_response(result: dict[str, Any]) -> dict[str, Any]:
         "expected_hash": EXPAND_METADATA_STRING_CAP,
         "actual_hash": EXPAND_METADATA_STRING_CAP,
         "source_modified_at": EXPAND_METADATA_STRING_CAP,
+        "fact_status": EXPAND_METADATA_TOKEN_CAP,
+        "observed_at": EXPAND_METADATA_STRING_CAP,
+        "valid_from": EXPAND_METADATA_STRING_CAP,
+        "valid_until": EXPAND_METADATA_STRING_CAP,
     }
     for key, max_chars in field_caps.items():
         if key not in compacted:
@@ -877,6 +881,22 @@ def expand_source_metadata(payload: dict[str, Any]) -> dict[str, Any]:
     return metadata
 
 
+def _temporal_fact_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    status = valid_fact_status(payload.get("fact_status"))
+    if status:
+        metadata["fact_status"] = status
+    for key in ("observed_at", "valid_from", "valid_until"):
+        value = _compact_expand_string(payload.get(key))
+        if value is not None:
+            metadata[key] = value
+    for key in ("supersedes", "superseded_by", "invalidated_by"):
+        links = sanitize_point_id_links(payload.get(key))
+        if links:
+            metadata[key] = links
+    return metadata
+
+
 def _compact_assertion_edge(edge: Any) -> dict[str, Any]:
     if isinstance(edge, str):
         source_uri = _compact_expand_string(edge)
@@ -955,6 +975,9 @@ def inspect_point(qdrant: Any, collection_name: str, point_id: str, *, collectio
         return _compact_status_response(result)
     payload = _point_payload(point)
     src = source_metadata(payload)
+    temporal = _temporal_fact_metadata(payload)
+    if temporal:
+        src.update(temporal)
     assertion = _assertion_metadata(payload)
     if assertion:
         src.update(assertion)
@@ -1092,6 +1115,28 @@ def _trace_edge(edge: Any, registry: SourceResolverRegistry) -> dict[str, Any]:
     return _compact_status_response(result)
 
 
+def _trace_supersession_link(qdrant: Any, collection_name: str, point_id: str) -> dict[str, Any]:
+    result: dict[str, Any] = {"point_id": _compact_expand_string(point_id) or point_id}
+    point = retrieve_point(qdrant, collection_name, point_id, with_payload=True, with_vector=False)
+    if point is None:
+        result["status"] = "missing"
+        return _compact_status_response(result)
+    result["status"] = "exists"
+    status = valid_fact_status(_point_payload(point).get("fact_status"))
+    if status:
+        result["fact_status"] = status
+    return _compact_status_response(result)
+
+
+def _supersession_trace(qdrant: Any, collection_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+    history: dict[str, Any] = {}
+    for key in ("supersedes", "superseded_by", "invalidated_by"):
+        links = sanitize_point_id_links(payload.get(key))
+        if links:
+            history[key] = [_trace_supersession_link(qdrant, collection_name, point_id) for point_id in links]
+    return history
+
+
 def trace_point(qdrant: Any, collection_name: str, point_id: str, *, collection: str = "memory", direction: str = "upstream", config: Mapping[str, Any] | None = None) -> dict[str, Any]:
     direction = str(direction or "upstream").strip().lower()
     if direction not in {"upstream", "downstream", "both"}:
@@ -1108,6 +1153,13 @@ def trace_point(qdrant: Any, collection_name: str, point_id: str, *, collection:
         "collection_name": collection_name,
         "direction": direction,
     }
+    temporal = _temporal_fact_metadata(payload)
+    for key in ("fact_status", "observed_at", "valid_from", "valid_until"):
+        if key in temporal:
+            result[key] = temporal[key]
+    supersession = _supersession_trace(qdrant, collection_name, payload)
+    if supersession:
+        result["supersession"] = supersession
     if direction in {"upstream", "both"}:
         upstream = payload.get("derived_from") if isinstance(payload.get("derived_from"), list) else []
         result["upstream"] = [_trace_edge(edge, registry) for edge in upstream]

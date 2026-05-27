@@ -91,7 +91,72 @@ def test_memory_search_schema_exposes_richer_filters_with_strict_args():
     params = SEARCH_SCHEMA["parameters"]
     props = params["properties"]
 
-    for key in ("tags", "source", "file_path", "project_path", "since", "until", "collection"):
+    for key in ("tags", "source", "file_path", "project_path", "since", "until", "collection", "include_fact_history"):
         assert key in props
+    assert props["include_fact_history"]["type"] == "boolean"
     assert props["collection"]["enum"] == ["memory", "learning"]
     assert params["additionalProperties"] is False
+
+
+class FakeFactStatusQdrant(FakeQdrant):
+    def search(self, name, vector, limit, filter=None, with_payload=True, with_vector=False):
+        self.searches.append(
+            {
+                "name": name,
+                "vector": vector,
+                "limit": limit,
+                "filter": filter,
+                "with_payload": with_payload,
+                "with_vector": with_vector,
+            }
+        )
+        return [
+            {
+                "id": "active-1",
+                "score": 0.91,
+                "payload": {
+                    "text": "Production endpoint is /api/v2.",
+                    "memory_kind": "assertion",
+                    "fact_status": "active",
+                    "importance": 8,
+                    "created_at": "2026-01-15T00:00:00+00:00",
+                },
+            },
+            {
+                "id": "deprecated-1",
+                "score": 0.9,
+                "payload": {
+                    "text": "Production endpoint is /api/v1.",
+                    "memory_kind": "assertion",
+                    "fact_status": "deprecated",
+                    "importance": 8,
+                    "created_at": "2026-01-15T00:00:00+00:00",
+                },
+            },
+            {
+                "id": "superseded-1",
+                "score": 0.89,
+                "payload": {
+                    "text": "Production endpoint is /api/beta.",
+                    "memory_kind": "assertion",
+                    "fact_status": "superseded",
+                    "importance": 8,
+                    "created_at": "2026-01-15T00:00:00+00:00",
+                },
+            },
+        ]
+
+
+def test_memory_search_hides_deprecated_and_superseded_fact_status_by_default():
+    qdrant = FakeFactStatusQdrant()
+    retriever = MemoryRetriever(qdrant=qdrant, embeddings=FakeEmbedding(), collection_name="memory", search_candidates=3)
+
+    default_results = retriever.search("production endpoint", top_k=5)
+    history_results = retriever.search("production endpoint", top_k=5, include_fact_history=True)
+
+    assert [result.id for result in default_results] == ["active-1"]
+    assert [result.id for result in history_results] == ["active-1", "deprecated-1", "superseded-1"]
+    default_filter = qdrant.searches[0]["filter"]
+    assert {"key": "fact_status", "match": {"value": "deprecated"}} in default_filter["must_not"]
+    assert {"key": "fact_status", "match": {"value": "superseded"}} in default_filter["must_not"]
+    assert "must_not" not in qdrant.searches[1]["filter"]
