@@ -177,6 +177,7 @@ class MemoryRetriever:
         since: str | None = None,
         until: str | None = None,
         include_fact_history: bool = False,
+        update_access: bool = True,
     ) -> list[RetrievedMemory]:
         vector = self.embeddings.embed_query(query)
         active_scope = self.scope.copy()
@@ -216,7 +217,8 @@ class MemoryRetriever:
             chunks.append(RetrievedMemory(str(item.get("id", "")), text, payload, raw_score, final))
         chunks.sort(key=lambda c: c.final_score, reverse=True)
         selected = chunks[: max(1, min(20, int(top_k)))]
-        self.update_access_metadata(selected)
+        if update_access:
+            self.update_access_metadata(selected)
         return selected
 
     def update_access_metadata(self, chunks: list[RetrievedMemory]) -> None:

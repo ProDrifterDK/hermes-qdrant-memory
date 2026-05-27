@@ -1417,6 +1417,48 @@ def _format_source_status_summary(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _bool_line(value: Any) -> str:
+    return str(bool(value)).lower()
+
+
+def _format_context_summary(payload: dict[str, Any]) -> str:
+    lines = [f"Context template: {payload.get('template') or '<unknown>'}"]
+    if payload.get("topic"):
+        lines.append(f"topic: {_safe_scalar(payload.get('topic'))}")
+    lines.append(f"recipe: {payload.get('recipe_name') or payload.get('template') or '<unknown>'}")
+    lines.append(f"read_only: {_bool_line(payload.get('read_only', True))}")
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    point_ids = summary.get("point_ids") if isinstance(summary.get("point_ids"), list) else []
+    source_uris = summary.get("source_uris") if isinstance(summary.get("source_uris"), list) else []
+    lines.append(f"result_count: {summary.get('result_count', 0)}")
+    if point_ids:
+        lines.append("point_ids: " + ", ".join(str(item) for item in point_ids))
+    if source_uris:
+        lines.append("source_uris: " + ", ".join(str(item) for item in source_uris))
+    flags = payload.get("status_flags") if isinstance(payload.get("status_flags"), dict) else {}
+    for key in ("stale", "review_required", "disputed", "superseded"):
+        lines.append(f"{key}: {_bool_line(flags.get(key, False))}")
+    sections = payload.get("sections") if isinstance(payload.get("sections"), dict) else {}
+    for section_name in ("source_text", "generated_summary", "extracted_assertion"):
+        lines.append(f"{section_name}:")
+        items = sections.get(section_name) if isinstance(sections.get(section_name), list) else []
+        if not items:
+            lines.append("  (none)")
+            continue
+        for item in items[:5]:
+            if not isinstance(item, dict):
+                continue
+            point_id = item.get("point_id") or "<unknown>"
+            source_uri = item.get("source_uri") or "<unknown>"
+            lines.append(f"  - point_id={_safe_scalar(point_id)} source_uri={_safe_scalar(source_uri)}")
+            text = _one_line(item.get("text") or "", max_chars=180)
+            if text:
+                lines.append(f"    text: {text}")
+        if len(items) > 5:
+            lines.append(f"  ... {len(items) - 5} more items not shown")
+    return "\n".join(lines)
+
+
 def _format_reports_list_summary(payload: dict[str, Any]) -> str:
     reports = payload.get("reports") if isinstance(payload.get("reports"), list) else []
     lines = [f"Reports: {payload.get('count', len(reports))}", f"artifact_root: {payload.get('artifact_root')}"]
@@ -1706,6 +1748,8 @@ def _format_human_payload(payload: Any, args: Namespace, tool_name: str) -> str:
         return _format_status_summary(payload)
     if tool_name == "qdrant_memory_search":
         return _format_result_list(payload, label="memory", plural_label="memories")
+    if tool_name == "qdrant_memory_context":
+        return _format_context_summary(payload)
     if tool_name == "qdrant_memory_inspect":
         return _format_inspect_summary(payload)
     if tool_name == "qdrant_memory_trace":
@@ -1825,6 +1869,17 @@ def build_tool_call(args: Namespace) -> tuple[str, dict[str, Any]]:
             tool_args["include_fact_history"] = True
         tool_args.update(_search_filter_tool_args(args, include_collection=True))
         return "qdrant_memory_search", tool_args
+
+    if subcommand == "context":
+        from qdrant_memory.context import ContextTemplateError, default_context_top_k
+
+        template = _non_empty(getattr(args, "template", "source_backed_answer"), "template")
+        topic = _non_empty(getattr(args, "topic", ""), "topic")
+        try:
+            top_k = getattr(args, "top_k", None) or default_context_top_k(template)
+        except ContextTemplateError as exc:
+            raise CliUsageError(str(exc)) from exc
+        return "qdrant_memory_context", {"template": template, "topic": topic, "top_k": int(top_k)}
 
     if subcommand == "inspect":
         return "qdrant_memory_inspect", {"point_id": _non_empty(args.point_id, "point_id"), "collection": getattr(args, "collection", "memory") or "memory"}

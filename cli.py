@@ -11,6 +11,7 @@ if str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT))
 
 from qdrant_memory.cli_core import execute_command
+from qdrant_memory.recipes import list_recipe_names
 
 
 def _top_k(value: str) -> int:
@@ -97,6 +98,12 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     search.add_argument("--include-metadata", action="store_true", help="Include full payload metadata.")
     search.add_argument("--include-fact-history", action="store_true", help="Include deprecated or superseded fact assertions in search results.")
     search.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
+
+    context = subcommands.add_parser("context", help="Build a read-only provenance-explicit context packet from a recipe template.")
+    context.add_argument("--template", choices=list_recipe_names(), default="source_backed_answer", help="Context template/recipe. Default: source_backed_answer.")
+    context.add_argument("--topic", required=True, help="Topic/query for the context packet.")
+    context.add_argument("--top-k", type=_top_k, default=None, help="Maximum compact recall results, 1 to 20. Default: recipe budget.")
+    context.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
 
     show = subcommands.add_parser("show", help="Inspect one explicit Qdrant point by ID. Read-only.")
     show.add_argument("point_id", help="Explicit Qdrant point ID to inspect.")

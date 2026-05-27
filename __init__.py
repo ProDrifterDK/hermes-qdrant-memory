@@ -33,6 +33,7 @@ except Exception:  # pragma: no cover - used only for standalone tests without H
 from qdrant_memory.client import QdrantClient
 from qdrant_memory.backup import create_backup
 from qdrant_memory.config import load_config
+from qdrant_memory.context import ContextTemplateError, build_context_packet, default_context_top_k
 from qdrant_memory.consolidation import (
     _point_requires_manual_review,
     build_consolidation_report,
@@ -227,7 +228,7 @@ class QdrantMemoryProvider(MemoryProvider):
             return ""
         return (
             "# Qdrant Memory\n"
-            "Active local long-term semantic memory. Use qdrant_memory_search, "
+            "Active local long-term semantic memory. Use qdrant_memory_context, qdrant_memory_search, "
             "qdrant_memory_inspect, qdrant_memory_trace, qdrant_memory_expand, "
             "qdrant_memory_source_status, qdrant_memory_store, qdrant_memory_index, "
             "qdrant_learning_search, qdrant_learning_store, and qdrant_memory_status "
@@ -601,6 +602,34 @@ class QdrantMemoryProvider(MemoryProvider):
             return json.dumps({"dry_run": False, "saved": bool(point_id), "id": point_id, "source_type": source_type, "collection_name": self._config["collection_name"], "write_decision": write_decision.to_dict()})
         except Exception as exc:
             return _json_error(f"Failed to store memory: {exc}")
+
+    def _tool_context(self, args: dict[str, Any]) -> str:
+        template = str(args.get("template") or "source_backed_answer").strip()
+        topic = str(args.get("topic") or "").strip()
+        if not topic:
+            return _json_error("topic is required")
+        if not self._retriever:
+            return _json_error("Qdrant memory provider is not initialized")
+        try:
+            default_top_k = default_context_top_k(template)
+            top_k = max(1, min(20, int(args.get("top_k") or default_top_k)))
+        except ContextTemplateError as exc:
+            return _json_error(str(exc))
+        except Exception:
+            top_k = 6
+        try:
+            chunks = self._retriever.search(
+                topic,
+                top_k=top_k,
+                include_fact_history=True,
+                update_access=False,
+            )
+            packet = build_context_packet(template=template, topic=topic, results=chunks)
+            return json.dumps(packet)
+        except ContextTemplateError as exc:
+            return _json_error(str(exc))
+        except Exception as exc:
+            return _json_error(f"Context packet failed: {exc}")
 
     def _tool_search(self, args: dict) -> str:
         query = str(args.get("query") or "").strip()
@@ -1391,6 +1420,8 @@ class QdrantMemoryProvider(MemoryProvider):
             return self._tool_store(args)
         if tool_name == "qdrant_memory_search":
             return self._tool_search(args)
+        if tool_name == "qdrant_memory_context":
+            return self._tool_context(args)
         if tool_name == "qdrant_memory_index":
             return self._tool_index(args)
         if tool_name == "qdrant_memory_forget":
