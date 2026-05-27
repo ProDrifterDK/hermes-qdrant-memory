@@ -51,6 +51,7 @@ from qdrant_memory.indexer import FileIndexer
 from qdrant_memory.learning import LearningStore, build_learning_payload, classify_learning_type
 from qdrant_memory.lesson_extractor import LearningCandidate, candidate_to_learning_args, contains_secret, extract_learning_candidates_from_messages
 from qdrant_memory.recipes import get_recipe
+from qdrant_memory.ranking import RankingPolicy
 from qdrant_memory.retriever import MemoryRetriever, format_for_prompt
 from qdrant_memory.sources import expand_point, inspect_point, source_status_for_point, trace_point
 from qdrant_memory.proposals import proposal_draft_metadata, write_proposal_draft
@@ -291,6 +292,9 @@ class QdrantMemoryProvider(MemoryProvider):
             scope=scope,
             min_raw_score=self._config.get("min_raw_score", 0.0),
             min_final_score=self._config.get("min_final_score", 0.0),
+            ranking_policy=RankingPolicy(
+                enabled=bool(self._config.get("provenance_ranking_enabled", True))
+            ),
         )
         self._writer = ConversationWriter(
             qdrant=self._qdrant,
@@ -787,9 +791,15 @@ class QdrantMemoryProvider(MemoryProvider):
             )
             results = []
             for chunk in chunks:
-                item: dict[str, Any] = {"id": chunk.id, "text": chunk.text, "score": round(chunk.final_score, 6)}
+                item: dict[str, Any] = {
+                    "id": chunk.id,
+                    "text": chunk.text,
+                    "score": round(chunk.final_score, 6),
+                    "vector_score": round(chunk.qdrant_score, 6),
+                }
                 if include_metadata:
                     item["metadata"] = chunk.payload
+                    item["ranking"] = chunk.ranking_debug
                 results.append(item)
             return json.dumps({"results": results, "count": len(results)})
         except Exception as exc:
@@ -1379,7 +1389,12 @@ class QdrantMemoryProvider(MemoryProvider):
             chunks = store.search(query, top_k=top_k, learning_type=learning_type, **_tool_search_filters(args))
             results = []
             for chunk in chunks:
-                item: dict[str, Any] = {"id": chunk.id, "text": chunk.text, "score": round(chunk.final_score, 6)}
+                item: dict[str, Any] = {
+                    "id": chunk.id,
+                    "text": chunk.text,
+                    "score": round(chunk.final_score, 6),
+                    "vector_score": round(chunk.qdrant_score, 6),
+                }
                 payload = chunk.payload or {}
                 if payload.get("learning_type"):
                     item["learning_type"] = payload.get("learning_type")

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .schema import now_iso, valid_fact_status, valid_memory_kind
-from .scoring import final_memory_score, normalize_minmax
+from .ranking import RankingContext, RankingPolicy, query_requests_review_history, rank_memory_candidate
+from .scoring import final_memory_score, normalize_minmax, recency_score
 
 
 @dataclass
@@ -14,6 +15,7 @@ class RetrievedMemory:
     payload: dict[str, Any]
     qdrant_score: float
     final_score: float
+    ranking_debug: dict[str, Any] = field(default_factory=dict)
 
 
 _HIDDEN_FACT_STATUSES = {"deprecated", "superseded"}
@@ -245,7 +247,19 @@ def format_for_prompt(chunks: list[RetrievedMemory], display_tokens: int = 300) 
 
 
 class MemoryRetriever:
-    def __init__(self, *, qdrant, embeddings, collection_name: str, search_candidates: int = 20, decay_rate: float = 0.001, scope: dict[str, str] | None = None, min_raw_score: float = 0.0, min_final_score: float = 0.0):
+    def __init__(
+        self,
+        *,
+        qdrant,
+        embeddings,
+        collection_name: str,
+        search_candidates: int = 20,
+        decay_rate: float = 0.001,
+        scope: dict[str, str] | None = None,
+        min_raw_score: float = 0.0,
+        min_final_score: float = 0.0,
+        ranking_policy: RankingPolicy | None = None,
+    ):
         self.qdrant = qdrant
         self.embeddings = embeddings
         self.collection_name = collection_name
@@ -254,6 +268,7 @@ class MemoryRetriever:
         self.scope = scope or {}
         self.min_raw_score = float(min_raw_score)
         self.min_final_score = float(min_final_score)
+        self.ranking_policy = ranking_policy or RankingPolicy()
 
     def search(
         self,
@@ -280,6 +295,7 @@ class MemoryRetriever:
         active_scope = self.scope.copy()
         if scope:
             active_scope.update(scope)
+        history_requested = include_fact_history or query_requests_review_history(query)
         raw = self.qdrant.search(
             self.collection_name,
             vector,
@@ -298,7 +314,7 @@ class MemoryRetriever:
                 stale=stale,
                 requires_review=requires_review,
                 canonical=canonical,
-                include_fact_history=include_fact_history,
+                include_fact_history=history_requested,
             ),
             with_payload=True,
             with_vector=False,
@@ -310,7 +326,7 @@ class MemoryRetriever:
             if raw_score < self.min_raw_score:
                 continue
             payload = item.get("payload") or {}
-            if not include_fact_history and valid_fact_status(payload.get("fact_status")) in _HIDDEN_FACT_STATUSES:
+            if not history_requested and valid_fact_status(payload.get("fact_status")) in _HIDDEN_FACT_STATUSES:
                 continue
             if not _payload_allowed(
                 payload,
@@ -323,10 +339,29 @@ class MemoryRetriever:
             ):
                 continue
             text = str(payload.get("text") or "")
-            final = final_memory_score(norm_score, payload.get("importance", 5), payload.get("created_at", ""), self.decay_rate)
-            if final < self.min_final_score:
+            final = final_memory_score(
+                norm_score,
+                payload.get("importance", 5),
+                payload.get("created_at", ""),
+                self.decay_rate,
+            )
+            ranked = rank_memory_candidate(
+                base_score=final,
+                vector_score=raw_score,
+                payload=payload,
+                context=RankingContext(
+                    query=query,
+                    include_fact_history=history_requested,
+                    source_filter=source,
+                    file_path_filter=file_path,
+                    project_path_filter=project_path,
+                ),
+                policy=self.ranking_policy,
+                recency_decay=recency_score(str(payload.get("created_at") or ""), self.decay_rate),
+            )
+            if ranked.score < self.min_final_score:
                 continue
-            chunks.append(RetrievedMemory(str(item.get("id", "")), text, payload, raw_score, final))
+            chunks.append(RetrievedMemory(str(item.get("id", "")), text, payload, raw_score, ranked.score, ranked.debug))
         chunks.sort(key=lambda c: c.final_score, reverse=True)
         selected = chunks[: max(1, min(20, int(top_k)))]
         if update_access:

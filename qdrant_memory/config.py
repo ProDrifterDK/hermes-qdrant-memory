@@ -65,6 +65,7 @@ DEFAULTS: dict[str, Any] = {
     "scope_mode": "profile",
     "min_raw_score": 0.0,
     "min_final_score": 0.0,
+    "provenance_ranking_enabled": True,
     "qdrant_api_key": "",
     "embedding_api_key": "",
     "index_dirs": [],
@@ -106,6 +107,7 @@ _BOOL_KEYS = {
     "reconsolidation_report_only",
     "reconsolidation_include_by_default",
     "index_dry_run_default",
+    "provenance_ranking_enabled",
 }
 _INT_KEYS = {
     "vector_size",
