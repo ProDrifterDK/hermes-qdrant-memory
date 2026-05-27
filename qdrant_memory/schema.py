@@ -59,6 +59,7 @@ class FactStatus(str, Enum):
     SUPERSEDED = "superseded"
     REVIEW_REQUIRED = "review_required"
 
+
 MEMORY_KINDS = tuple(kind.value for kind in MemoryKind)
 RELATION_TYPES = tuple(relation.value for relation in RelationType)
 FACT_STATUSES = tuple(status.value for status in FactStatus)
@@ -66,7 +67,6 @@ _MEMORY_KIND_SET = set(MEMORY_KINDS)
 _RELATION_TYPE_SET = set(RELATION_TYPES)
 _FACT_STATUS_SET = set(FACT_STATUSES)
 _POINT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$")
-
 
 
 def _grammar_value(value: Any) -> str:
