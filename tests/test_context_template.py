@@ -51,6 +51,78 @@ class FakeRetriever:
         return self.chunks
 
 
+class PlanAwareFakeRetriever:
+    def __init__(self):
+        self.calls = []
+
+    def search(self, query, **kwargs):
+        self.calls.append({"query": query, **kwargs})
+        if (
+            kwargs.get("memory_kind") == ["tool_quirk", "workflow_lesson"]
+            and kwargs.get("tags") == ["tool", "quirk", "environment"]
+            and kwargs.get("fact_status_exclude") == ["disputed", "superseded", "deprecated"]
+            and kwargs.get("stale") is False
+            and kwargs.get("requires_review") is False
+            and kwargs.get("include_fact_history") is False
+            and kwargs.get("update_access") is False
+        ):
+            return [
+                RetrievedMemory(
+                    id="m-tool",
+                    text="Memory note: ctx_execute is faster for log scans.",
+                    payload={
+                        "memory_kind": "tool_quirk",
+                        "source_type": "manual",
+                        "fact_status": "current",
+                        "tags": ["tool", "quirk"],
+                    },
+                    qdrant_score=0.88,
+                    final_score=0.88,
+                )
+            ]
+        return [
+            RetrievedMemory(
+                id="m-disputed",
+                text="Disputed memory should not appear when recipe status filters are ignored.",
+                payload={"memory_kind": "tool_quirk", "fact_status": "disputed"},
+                qdrant_score=0.99,
+                final_score=0.99,
+            )
+        ]
+
+
+class PlanAwareFakeLearningStore:
+    def __init__(self):
+        self.calls = []
+
+    def search(self, query, **kwargs):
+        self.calls.append({"query": query, **kwargs})
+        if (
+            kwargs.get("learning_type") == ["tool_failure_lesson", "environment_quirk"]
+            and kwargs.get("tags") == ["tool", "quirk", "environment"]
+            and kwargs.get("fact_status_exclude") == ["disputed", "superseded", "deprecated"]
+            and kwargs.get("stale") is False
+            and kwargs.get("requires_review") is False
+            and kwargs.get("update_access") is False
+        ):
+            return [
+                RetrievedMemory(
+                    id="l-tool",
+                    text="Lesson: use ctx_execute_file for large logs instead of reading them into context.",
+                    payload={
+                        "memory_kind": "learning",
+                        "source_type": "learning",
+                        "learning_type": "tool_failure_lesson",
+                        "fact_status": "current",
+                        "tags": ["tool", "quirk"],
+                    },
+                    qdrant_score=0.93,
+                    final_score=0.93,
+                )
+            ]
+        return []
+
+
 def _context_results() -> list[dict]:
     return [
         {
@@ -259,7 +331,69 @@ def test_provider_context_tool_uses_read_only_search_and_returns_packet():
         {
             "query": "certificate rotation",
             "top_k": 6,
-            "include_fact_history": True,
+            "memory_kind": ["source_chunk", "assertion", "manual_fact", "project_invariant"],
+            "source_type": ["file", "markdown", "url", "skill", "manual"],
+            "fact_status_exclude": ["disputed", "superseded", "deprecated"],
+            "stale": False,
+            "requires_review": False,
+            "include_fact_history": False,
+            "update_access": False,
+        }
+    ]
+
+
+def test_provider_context_tool_applies_learning_recipe_plan_without_access_updates():
+    from __init__ import QdrantMemoryProvider
+
+    retriever = PlanAwareFakeRetriever()
+    learning_store = PlanAwareFakeLearningStore()
+    provider = QdrantMemoryProvider()
+    provider._retriever = retriever
+    provider._learning_store = learning_store
+    provider._config["learning_enabled"] = True
+
+    payload = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_context",
+            {"template": "tool_quirks", "topic": "ctx_execute log scan failure"},
+        )
+    )
+
+    assert payload["template"] == "tool_quirks"
+    assert payload["read_only"] is True
+    assert payload["recipe"]["collections"] == ["learning", "memory"]
+    assert payload["recipe"]["filters"]["learning_type"] == ["tool_failure_lesson", "environment_quirk"]
+    assert payload["recipe"]["filters"]["memory_kind"] == ["tool_quirk", "workflow_lesson"]
+    assert payload["recipe"]["status_filters"]["fact_status"]["exclude"] == [
+        "disputed",
+        "superseded",
+        "deprecated",
+    ]
+    assert set(payload["summary"]["point_ids"]) == {"l-tool", "m-tool"}
+    assert "m-disputed" not in payload["summary"]["point_ids"]
+    assert any(section["point_id"] == "l-tool" for section in payload["sections"]["source_text"])
+    assert learning_store.calls == [
+        {
+            "query": "ctx_execute log scan failure",
+            "top_k": 6,
+            "learning_type": ["tool_failure_lesson", "environment_quirk"],
+            "tags": ["tool", "quirk", "environment"],
+            "fact_status_exclude": ["disputed", "superseded", "deprecated"],
+            "stale": False,
+            "requires_review": False,
+            "update_access": False,
+        }
+    ]
+    assert retriever.calls == [
+        {
+            "query": "ctx_execute log scan failure",
+            "top_k": 6,
+            "memory_kind": ["tool_quirk", "workflow_lesson"],
+            "tags": ["tool", "quirk", "environment"],
+            "fact_status_exclude": ["disputed", "superseded", "deprecated"],
+            "stale": False,
+            "requires_review": False,
+            "include_fact_history": False,
             "update_access": False,
         }
     ]

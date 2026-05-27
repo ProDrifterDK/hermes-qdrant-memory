@@ -181,6 +181,18 @@ def test_learning_search_uses_learning_collection():
     assert {"key": "learning_type", "match": {"value": "tool_failure_lesson"}} in filter_payload["must"]
 
 
+def test_learning_search_can_skip_access_metadata_updates():
+    qdrant = FakeQdrant()
+    embeddings = FakeEmbedding()
+    store = LearningStore(qdrant=qdrant, embeddings=embeddings, collection_name="learnings", scope={"profile_id": "coder"})
+
+    results = store.search("embedding batch failure", top_k=3, update_access=False)
+
+    assert len(results) == 1
+    assert qdrant.searches[0][0] == "learnings"
+    assert qdrant.payload_updates == []
+
+
 def test_learning_search_adds_richer_filters_as_must_conditions():
     qdrant = FakeQdrant()
     embeddings = FakeEmbedding()

@@ -41,6 +41,87 @@ def _filter_tags(tags: Any) -> list[str]:
     return normalized
 
 
+def _match_values(value: Any) -> list[Any]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, (list, tuple, set)):
+        values = list(value)
+    else:
+        values = [value]
+    normalized: list[Any] = []
+    for raw in values:
+        if isinstance(raw, bool):
+            normalized.append(raw)
+            continue
+        text = str(raw or "").strip()
+        if text:
+            normalized.append(text)
+    return normalized
+
+
+def _match_condition(key: str, value: Any) -> dict[str, Any] | None:
+    values = _match_values(value)
+    if not values:
+        return None
+    if len(values) == 1:
+        return {"key": key, "match": {"value": values[0]}}
+    return {"key": key, "match": {"any": values}}
+
+
+def _append_match(must: list[dict[str, Any]], key: str, value: Any) -> None:
+    condition = _match_condition(key, value)
+    if condition:
+        must.append(condition)
+
+
+def _append_bool_filter(must: list[dict[str, Any]], must_not: list[dict[str, Any]], key: str, value: Any) -> None:
+    if isinstance(value, bool):
+        if value:
+            must.append({"key": key, "match": {"value": True}})
+        else:
+            must_not.append({"key": key, "match": {"value": True}})
+
+
+def _payload_value_matches(value: Any, allowed: Any) -> bool:
+    allowed_values = _match_values(allowed)
+    if not allowed_values:
+        return True
+    text = str(value or "").strip()
+    return bool(text) and text in {str(item) for item in allowed_values}
+
+
+def _payload_bool_allowed(value: Any, expected: Any) -> bool:
+    if not isinstance(expected, bool):
+        return True
+    return bool(value) is expected if expected else not bool(value)
+
+
+def _payload_allowed(
+    payload: dict[str, Any],
+    *,
+    source_type: Any = None,
+    memory_kind: Any = None,
+    fact_status_exclude: Any = None,
+    stale: Any = None,
+    requires_review: Any = None,
+    canonical: Any = None,
+) -> bool:
+    if not _payload_value_matches(payload.get("source_type"), source_type):
+        return False
+    if not _payload_value_matches(payload.get("memory_kind"), memory_kind):
+        return False
+    fact_status = str(payload.get("fact_status") or "").strip()
+    if fact_status and fact_status in {str(item) for item in _match_values(fact_status_exclude)}:
+        return False
+    if not _payload_bool_allowed(payload.get("stale"), stale):
+        return False
+    if not _payload_bool_allowed(payload.get("requires_review"), requires_review):
+        return False
+    return _payload_bool_allowed(payload.get("canonical"), canonical)
+
+
 def _extend_search_filter_conditions(
     must: list[dict[str, Any]],
     *,
@@ -74,7 +155,7 @@ def _extend_search_filter_conditions(
 
 def _scope_filter(
     scope: dict[str, str] | None,
-    source_type: str | None = None,
+    source_type: Any = None,
     *,
     tags: Any = None,
     source: Any = None,
@@ -82,15 +163,21 @@ def _scope_filter(
     project_path: Any = None,
     since: Any = None,
     until: Any = None,
+    memory_kind: Any = None,
+    fact_status_exclude: Any = None,
+    stale: Any = None,
+    requires_review: Any = None,
+    canonical: Any = None,
     include_fact_history: bool = False,
 ) -> dict[str, Any] | None:
-    must = []
+    must: list[dict[str, Any]] = []
+    must_not: list[dict[str, Any]] = []
     if scope:
         for key, value in scope.items():
             if value:
                 must.append({"key": key, "match": {"value": value}})
-    if source_type:
-        must.append({"key": "source_type", "match": {"value": source_type}})
+    _append_match(must, "source_type", source_type)
+    _append_match(must, "memory_kind", memory_kind)
     _extend_search_filter_conditions(
         must,
         tags=tags,
@@ -100,14 +187,19 @@ def _scope_filter(
         since=since,
         until=until,
     )
+    if not include_fact_history:
+        for status in sorted(_HIDDEN_FACT_STATUSES):
+            must_not.append({"key": "fact_status", "match": {"value": status}})
+    for status in _match_values(fact_status_exclude):
+        must_not.append({"key": "fact_status", "match": {"value": status}})
+    _append_bool_filter(must, must_not, "stale", stale)
+    _append_bool_filter(must, must_not, "requires_review", requires_review)
+    _append_bool_filter(must, must_not, "canonical", canonical)
     result: dict[str, Any] = {}
     if must:
         result["must"] = must
-    if not include_fact_history:
-        result["must_not"] = [
-            {"key": "fact_status", "match": {"value": status}}
-            for status in sorted(_HIDDEN_FACT_STATUSES)
-        ]
+    if must_not:
+        result["must_not"] = must_not
     if include_fact_history and not result:
         return {}
     return result or None
@@ -167,7 +259,7 @@ class MemoryRetriever:
         self,
         query: str,
         top_k: int = 5,
-        source_type: str | None = None,
+        source_type: Any = None,
         scope: dict[str, str] | None = None,
         *,
         tags: list[str] | None = None,
@@ -176,6 +268,11 @@ class MemoryRetriever:
         project_path: str | None = None,
         since: str | None = None,
         until: str | None = None,
+        memory_kind: Any = None,
+        fact_status_exclude: Any = None,
+        stale: Any = None,
+        requires_review: Any = None,
+        canonical: Any = None,
         include_fact_history: bool = False,
         update_access: bool = True,
     ) -> list[RetrievedMemory]:
@@ -196,6 +293,11 @@ class MemoryRetriever:
                 project_path=project_path,
                 since=since,
                 until=until,
+                memory_kind=memory_kind,
+                fact_status_exclude=fact_status_exclude,
+                stale=stale,
+                requires_review=requires_review,
+                canonical=canonical,
                 include_fact_history=include_fact_history,
             ),
             with_payload=True,
@@ -209,6 +311,16 @@ class MemoryRetriever:
                 continue
             payload = item.get("payload") or {}
             if not include_fact_history and valid_fact_status(payload.get("fact_status")) in _HIDDEN_FACT_STATUSES:
+                continue
+            if not _payload_allowed(
+                payload,
+                source_type=source_type,
+                memory_kind=memory_kind,
+                fact_status_exclude=fact_status_exclude,
+                stale=stale,
+                requires_review=requires_review,
+                canonical=canonical,
+            ):
                 continue
             text = str(payload.get("text") or "")
             final = final_memory_score(norm_score, payload.get("importance", 5), payload.get("created_at", ""), self.decay_rate)

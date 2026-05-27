@@ -7,7 +7,7 @@ from typing import Any
 from .fact_metadata import derive_fact_metadata
 from .schema import build_payload, clean_text_for_memory, now_iso
 from .scoring import final_memory_score, normalize_minmax
-from .retriever import RetrievedMemory, _extend_search_filter_conditions
+from .retriever import RetrievedMemory, _append_bool_filter, _extend_search_filter_conditions, _match_condition, _match_values
 
 LEARNING_TYPES = {
     "tool_failure_lesson",
@@ -217,7 +217,7 @@ class LearningStore:
 
     def _filter(
         self,
-        learning_type: str | None = None,
+        learning_type: Any = None,
         scope: dict[str, str] | None = None,
         *,
         tags: list[str] | None = None,
@@ -226,16 +226,23 @@ class LearningStore:
         project_path: str | None = None,
         since: str | None = None,
         until: str | None = None,
+        fact_status_exclude: Any = None,
+        stale: Any = None,
+        requires_review: Any = None,
+        canonical: Any = None,
     ) -> dict[str, Any]:
         must = [{"key": "source_type", "match": {"value": "learning"}}]
+        must_not: list[dict[str, Any]] = []
         active_scope = self.scope.copy()
         if scope:
             active_scope.update(scope)
         for key, value in active_scope.items():
             if value:
                 must.append({"key": key, "match": {"value": value}})
-        if learning_type:
-            must.append({"key": "learning_type", "match": {"value": _normalize_learning_type(learning_type)}})
+        learning_types = [_normalize_learning_type(str(item)) for item in _match_values(learning_type)]
+        condition = _match_condition("learning_type", learning_types)
+        if condition:
+            must.append(condition)
         _extend_search_filter_conditions(
             must,
             tags=tags,
@@ -245,7 +252,15 @@ class LearningStore:
             since=since,
             until=until,
         )
-        return {"must": must}
+        for status in _match_values(fact_status_exclude):
+            must_not.append({"key": "fact_status", "match": {"value": status}})
+        _append_bool_filter(must, must_not, "stale", stale)
+        _append_bool_filter(must, must_not, "requires_review", requires_review)
+        _append_bool_filter(must, must_not, "canonical", canonical)
+        result: dict[str, Any] = {"must": must}
+        if must_not:
+            result["must_not"] = must_not
+        return result
 
     def find_semantic_duplicate(
         self,
@@ -288,7 +303,7 @@ class LearningStore:
         query: str,
         *,
         top_k: int = 5,
-        learning_type: str | None = None,
+        learning_type: Any = None,
         scope: dict[str, str] | None = None,
         tags: list[str] | None = None,
         source: str | None = None,
@@ -296,6 +311,11 @@ class LearningStore:
         project_path: str | None = None,
         since: str | None = None,
         until: str | None = None,
+        fact_status_exclude: Any = None,
+        stale: Any = None,
+        requires_review: Any = None,
+        canonical: Any = None,
+        update_access: bool = True,
     ) -> list[RetrievedMemory]:
         vector = self.embeddings.embed_query(query)
         raw = self.qdrant.search(
@@ -311,10 +331,16 @@ class LearningStore:
                 project_path=project_path,
                 since=since,
                 until=until,
+                fact_status_exclude=fact_status_exclude,
+                stale=stale,
+                requires_review=requires_review,
+                canonical=canonical,
             ),
             with_payload=True,
             with_vector=False,
         )
+        allowed_learning_types = {_normalize_learning_type(str(item)) for item in _match_values(learning_type)}
+        excluded_statuses = {str(item) for item in _match_values(fact_status_exclude)}
         scores = normalize_minmax([float(item.get("score", 0.0)) for item in raw])
         chunks: list[RetrievedMemory] = []
         for item, norm_score in zip(raw, scores):
@@ -322,6 +348,17 @@ class LearningStore:
             if raw_score < self.min_raw_score:
                 continue
             payload = item.get("payload") or {}
+            payload_learning_type = str(payload.get("learning_type") or "").strip()
+            if allowed_learning_types and payload_learning_type and payload_learning_type not in allowed_learning_types:
+                continue
+            if str(payload.get("fact_status") or "").strip() in excluded_statuses:
+                continue
+            if isinstance(stale, bool) and bool(payload.get("stale")) is not stale:
+                continue
+            if isinstance(requires_review, bool) and bool(payload.get("requires_review")) is not requires_review:
+                continue
+            if isinstance(canonical, bool) and bool(payload.get("canonical")) is not canonical:
+                continue
             text = str(payload.get("text") or "")
             final = final_memory_score(norm_score, payload.get("importance", 7), payload.get("created_at", ""), self.decay_rate)
             if final < self.min_final_score:
@@ -329,7 +366,8 @@ class LearningStore:
             chunks.append(RetrievedMemory(str(item.get("id", "")), text, payload, raw_score, final))
         chunks.sort(key=lambda c: c.final_score, reverse=True)
         selected = chunks[: max(1, min(20, int(top_k)))]
-        self.update_access_metadata(selected)
+        if update_access:
+            self.update_access_metadata(selected)
         return selected
 
     def update_access_metadata(self, chunks: list[RetrievedMemory]) -> None:

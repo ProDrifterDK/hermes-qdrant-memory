@@ -50,6 +50,7 @@ from qdrant_memory.embeddings import EmbeddingClient
 from qdrant_memory.indexer import FileIndexer
 from qdrant_memory.learning import LearningStore, build_learning_payload, classify_learning_type
 from qdrant_memory.lesson_extractor import LearningCandidate, candidate_to_learning_args, contains_secret, extract_learning_candidates_from_messages
+from qdrant_memory.recipes import get_recipe
 from qdrant_memory.retriever import MemoryRetriever, format_for_prompt
 from qdrant_memory.sources import expand_point, inspect_point, source_status_for_point, trace_point
 from qdrant_memory.proposals import proposal_draft_metadata, write_proposal_draft
@@ -106,6 +107,119 @@ def _tool_search_filters(args: dict[str, Any]) -> dict[str, Any]:
         if value:
             filters[key] = value
     return filters
+
+
+def _context_filter_values(value: Any) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, (list, tuple, set)):
+        values = list(value)
+    else:
+        values = [value]
+    output: list[str] = []
+    for raw in values:
+        text = str(raw or "").strip()
+        if text:
+            output.append(text)
+    return output
+
+
+def _context_bool_filter(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    return None
+
+
+def _context_status_search_kwargs(status_filters: dict[str, Any]) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
+    raw_fact_status = status_filters.get("fact_status")
+    fact_status: dict[str, Any] = raw_fact_status if isinstance(raw_fact_status, dict) else {}
+    excludes = _context_filter_values(fact_status.get("exclude"))
+    if excludes:
+        kwargs["fact_status_exclude"] = excludes
+    for key in ("stale", "requires_review", "canonical"):
+        rule = status_filters.get(key)
+        if not isinstance(rule, dict) or "include" not in rule:
+            continue
+        include = rule.get("include")
+        bool_value = _context_bool_filter(include)
+        if bool_value is not None:
+            kwargs[key] = bool_value
+    return kwargs
+
+
+def _context_include_fact_history(status_filters: dict[str, Any]) -> bool:
+    raw_fact_status = status_filters.get("fact_status")
+    fact_status: dict[str, Any] = raw_fact_status if isinstance(raw_fact_status, dict) else {}
+    included = set(_context_filter_values(fact_status.get("include")))
+    review_statuses = {"disputed", "superseded", "deprecated"}
+    return bool(included & review_statuses)
+
+
+def _context_recipe_collections(recipe: dict[str, Any]) -> list[str]:
+    collections = [str(item).strip() for item in recipe.get("collections") or []]
+    collections = [item for item in collections if item in {"memory", "learning"}]
+    return collections or ["memory"]
+
+
+def _context_search_kwargs(collection: str, recipe: dict[str, Any], top_k: int) -> dict[str, Any]:
+    raw_filters = recipe.get("filters")
+    filters: dict[str, Any] = raw_filters if isinstance(raw_filters, dict) else {}
+    raw_status_filters = recipe.get("status_filters")
+    status_filters: dict[str, Any] = raw_status_filters if isinstance(raw_status_filters, dict) else {}
+    kwargs: dict[str, Any] = {"top_k": top_k, "update_access": False}
+    tags = _context_filter_values(filters.get("tags"))
+    if tags:
+        kwargs["tags"] = tags
+    kwargs.update(_context_status_search_kwargs(status_filters))
+    if collection == "learning":
+        learning_type = _context_filter_values(filters.get("learning_type"))
+        if learning_type:
+            kwargs["learning_type"] = learning_type
+        return kwargs
+    memory_kind = _context_filter_values(filters.get("memory_kind"))
+    if memory_kind:
+        kwargs["memory_kind"] = memory_kind
+    source_type = _context_filter_values(filters.get("source_type"))
+    if source_type:
+        kwargs["source_type"] = source_type
+    kwargs["include_fact_history"] = _context_include_fact_history(status_filters)
+    return kwargs
+
+
+def _result_id(result: Any) -> str:
+    if isinstance(result, dict):
+        return str(result.get("id") or result.get("point_id") or "").strip()
+    return str(getattr(result, "id", "") or "").strip()
+
+
+def _merge_context_results(groups: list[list[Any]], top_k: int) -> list[Any]:
+    selected: list[Any] = []
+    seen: set[str] = set()
+    max_len = max((len(group) for group in groups), default=0)
+    limit = max(1, min(20, int(top_k)))
+    for index in range(max_len):
+        for group in groups:
+            if index >= len(group):
+                continue
+            result = group[index]
+            point_id = _result_id(result)
+            if point_id and point_id in seen:
+                continue
+            if point_id:
+                seen.add(point_id)
+            selected.append(result)
+            if len(selected) >= limit:
+                return selected
+    return selected
 
 
 class QdrantMemoryProvider(MemoryProvider):
@@ -608,22 +722,33 @@ class QdrantMemoryProvider(MemoryProvider):
         topic = str(args.get("topic") or "").strip()
         if not topic:
             return _json_error("topic is required")
-        if not self._retriever:
-            return _json_error("Qdrant memory provider is not initialized")
         try:
+            recipe = get_recipe(template)
             default_top_k = default_context_top_k(template)
             top_k = max(1, min(20, int(args.get("top_k") or default_top_k)))
-        except ContextTemplateError as exc:
-            return _json_error(str(exc))
+        except (ContextTemplateError, KeyError) as exc:
+            return _json_error(str(exc).strip("'"))
         except Exception:
             top_k = 6
+            recipe = get_recipe(template)
+        collections = _context_recipe_collections(recipe)
+        if "memory" in collections and not self._retriever:
+            return _json_error("Qdrant memory provider is not initialized")
         try:
-            chunks = self._retriever.search(
-                topic,
-                top_k=top_k,
-                include_fact_history=True,
-                update_access=False,
-            )
+            result_groups: list[list[Any]] = []
+            for collection in collections:
+                search_kwargs = _context_search_kwargs(collection, recipe, top_k)
+                if collection == "learning":
+                    if not self._config.get("learning_enabled", True):
+                        continue
+                    store = self._ensure_learning_store()
+                    if not store:
+                        continue
+                    result_groups.append(list(store.search(topic, **search_kwargs)))
+                    continue
+                if self._retriever:
+                    result_groups.append(list(self._retriever.search(topic, **search_kwargs)))
+            chunks = _merge_context_results(result_groups, top_k)
             packet = build_context_packet(template=template, topic=topic, results=chunks)
             return json.dumps(packet)
         except ContextTemplateError as exc:
