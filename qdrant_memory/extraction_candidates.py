@@ -110,11 +110,11 @@ def _validate_payload_grammar(value: Any) -> None:
     if isinstance(value, Mapping):
         for key, item in value.items():
             key_s = str(key)
-            if key_s == "memory_kind" and not _is_empty(item):
+            if key_s == "memory_kind":
                 validate_memory_kind(item)
-            elif key_s == "relation_type" and not _is_empty(item):
+            elif key_s == "relation_type":
                 validate_relation_type(item)
-            elif key_s == "fact_status" and not _is_empty(item):
+            elif key_s == "fact_status":
                 validate_fact_status(item)
             _validate_payload_grammar(item)
     elif isinstance(value, list):

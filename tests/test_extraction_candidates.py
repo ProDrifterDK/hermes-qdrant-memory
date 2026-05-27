@@ -171,3 +171,40 @@ def test_invalid_proposed_payload_memory_grammar_is_rejected():
             proposed_payload={"text": "bad status", "memory_kind": "assertion", "fact_status": "not_a_status"},
             reason="bad grammar",
         )
+
+
+@pytest.mark.parametrize("empty_value", ["", None, [], {}])
+def test_present_but_empty_proposed_payload_memory_kind_is_rejected(empty_value):
+    with pytest.raises(ValueError, match="memory_kind"):
+        build_extraction_candidate(
+            candidate_type="memory_candidate",
+            source_uri="session://bad/empty-memory-kind",
+            proposed_payload={"text": "missing explicit kind", "memory_kind": empty_value},
+            reason="empty grammar field",
+        )
+
+
+@pytest.mark.parametrize("empty_value", ["", None, [], {}])
+def test_present_but_empty_nested_proposed_payload_relation_type_is_rejected(empty_value):
+    with pytest.raises(ValueError, match="relation_type"):
+        build_extraction_candidate(
+            candidate_type="assertion_candidate",
+            source_uri="session://bad/empty-relation",
+            proposed_payload={
+                "text": "missing explicit relation",
+                "memory_kind": "assertion",
+                "derived_from": [{"source_uri": "session://root", "relation_type": empty_value}],
+            },
+            reason="empty grammar field",
+        )
+
+
+@pytest.mark.parametrize("empty_value", ["", None, [], {}])
+def test_present_but_empty_proposed_payload_fact_status_is_rejected(empty_value):
+    with pytest.raises(ValueError, match="fact_status"):
+        build_extraction_candidate(
+            candidate_type="status_update_candidate",
+            source_uri="session://bad/empty-fact-status",
+            proposed_payload={"text": "missing explicit fact status", "memory_kind": "assertion", "fact_status": empty_value},
+            reason="empty grammar field",
+        )
