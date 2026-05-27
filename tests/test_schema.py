@@ -5,7 +5,14 @@ import math
 
 import pytest
 
-from qdrant_memory.schema import DerivationEdge, MEMORY_KINDS, RELATION_TYPES, SourceLocator, build_payload
+from qdrant_memory.schema import (
+    DerivationEdge,
+    MEMORY_KINDS,
+    RELATION_TYPES,
+    SourceLocator,
+    build_assertion_payload,
+    build_payload,
+)
 
 
 def _contains_non_finite_float(value):
@@ -240,3 +247,108 @@ def test_build_payload_rejects_unknown_relation_type_in_edges():
             source="unit",
             source_ref={"source_uri": "memory://point/root", "relation_type": "NOT_A_RELATION"},
         )
+
+
+def test_build_assertion_payload_creates_review_required_noncanonical_assertion():
+    payload = build_assertion_payload(
+        claim_text="Hermes stores source chunks separately from assertion claims.",
+        subject="hermes.memory",
+        predicate="stores_separately",
+        object="source_chunks",
+        confidence=0.67,
+        source_uri="file:///tmp/source.md",
+        locator=SourceLocator(line_start=12, line_end=14, heading="Memory"),
+        evidence=[
+            {
+                "source_uri": "file:///tmp/source.md",
+                "locator": {"line_start": 12, "line_end": 14},
+                "relation_type": "SUPPORTS",
+            }
+        ],
+    )
+
+    assert payload["memory_kind"] == "assertion"
+    assert payload["source"] == "hermes_assertion"
+    assert payload["source_type"] == "assertion"
+    assert payload["chunk_type"] == "assertion"
+    assert payload["text"] == "Hermes stores source chunks separately from assertion claims."
+    assert payload["claim_text"] == "Hermes stores source chunks separately from assertion claims."
+    assert payload["subject"] == "hermes.memory"
+    assert payload["predicate"] == "stores_separately"
+    assert payload["object"] == "source_chunks"
+    assert payload["confidence"] == 0.67
+    assert payload["canonical"] is False
+    assert payload["requires_review"] is True
+    assert payload["source_uri"] == "file:///tmp/source.md"
+    assert payload["locator"] == {"line_start": 12, "line_end": 14, "heading": "Memory"}
+    assert payload["evidence"] == [
+        {
+            "source_uri": "file:///tmp/source.md",
+            "locator": {"line_start": 12, "line_end": 14},
+            "relation_type": "SUPPORTS",
+        }
+    ]
+
+
+def test_build_assertion_payload_rejects_missing_provenance():
+    with pytest.raises(ValueError, match="provenance"):
+        build_assertion_payload(
+            claim_text="A claim without evidence must not become an assertion payload.",
+            subject="hermes.memory",
+            predicate="requires",
+            object="provenance",
+            confidence=0.5,
+        )
+
+
+def test_build_assertion_payload_rejects_invalid_evidence_relation_type():
+    with pytest.raises(ValueError, match="relation_type"):
+        build_assertion_payload(
+            claim_text="Invalid relation evidence must be rejected.",
+            subject="hermes.memory",
+            predicate="validates",
+            object="relation_type",
+            confidence=0.5,
+            evidence=[{"source_uri": "memory://point/root", "relation_type": "NOT_A_RELATION"}],
+        )
+
+
+def test_build_assertion_payload_sanitizes_secret_bearing_evidence_and_source_metadata():
+    secret_uri = "https://" + "user" + ":" + "pass" + "@example.test/private.md"
+    secret_heading = "".join(["api", "_key=", "not", "-a", "-real", "-value"])
+    bearer_value = "".join(["abcdef", "ghijkl", "mnop"])
+    bearer_heading = " ".join(["Authorization:", "Bearer", bearer_value])
+
+    payload = build_assertion_payload(
+        claim_text="Assertion metadata should be safe to inspect.",
+        subject="hermes.memory",
+        predicate="sanitizes",
+        object="evidence_metadata",
+        confidence=0.8,
+        source_uri=secret_uri,
+        locator=SourceLocator(line_start=5, heading=secret_heading),
+        evidence=[
+            {
+                "source_uri": "file:///tmp/source.md",
+                "locator": {"line_start": 5, "heading": bearer_heading},
+                "relation_type": "SUPPORTS",
+                "note": secret_heading,
+                "safe_marker": "reviewed-source",
+            }
+        ],
+    )
+
+    dumped = json.dumps(payload, sort_keys=True)
+    assert secret_uri not in dumped
+    assert secret_heading not in dumped
+    assert bearer_heading not in dumped
+    assert "source_uri" not in payload
+    assert payload["locator"] == {"line_start": 5}
+    assert payload["evidence"] == [
+        {
+            "source_uri": "file:///tmp/source.md",
+            "locator": {"line_start": 5},
+            "relation_type": "SUPPORTS",
+            "safe_marker": "reviewed-source",
+        }
+    ]

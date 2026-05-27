@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
@@ -876,6 +877,72 @@ def expand_source_metadata(payload: dict[str, Any]) -> dict[str, Any]:
     return metadata
 
 
+def _compact_assertion_edge(edge: Any) -> dict[str, Any]:
+    if isinstance(edge, str):
+        source_uri = _compact_expand_string(edge)
+        if source_uri is not None and "://" in source_uri:
+            return {"source_uri": source_uri}
+        return {}
+    if not isinstance(edge, dict):
+        return {}
+    compacted: dict[str, Any] = {}
+    for key in ("source_uri", "point_id", "source_modified_at"):
+        value = _compact_expand_string(edge.get(key))
+        if value is not None:
+            compacted[key] = value
+    for key in ("source_type", "derivation_type"):
+        value = _compact_expand_token(edge.get(key))
+        if value is not None:
+            compacted[key] = value
+    relation_type = valid_relation_type(edge.get("relation_type"))
+    if relation_type is not None:
+        compacted["relation_type"] = relation_type
+    content_hash = _compact_expand_hash(edge.get("content_hash"))
+    if content_hash is not None:
+        compacted["content_hash"] = content_hash
+    locator = expand_locator_metadata(edge.get("locator") if isinstance(edge.get("locator"), dict) else None)
+    if locator:
+        compacted["locator"] = locator
+    return compacted
+
+
+def _compact_assertion_edge_list(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        candidates = [value]
+    elif isinstance(value, (list, tuple)):
+        candidates = list(value)
+    else:
+        return []
+    compacted: list[dict[str, Any]] = []
+    for edge in candidates[:8]:
+        item = _compact_assertion_edge(edge)
+        if item:
+            compacted.append(item)
+    return compacted
+
+
+def _assertion_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    if valid_memory_kind(payload.get("memory_kind")) != "assertion":
+        return {}
+    metadata: dict[str, Any] = {}
+    for key in ("claim_text", "subject", "predicate", "object"):
+        value = _compact_expand_string(payload.get(key))
+        if value is not None:
+            metadata[key] = value
+    raw_confidence = payload.get("confidence")
+    try:
+        confidence = float(raw_confidence) if raw_confidence is not None else None
+    except Exception:
+        confidence = None
+    if confidence is not None and math.isfinite(confidence):
+        metadata["confidence"] = confidence
+    for key in ("evidence", "derived_from"):
+        edges = _compact_assertion_edge_list(payload.get(key))
+        if edges:
+            metadata[key] = edges
+    return metadata
+
+
 def inspect_point(qdrant: Any, collection_name: str, point_id: str, *, collection: str = "memory") -> dict[str, Any]:
     point = retrieve_point(qdrant, collection_name, point_id, with_payload=True, with_vector=False)
     result: dict[str, Any] = {
@@ -888,6 +955,9 @@ def inspect_point(qdrant: Any, collection_name: str, point_id: str, *, collectio
         return _compact_status_response(result)
     payload = _point_payload(point)
     src = source_metadata(payload)
+    assertion = _assertion_metadata(payload)
+    if assertion:
+        src.update(assertion)
     if src:
         result["source"] = src
     text = _point_text(point)

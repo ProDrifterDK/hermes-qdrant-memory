@@ -142,7 +142,7 @@ class SourceReference:
     source_modified_at: str = ""
     derivation_type: str = ""
     relation_type: str | RelationType = ""
-    derived_from: list[DerivationEdge | SourceReference | dict[str, Any]] = field(default_factory=list)
+    derived_from: list[DerivationEdge | SourceReference | dict[str, Any] | str] = field(default_factory=list)
     canonical: bool | None = None
     stale: bool | None = None
     requires_review: bool | None = None
@@ -337,7 +337,7 @@ def build_payload(
     content_hash: str | None = None,
     source_modified_at: str | None = None,
     derivation_type: str | None = None,
-    derived_from: list[DerivationEdge | SourceReference | dict[str, Any]] | None = None,
+    derived_from: list[DerivationEdge | SourceReference | dict[str, Any] | str] | None = None,
     canonical: bool | None = None,
     stale: bool | None = None,
     requires_review: bool | None = None,
@@ -387,4 +387,84 @@ def build_payload(
     _add_source_metadata(payload, "canonical", canonical)
     _add_source_metadata(payload, "stale", stale)
     _add_source_metadata(payload, "requires_review", requires_review)
+    return payload
+
+
+def _required_assertion_string(name: str, value: Any) -> str:
+    text = "" if value is None else str(value).strip()
+    if not text:
+        raise ValueError(f"{name} is required for assertion payloads")
+    return text
+
+
+def build_assertion_payload(
+    *,
+    claim_text: str,
+    subject: Any,
+    predicate: Any,
+    object: Any,
+    confidence: float = 0.5,
+    source_uri: str | None = None,
+    locator: SourceLocator | dict[str, Any] | None = None,
+    derived_from: list[DerivationEdge | SourceReference | dict[str, Any] | str] | None = None,
+    evidence: Any = None,
+    tags: list[str] | None = None,
+    profile_id: str = "default",
+    platform: str = "cli",
+    user_id_hash: str = "",
+    chat_id_hash: str = "",
+    session_id: str = "",
+    project_path: str = "",
+    model: str = "",
+    provider: str = "qdrant",
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Build a review-gated assertion payload without writing it anywhere.
+
+    Assertions are source-backed factual claim candidates. This helper only
+    returns payload data; it does not upsert points or provide a promotion path.
+    Extraction confidence is stored as confidence, while truth/canonical status
+    remains explicitly non-canonical and review-required.
+    """
+    claim = _required_assertion_string("claim_text", claim_text)
+    payload = build_payload(
+        text=claim,
+        source="hermes_assertion",
+        source_type="assertion",
+        chunk_type="assertion",
+        confidence=confidence,
+        tags=tags,
+        profile_id=profile_id,
+        platform=platform,
+        user_id_hash=user_id_hash,
+        chat_id_hash=chat_id_hash,
+        session_id=session_id,
+        project_path=project_path,
+        model=model,
+        provider=provider,
+        memory_kind=MemoryKind.ASSERTION,
+        created_at=created_at,
+        source_uri=source_uri,
+        locator=locator,
+        derived_from=derived_from,
+        canonical=False,
+        requires_review=True,
+    )
+    payload.update(
+        {
+            "claim_text": claim,
+            "subject": _required_assertion_string("subject", subject),
+            "predicate": _required_assertion_string("predicate", predicate),
+            "object": _required_assertion_string("object", object),
+            "canonical": False,
+            "requires_review": True,
+        }
+    )
+
+    sanitized_evidence = _sanitize_source_metadata(evidence)
+    if not _metadata_is_empty(sanitized_evidence):
+        payload["evidence"] = sanitized_evidence
+
+    if not any(key in payload for key in ("source_uri", "locator", "derived_from", "evidence")):
+        raise ValueError("assertion payload requires provenance via source_uri, locator, derived_from, or evidence")
     return payload

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 
+from qdrant_memory.schema import build_assertion_payload
 from qdrant_memory.sources import (
     FileSourceResolver,
     MemoryPointResolver,
@@ -628,6 +629,85 @@ def test_inspect_point_surfaces_valid_memory_kind_and_omits_invalid_legacy_kind(
 
     assert valid_inspected["source"]["memory_kind"] == "decision"
     assert "memory_kind" not in invalid_inspected.get("source", {})
+
+
+def test_inspect_point_surfaces_assertion_claim_and_safe_evidence_metadata():
+    secret_note = "".join(["secret", "=", "not", "-a", "-real", "-value"])
+    payload = build_assertion_payload(
+        claim_text="Hermes assertions are review-required by default.",
+        subject="hermes.assertions",
+        predicate="requires",
+        object="review",
+        confidence=0.81,
+        source_uri="file:///tmp/assertions.md",
+        locator={"line_start": 4, "line_end": 6, "heading": "Assertions"},
+        evidence=[
+            {
+                "source_uri": "memory://point/source-1",
+                "locator": {"line_start": 4, "line_end": 4, "heading": "Evidence"},
+                "relation_type": "SUPPORTS",
+                "text": "arbitrary evidence text should not be exposed by inspect",
+                "note": secret_note,
+            }
+        ],
+        derived_from=[
+            {
+                "source_uri": "memory://point/source-1",
+                "locator": {"line_start": 4, "line_end": 4},
+                "relation_type": "SUPPORTS",
+                "text": "derived arbitrary text should not be exposed by inspect",
+            }
+        ],
+    )
+    point = {"id": "assertion-1", "payload": payload}
+
+    inspected = inspect_point(_FakeQdrant(point), "memory", "assertion-1")
+    serialized = json.dumps(inspected, sort_keys=True)
+    source = inspected["source"]
+
+    assert inspected["found"] is True
+    assert source["memory_kind"] == "assertion"
+    assert source["claim_text"] == "Hermes assertions are review-required by default."
+    assert source["subject"] == "hermes.assertions"
+    assert source["predicate"] == "requires"
+    assert source["object"] == "review"
+    assert source["confidence"] == 0.81
+    assert source["requires_review"] is True
+    assert source["canonical"] is False
+    assert source["source_uri"] == "file:///tmp/assertions.md"
+    assert source["locator"] == {"line_start": 4, "line_end": 6, "heading": "Assertions"}
+    assert source["evidence"] == [
+        {
+            "source_uri": "memory://point/source-1",
+            "locator": {"line_start": 4, "line_end": 4, "heading": "Evidence"},
+            "relation_type": "SUPPORTS",
+        }
+    ]
+    assert source["derived_from"] == [
+        {
+            "source_uri": "memory://point/source-1",
+            "locator": {"line_start": 4, "line_end": 4},
+            "relation_type": "SUPPORTS",
+        }
+    ]
+    assert secret_note not in serialized
+    assert "arbitrary evidence text" not in serialized
+    assert "derived arbitrary text" not in serialized
+
+
+def test_inspect_point_surfaces_assertion_derived_from_string_source_chain():
+    payload = build_assertion_payload(
+        claim_text="Assertions can derive from exact memory point handles.",
+        subject="hermes.assertions",
+        predicate="derives_from",
+        object="memory_point",
+        derived_from=["memory://point/source-1"],
+    )
+    point = {"id": "assertion-derived-string", "payload": payload}
+
+    inspected = inspect_point(_FakeQdrant(point), "memory", "assertion-derived-string")
+
+    assert inspected["source"]["derived_from"] == [{"source_uri": "memory://point/source-1"}]
 
 
 def test_trace_point_surfaces_valid_relation_type_and_omits_invalid_legacy_relation_type():
