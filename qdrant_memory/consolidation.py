@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,14 +51,76 @@ _PROFILE_MEMORY_SOURCE_TYPES = {
 }
 _PROFILE_TARGETS = {"profile", "user"}
 _FACT_METADATA_KEYS = ("entity", "fact_key", "reconsolidation_key", "subject")
+_IDENTITY_FACT_METADATA_KEYS = (*_FACT_METADATA_KEYS, "topic")
+_IDENTITY_CONTEXT_TOKENS = {"account", "client", "contact", "customer", "identity", "person", "profile", "user"}
+_STRONG_IDENTITY_KEY_PHRASES = {
+    "birth_date",
+    "birthdate",
+    "date_of_birth",
+    "dob",
+    "driver_license",
+    "family_name",
+    "first_name",
+    "full_name",
+    "given_name",
+    "last_name",
+    "legal_name",
+    "middle_name",
+    "national_id",
+    "passport",
+    "real_name",
+    "social_security",
+    "ssn",
+    "tax_id",
+}
+_CONTEXTUAL_IDENTITY_KEY_FIELDS = {
+    "address",
+    "display_name",
+    "email",
+    "email_address",
+    "handle",
+    "phone",
+    "phone_number",
+    "preferred_name",
+    "screen_name",
+    "user_name",
+    "username",
+}
+_WEAK_IDENTITY_KEY_FIELDS = {"id", "identifier", "name"}
 _TERMINAL_FACT_STATUSES = {"deprecated", "superseded"}
 IDENTITY_REDACTED_SNIPPET = "[redacted: identity-bearing memory]"
+
+
+def _identity_key_terms(tokens: list[str]) -> set[str]:
+    terms = set(tokens)
+    for size in range(2, min(4, len(tokens)) + 1):
+        terms.update("_".join(tokens[index : index + size]) for index in range(len(tokens) - size + 1))
+    return terms
+
+
+def _identity_bearing_metadata_value(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    tokens = [token for token in re.split(r"[^a-z0-9]+", text) if token]
+    if not tokens:
+        return False
+    token_set = set(tokens)
+    terms = _identity_key_terms(tokens)
+    has_identity_context = bool(token_set & _IDENTITY_CONTEXT_TOKENS)
+    if terms & _STRONG_IDENTITY_KEY_PHRASES:
+        return True
+    if terms & _CONTEXTUAL_IDENTITY_KEY_FIELDS and (has_identity_context or len(tokens) == 1):
+        return True
+    return bool(has_identity_context and token_set & _WEAK_IDENTITY_KEY_FIELDS)
 
 
 def identity_bearing_payload(payload: dict[str, Any]) -> bool:
     source_type = str(payload.get("source_type") or "").strip().lower()
     target = str(payload.get("target") or payload.get("memory_target") or "").strip().lower()
-    return source_type in _PROFILE_MEMORY_SOURCE_TYPES or target in _PROFILE_TARGETS
+    if source_type in _PROFILE_MEMORY_SOURCE_TYPES or target in _PROFILE_TARGETS:
+        return True
+    return any(_identity_bearing_metadata_value(payload.get(key)) for key in _IDENTITY_FACT_METADATA_KEYS)
 
 
 def _point_requires_manual_review(point: ConsolidationPoint) -> bool:
