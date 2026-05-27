@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
-from qdrant_memory.consolidation import redact_secrets
+from qdrant_memory.consolidation import IDENTITY_REDACTED_SNIPPET, identity_bearing_payload, redact_secrets
 from qdrant_memory.write_gate import WriteDecision
 
 _SOURCE_KEYS = (
@@ -60,6 +60,12 @@ def _point_payload(point: Any) -> dict[str, Any]:
 
 def _source_metadata(payload: dict[str, Any]) -> dict[str, Any]:
     return {key: payload.get(key) for key in _SOURCE_KEYS if payload.get(key) not in (None, "", [], {})}
+
+
+def _point_snippet(point: Any) -> str:
+    if identity_bearing_payload(_point_payload(point)):
+        return IDENTITY_REDACTED_SNIPPET
+    return _snippet(str(redact_secrets(_point_text(point)))) or "N/A"
 
 
 def proposal_root(hermes_home: str, config: Mapping[str, Any] | None = None) -> Path:
@@ -137,7 +143,7 @@ def render_proposal_markdown(
         point_id = _point_id(point)
         payload = redact_secrets(_point_payload(point))
         source = _source_metadata(payload)
-        lines.extend(["", f"### {point_id or 'unknown-point'}", "", "```json", json.dumps({"id": point_id, "source": source}, indent=2, sort_keys=True, default=str), "```", "", "#### Snippet", _snippet(str(redact_secrets(_point_text(point)))) or "N/A"])
+        lines.extend(["", f"### {point_id or 'unknown-point'}", "", "```json", json.dumps({"id": point_id, "source": source}, indent=2, sort_keys=True, default=str), "```", "", "#### Snippet", _point_snippet(point)])
     lines.extend(
         [
             "",

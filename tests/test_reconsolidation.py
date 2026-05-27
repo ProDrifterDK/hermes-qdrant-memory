@@ -352,6 +352,67 @@ def test_fact_conflict_candidate_includes_status_plan_snippets_and_preview(tmp_p
     assert provider._qdrant.deleted_filters == []
 
 
+def test_identity_only_fact_conflict_redacts_snippets_in_response_report_and_live_draft(tmp_path):
+    provider = _provider(tmp_path)
+    identifying_texts = ["Casey Morgan", "Cameron Morgan"]
+    provider._qdrant = FakeQdrant(
+        {
+            "memory": [
+                _point(
+                    "identity-current",
+                    f"The profile legal name is {identifying_texts[0]}",
+                    source_type="user_profile",
+                    fact_key="profile.legal_name",
+                    importance=9,
+                    confidence=0.95,
+                ),
+                _point(
+                    "identity-conflict",
+                    f"The profile legal name is {identifying_texts[1]}",
+                    source_type="user_profile",
+                    fact_key="profile.legal_name",
+                    importance=9,
+                    confidence=0.9,
+                ),
+            ],
+            "learnings": [],
+        }
+    )
+
+    result_text = provider.handle_tool_call(
+        "qdrant_memory_consolidate",
+        {"scope": "memory", "include_reconsolidation": True, "persist": True},
+    )
+    report = json.loads(result_text)
+    artifact_path = tmp_path / "qdrant_memory" / "consolidation" / f"report-{report['report_id']}.json"
+    artifact_text = artifact_path.read_text()
+    conflict = next(p for p in report["proposals"] if p["proposal_type"] == "fact_conflict_candidate")
+
+    live_result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_consolidation_apply",
+            {"report_id": report["report_id"], "proposal_id": conflict["proposal_id"], "action": "draft_review", "dry_run": False, "approve": True},
+        )
+    )
+    draft_path = Path(live_result["reconsolidation_draft_path"])
+    assert draft_path.exists()
+    draft_text = draft_path.read_text()
+
+    assert conflict["manual_review_required"] is True
+    assert conflict["guarded_auto_eligible"] is False
+    assert conflict["risk"] == "high"
+    assert "identity-bearing" in conflict["manual_review_reason"]
+    assert all("redacted" in item["snippet"] for item in conflict["source_snippets"])
+    for identifying_text in identifying_texts:
+        assert identifying_text not in result_text
+        assert identifying_text not in artifact_text
+        assert identifying_text not in draft_text
+    assert provider._qdrant.upserts == []
+    assert provider._qdrant.payload_updates == []
+    assert provider._qdrant.deleted_ids == []
+    assert provider._qdrant.deleted_filters == []
+
+
 def test_fact_supersession_candidate_explains_newer_assertion(tmp_path):
     provider = _provider(tmp_path)
     provider._qdrant = FakeQdrant(

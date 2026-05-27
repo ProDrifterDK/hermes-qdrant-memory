@@ -51,27 +51,35 @@ _PROFILE_MEMORY_SOURCE_TYPES = {
 _PROFILE_TARGETS = {"profile", "user"}
 _FACT_METADATA_KEYS = ("entity", "fact_key", "reconsolidation_key", "subject")
 _TERMINAL_FACT_STATUSES = {"deprecated", "superseded"}
+IDENTITY_REDACTED_SNIPPET = "[redacted: identity-bearing memory]"
 
 
-def _point_requires_manual_review(point: ConsolidationPoint) -> bool:
-    payload = point.payload or {}
-    source_type = str(payload.get("source_type") or "").strip().lower()
-    target = str(payload.get("target") or payload.get("memory_target") or "").strip().lower()
-    if source_type in _PROFILE_MEMORY_SOURCE_TYPES or target in _PROFILE_TARGETS:
-        return True
-    return any(str(payload.get(key) or "").strip() for key in _FACT_METADATA_KEYS)
-
-
-def _point_is_identity_bearing(point: ConsolidationPoint) -> bool:
-    payload = point.payload or {}
+def identity_bearing_payload(payload: dict[str, Any]) -> bool:
     source_type = str(payload.get("source_type") or "").strip().lower()
     target = str(payload.get("target") or payload.get("memory_target") or "").strip().lower()
     return source_type in _PROFILE_MEMORY_SOURCE_TYPES or target in _PROFILE_TARGETS
 
 
+def _point_requires_manual_review(point: ConsolidationPoint) -> bool:
+    payload = point.payload or {}
+    if identity_bearing_payload(payload):
+        return True
+    return any(str(payload.get(key) or "").strip() for key in _FACT_METADATA_KEYS)
+
+
+def _point_is_identity_bearing(point: ConsolidationPoint) -> bool:
+    return identity_bearing_payload(point.payload or {})
+
+
 def _point_contains_secret(point: ConsolidationPoint) -> bool:
     payload_text = json.dumps(point.payload or {}, sort_keys=True, default=str)
     return contains_secret(point.text) or contains_secret(payload_text)
+
+
+def _point_snippet(point: ConsolidationPoint, *, max_chars: int = 160) -> str:
+    if _point_is_identity_bearing(point):
+        return IDENTITY_REDACTED_SNIPPET
+    return _snippet(point.text, max_chars=max_chars)
 
 
 def _fact_status_for_point(point: ConsolidationPoint) -> str:
@@ -107,7 +115,7 @@ def _source_snippet(point: ConsolidationPoint) -> dict[str, Any]:
     payload = point.payload or {}
     snippet: dict[str, Any] = {
         "id": point.id,
-        "snippet": _snippet(point.text),
+        "snippet": _point_snippet(point),
         "source_type": payload.get("source_type", "unknown"),
         "fact_status": _fact_status_for_point(point),
     }
@@ -383,7 +391,7 @@ def build_reconsolidation_draft_text(points: list[ConsolidationPoint], *, propos
                 f"- importance: {payload.get('importance', 'unknown')}",
                 f"- confidence: {payload.get('confidence', 'unknown')}",
                 "",
-                _snippet(point.text, max_chars=500),
+                _point_snippet(point, max_chars=500),
             ]
         )
     lines.extend(
@@ -467,7 +475,7 @@ def _heading_noise_proposals(points: list[ConsolidationPoint], *, include_exampl
         else:
             proposal["manual_review_required"] = True
         if include_examples:
-            proposal["examples"] = [{"id": point.id, "text": _snippet(point.text)}]
+            proposal["examples"] = [{"id": point.id, "text": _point_snippet(point)}]
         proposals.append(proposal)
     return proposals
 
@@ -516,7 +524,7 @@ def _duplicate_proposals(points: list[ConsolidationPoint], *, max_groups: int, i
         if proposal.get("guarded_auto_eligible"):
             proposal["preauthorized_policy"] = "guarded-auto:exact-duplicate-merge"
         if include_examples:
-            proposal["examples"] = [{"id": point.id, "text": _snippet(point.text)} for point in group]
+            proposal["examples"] = [{"id": point.id, "text": _point_snippet(point)} for point in group]
         proposals.append(proposal)
         if len(proposals) >= max_groups:
             break
@@ -577,7 +585,7 @@ def _stale_low_value_proposals(
         if contains_secret_text:
             proposal["contains_secret_text"] = True
         if include_examples:
-            proposal["examples"] = [{"id": point.id, "text": _snippet(point.text)}]
+            proposal["examples"] = [{"id": point.id, "text": _point_snippet(point)}]
         proposals.append(proposal)
         if len(proposals) >= max_groups:
             break
@@ -617,7 +625,7 @@ def _learning_promotion_proposals(points: list[ConsolidationPoint], *, include_e
             "preauthorized_policy": "guarded-auto:learning-skill-draft",
         }
         if include_examples:
-            proposal["examples"] = [{"id": point.id, "text": _snippet(point.text)}]
+            proposal["examples"] = [{"id": point.id, "text": _point_snippet(point)}]
         proposals.append(proposal)
         if len(proposals) >= max_groups:
             break
@@ -858,7 +866,7 @@ def _reconsolidation_proposals(
                     "source_type": point.payload.get("source_type", ""),
                     "importance": _as_int(point.payload.get("importance"), 5),
                     "confidence": _as_float(point.payload.get("confidence"), 1.0),
-                    "snippet": _snippet(point.text) if include_examples else "redacted/manual review",
+                    "snippet": _point_snippet(point) if include_examples else "redacted/manual review",
                 }
             )
         proposal: dict[str, Any] = {
@@ -879,7 +887,7 @@ def _reconsolidation_proposals(
             "requires_explicit_approval": True,
         }
         if include_examples:
-            proposal["examples"] = [{"id": point.id, "text": _snippet(point.text)} for point in group]
+            proposal["examples"] = [{"id": point.id, "text": _point_snippet(point)} for point in group]
         proposals.append(proposal)
         if len(proposals) >= max_candidates:
             break
