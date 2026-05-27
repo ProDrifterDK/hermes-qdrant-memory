@@ -31,6 +31,10 @@ DEFAULTS: dict[str, Any] = {
     "learning_auto_extract_semantic_dedupe_enabled": True,
     "learning_auto_extract_semantic_dedupe_threshold": 0.9,
     "learning_auto_extract_semantic_dedupe_top_k": 3,
+    "source_extraction_enabled": False,
+    "source_extraction_mode": "preview",
+    "source_extraction_min_confidence": 0.0,
+    "source_extraction_max_candidates_per_session": 8,
     "consolidation_enabled": False,
     "consolidation_report_max_points": 200,
     "consolidation_report_max_groups": 20,
@@ -92,6 +96,7 @@ _BOOL_KEYS = {
     "learning_auto_extract_enabled",
     "learning_auto_extract_require_evidence",
     "learning_auto_extract_semantic_dedupe_enabled",
+    "source_extraction_enabled",
     "consolidation_enabled",
     "consolidation_persist_reports",
     "obsidian_adapter_enabled",
@@ -111,6 +116,7 @@ _INT_KEYS = {
     "index_max_files",
     "learning_auto_extract_max_candidates_per_session",
     "learning_auto_extract_semantic_dedupe_top_k",
+    "source_extraction_max_candidates_per_session",
     "consolidation_report_max_points",
     "consolidation_report_max_groups",
     "consolidation_stale_days",
@@ -121,7 +127,7 @@ _INT_KEYS = {
     "reconsolidation_max_candidates",
     "manual_store_duplicate_top_k",
 }
-_FLOAT_KEYS = {"decay_rate", "min_raw_score", "min_final_score", "learning_auto_extract_min_confidence", "learning_auto_extract_semantic_dedupe_threshold", "consolidation_duplicate_threshold", "guarded_auto_duplicate_min_confidence", "guarded_auto_learning_min_confidence", "reconsolidation_min_confidence", "manual_store_duplicate_threshold"}
+_FLOAT_KEYS = {"decay_rate", "min_raw_score", "min_final_score", "learning_auto_extract_min_confidence", "learning_auto_extract_semantic_dedupe_threshold", "source_extraction_min_confidence", "consolidation_duplicate_threshold", "guarded_auto_duplicate_min_confidence", "guarded_auto_learning_min_confidence", "reconsolidation_min_confidence", "manual_store_duplicate_threshold"}
 _LIST_KEYS = {"index_dirs", "index_extensions", "index_exclude_dirs"}
 
 

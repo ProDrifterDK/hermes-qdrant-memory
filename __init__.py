@@ -52,6 +52,12 @@ from qdrant_memory.lesson_extractor import LearningCandidate, candidate_to_learn
 from qdrant_memory.retriever import MemoryRetriever, format_for_prompt
 from qdrant_memory.sources import expand_point, inspect_point, source_status_for_point, trace_point
 from qdrant_memory.proposals import proposal_draft_metadata, write_proposal_draft
+from qdrant_memory.source_extraction import (
+    build_source_extraction_proposal,
+    evaluate_source_extraction_candidate,
+    extract_source_candidates_from_messages,
+    preview_source_extraction_candidates,
+)
 from qdrant_memory.write_gate import evaluate_write_candidate
 from qdrant_memory.tools import TOOL_SCHEMAS
 from qdrant_memory.writer import ConversationWriter
@@ -121,6 +127,7 @@ class QdrantMemoryProvider(MemoryProvider):
         self._active = False
         self._write_enabled = True
         self._pending_learning_candidates: dict[str, LearningCandidate] = {}
+        self._pending_extraction_candidates: dict[str, Any] = {}
 
     @property
     def name(self) -> str:
@@ -292,6 +299,7 @@ class QdrantMemoryProvider(MemoryProvider):
             with self._prefetch_lock:
                 self._prefetch_cache.clear()
             self._pending_learning_candidates.clear()
+            self._pending_extraction_candidates.clear()
 
     def _auto_learning_enabled(self) -> bool:
         return bool(self._config.get("learning_enabled", True)) and bool(self._config.get("learning_auto_extract_enabled", False))
@@ -368,17 +376,80 @@ class QdrantMemoryProvider(MemoryProvider):
             logger.info("qdrant learning auto_extract_mode=store is not active yet; candidates kept pending")
         return accepted
 
-    def on_pre_compress(self, messages: list[Any]) -> str:
-        candidates = self._collect_learning_candidates(messages, source_hook="on_pre_compress")
-        if not candidates:
-            return ""
-        lines = ["# Qdrant Learning Candidates", "Potential procedural lessons detected but not stored. Review with qdrant_learning_preview and approve explicitly."]
+    def _source_extraction_enabled(self) -> bool:
+        return bool(self._config.get("source_extraction_enabled", False))
+
+    def _source_extraction_limits(self) -> tuple[float, int]:
+        try:
+            min_confidence = float(self._config.get("source_extraction_min_confidence", 0.0))
+        except Exception:
+            min_confidence = 0.0
+        try:
+            max_candidates = int(self._config.get("source_extraction_max_candidates_per_session", 8))
+        except Exception:
+            max_candidates = 8
+        return max(0.0, min(1.0, min_confidence)), max(1, max_candidates)
+
+    def _collect_source_extraction_candidates(self, messages: list[Any], *, source_hook: str) -> list[Any]:
+        if not self._source_extraction_enabled():
+            return []
+        mode = str(self._config.get("source_extraction_mode") or "preview")
+        if mode not in {"preview", "store"}:
+            return []
+        min_confidence, max_candidates = self._source_extraction_limits()
+        remaining = max_candidates - len(self._pending_extraction_candidates)
+        if remaining <= 0:
+            return []
+        source_uri = f"session://{self._session_id or 'current'}/{source_hook}"
+        candidates = extract_source_candidates_from_messages(
+            messages,
+            source_uri=source_uri,
+            lifecycle_id=f"{self._session_id or 'current'}:{source_hook}",
+            min_confidence=min_confidence,
+            max_candidates=remaining,
+        )
+        accepted: list[Any] = []
         for candidate in candidates:
-            lines.append(f"- {candidate.candidate_id} [{candidate.learning_type}] {candidate.lesson[:220]}")
-        return "\n".join(lines)
+            if len(self._pending_extraction_candidates) >= max_candidates:
+                break
+            if candidate.candidate_id in self._pending_extraction_candidates:
+                continue
+            decision = evaluate_source_extraction_candidate(candidate)
+            if decision.decision == "reject":
+                continue
+            self._pending_extraction_candidates[candidate.candidate_id] = candidate
+            accepted.append(candidate)
+        if mode == "store":
+            # Source extraction never auto-mutates; exact candidate approval remains required.
+            logger.info("qdrant source_extraction_mode=store is not active; candidates kept pending")
+        return accepted
+
+    def on_pre_compress(self, messages: list[Any]) -> str:
+        learning_candidates = self._collect_learning_candidates(messages, source_hook="on_pre_compress")
+        source_candidates = self._collect_source_extraction_candidates(messages, source_hook="on_pre_compress")
+        blocks: list[str] = []
+        if learning_candidates:
+            lines = [
+                "# Qdrant Learning Candidates",
+                "Potential procedural lessons detected but not stored. Review with qdrant_learning_preview and approve explicitly.",
+            ]
+            for candidate in learning_candidates:
+                lines.append(f"- {candidate.candidate_id} [{candidate.learning_type}] {candidate.lesson[:220]}")
+            blocks.append("\n".join(lines))
+        if source_candidates:
+            lines = [
+                "# Qdrant Source Extraction Candidates",
+                "Potential source-backed memory/assertion candidates detected but not stored. Review with qdrant_memory_extraction_preview and approve explicitly.",
+            ]
+            for candidate in source_candidates:
+                text = str(candidate.proposed_payload.get("text") or "")[:220]
+                lines.append(f"- {candidate.candidate_id} [{candidate.candidate_type}] {text}")
+            blocks.append("\n".join(lines))
+        return "\n\n".join(blocks)
 
     def on_session_end(self, messages: list[Any]) -> None:
         self._collect_learning_candidates(messages, source_hook="on_session_end")
+        self._collect_source_extraction_candidates(messages, source_hook="on_session_end")
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return TOOL_SCHEMAS
@@ -438,6 +509,9 @@ class QdrantMemoryProvider(MemoryProvider):
             "learning_auto_extract_enabled": self._config.get("learning_auto_extract_enabled", False),
             "learning_auto_extract_mode": self._config.get("learning_auto_extract_mode", "preview"),
             "pending_learning_candidate_count": len(self._pending_learning_candidates),
+            "source_extraction_enabled": self._config.get("source_extraction_enabled", False),
+            "source_extraction_mode": self._config.get("source_extraction_mode", "preview"),
+            "pending_extraction_candidate_count": len(self._pending_extraction_candidates),
             "consolidation_enabled": self._config.get("consolidation_enabled", False),
             "consolidation_persist_reports": self._config.get("consolidation_persist_reports", True),
             "consolidation_apply_enabled": True,
@@ -1214,6 +1288,85 @@ class QdrantMemoryProvider(MemoryProvider):
         except Exception as exc:
             return _json_error(f"Learning approval failed: {exc}")
 
+    def _tool_extraction_preview(self, args: dict) -> str:
+        return json.dumps(preview_source_extraction_candidates(list(self._pending_extraction_candidates.values())))
+
+    def _source_extraction_approval_payload(self, candidate: Any) -> dict[str, Any]:
+        payload = dict(candidate.proposed_payload or {})
+        payload.update(
+            {
+                "profile_id": self._profile_id,
+                "platform": self._platform,
+                "session_id": self._session_id,
+                "user_id_hash": self._user_id_hash,
+                "chat_id_hash": self._chat_id_hash,
+                "model": self._config.get("embedding_model", ""),
+                "provider": "qdrant",
+                "source_extraction_candidate_id": candidate.candidate_id,
+                "source_extraction_approved_at": datetime.utcnow().isoformat() + "Z",
+            }
+        )
+        return payload
+
+    def _tool_extraction_approve(self, args: dict) -> str:
+        candidate_id = str(args.get("candidate_id") or "").strip()
+        if not candidate_id:
+            return _json_error("candidate_id is required")
+        candidate = self._pending_extraction_candidates.get(candidate_id)
+        if not candidate:
+            return _json_error(f"Unknown extraction candidate: {candidate_id}")
+        dry_run = parse_bool_arg(args.get("dry_run"), default=True)
+        approve = parse_bool_arg(args.get("approve"), default=False)
+        write_decision = evaluate_source_extraction_candidate(candidate)
+        base = {
+            "candidate": candidate.to_dict(),
+            "write_decision": write_decision.to_dict(),
+            "would_store": write_decision.decision == "store",
+            "would_create_proposal": write_decision.decision == "draft_review",
+            "collection_name": self._config["collection_name"],
+        }
+        if dry_run:
+            return json.dumps({"dry_run": True, "saved": False, "proposal_created": False, **base})
+        if not approve:
+            return _json_error("approve=true is required when dry_run=false")
+        if write_decision.decision == "reject":
+            return _json_error("write gate rejected extraction candidate")
+        if write_decision.decision == "draft_review":
+            report, proposal, points = build_source_extraction_proposal(candidate, write_decision)
+            draft = write_proposal_draft(
+                report=report,
+                proposal=proposal,
+                points=points,
+                hermes_home=self._hermes_home,
+                config=self._config,
+                write_decision=write_decision,
+            )
+            self._pending_extraction_candidates.pop(candidate_id, None)
+            draft_path = str(draft["path"])
+            return json.dumps(
+                {
+                    "dry_run": False,
+                    "saved": False,
+                    "proposal_created": True,
+                    "proposal_draft_path": draft_path,
+                    "proposal_id": proposal["proposal_id"],
+                    **base,
+                }
+            )
+        if write_decision.decision != "store":
+            return _json_error("extraction candidate requires manual review before storing")
+        if not self._qdrant or not self._embeddings:
+            return _json_error("Qdrant memory provider is not initialized")
+        try:
+            payload = self._source_extraction_approval_payload(candidate)
+            text = str(payload.get("text") or payload.get("claim_text") or "")
+            vector = self._embeddings.embed_document(text)
+            self._qdrant.upsert(self._config["collection_name"], [{"id": candidate.candidate_id, "vector": vector, "payload": payload}])
+            self._pending_extraction_candidates.pop(candidate_id, None)
+            return json.dumps({"dry_run": False, "saved": True, "proposal_created": False, "id": candidate.candidate_id, **base})
+        except Exception as exc:
+            return _json_error(f"Extraction approval failed: {exc}")
+
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         args = args or {}
         if tool_name == "qdrant_memory_status":
@@ -1246,6 +1399,10 @@ class QdrantMemoryProvider(MemoryProvider):
             return self._tool_learning_preview(args)
         if tool_name == "qdrant_learning_approve":
             return self._tool_learning_approve(args)
+        if tool_name == "qdrant_memory_extraction_preview":
+            return self._tool_extraction_preview(args)
+        if tool_name == "qdrant_memory_extraction_approve":
+            return self._tool_extraction_approve(args)
         return _json_error(f"Unknown tool: {tool_name}")
 
     def shutdown(self) -> None:
