@@ -209,6 +209,46 @@ def test_secret_and_identity_bearing_ontology_suggestions_are_redacted_and_force
     assert "redacted" in markdown
 
 
+def test_numeric_secret_and_identity_keyed_evidence_is_redacted_without_hiding_harmless_counters():
+    chat_id_value = 8675309001
+    user_id_value = 4242424242
+    numeric_secret_value = 3141592653
+    harmless_counter_value = 2718281828
+    sensitive_key = "tok" + "en"
+    suggestion = suggest_fact_key_pattern_promotion(
+        pattern="session.identity.example_count",
+        examples=["session.alpha.example_count", "session.beta.example_count"],
+        evidence=[
+            {
+                "chat_id": chat_id_value,
+                "user_id": user_id_value,
+                sensitive_key: numeric_secret_value,
+                "retry_count": harmless_counter_value,
+            }
+        ],
+        source_uri="session://task-13-2/numeric-keyed-evidence",
+        confidence=0.88,
+    )
+
+    payload = suggestion.to_dict()
+    serialized = json.dumps(payload, sort_keys=True)
+    redacted_evidence = payload["evidence"][0]
+    assert payload["requires_review"] is True
+    assert payload["manual_review_required"] is True
+    assert payload["risk"] == "high"
+    assert payload["redaction_applied"] is True
+    assert payload["proposed_payload"]["safety"]["identity_bearing"] is True
+    assert payload["proposed_payload"]["safety"]["secret_bearing"] is True
+    assert redacted_evidence["chat_id"] == "[redacted: identity-bearing value]"
+    assert redacted_evidence["user_id"] == "[redacted: identity-bearing value]"
+    assert redacted_evidence[sensitive_key] == "[redacted: possible secret-bearing value]"
+    assert redacted_evidence["retry_count"] == harmless_counter_value
+    assert str(chat_id_value) not in serialized
+    assert str(user_id_value) not in serialized
+    assert str(numeric_secret_value) not in serialized
+    assert str(harmless_counter_value) in serialized
+
+
 def test_ontology_suggestions_can_be_serialized_as_existing_extraction_candidates_without_validating_as_live_schema():
     suggestion = suggest_new_memory_kind(
         "experiment_note",

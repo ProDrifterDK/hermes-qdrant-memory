@@ -183,7 +183,7 @@ def _contains_secret_like(value: Any) -> bool:
 
 
 def _should_redact_keyed_value(item: Any) -> bool:
-    return item not in (None, "", [], {}) and not isinstance(item, bool | int | float)
+    return item not in (None, "", [], {}) and not isinstance(item, bool)
 
 
 def _redact_secret_like(value: Any) -> Any:
