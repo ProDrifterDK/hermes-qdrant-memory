@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 from typing import Any, Iterable, Mapping
 
@@ -8,7 +7,7 @@ from qdrant_memory.consolidation import redact_secrets
 from qdrant_memory.extraction_candidates import ExtractionCandidate, build_extraction_candidate
 from qdrant_memory.lesson_extractor import contains_secret
 from qdrant_memory.schema import build_assertion_payload, build_payload, clean_text_for_memory
-from qdrant_memory.write_gate import WriteDecision, evaluate_write_candidate
+from qdrant_memory.write_gate import WriteDecision, evaluate_extraction_candidate_write
 
 SOURCE_EXTRACTION_DERIVATION_TYPE = "source_extraction"
 LOW_CONFIDENCE_DRAFT_THRESHOLD = 0.65
@@ -401,54 +400,18 @@ def _candidate_kind_valid(candidate: ExtractionCandidate) -> bool:
     return memory_kind in expected_kinds
 
 
-def evaluate_source_extraction_candidate(candidate: ExtractionCandidate) -> WriteDecision:
-    """Validate an extraction candidate through the conservative write gate."""
+def evaluate_source_extraction_candidate(
+    candidate: ExtractionCandidate,
+    *,
+    persisted_payload: dict[str, Any] | None = None,
+) -> WriteDecision:
+    """Validate an extraction candidate through the shared conservative write gate."""
 
-    candidate_payload = candidate.to_dict()
-    if contains_secret(json.dumps(candidate_payload, sort_keys=True, default=str)):
-        return WriteDecision("reject", ["possible_secret"], 1.0, True, {"candidate_type": candidate.candidate_type})
-    if not _candidate_has_provenance(candidate):
-        return WriteDecision(
-            "draft_review",
-            ["missing_provenance"],
-            _clamp_confidence(candidate.confidence),
-            True,
-            {"candidate_type": candidate.candidate_type},
-        )
-    if candidate.candidate_type == "ontology_suggestion":
-        return WriteDecision(
-            "draft_review",
-            ["ontology_suggestion_review_only"],
-            _clamp_confidence(candidate.confidence),
-            True,
-            {"candidate_type": candidate.candidate_type},
-        )
-    if not _candidate_kind_valid(candidate):
-        return WriteDecision(
-            "draft_review",
-            ["candidate_kind_mismatch"],
-            _clamp_confidence(candidate.confidence),
-            True,
-            {"candidate_type": candidate.candidate_type},
-        )
-    if _clamp_confidence(candidate.confidence) < LOW_CONFIDENCE_DRAFT_THRESHOLD:
-        return WriteDecision(
-            "draft_review",
-            ["low_confidence_source_extraction"],
-            _clamp_confidence(candidate.confidence),
-            True,
-            {"candidate_type": candidate.candidate_type},
-        )
-    payload = candidate.proposed_payload or {}
-    return evaluate_write_candidate(
-        text=_candidate_payload_text(candidate),
+    return evaluate_extraction_candidate_write(
+        candidate,
         target="memory",
-        source_type=str(payload.get("source_type") or "source_extraction"),
-        derivation_type=str(payload.get("derivation_type") or SOURCE_EXTRACTION_DERIVATION_TYPE),
-        source_uri=str(candidate.source_uri or payload.get("source_uri") or ""),
-        derived_from=list(candidate.derived_from or payload.get("derived_from") or []),
-        confidence=candidate.confidence,
-        metadata={**payload, "candidate_type": candidate.candidate_type},
+        persisted_payload=persisted_payload,
+        low_confidence_threshold=LOW_CONFIDENCE_DRAFT_THRESHOLD,
     )
 
 

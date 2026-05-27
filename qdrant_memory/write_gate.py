@@ -10,6 +10,17 @@ from qdrant_memory.schema import clean_text_for_memory, score_importance
 WRITE_DECISIONS = {"store", "skip", "draft_review", "learning_candidate", "skill_candidate", "reject"}
 _DERIVED_TYPES = {"summary", "consolidation_summary", "proposal", "draft", "reconsolidation", "derived_memory"}
 _LEARNING_TARGETS = {"learning", "learnings", "procedural_learning"}
+_MEMORY_TARGETS = {"memory", "memories"}
+_CANDIDATE_KIND_TO_MEMORY_KIND = {
+    "preference_candidate": {"user_preference"},
+    "invariant_candidate": {"project_invariant"},
+    "risk_candidate": {"risk"},
+    "status_update_candidate": {"assertion"},
+    "assertion_candidate": {"assertion"},
+    "memory_candidate": {"decision", "tool_quirk", "workflow_lesson", "manual_fact", "source_chunk", "summary"},
+}
+_DRAFT_RISKS = {"high"}
+_REJECT_RISKS = {"critical", "forbidden"}
 
 
 @dataclass(frozen=True)
@@ -55,6 +66,86 @@ def _semantic_text_for_quality(text: str) -> str:
         if stripped:
             parts.append(stripped)
     return "\n".join(parts) or text
+
+
+def _candidate_payload(candidate: Any) -> dict[str, Any]:
+    payload = getattr(candidate, "proposed_payload", None)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _candidate_to_dict(candidate: Any) -> dict[str, Any]:
+    to_dict = getattr(candidate, "to_dict", None)
+    if callable(to_dict):
+        data = to_dict()
+        if isinstance(data, dict):
+            return data
+    return {
+        "candidate_id": getattr(candidate, "candidate_id", ""),
+        "candidate_type": getattr(candidate, "candidate_type", ""),
+        "source_uri": getattr(candidate, "source_uri", ""),
+        "locator": getattr(candidate, "locator", {}),
+        "derived_from": getattr(candidate, "derived_from", []),
+        "proposed_payload": _candidate_payload(candidate),
+        "reason": getattr(candidate, "reason", ""),
+        "confidence": getattr(candidate, "confidence", 0.0),
+        "risk": getattr(candidate, "risk", "unknown"),
+        "requires_review": getattr(candidate, "requires_review", True),
+        "created_at": getattr(candidate, "created_at", ""),
+    }
+
+
+def _candidate_payload_text(candidate: Any, payload: dict[str, Any] | None = None) -> str:
+    payload = payload if payload is not None else _candidate_payload(candidate)
+    return str(payload.get("text") or payload.get("claim_text") or "")
+
+
+def _source_uris_from_edges(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    uris: list[str] = []
+    for edge in value:
+        if isinstance(edge, dict):
+            source_uri = str(edge.get("source_uri") or "").strip()
+            if source_uri:
+                uris.append(source_uri)
+    return uris
+
+
+def _candidate_has_source_provenance(candidate: Any, payload: dict[str, Any]) -> bool:
+    source_uris = [
+        str(getattr(candidate, "source_uri", "") or "").strip(),
+        str(payload.get("source_uri") or "").strip(),
+    ]
+    candidate_edges = getattr(candidate, "derived_from", []) or []
+    payload_edges = payload.get("derived_from") or []
+    evidence = payload.get("evidence") or []
+    source_uris.extend(_source_uris_from_edges(candidate_edges))
+    source_uris.extend(_source_uris_from_edges(payload_edges))
+    source_uris.extend(_source_uris_from_edges(evidence))
+    has_source_uri = any(source_uris)
+    has_source_detail = bool(candidate_edges or payload_edges or evidence or getattr(candidate, "locator", None) or payload.get("locator"))
+    return has_source_uri and has_source_detail
+
+
+def _candidate_destination_valid(candidate_type: str, payload: dict[str, Any], target: str) -> bool:
+    normalized_target = str(target or "memory").strip().lower()
+    if normalized_target not in _MEMORY_TARGETS:
+        return False
+    for key in ("target", "destination", "collection", "collection_name"):
+        destination = str(payload.get(key) or "").strip().lower()
+        if destination and destination not in _MEMORY_TARGETS:
+            return False
+    if candidate_type == "ontology_suggestion":
+        return True
+    return candidate_type in _CANDIDATE_KIND_TO_MEMORY_KIND
+
+
+def _candidate_kind_valid(candidate_type: str, payload: dict[str, Any]) -> bool:
+    expected_kinds = _CANDIDATE_KIND_TO_MEMORY_KIND.get(candidate_type)
+    if expected_kinds is None:
+        return candidate_type == "ontology_suggestion"
+    memory_kind = str(payload.get("memory_kind") or "")
+    return memory_kind in expected_kinds
 
 
 def _decision(decision: str, reasons: list[str], *, confidence: float, requires_review: bool, metadata: dict[str, Any] | None = None) -> WriteDecision:
@@ -135,6 +226,110 @@ def evaluate_write_candidate(
         return _decision("learning_candidate", ["learning_candidate"], confidence=candidate_confidence, requires_review=True, metadata={"importance": importance})
 
     return _decision("store", ["storeable"], confidence=candidate_confidence, requires_review=False, metadata={"importance": importance})
+
+
+def evaluate_extraction_candidate_write(
+    candidate: Any,
+    *,
+    target: str = "memory",
+    persisted_payload: dict[str, Any] | None = None,
+    low_confidence_threshold: float = 0.65,
+) -> WriteDecision:
+    """Validate a source extraction candidate through the shared write gate.
+
+    This intentionally accepts ``Any`` so approval paths cannot bypass the gate by
+    constructing candidate-like objects outside ``extraction_candidates.py``.
+    """
+
+    payload = dict(persisted_payload or _candidate_payload(candidate))
+    candidate_type = str(getattr(candidate, "candidate_type", "") or "").strip()
+    candidate_risk = str(getattr(candidate, "risk", "unknown") or "unknown").strip().lower()
+    candidate_confidence = _clamp_confidence(getattr(candidate, "confidence", None), 0.0)
+    metadata = {
+        **payload,
+        "candidate_id": getattr(candidate, "candidate_id", ""),
+        "candidate_type": candidate_type,
+        "candidate_risk": candidate_risk,
+    }
+    candidate_payload = _candidate_to_dict(candidate)
+    if persisted_payload is not None:
+        candidate_payload = {**candidate_payload, "persisted_payload": payload}
+
+    if contains_secret(json.dumps(candidate_payload, sort_keys=True, default=str)) or _metadata_contains_secret(payload):
+        return _decision(
+            "reject",
+            ["possible_secret"],
+            confidence=1.0,
+            requires_review=True,
+            metadata={"candidate_type": candidate_type},
+        )
+    if not _candidate_destination_valid(candidate_type, payload, target):
+        return _decision(
+            "reject",
+            ["unsupported_destination"],
+            confidence=candidate_confidence,
+            requires_review=True,
+            metadata={"candidate_type": candidate_type},
+        )
+    if not _candidate_has_source_provenance(candidate, payload):
+        return _decision(
+            "reject",
+            ["missing_source_provenance"],
+            confidence=candidate_confidence,
+            requires_review=True,
+            metadata={"candidate_type": candidate_type},
+        )
+    if candidate_risk in _REJECT_RISKS:
+        return _decision(
+            "reject",
+            ["candidate_risk_too_high"],
+            confidence=candidate_confidence,
+            requires_review=True,
+            metadata={"candidate_type": candidate_type, "risk": candidate_risk},
+        )
+    if candidate_type == "ontology_suggestion":
+        return _decision(
+            "draft_review",
+            ["ontology_suggestion_review_only"],
+            confidence=candidate_confidence,
+            requires_review=True,
+            metadata={"candidate_type": candidate_type},
+        )
+    if not _candidate_kind_valid(candidate_type, payload):
+        return _decision(
+            "draft_review",
+            ["candidate_kind_mismatch"],
+            confidence=candidate_confidence,
+            requires_review=True,
+            metadata={"candidate_type": candidate_type},
+        )
+    if candidate_risk in _DRAFT_RISKS:
+        return _decision(
+            "draft_review",
+            ["candidate_risk_requires_review"],
+            confidence=candidate_confidence,
+            requires_review=True,
+            metadata={"candidate_type": candidate_type, "risk": candidate_risk},
+        )
+    if candidate_confidence < low_confidence_threshold:
+        return _decision(
+            "draft_review",
+            ["low_confidence_source_extraction"],
+            confidence=candidate_confidence,
+            requires_review=True,
+            metadata={"candidate_type": candidate_type},
+        )
+
+    return evaluate_write_candidate(
+        text=_candidate_payload_text(candidate, payload),
+        target=target,
+        source_type=str(payload.get("source_type") or "source_extraction"),
+        derivation_type=str(payload.get("derivation_type") or "source_extraction"),
+        source_uri=str(getattr(candidate, "source_uri", "") or payload.get("source_uri") or ""),
+        derived_from=list(getattr(candidate, "derived_from", None) or payload.get("derived_from") or []),
+        confidence=candidate_confidence,
+        metadata=metadata,
+    )
 
 
 def decision_to_json(decision: WriteDecision) -> str:

@@ -244,6 +244,7 @@ class QdrantMemoryProvider(MemoryProvider):
         self._write_enabled = True
         self._pending_learning_candidates: dict[str, LearningCandidate] = {}
         self._pending_extraction_candidates: dict[str, Any] = {}
+        self._reviewed_extraction_candidate_ids: set[str] = set()
 
     @property
     def name(self) -> str:
@@ -419,6 +420,7 @@ class QdrantMemoryProvider(MemoryProvider):
                 self._prefetch_cache.clear()
             self._pending_learning_candidates.clear()
             self._pending_extraction_candidates.clear()
+            self._reviewed_extraction_candidate_ids.clear()
 
     def _auto_learning_enabled(self) -> bool:
         return bool(self._config.get("learning_enabled", True)) and bool(self._config.get("learning_auto_extract_enabled", False))
@@ -1474,7 +1476,10 @@ class QdrantMemoryProvider(MemoryProvider):
             return _json_error(f"Learning approval failed: {exc}")
 
     def _tool_extraction_preview(self, args: dict) -> str:
-        return json.dumps(preview_source_extraction_candidates(list(self._pending_extraction_candidates.values())))
+        candidates = list(self._pending_extraction_candidates.values())
+        preview = preview_source_extraction_candidates(candidates)
+        self._reviewed_extraction_candidate_ids.update(str(candidate.candidate_id) for candidate in candidates)
+        return json.dumps(preview)
 
     def _source_extraction_approval_payload(self, candidate: Any) -> dict[str, Any]:
         payload = dict(candidate.proposed_payload or {})
@@ -1503,19 +1508,28 @@ class QdrantMemoryProvider(MemoryProvider):
         dry_run = parse_bool_arg(args.get("dry_run"), default=True)
         approve = parse_bool_arg(args.get("approve"), default=False)
         write_decision = evaluate_source_extraction_candidate(candidate)
+        proposal_payload: dict[str, Any] = {}
+        if write_decision.decision == "draft_review":
+            _, proposal, _ = build_source_extraction_proposal(candidate, write_decision)
+            proposal_payload["proposal_id"] = proposal["proposal_id"]
         base = {
             "candidate": candidate.to_dict(),
             "write_decision": write_decision.to_dict(),
             "would_store": write_decision.decision == "store",
             "would_create_proposal": write_decision.decision == "draft_review",
             "collection_name": self._config["collection_name"],
+            **proposal_payload,
         }
         if dry_run:
+            self._reviewed_extraction_candidate_ids.add(candidate_id)
             return json.dumps({"dry_run": True, "saved": False, "proposal_created": False, **base})
         if not approve:
             return _json_error("approve=true is required when dry_run=false")
+        if candidate_id not in self._reviewed_extraction_candidate_ids:
+            return _json_error("dry-run preview is required before live extraction approval")
         if write_decision.decision == "reject":
-            return _json_error("write gate rejected extraction candidate")
+            reasons = ", ".join(write_decision.reasons)
+            return _json_error(f"write gate rejected extraction candidate: {reasons}")
         if write_decision.decision == "draft_review":
             report, proposal, points = build_source_extraction_proposal(candidate, write_decision)
             draft = write_proposal_draft(
@@ -1527,6 +1541,7 @@ class QdrantMemoryProvider(MemoryProvider):
                 write_decision=write_decision,
             )
             self._pending_extraction_candidates.pop(candidate_id, None)
+            self._reviewed_extraction_candidate_ids.discard(candidate_id)
             draft_path = str(draft["path"])
             return json.dumps(
                 {
@@ -1544,11 +1559,55 @@ class QdrantMemoryProvider(MemoryProvider):
             return _json_error("Qdrant memory provider is not initialized")
         try:
             payload = self._source_extraction_approval_payload(candidate)
+            persisted_decision = evaluate_source_extraction_candidate(candidate, persisted_payload=payload)
+            persisted_base = {
+                **base,
+                "write_decision": persisted_decision.to_dict(),
+                "would_store": persisted_decision.decision == "store",
+                "would_create_proposal": persisted_decision.decision == "draft_review",
+            }
+            if persisted_decision.decision == "reject":
+                reasons = ", ".join(persisted_decision.reasons)
+                return _json_error(f"write gate rejected extraction candidate: {reasons}")
+            if persisted_decision.decision == "draft_review":
+                report, proposal, points = build_source_extraction_proposal(candidate, persisted_decision)
+                draft = write_proposal_draft(
+                    report=report,
+                    proposal=proposal,
+                    points=points,
+                    hermes_home=self._hermes_home,
+                    config=self._config,
+                    write_decision=persisted_decision,
+                )
+                self._pending_extraction_candidates.pop(candidate_id, None)
+                self._reviewed_extraction_candidate_ids.discard(candidate_id)
+                draft_path = str(draft["path"])
+                return json.dumps(
+                    {
+                        "dry_run": False,
+                        "saved": False,
+                        "proposal_created": True,
+                        "proposal_draft_path": draft_path,
+                        "proposal_id": proposal["proposal_id"],
+                        **persisted_base,
+                    }
+                )
+            if persisted_decision.decision != "store":
+                return _json_error("extraction candidate requires manual review before storing")
             text = str(payload.get("text") or payload.get("claim_text") or "")
             vector = self._embeddings.embed_document(text)
             self._qdrant.upsert(self._config["collection_name"], [{"id": candidate.candidate_id, "vector": vector, "payload": payload}])
             self._pending_extraction_candidates.pop(candidate_id, None)
-            return json.dumps({"dry_run": False, "saved": True, "proposal_created": False, "id": candidate.candidate_id, **base})
+            self._reviewed_extraction_candidate_ids.discard(candidate_id)
+            return json.dumps(
+                {
+                    "dry_run": False,
+                    "saved": True,
+                    "proposal_created": False,
+                    "id": candidate.candidate_id,
+                    **persisted_base,
+                }
+            )
         except Exception as exc:
             return _json_error(f"Extraction approval failed: {exc}")
 
