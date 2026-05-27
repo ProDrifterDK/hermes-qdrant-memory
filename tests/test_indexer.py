@@ -164,6 +164,7 @@ def test_prepare_file_records_source_derivation_metadata_for_markdown_chunks(tmp
     assert details_payload["locator"] == {"line_start": 4, "line_end": 6, "heading": "Details"}
     assert intro_payload["content_hash"] == f"sha256:{chunks_by_heading['Intro'].chunk_hash}"
     datetime.fromisoformat(intro_payload["source_modified_at"].replace("Z", "+00:00"))
+    assert intro_payload["memory_kind"] == "source_chunk"
     assert intro_payload["derivation_type"] == "indexed_chunk"
     assert intro_payload["canonical"] is True
     assert intro_payload["stale"] is False

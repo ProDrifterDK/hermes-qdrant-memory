@@ -105,6 +105,7 @@ class FileChunk:
             session_id=session_id,
             project_path=project_path,
             model=model,
+            memory_kind="source_chunk",
             fact_metadata=fact_metadata,
             source_uri=self.source_uri or file_uri(self.file_path),
             locator=locator,

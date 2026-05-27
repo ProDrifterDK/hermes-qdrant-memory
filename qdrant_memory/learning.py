@@ -115,6 +115,7 @@ def build_learning_payload(
         session_id=session_id,
         project_path=project_path,
         model=model,
+        memory_kind="learning",
         fact_metadata=fact_metadata,
     )
     payload.update(

@@ -96,6 +96,7 @@ def test_build_learning_payload_has_procedural_fields_and_source_type():
     )
     assert payload["source_type"] == "learning"
     assert payload["chunk_type"] == "environment_quirk"
+    assert payload["memory_kind"] == "learning"
     assert payload["learning_type"] == "environment_quirk"
     assert payload["trigger"] == "pytest not found"
     assert payload["mistake"] == "ran pytest from system shell"

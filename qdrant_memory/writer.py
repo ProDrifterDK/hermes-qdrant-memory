@@ -9,6 +9,17 @@ from .schema import build_payload, clean_text_for_memory, make_point_id, score_i
 def strip_injected_context(text: str) -> str:
     return clean_text_for_memory(text)
 
+
+def _memory_kind_for_payload(source_type: str, chunk_type: str) -> str | None:
+    source_type = str(source_type or "").strip()
+    chunk_type = str(chunk_type or "").strip()
+    if source_type == "manual" and chunk_type == "fact":
+        return "manual_fact"
+    if source_type == "conversation" and chunk_type == "turn":
+        return "conversation_turn"
+    return None
+
+
 class ConversationWriter:
     def __init__(
         self,
@@ -71,6 +82,7 @@ class ConversationWriter:
             session_id=self.session_id,
             project_path=self.project_path,
             model=self.model,
+            memory_kind=_memory_kind_for_payload(source_type, chunk_type),
             fact_metadata=fact_metadata,
         )
         return {"id": point_id, "text": clean, "payload": payload}

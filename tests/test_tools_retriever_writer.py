@@ -140,6 +140,7 @@ def test_writer_stores_completed_turn_with_fake_clients():
     payload = q.points[0]["payload"]
     assert payload["source_type"] == "conversation"
     assert payload["chunk_type"] == "turn"
+    assert payload["memory_kind"] == "conversation_turn"
     assert "User: User asks about alpha" in payload["text"]
     assert "fact_key" not in payload
 
@@ -154,6 +155,7 @@ def test_writer_store_text_adds_fact_metadata_for_explicit_manual_fact():
     assert point_id
     payload = q.points[0]["payload"]
     assert payload["subject"] == "TeamForge MCP binary"
+    assert payload["memory_kind"] == "manual_fact"
     assert payload["fact_key"] == "teamforge.mcp.binary"
     assert payload["reconsolidation_key"] == "teamforge.mcp.binary"
 
@@ -169,9 +171,18 @@ def test_writer_preview_text_does_not_embed_or_upsert():
     assert preview["text"] == "TeamForge MCP binary is teamforge-mcp"
     assert preview["payload"]["importance"] == 6
     assert preview["payload"]["tags"] == ["ops"]
+    assert preview["payload"]["memory_kind"] == "manual_fact"
     assert preview["payload"]["fact_key"] == "teamforge.mcp.binary"
     assert emb.documents == []
     assert q.points == []
+
+
+def test_writer_preview_text_omits_memory_kind_for_unknown_source_chunk_type():
+    writer = ConversationWriter(qdrant=FakeQdrant(), embeddings=FakeEmbedding(), collection_name="test_collection")
+
+    preview = writer.preview_text("External notes mention the backup window.", source_type="external", chunk_type="note")
+
+    assert "memory_kind" not in preview["payload"]
 
 
 def test_writer_find_semantic_duplicate_uses_memory_collection_without_upsert():
