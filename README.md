@@ -8,7 +8,7 @@ This plugin turns Hermes memory into an external associative substrate: conversa
 
 ## Status
 
-Public beta / experimental. Current published release: `v0.8.0 Public Beta`. The plugin is functional and tested, but it depends on external Qdrant and embedding services. Learning, origin-time fact metadata, sleep consolidation, guarded-auto low-risk watcher apply, manual-review reconsolidation, native Hermes CLI commands with human-readable defaults, backup/export/restore recovery primitives, watcher lifecycle commands, env-gated live integration tests, manual-store dry-run/duplicate-preview flows, filtered search ergonomics, and read-only inspection helpers are implemented with conservative gates. Automatic fact reconsolidation remains disabled by design.
+Public beta / experimental. Current published release: `v0.9.0 Public Beta`. The plugin is functional and tested, but it depends on external Qdrant and embedding services. Learning, source derivation/progressive disclosure, assertion-lite payloads, temporal fact metadata, sleep consolidation, guarded-auto low-risk watcher apply, manual-review reconsolidation, source-first extraction candidates, read-only recall recipes/context templates, provenance-aware ranking, ontology suggestion proposals, native Hermes CLI commands with human-readable defaults, backup/export/restore recovery primitives, watcher lifecycle commands, env-gated live integration tests, manual-store dry-run/duplicate-preview flows, filtered search ergonomics, and read-only inspection helpers are implemented with conservative gates. Automatic fact reconsolidation, ontology mutation, and canonical assertion promotion remain disabled by design.
 
 ## What it does
 
@@ -20,7 +20,8 @@ Public beta / experimental. Current published release: `v0.8.0 Public Beta`. The
 - Provides explicit tools for status, search, store, indexing, and safe deletion.
 - Can index Markdown and text notes/directories with dry-run first.
 - Preserves provenance fields such as `source_type`, `file_path`, `heading`, `session_id`, `profile_id`, and timestamps.
-- Adds conservative origin-time fact metadata (`fact_key`, `reconsolidation_key`, `subject`, `topic`, `entity`) when explicit tags or clear fact statements make the key safe enough for later reconsolidation review.
+- Adds source derivation and progressive-disclosure fields so operators can inspect where a memory came from before trusting it.
+- Adds conservative origin-time and temporal fact metadata (`memory_kind`, `fact_key`, `reconsolidation_key`, `subject`, `topic`, `entity`, `fact_status`, validity windows, and supersession links) when explicit tags or clear fact statements make the key safe enough for later review.
 
 ## What it does not do
 
@@ -50,9 +51,15 @@ Public beta / experimental. Current published release: `v0.8.0 Public Beta`. The
 | Legacy force reindex by `file_path` fallback | Implemented |
 | Safe forget by explicit point IDs | Implemented |
 | Manual procedural learning collection | Implemented |
-| Origin-time fact metadata | Implemented conservatively from explicit tags, clear fact statements, file headings, and structured learning context |
+| Origin-time and temporal fact metadata | Implemented conservatively from explicit tags, clear fact statements, file headings, and structured learning context; deprecated/superseded facts hidden by default unless history/review is requested |
+| Source derivation / progressive disclosure | Implemented for file/session/memory provenance with inspect, trace, expand, source-status, and compact disclosure surfaces |
+| Assertion-lite payloads | Implemented as source-backed optional payloads; extracted assertions remain `canonical=false` and `requires_review=true` |
+| Source-first extraction candidates | Implemented with preview-first pending candidates, exact-ID approval, full-payload write-gate validation, and draft-only unsafe routes |
+| Recall recipes / context templates | Implemented as read-only retrieval plans via `qdrant_memory_context` and `hermes qdrant context` |
+| Provenance-aware ranking | Implemented with auditable raw vector scores plus transparent provenance/status/review-history boosts and penalties |
+| Ontology suggestions | Implemented as review/draft artifacts only; no self-modifying ontology |
 | Sleep consolidation | M11 guarded-auto watcher policy implemented: report persistence plus preauthorized low-risk apply for heading noise, exact duplicate merges, stale quarantine, and learning-to-skill drafts |
-| Reconsolidation | M10 report-only conflict candidates + local review drafts implemented; no automatic fact rewrites |
+| Reconsolidation | M10 + fact-conflict proposals create local review drafts; no automatic fact rewrites |
 | Native Hermes CLI beta | Implemented for active memory provider (`hermes qdrant ...`) with human-readable defaults, stable `--json`, CLI parity, recovery commands, read-only inspection helpers, filtered search ergonomics, and watcher lifecycle management |
 | Backup/export/restore recovery | Implemented with private local artifacts, dry-run restore default, live approval gate, and automatic pre-restore backup |
 | CLI inspection/ergonomics | Implemented for exact point lookup, persisted report listing/showing, proposal inspection, and read-only search filters without widening mutation authority |
@@ -255,12 +262,12 @@ cd ~/.hermes/plugins/memory/qdrant
 git pull --ff-only origin main
 ```
 
-Use the published `v0.8.0` tag instead of `main` when you want a stable beta snapshot:
+Use the published `v0.9.0` tag instead of `main` when you want a stable beta snapshot:
 
 ```bash
 cd ~/.hermes/plugins/memory/qdrant
 git fetch --tags origin
-git checkout v0.8.0
+git checkout v0.9.0
 ```
 
 Rollback plugin code:

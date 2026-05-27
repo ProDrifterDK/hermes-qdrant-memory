@@ -12,11 +12,11 @@
 
 ## 1. Current state
 
-The project is published as `v0.8.0 Public Beta` and is functional as a Hermes Qdrant-backed memory provider. The latest release URL is:
+The project is published as `v0.9.0 Public Beta` and is functional as a Hermes Qdrant-backed memory provider. The latest release URL is:
 
-- <https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.8.0>
+- <https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.9.0>
 
-Implemented capabilities through v0.8.0:
+Implemented capabilities through v0.9.0:
 
 - Hermes `MemoryProvider` subclass: `QdrantMemoryProvider`.
 - Plugin registration through `register(ctx)`.
@@ -39,6 +39,13 @@ Implemented capabilities through v0.8.0:
 - Human-readable default CLI output with `--json` as the stable machine-readable mode, documented in `docs/CLI_OUTPUT_CONTRACT.md`.
 - Read-only CLI inspection helpers for exact point lookup, persisted report listing/showing, and proposal inspection.
 - Read-only search filters for memory and learning search by tag, source, file path, project path, creation date range, and collection routing.
+- Source derivation and progressive disclosure fields with resolver-backed inspect/trace/expand/source-status surfaces.
+- Assertion-lite payloads and temporal fact metadata with review-oriented `fact_status` and explicit supersession links.
+- Fact conflict, supersession, and status-update proposal drafts with identity/secret redaction.
+- Generic extraction candidates and source-first preview/approval flow through the shared write gate.
+- Recall recipe catalog and read-only context templates through `qdrant_memory_context` and `hermes qdrant context`.
+- Provenance-aware ranking policy with auditable vector score and transparent boost/penalty debug fields.
+- Ontology suggestion proposals as draft artifacts only; no automatic schema mutation.
 - GitHub Actions test workflow with pytest, compileall, and scanner guard.
 - Release documentation: `CHANGELOG.md`, `RELEASE_NOTES.md`, install/update/remove/rollback notes.
 
@@ -60,6 +67,7 @@ Post-release validation status:
 - v0.7.0 release preparation covered read-only search filters; post-tag consumer smoke passed before v0.8.0 release preparation.
 - v0.8.0 release preparation covers watcher lifecycle commands, env-gated live integration tests, and manual-store dry-run/duplicate preview; consumer smoke passed before tagging.
 - v0.8.0 post-release compatibility smoke confirmed category-only install does not work yet: `hermes memory status` reports `Plugin: NOT installed` and `hermes qdrant --help` is unavailable until the flat `plugins/qdrant` symlink exists.
+- v0.9.0 release preparation covers source derivation/progressive disclosure, temporal assertion metadata, generic source extraction candidates, context templates, provenance-aware ranking, ontology suggestion proposals, and the full persisted-payload write-gate fix.
 
 ---
 
@@ -897,7 +905,7 @@ gh run list --repo ProDrifterDK/hermes-qdrant-memory --limit 5
 
 The plugin is ready to call “formal Hermes plugin beta” when:
 
-Status after v0.8.0: release smoke and category-path discovery verification are complete. The public install path intentionally keeps the flat compatibility symlink. A Hermes core change should wait until plugin adoption creates a strong reason to upstream native category-path memory-provider discovery.
+Status for v0.9.0 release preparation: local verification covers source derivation/progressive disclosure, context templates, provenance-aware ranking, and review-only ontology suggestions without changing the public install path or widening mutation authority. Prior release smoke and category-path discovery verification remain valid for the install model. The public install path intentionally keeps the flat compatibility symlink. A Hermes core change should wait until plugin adoption creates a strong reason to upstream native category-path memory-provider discovery.
 
 - README documents preferred install path and compatibility symlink.
 - Install, update, remove, and rollback docs exist for both preferred category path and current compatibility path.
@@ -932,6 +940,10 @@ Status after v0.8.0: release smoke and category-path discovery verification are 
 | Publish v0.3.0 as prerelease | Accepted | CLI parity was useful enough for public beta while backup/export and doctor diagnostics remained follow-up work. |
 | Publish v0.4.0 as prerelease | Accepted | Backup/export/restore recovery primitives passed real install smoke and are substantial enough for a new beta release. |
 | Publish v0.5.0 as prerelease | Accepted | CLI output contract makes the operator surface human-friendly by default while preserving stable `--json` automation output. |
+| Publish v0.6.0 as prerelease | Accepted | Read-only point/report/proposal inspection improved operator review without adding mutation authority. |
+| Publish v0.7.0 as prerelease | Accepted | Search filters improved recall ergonomics while remaining read-only narrowing controls. |
+| Publish v0.8.0 as prerelease | Accepted | Watcher lifecycle commands, integration confidence, and dry-run-first manual store previews justified a new beta snapshot. |
+| Publish v0.9.0 as prerelease | Accepted | Source derivation, temporal assertion metadata, context templates, ranking, and write-gate hardening form a coherent provenance release while keeping mutation gates conservative. |
 
 ---
 

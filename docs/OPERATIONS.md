@@ -185,7 +185,7 @@ For current release validation, verify the installed plugin as a user would run 
 ```bash
 cd ~/.hermes/plugins/memory/qdrant
 git fetch --tags origin
-git checkout v0.8.0
+git checkout v0.9.0
 hermes qdrant config show
 hermes qdrant config show --json
 hermes qdrant status

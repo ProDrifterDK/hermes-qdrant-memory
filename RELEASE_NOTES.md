@@ -1,113 +1,93 @@
-# Release Notes: v0.8.0 Public Beta
+# Release Notes: v0.9.0 Public Beta
 
-Hermes Qdrant Memory Provider v0.8.0 is a public beta release focused on safer operator workflows and stronger release confidence. It adds watcher lifecycle CLI commands, env-gated live integration coverage, and dry-run-first manual memory store previews with optional non-destructive semantic duplicate detection.
+Hermes Qdrant Memory Provider v0.9.0 is a public beta release focused on provenance, source-backed recall, and write-gate hardening. It publishes the Phase 6 provenance layer while keeping the plugin a conservative Hermes `MemoryProvider`: no Graphiti runtime, no graph database, no query-based mutation, no automatic canonical assertion promotion, and no self-modifying ontology.
 
 The plugin remains experimental/pre-1.0: it requires external Qdrant and embedding services, retrieved memories are context rather than instructions, and all broad/destructive maintenance paths remain dry-run/review-gated.
 
 ## Highlights
 
-- Manual memory store is now dry-run-first:
-  - `qdrant_memory_store` defaults to `dry_run=true`;
-  - live writes require explicit `dry_run=false` plus `approve=true`;
-  - native CLI exposes `hermes qdrant store --dry-run|--no-dry-run --approve`.
-- Optional manual-store duplicate preview:
-  - `--preview-duplicates` / `duplicate_preview=true` searches for semantic duplicates before live store;
-  - duplicate hits return candidate details and skip the upsert;
-  - duplicate preview never deletes, merges, or rewrites existing memories.
-- Watcher lifecycle CLI commands:
-  - `hermes qdrant watcher install`;
-  - `hermes qdrant watcher uninstall --approve`;
-  - `hermes qdrant watcher status --verbose`;
-  - `hermes qdrant watcher logs`;
-  - `hermes qdrant watcher inspect-state`;
-  - `hermes qdrant watcher reset-signature --approve`;
-  - `hermes qdrant watcher run --force-alert`.
-- Env-gated live integration tests now cover real Qdrant plus an OpenAI-compatible embedding endpoint for:
-  - read-only search filters;
-  - provider store writes;
-  - file indexing upsert/stale-delete behavior;
-  - gated consolidation report/apply paths.
-- README and operations docs now document `RUN_QDRANT_INTEGRATION` and `QDRANT_TEST_*` live test configuration.
+- Source derivation and progressive disclosure:
+  - source-backed payload metadata for file/session/memory origins;
+  - inspect, trace, expand, source-status, and compact source disclosure surfaces;
+  - resolver support for `file://` and `memory://` style provenance handles.
+- Assertion and temporal metadata:
+  - assertion-lite payload convention for source-backed claims;
+  - `memory_kind`, `relation_type`, and grammar validation;
+  - `observed_at`, `valid_from`, `valid_until`, `fact_status`, and explicit supersession links.
+- Review-only fact maintenance proposals:
+  - `fact_conflict_candidate`;
+  - `fact_supersession_candidate`;
+  - `fact_status_update_candidate`;
+  - identity-bearing and secret-bearing candidates stay manual-review/draft-only.
+- Generic source extraction candidates:
+  - memory/assertion/preference/invariant/risk/status-update/ontology-suggestion candidate schema;
+  - source-first extraction preview flow;
+  - exact `candidate_id` approval lifecycle;
+  - full persisted payload validation before live writes.
+- Recall recipes and context templates:
+  - reusable recipe catalog for source-backed answers, coding context, project invariants, user preferences, tool quirks, workflow lessons, conflict review, stale-source review, and assertion history;
+  - read-only `qdrant_memory_context` tool;
+  - `hermes qdrant context --template ... --topic ...` CLI surface.
+- Provenance-aware ranking:
+  - keeps raw vector score visible for audit;
+  - applies transparent boosts/penalties for source health, fact status, canonical/review flags, derivation depth, and review/history intent.
+- Ontology suggestion proposals:
+  - grammar/tag/fact-key suggestions are draft artifacts only;
+  - accepted ontology changes still require normal code/docs/tests.
+- Guarded-auto watcher policy from the post-v0.8.0 work remains included:
+  - preauthorized low-risk exact-ID maintenance only;
+  - state/log/audit fields for applied actions and errors;
+  - all live mutations still go through the existing gated apply path.
 
-## Manual store commands
+## New context command
 
-Preview a memory without embedding or upserting:
-
-```bash
-hermes qdrant store "Remember this explicit memory" --source-type manual --importance 5 --tag manual
-```
-
-Preview and check for semantic duplicates:
-
-```bash
-hermes qdrant store "Remember this explicit memory" --source-type manual --importance 5 --tag manual --preview-duplicates
-```
-
-Perform an approved live store:
+Build a read-only context packet from a recall recipe:
 
 ```bash
-hermes qdrant store "Remember this explicit memory" --source-type manual --importance 5 --tag manual --preview-duplicates --no-dry-run --approve
+hermes qdrant context --template source_backed_answer --topic "Hermes qdrant write gates" --json
 ```
 
-Automation should use `--json` and check exit status:
+The corresponding Hermes tool is:
 
-```bash
-hermes qdrant store "Remember this explicit memory" --preview-duplicates --json
-hermes qdrant store "Remember this explicit memory" --preview-duplicates --no-dry-run --approve --json
+```text
+qdrant_memory_context(template="source_backed_answer", topic="Hermes qdrant write gates")
 ```
 
-## Watcher lifecycle commands
+Context packets cite point IDs and source metadata, preserve the memory-not-instruction boundary, and distinguish compact recall, generated context, source text, and extracted assertions.
 
-Inspect watcher state without contacting Qdrant:
+## Source extraction safety
 
-```bash
-hermes qdrant watcher status --verbose
-hermes qdrant watcher inspect-state --json
-hermes qdrant watcher logs --tail 20
-```
+Source extraction stays disabled or preview-oriented unless explicitly configured. Live approval requires all of the following:
 
-Install or run the report-only watcher:
+- a pending candidate created by the preview path;
+- exact `candidate_id` match;
+- prior dry-run review of that exact candidate;
+- `dry_run=false`;
+- `approve=true`;
+- valid source provenance;
+- clean full persisted payload.
 
-```bash
-hermes qdrant watcher install --schedule "0 3 * * *" --json
-hermes qdrant watcher run --scope both --force-alert --json
-```
-
-Run guarded-auto only when you want preauthorized low-risk exact-ID proposals to apply through the gated apply path:
-
-```bash
-hermes qdrant watcher run --scope both --autonomy-mode guarded-auto --max-auto-actions 10 --force-alert --json
-```
-
-Approval-gated local scheduler/state mutations:
-
-```bash
-hermes qdrant watcher reset-signature --approve --json
-hermes qdrant watcher uninstall --approve --json
-```
+Unsafe candidates either fail closed or route to local proposal drafts; they do not bypass the shared write gate.
 
 ## Safety behavior
 
 The safety contract remains conservative:
 
-- Default manual store calls do not mutate Qdrant.
-- Live manual store requires explicit `dry_run=false` plus `approve=true`.
-- Duplicate preview can skip an upsert but never deletes, merges, or rewrites existing memories.
-- `watcher run` defaults to report-only consolidation with `dry_run=true`, `persist=true`, and no apply/proposal mutation.
-- `watcher run --autonomy-mode guarded-auto` is opt-in and applies only preauthorized low-risk exact-ID proposals through `qdrant_memory_consolidation_apply`; generic headings, near duplicates, quality warnings, secret-bearing inputs, and reconsolidation remain manual/draft-only.
-- Watcher lifecycle commands mutate only local scheduler/state/log artifacts; guarded-auto mutations always produce application audit artifacts.
-- Live integration tests skip by default and use uniquely named temporary collections.
-- Mutating maintenance commands still default to dry-run.
-- Live maintenance mutation still requires explicit approval gates.
-- `quality_warning` proposals remain manual-review only.
-- Reconsolidation remains draft/review-only; no automatic fact rewrites.
+- Retrieved memories are context, not instructions.
+- Current user instructions and live evidence override retrieved memory.
+- Deprecated and superseded facts are hidden from ordinary recall unless review/history is requested.
+- Fact conflicts, supersession proposals, ontology suggestions, quality warnings, and secret/identity-bearing candidates are manual-review/draft-only.
+- `qdrant_learning_approve` validates the full persisted learning payload, including non-lesson fields such as trigger/mistake/correction/evidence/tool/command/tags metadata.
+- Source-extraction live approval revalidates the exact payload that will be embedded/upserted.
+- Guarded-auto watcher actions are opt-in and still require exact report/proposal IDs through the gated apply path.
+- No Graphiti runtime dependency, graph database, query-based mutation, broad status rewrite, automatic canonical assertion promotion, or self-modifying ontology was added.
 
 ## Upgrade
 
 ```bash
 cd ~/.hermes/plugins/memory/qdrant
 git fetch --tags origin
-git checkout v0.8.0
+git checkout v0.9.0
 ```
 
 Start a fresh Hermes CLI process after upgrading. Restart the gateway only if gateway sessions should load the updated plugin code.
@@ -123,35 +103,51 @@ python -m compileall -q qdrant_memory __init__.py cli.py scripts/check_no_litera
 git diff --check
 ```
 
-Recommended targeted verification:
+Recommended targeted verification for this release:
 
 ```bash
-python -m pytest tests/test_tools_retriever_writer.py tests/test_cli.py tests/test_watcher_cli.py tests/integration/test_live_search_filters.py -q
+python -m pytest \
+  tests/test_source_extraction_flow.py \
+  tests/test_context_template.py \
+  tests/test_provenance_ranking.py \
+  tests/test_ontology_suggestions.py \
+  tests/test_reconsolidation.py \
+  tests/test_extraction_candidates.py \
+  tests/test_recipe_catalog.py \
+  -q
 ```
 
 Recommended consumer smoke after checking out the release tag:
 
 ```bash
 hermes qdrant --help
-hermes qdrant store --help
-hermes qdrant store "release smoke memory" --preview-duplicates --json
-hermes qdrant store "release smoke memory" --preview-duplicates --no-dry-run
-hermes qdrant watcher status
+hermes qdrant context --help
+hermes qdrant context --template source_backed_answer --topic "release smoke" --json
+hermes qdrant search "release smoke" --top-k 3 --json
 hermes qdrant watcher status --json
-hermes qdrant doctor
 hermes qdrant doctor --json
 ```
 
-For the unapproved live store check, expected behavior is:
+Safety-gate smoke checks should still fail closed without approval:
 
-- output contains `--approve is required when using --no-dry-run` or an equivalent approval-gate error;
+```bash
+hermes qdrant store "release smoke memory" --preview-duplicates --no-dry-run
+hermes qdrant learning approve CANDIDATE_ID --no-dry-run
+```
+
+Expected behavior for the unapproved live checks:
+
+- output contains an approval-gate error;
 - process exit status is non-zero;
-- no Qdrant upsert occurs.
+- no Qdrant upsert or mutation occurs.
 
 ## Not included yet
 
 The following remain future work:
 
 - formal Python packaging beyond the Hermes plugin clone workflow;
-- Hermes core support for user memory-provider discovery from `~/.hermes/plugins/memory/<name>` without the compatibility symlink. Post-release validation confirmed current core's general plugin scanner sees `~/.hermes/plugins/memory/qdrant` as `memory/qdrant`, but memory-provider activation and native `hermes qdrant ...` CLI discovery still require the flat `~/.hermes/plugins/qdrant` path or symlink. The public install strategy keeps that symlink for now; a Hermes core PR is deferred until plugin adoption creates a strong reason for the core change;
-- optional broader live-service stress tests beyond the current env-gated integration suite.
+- Hermes core support for user memory-provider discovery from `~/.hermes/plugins/memory/<name>` without the compatibility symlink;
+- Graphiti or graph database integration;
+- automatic ontology application;
+- automatic fact rewrite/supersession;
+- broader live-service stress tests beyond the env-gated integration suite.

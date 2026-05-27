@@ -6,20 +6,42 @@ This project is currently public beta / experimental. The format follows Keep a 
 
 ## [Unreleased]
 
+_No changes yet._
+
+## [0.9.0]
+
+Ninth public beta release of the Hermes Qdrant Memory Provider. This release completes the Phase 3/4 source-derivation write-gate blocker and publishes the Phase 6 provenance layer: temporal assertion metadata, generic source-backed extraction candidates, read-only recall recipes/context templates, provenance-aware ranking, and ontology suggestion proposals. It also carries forward guarded-auto watcher policy work while preserving the plugin's no-Graphiti, no-graph-database, dry-run-first mutation boundary.
+
 ### Added
 
-- Implemented watcher `--autonomy-mode guarded-auto` for preauthorized low-risk exact-ID maintenance: known heading-noise cleanup, exact-normalized duplicate merge, stale-low-value quarantine, and learning-to-skill draft artifacts.
-- Added guarded-auto policy controls for max actions and quarantine days, plus state/log fields for applied action and error counts.
+- Plugin metadata version bumped to `0.9.0`.
+- Source derivation and progressive disclosure payloads for source-backed memory, including compact source metadata, resolver-backed inspect/trace/expand surfaces, memory grammar validation, and assertion-lite fields.
+- Temporal validity metadata for assertions and source-backed facts: `observed_at`, `valid_from`, `valid_until`, `fact_status`, `supersedes`, `superseded_by`, and `invalidated_by`.
+- Fact conflict, supersession, and status-update proposal types as local review/draft artifacts.
+- Generic extraction candidate schema for memory, assertion, preference, invariant, risk, status-update, and ontology-suggestion candidates.
+- Source-first extraction preview/approval flow with pending exact candidate IDs and shared write-gate validation.
+- Recall recipe catalog and the read-only `qdrant_memory_context` tool / `hermes qdrant context` CLI for provenance-explicit context packets.
+- Provenance-aware ranking policy that keeps raw vector scores auditable while applying transparent boosts and penalties for provenance, fact status, source health, derivation depth, and review/history queries.
+- Ontology suggestion proposals for grammar/tag/fact-key improvements without schema self-modification.
+- Watcher `--autonomy-mode guarded-auto` for preauthorized low-risk exact-ID maintenance: known heading-noise cleanup, exact-normalized duplicate merge, stale-low-value quarantine, and learning-to-skill draft artifacts.
+- Guarded-auto policy controls for max actions and quarantine days, plus state/log fields for applied action and error counts.
 
 ### Safety
 
+- `qdrant_learning_approve` and source-extraction approval gates now validate the full persisted payload, not only the display/lesson text, before any live write.
+- Source extraction live approval requires prior dry-run preview, exact `candidate_id`, `dry_run=false`, and `approve=true`; unsafe candidates route to proposal drafts or fail closed.
+- Missing provenance and secret-bearing persisted fields are refused before embedding/upsert.
+- Deprecated and superseded facts are hidden from normal search by default, while inspect/trace/context review paths can include history explicitly.
+- Identity-bearing fact conflicts redact snippets across response/report/draft surfaces and remain high-risk manual review.
 - Guarded-auto still routes every live mutation through `qdrant_memory_consolidation_apply` with exact `report_id`, exact `proposal_id`, `dry_run=false`, and `approve=true`.
-- Generic short markdown headings, near-duplicate clusters, secret-bearing inputs, `quality_warning`, and reconsolidation/fact-conflict proposals remain manual-review/draft-only.
+- Generic short markdown headings, near-duplicate clusters, secret-bearing inputs, `quality_warning`, reconsolidation candidates, fact-conflict proposals, and ontology suggestions remain manual-review/draft-only.
+- No Graphiti runtime dependency, graph database, query-based mutation, automatic canonical assertion promotion, broad status rewrite, or self-modifying ontology was added.
 
 ### Documentation
 
 - Documented the Hermes core discovery result for category-path installs: current Hermes discovers `~/.hermes/plugins/memory/qdrant` in the general plugin list as `memory/qdrant`, but memory-provider activation and native `hermes qdrant ...` CLI discovery still require the flat `~/.hermes/plugins/qdrant` compatibility path or symlink.
 - Clarified the public distribution strategy: install the plugin under `~/.hermes/plugins/memory/qdrant` and expose it through the `~/.hermes/plugins/qdrant` compatibility symlink; defer Hermes core discovery changes until real adoption justifies a core PR.
+- Added `docs/SOURCE_DERIVATIONS_BACKLOG.md` as the provenance/assertion backlog and design guardrail for future temporal/assertion work.
 
 ## [0.8.0]
 
@@ -235,6 +257,7 @@ Second public beta release of the Hermes Qdrant Memory Provider.
 
 Initial public beta tag. The v0.1.0 tag predates the learning, consolidation, reconsolidation, scanner guard, and native CLI MVP work documented in later releases.
 
+[0.9.0]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.9.0
 [0.8.0]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.8.0
 [0.7.0]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.7.0
 [0.6.0]: https://github.com/ProDrifterDK/hermes-qdrant-memory/releases/tag/v0.6.0
