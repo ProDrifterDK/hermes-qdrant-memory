@@ -50,6 +50,7 @@ _PROFILE_MEMORY_SOURCE_TYPES = {
 }
 _PROFILE_TARGETS = {"profile", "user"}
 _FACT_METADATA_KEYS = ("entity", "fact_key", "reconsolidation_key", "subject")
+_TERMINAL_FACT_STATUSES = {"deprecated", "superseded"}
 
 
 def _point_requires_manual_review(point: ConsolidationPoint) -> bool:
@@ -59,6 +60,76 @@ def _point_requires_manual_review(point: ConsolidationPoint) -> bool:
     if source_type in _PROFILE_MEMORY_SOURCE_TYPES or target in _PROFILE_TARGETS:
         return True
     return any(str(payload.get(key) or "").strip() for key in _FACT_METADATA_KEYS)
+
+
+def _point_is_identity_bearing(point: ConsolidationPoint) -> bool:
+    payload = point.payload or {}
+    source_type = str(payload.get("source_type") or "").strip().lower()
+    target = str(payload.get("target") or payload.get("memory_target") or "").strip().lower()
+    return source_type in _PROFILE_MEMORY_SOURCE_TYPES or target in _PROFILE_TARGETS
+
+
+def _point_contains_secret(point: ConsolidationPoint) -> bool:
+    payload_text = json.dumps(point.payload or {}, sort_keys=True, default=str)
+    return contains_secret(point.text) or contains_secret(payload_text)
+
+
+def _fact_status_for_point(point: ConsolidationPoint) -> str:
+    payload = point.payload or {}
+    status = str(payload.get("fact_status") or "").strip().lower()
+    if status in {"current", "verified", "unknown"}:
+        return "active"
+    if status:
+        return status
+    if payload.get("stale") is True:
+        return "stale"
+    return "active"
+
+
+def _status_change(point: ConsolidationPoint, to_status: str, *, reason: str, **extra: Any) -> dict[str, Any]:
+    change: dict[str, Any] = {"id": point.id, "from": _fact_status_for_point(point), "to": to_status, "reason": reason}
+    for key, value in extra.items():
+        if value not in (None, "", [], {}):
+            change[key] = value
+    return change
+
+
+def _point_observed_at(point: ConsolidationPoint) -> datetime | None:
+    payload = point.payload or {}
+    for key in ("observed_at", "valid_from", "created_at", "source_modified_at"):
+        parsed = _parse_datetime(payload.get(key))
+        if parsed:
+            return parsed
+    return None
+
+
+def _source_snippet(point: ConsolidationPoint) -> dict[str, Any]:
+    payload = point.payload or {}
+    snippet: dict[str, Any] = {
+        "id": point.id,
+        "snippet": _snippet(point.text),
+        "source_type": payload.get("source_type", "unknown"),
+        "fact_status": _fact_status_for_point(point),
+    }
+    for key in ("source_uri", "created_at", "observed_at", "valid_from", "valid_until"):
+        if payload.get(key):
+            snippet[key] = payload.get(key)
+    return snippet
+
+
+def _fact_review_risk(points: list[ConsolidationPoint]) -> str:
+    if any(_point_contains_secret(point) or _point_is_identity_bearing(point) for point in points):
+        return "high"
+    return "medium"
+
+
+def _manual_review_reason(points: list[ConsolidationPoint], base_reason: str) -> str:
+    reasons = [base_reason]
+    if any(_point_contains_secret(point) for point in points):
+        reasons.append("secret-bearing assertion requires manual review")
+    if any(_point_is_identity_bearing(point) for point in points):
+        reasons.append("identity-bearing assertion requires manual review")
+    return "; ".join(reasons)
 
 
 _HEADING_NOISE_FINGERPRINTS = {
@@ -144,7 +215,9 @@ def redact_secrets(value: Any) -> Any:
         redacted: dict[str, Any] = {}
         for key, item in value.items():
             key_text = str(key).lower()
-            if any(keyword in key_text for keyword in SECRET_KEYWORDS):
+            if key_text in {"contains_secret_text", "secret_bearing"} and isinstance(item, bool):
+                redacted[key] = item
+            elif any(keyword in key_text for keyword in SECRET_KEYWORDS):
                 redacted[key] = "[redacted: possible secret-bearing value]"
             else:
                 redacted[key] = redact_secrets(item)
@@ -222,6 +295,9 @@ def expected_action_for_proposal(proposal_type: str) -> str | None:
         "stale_low_value": "delete",
         "learning_promotion_candidate": "promote_to_skill",
         "reconsolidation_candidate": "draft_review",
+        "fact_conflict_candidate": "draft_review",
+        "fact_supersession_candidate": "draft_review",
+        "fact_status_update_candidate": "draft_review",
     }.get(proposal_type)
 
 
@@ -557,6 +633,186 @@ def _fact_key(point: ConsolidationPoint) -> str:
     return ""
 
 
+def _fact_groups(points: list[ConsolidationPoint], *, min_confidence: float) -> dict[str, list[ConsolidationPoint]]:
+    groups: dict[str, list[ConsolidationPoint]] = {}
+    for point in points:
+        key = _fact_key(point)
+        if not key:
+            continue
+        if _as_float(point.payload.get("confidence"), 1.0) < min_confidence:
+            continue
+        groups.setdefault(key, []).append(point)
+    return groups
+
+
+def _fact_status_update_proposals(
+    points: list[ConsolidationPoint],
+    *,
+    max_candidates: int,
+    min_confidence: float,
+    collection_name: str,
+) -> list[dict[str, Any]]:
+    proposals: list[dict[str, Any]] = []
+    now = datetime.now(timezone.utc)
+    for point in points:
+        if not _fact_key(point):
+            continue
+        if _as_float(point.payload.get("confidence"), 1.0) < min_confidence:
+            continue
+        current_status = _fact_status_for_point(point)
+        target_status = ""
+        reason = ""
+        payload = point.payload or {}
+        if payload.get("stale") is True and current_status != "stale":
+            target_status = "stale"
+            reason = "payload stale flag is set"
+        elif payload.get("superseded_by") and current_status != "superseded":
+            target_status = "superseded"
+            reason = "payload superseded_by link is set"
+        elif payload.get("invalidated_by") and current_status != "disputed":
+            target_status = "disputed"
+            reason = "payload invalidated_by link is set"
+        else:
+            valid_until = _parse_datetime(payload.get("valid_until"))
+            if valid_until and valid_until < now and current_status not in {"stale", *_TERMINAL_FACT_STATUSES}:
+                target_status = "stale"
+                reason = "valid_until is in the past"
+        if not target_status:
+            continue
+
+        contains_secret_text = _point_contains_secret(point)
+        proposal: dict[str, Any] = {
+            "proposal_id": _proposal_id("fact_status_update_candidate", [point.id]),
+            "proposal_type": "fact_status_update_candidate",
+            "collection_name": collection_name,
+            "affected_ids": [point.id],
+            "fact_key": _fact_key(point),
+            "candidate_statement": "Review proposed fact status metadata before changing memory.",
+            "suggested_action": "draft_review_only",
+            "confidence": min(0.9, max(0.5, _as_float(point.payload.get("confidence"), 0.75))),
+            "risk": _fact_review_risk([point]),
+            "source_snippets": [_source_snippet(point)],
+            "proposed_status_changes": [_status_change(point, target_status, reason=reason)],
+            "manual_review_required": True,
+            "manual_review_reason": _manual_review_reason([point], "fact status update requires manual review"),
+            "requires_explicit_approval": True,
+            "guarded_auto_eligible": False,
+            "draft_only": True,
+        }
+        if contains_secret_text:
+            proposal["contains_secret_text"] = True
+        proposals.append(proposal)
+        if len(proposals) >= max_candidates:
+            break
+    return proposals
+
+
+def _fact_supersession_proposal(
+    key: str,
+    group: list[ConsolidationPoint],
+    *,
+    collection_name: str,
+) -> dict[str, Any] | None:
+    dated = [(point, observed_at) for point in group if (observed_at := _point_observed_at(point))]
+    if len(dated) < 2:
+        return None
+    newest, newest_at = max(
+        dated,
+        key=lambda item: (
+            item[1],
+            _as_int(item[0].payload.get("importance"), 5),
+            _as_float(item[0].payload.get("confidence"), 0.0),
+            item[0].id,
+        ),
+    )
+    older = [point for point, observed_at in dated if point.id != newest.id and observed_at < newest_at]
+    older = [point for point in older if _fact_status_for_point(point) not in _TERMINAL_FACT_STATUSES]
+    if not older:
+        return None
+    affected_points = [*older, newest]
+    affected_ids = [point.id for point in affected_points if point.id]
+    contains_secret_text = any(_point_contains_secret(point) for point in affected_points)
+    proposed_status_changes = [
+        _status_change(point, "superseded", reason="newer assertion may supersede this fact", superseded_by=[newest.id])
+        for point in older
+    ]
+    proposed_status_changes.append(_status_change(newest, "active", reason="newer assertion remains current pending review"))
+    proposal: dict[str, Any] = {
+        "proposal_id": _proposal_id("fact_supersession_candidate", affected_ids),
+        "proposal_type": "fact_supersession_candidate",
+        "collection_name": collection_name,
+        "affected_ids": affected_ids,
+        "fact_key": key,
+        "current_or_newer_id": newest.id,
+        "superseded_candidate_ids": [point.id for point in older],
+        "supersession_reason": f"newer assertion {newest.id} may supersede older assertion(s) for {key}; review only.",
+        "candidate_statement": f"Newer fact evidence may supersede older assertion(s) for {key}.",
+        "suggested_action": "draft_review_only",
+        "confidence": min(0.95, max(_as_float(point.payload.get("confidence"), 0.0) for point in affected_points)),
+        "risk": _fact_review_risk(affected_points),
+        "source_snippets": [_source_snippet(point) for point in affected_points],
+        "proposed_status_changes": proposed_status_changes,
+        "manual_review_required": True,
+        "manual_review_reason": _manual_review_reason(affected_points, "fact supersession requires manual review"),
+        "requires_explicit_approval": True,
+        "guarded_auto_eligible": False,
+        "draft_only": True,
+    }
+    if contains_secret_text:
+        proposal["contains_secret_text"] = True
+    return proposal
+
+
+def _fact_conflict_and_supersession_proposals(
+    points: list[ConsolidationPoint],
+    *,
+    max_candidates: int,
+    min_confidence: float,
+    collection_name: str,
+) -> list[dict[str, Any]]:
+    proposals: list[dict[str, Any]] = []
+    for key, raw_group in sorted(_fact_groups(points, min_confidence=min_confidence).items()):
+        group = [point for point in raw_group if _fact_status_for_point(point) not in _TERMINAL_FACT_STATUSES]
+        if len(group) < 2:
+            continue
+        unique_texts = {normalize_text_fingerprint(point.text) for point in group if normalize_text_fingerprint(point.text)}
+        if len(unique_texts) < 2:
+            continue
+        affected_ids = [point.id for point in group if point.id]
+        contains_secret_text = any(_point_contains_secret(point) for point in group)
+        proposal: dict[str, Any] = {
+            "proposal_id": _proposal_id("fact_conflict_candidate", affected_ids),
+            "proposal_type": "fact_conflict_candidate",
+            "collection_name": collection_name,
+            "affected_ids": affected_ids,
+            "fact_key": key,
+            "candidate_statement": f"Conflicting fact assertions share {key}; review before changing status.",
+            "suggested_action": "draft_review_only",
+            "confidence": min(0.9, max(_as_float(point.payload.get("confidence"), 0.0) for point in group)),
+            "risk": _fact_review_risk(group),
+            "source_snippets": [_source_snippet(point) for point in group],
+            "proposed_status_changes": [
+                _status_change(point, "disputed", reason=f"conflicting assertions share {key}") for point in group
+            ],
+            "manual_review_required": True,
+            "manual_review_reason": _manual_review_reason(group, "fact conflict requires manual review"),
+            "requires_explicit_approval": True,
+            "guarded_auto_eligible": False,
+            "draft_only": True,
+        }
+        if contains_secret_text:
+            proposal["contains_secret_text"] = True
+        proposals.append(proposal)
+        if len(proposals) >= max_candidates:
+            break
+        supersession = _fact_supersession_proposal(key, group, collection_name=collection_name)
+        if supersession:
+            proposals.append(supersession)
+        if len(proposals) >= max_candidates:
+            break
+    return proposals
+
+
 def _reconsolidation_proposals(
     points: list[ConsolidationPoint],
     *,
@@ -702,6 +958,22 @@ def build_consolidation_report(
     )
     proposals.extend(_learning_promotion_proposals(learning_points, include_examples=include_examples, max_groups=max_groups))
     if include_reconsolidation:
+        proposals.extend(
+            _fact_status_update_proposals(
+                memory_points,
+                max_candidates=reconsolidation_max_candidates,
+                min_confidence=reconsolidation_min_confidence,
+                collection_name=collection_name,
+            )
+        )
+        proposals.extend(
+            _fact_conflict_and_supersession_proposals(
+                memory_points,
+                max_candidates=reconsolidation_max_candidates,
+                min_confidence=reconsolidation_min_confidence,
+                collection_name=collection_name,
+            )
+        )
         proposals.extend(
             _reconsolidation_proposals(
                 memory_points,

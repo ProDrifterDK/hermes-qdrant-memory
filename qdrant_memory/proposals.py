@@ -104,10 +104,34 @@ def render_proposal_markdown(
         f"- proposal_id: {safe_proposal.get('proposal_id', 'N/A')}",
         f"- proposal_type: {safe_proposal.get('proposal_type', 'N/A')}",
         f"- suggested_action: {safe_proposal.get('suggested_action', safe_proposal.get('action', 'N/A'))}",
+        f"- risk: {safe_proposal.get('risk', 'N/A')}",
+        f"- confidence: {safe_proposal.get('confidence', 'N/A')}",
         f"- affected_ids: {', '.join(str(item) for item in safe_proposal.get('affected_ids', []))}",
     ]
     if decision:
         lines.extend([f"- write_decision: {decision.get('decision')}", f"- requires_review: {decision.get('requires_review')}"])
+    if safe_proposal.get("proposed_status_changes"):
+        lines.extend(
+            [
+                "",
+                "## Proposed status changes",
+                "",
+                "```json",
+                json.dumps(safe_proposal.get("proposed_status_changes"), indent=2, sort_keys=True, default=str),
+                "```",
+            ]
+        )
+    if safe_proposal.get("source_snippets"):
+        lines.extend(
+            [
+                "",
+                "## Proposal source snippets",
+                "",
+                "```json",
+                json.dumps(safe_proposal.get("source_snippets"), indent=2, sort_keys=True, default=str),
+                "```",
+            ]
+        )
     lines.extend(["", "## Source points"])
     for point in points:
         point_id = _point_id(point)

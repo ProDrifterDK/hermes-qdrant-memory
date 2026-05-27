@@ -914,6 +914,20 @@ class QdrantMemoryProvider(MemoryProvider):
             "affected_ids": affected_ids,
             "collection_name": self._collection_for_proposal(proposal),
         }
+        for key in (
+            "risk",
+            "confidence",
+            "source_snippets",
+            "proposed_status_changes",
+            "manual_review_required",
+            "manual_review_reason",
+            "candidate_statement",
+            "fact_key",
+            "current_or_newer_id",
+            "superseded_candidate_ids",
+        ):
+            if key in proposal:
+                plan[key] = proposal[key]
         if action == "merge" and points:
             canonical = self._select_canonical_point(points)
             plan.update({"canonical_id": canonical.id, "delete_ids": [p.id for p in points if p.id != canonical.id]})
@@ -958,6 +972,8 @@ class QdrantMemoryProvider(MemoryProvider):
         dry_run = parse_bool_arg(args.get("dry_run"), default=bool(self._config.get("consolidation_apply_dry_run_default", True)))
         if not dry_run and not parse_bool_arg(args.get("approve"), default=False):
             return _json_error("approve=true is required when dry_run=false")
+        if not dry_run and not str(args.get("action") or "").strip():
+            return _json_error("action is required when dry_run=false")
         try:
             report = load_consolidation_report(report_id, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))
             if str(report.get("profile_id") or self._profile_id) != self._profile_id:
