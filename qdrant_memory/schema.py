@@ -6,6 +6,7 @@ import re
 import uuid
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any
 
 from .lesson_extractor import contains_secret
@@ -18,6 +19,72 @@ def now_iso() -> str:
 def make_point_id(source: str, text: str) -> str:
     digest = hashlib.sha256(f"{source}\n{text}".encode("utf-8")).hexdigest()
     return str(uuid.UUID(digest[:32]))
+
+
+class MemoryKind(str, Enum):
+    CONVERSATION_TURN = "conversation_turn"
+    MANUAL_FACT = "manual_fact"
+    SOURCE_CHUNK = "source_chunk"
+    LEARNING = "learning"
+    ASSERTION = "assertion"
+    DECISION = "decision"
+    USER_PREFERENCE = "user_preference"
+    PROJECT_INVARIANT = "project_invariant"
+    TOOL_QUIRK = "tool_quirk"
+    WORKFLOW_LESSON = "workflow_lesson"
+    RISK = "risk"
+    PROPOSAL = "proposal"
+    SUMMARY = "summary"
+
+
+class RelationType(str, Enum):
+    DERIVED_FROM = "DERIVED_FROM"
+    EXTRACTED_FROM = "EXTRACTED_FROM"
+    SUMMARIZES = "SUMMARIZES"
+    SUPPORTS = "SUPPORTS"
+    CONTRADICTS = "CONTRADICTS"
+    SUPERSEDES = "SUPERSEDES"
+    REFERENCES = "REFERENCES"
+    APPLIES_TO = "APPLIES_TO"
+    USES_TOOL = "USES_TOOL"
+    PREFERS = "PREFERS"
+    BLOCKS = "BLOCKS"
+
+
+MEMORY_KINDS = tuple(kind.value for kind in MemoryKind)
+RELATION_TYPES = tuple(relation.value for relation in RelationType)
+_MEMORY_KIND_SET = set(MEMORY_KINDS)
+_RELATION_TYPE_SET = set(RELATION_TYPES)
+
+
+def _grammar_value(value: Any) -> str:
+    if isinstance(value, Enum):
+        return str(value.value).strip()
+    return str(value or "").strip()
+
+
+def valid_memory_kind(value: Any) -> str | None:
+    text = _grammar_value(value)
+    return text if text in _MEMORY_KIND_SET else None
+
+
+def validate_memory_kind(value: Any) -> str:
+    text = _grammar_value(value)
+    if text not in _MEMORY_KIND_SET:
+        raise ValueError(f"unknown memory_kind: {text or '<empty>'}")
+    return text
+
+
+def valid_relation_type(value: Any) -> str | None:
+    text = _grammar_value(value)
+    return text if text in _RELATION_TYPE_SET else None
+
+
+def validate_relation_type(value: Any) -> str:
+    text = _grammar_value(value)
+    if text not in _RELATION_TYPE_SET:
+        raise ValueError(f"unknown relation_type: {text or '<empty>'}")
+    return text
 
 
 @dataclass
@@ -47,6 +114,7 @@ class DerivationEdge:
     source_uri: str = ""
     locator: SourceLocator | dict[str, Any] | None = None
     derivation_type: str = ""
+    relation_type: str | RelationType = ""
     source_type: str = ""
     content_hash: str = ""
     source_modified_at: str = ""
@@ -59,6 +127,7 @@ class DerivationEdge:
             "content_hash": self.content_hash,
             "source_modified_at": self.source_modified_at,
             "derivation_type": self.derivation_type,
+            "relation_type": self.relation_type,
         }
         sanitized = _sanitize_source_metadata(data)
         return sanitized if isinstance(sanitized, dict) else {}
@@ -72,6 +141,7 @@ class SourceReference:
     content_hash: str = ""
     source_modified_at: str = ""
     derivation_type: str = ""
+    relation_type: str | RelationType = ""
     derived_from: list[DerivationEdge | SourceReference | dict[str, Any]] = field(default_factory=list)
     canonical: bool | None = None
     stale: bool | None = None
@@ -85,6 +155,7 @@ class SourceReference:
             "content_hash": self.content_hash,
             "source_modified_at": self.source_modified_at,
             "derivation_type": self.derivation_type,
+            "relation_type": self.relation_type,
             "derived_from": self.derived_from,
             "canonical": self.canonical,
             "stale": self.stale,
@@ -175,6 +246,7 @@ _SOURCE_REF_PAYLOAD_KEYS = {
     "content_hash",
     "source_modified_at",
     "derivation_type",
+    "relation_type",
     "derived_from",
     "canonical",
     "stale",
@@ -210,7 +282,12 @@ def _sanitize_source_metadata(value: Any) -> Any:
             key_s = str(key).strip()
             if not key_s or contains_secret(key_s):
                 continue
-            sanitized_item = _sanitize_source_metadata(item)
+            if key_s == "relation_type":
+                if _metadata_is_empty(item):
+                    continue
+                sanitized_item = validate_relation_type(item)
+            else:
+                sanitized_item = _sanitize_source_metadata(item)
             if not _metadata_is_empty(sanitized_item):
                 sanitized_dict[key_s] = sanitized_item
         return sanitized_dict or None
@@ -251,6 +328,7 @@ def build_payload(
     project_path: str = "",
     model: str = "",
     provider: str = "qdrant",
+    memory_kind: str | MemoryKind | None = None,
     created_at: str | None = None,
     fact_metadata: dict[str, Any] | None = None,
     source_ref: SourceReference | dict[str, Any] | None = None,
@@ -290,6 +368,9 @@ def build_payload(
     for key, value in (fact_metadata or {}).items():
         if key in {"fact_key", "subject", "topic", "entity", "reconsolidation_key"} and value and not contains_secret(str(value)):
             payload[key] = value
+
+    if not _metadata_is_empty(memory_kind):
+        payload["memory_kind"] = validate_memory_kind(memory_kind)
 
     if source_ref:
         sanitized_ref = _sanitize_source_metadata(source_ref)

@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import math
 
-from qdrant_memory.schema import DerivationEdge, SourceLocator, build_payload
+import pytest
+
+from qdrant_memory.schema import DerivationEdge, MEMORY_KINDS, RELATION_TYPES, SourceLocator, build_payload
 
 
 def _contains_non_finite_float(value):
@@ -168,3 +170,73 @@ def test_build_payload_secret_scans_user_controlled_source_metadata_strings():
     assert payload["derived_from"] == [
         {"source_uri": "file:///tmp/source.md", "locator": {"line_start": 1}, "derivation_type": "summary"}
     ]
+
+
+def test_memory_grammar_values_include_phase_6_terms():
+    assert set(MEMORY_KINDS) >= {
+        "conversation_turn",
+        "manual_fact",
+        "source_chunk",
+        "learning",
+        "assertion",
+        "decision",
+        "user_preference",
+        "project_invariant",
+        "tool_quirk",
+        "workflow_lesson",
+        "risk",
+        "proposal",
+        "summary",
+    }
+    assert set(RELATION_TYPES) >= {
+        "DERIVED_FROM",
+        "EXTRACTED_FROM",
+        "SUMMARIZES",
+        "SUPPORTS",
+        "CONTRADICTS",
+        "SUPERSEDES",
+        "REFERENCES",
+        "APPLIES_TO",
+        "USES_TOOL",
+        "PREFERS",
+        "BLOCKS",
+    }
+
+
+def test_build_payload_accepts_valid_memory_kind():
+    payload = build_payload(text="keep the API stable", source="unit", memory_kind="decision")
+
+    assert payload["memory_kind"] == "decision"
+
+
+def test_build_payload_omits_empty_memory_kind_for_legacy_callers():
+    payload = build_payload(text="legacy memory", source="unit", memory_kind="")
+
+    assert "memory_kind" not in payload
+
+
+def test_build_payload_rejects_unknown_memory_kind():
+    with pytest.raises(ValueError, match="memory_kind"):
+        build_payload(text="bad kind", source="unit", memory_kind="unknown_kind")
+
+
+def test_derivation_edge_accepts_valid_relation_type_and_serializes_it():
+    edge = DerivationEdge(source_uri="memory://point/root", relation_type="SUPPORTS")
+
+    assert edge.to_payload()["relation_type"] == "SUPPORTS"
+
+
+def test_build_payload_rejects_unknown_relation_type_in_edges():
+    with pytest.raises(ValueError, match="relation_type"):
+        build_payload(
+            text="bad edge",
+            source="unit",
+            derived_from=[{"source_uri": "memory://point/root", "relation_type": "NOT_A_RELATION"}],
+        )
+
+    with pytest.raises(ValueError, match="relation_type"):
+        build_payload(
+            text="bad source ref edge",
+            source="unit",
+            source_ref={"source_uri": "memory://point/root", "relation_type": "NOT_A_RELATION"},
+        )

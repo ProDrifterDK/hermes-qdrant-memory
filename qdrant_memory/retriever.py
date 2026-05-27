@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .schema import now_iso
+from .schema import now_iso, valid_memory_kind
 from .scoring import final_memory_score, normalize_minmax
 
 
@@ -115,6 +115,7 @@ def format_for_prompt(chunks: list[RetrievedMemory], display_tokens: int = 300) 
         created = str(payload.get("created_at", ""))[:10]
         importance = payload.get("importance", "?")
         source_type = payload.get("source_type", "unknown")
+        memory_kind = valid_memory_kind(payload.get("memory_kind"))
         file_path = str(payload.get("file_path") or payload.get("source") or "")
         heading = str(payload.get("heading") or "")
         source_bits = [source_type]
@@ -122,8 +123,11 @@ def format_for_prompt(chunks: list[RetrievedMemory], display_tokens: int = 300) 
             source_bits.append(file_path)
         if heading:
             source_bits.append(f"heading={heading}")
+        meta_bits = [f"importance={importance}", f"score={chunk.final_score:.3f}"]
+        if memory_kind:
+            meta_bits.append(f"kind={memory_kind}")
         text = " ".join((chunk.text or "").split())
-        entry = f"{idx}. [{created} | importance={importance} | score={chunk.final_score:.3f} | source={' | '.join(source_bits)}]\n   {text}\n"
+        entry = f"{idx}. [{created} | {' | '.join(meta_bits)} | source={' | '.join(source_bits)}]\n   {text}\n"
         if used + len(entry) > char_cap:
             break
         lines.append(entry)

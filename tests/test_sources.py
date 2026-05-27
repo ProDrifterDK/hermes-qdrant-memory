@@ -613,6 +613,41 @@ def test_trace_point_sanitizes_untrusted_derived_edges():
     assert len(serialized) < 2500
 
 
+def test_inspect_point_surfaces_valid_memory_kind_and_omits_invalid_legacy_kind():
+    valid = {
+        "id": "valid-kind",
+        "payload": {"text": "stable API decision", "source_type": "manual", "memory_kind": "decision"},
+    }
+    invalid = {
+        "id": "invalid-kind",
+        "payload": {"text": "legacy bad kind", "source_type": "manual", "memory_kind": "unknown_kind"},
+    }
+
+    valid_inspected = inspect_point(_FakeQdrant(valid), "memory", "valid-kind")
+    invalid_inspected = inspect_point(_FakeQdrant(invalid), "memory", "invalid-kind")
+
+    assert valid_inspected["source"]["memory_kind"] == "decision"
+    assert "memory_kind" not in invalid_inspected.get("source", {})
+
+
+def test_trace_point_surfaces_valid_relation_type_and_omits_invalid_legacy_relation_type():
+    child = {
+        "id": "child",
+        "payload": {
+            "text": "child text",
+            "derived_from": [
+                {"source_uri": "session://valid", "relation_type": "SUPPORTS"},
+                {"source_uri": "session://invalid", "relation_type": "NOPE"},
+            ],
+        },
+    }
+
+    traced = trace_point(_FakeQdrant(child), "memory", "child")
+
+    assert traced["upstream"][0]["relation_type"] == "SUPPORTS"
+    assert "relation_type" not in traced["upstream"][1]
+
+
 def test_source_status_for_point_sanitizes_status_metadata(tmp_path):
     sentinel = "STATUS_SENTINEL_SHOULD_NOT_LEAK"
     source = tmp_path / "source.md"

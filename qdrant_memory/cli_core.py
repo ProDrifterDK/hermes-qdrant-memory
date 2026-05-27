@@ -1323,7 +1323,7 @@ def _format_inspect_summary(payload: dict[str, Any]) -> str:
     if payload.get("collection") or payload.get("collection_name"):
         lines.append(f"collection: {payload.get('collection')} ({payload.get('collection_name')})")
     source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
-    for key in ("source_uri", "source_type", "derivation_type", "canonical", "stale", "requires_review"):
+    for key in ("memory_kind", "source_uri", "source_type", "derivation_type", "canonical", "stale", "requires_review"):
         if source.get(key) not in (None, "", [], {}):
             lines.append(f"{key}: {_safe_scalar(source.get(key))}")
     derived = source.get("derived_from") if isinstance(source.get("derived_from"), list) else []
@@ -1346,7 +1346,8 @@ def _format_trace_summary(payload: dict[str, Any]) -> str:
             if isinstance(edge, dict):
                 source_uri = edge.get("source_uri") or edge.get("point_id") or "<unknown>"
                 status = edge.get("status") or "unknown"
-                lines.append(f"  - {_safe_scalar(source_uri)} status={_safe_scalar(status)}")
+                relation = f" relation={_safe_scalar(edge.get('relation_type'))}" if edge.get("relation_type") else ""
+                lines.append(f"  - {_safe_scalar(source_uri)} status={_safe_scalar(status)}{relation}")
     downstream = payload.get("downstream") if isinstance(payload.get("downstream"), dict) else None
     if downstream is not None:
         lines.append(f"downstream: {downstream.get('status', 'unknown')}")

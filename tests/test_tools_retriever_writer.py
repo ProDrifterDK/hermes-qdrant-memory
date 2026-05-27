@@ -61,6 +61,60 @@ def test_format_for_prompt_fenced_and_bounded():
     assert "alpha memory" in out
 
 
+def test_format_for_prompt_includes_compact_valid_memory_kind_only():
+    out = format_for_prompt(
+        [
+            RetrievedMemory(
+                id="1",
+                text="Use the stable API shape",
+                payload={
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "importance": 8,
+                    "source_type": "manual",
+                    "memory_kind": "decision",
+                },
+                qdrant_score=0.8,
+                final_score=0.7,
+            )
+        ],
+        display_tokens=80,
+    )
+    legacy_out = format_for_prompt(
+        [
+            RetrievedMemory(
+                id="2",
+                text="legacy memory",
+                payload={"created_at": "2026-01-01T00:00:00+00:00", "importance": 5, "source_type": "manual"},
+                qdrant_score=0.7,
+                final_score=0.6,
+            )
+        ],
+        display_tokens=80,
+    )
+    invalid_out = format_for_prompt(
+        [
+            RetrievedMemory(
+                id="3",
+                text="bad legacy kind",
+                payload={
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "importance": 5,
+                    "source_type": "manual",
+                    "memory_kind": "not_a_kind",
+                },
+                qdrant_score=0.7,
+                final_score=0.6,
+            )
+        ],
+        display_tokens=80,
+    )
+
+    assert "kind=decision" in out
+    assert "kind=unknown" not in out
+    assert "kind=" not in legacy_out
+    assert "not_a_kind" not in invalid_out
+
+
 def test_strip_injected_context_removes_memory_sections():
     raw = "User text\n# Relevant Long-Term Memory\n- polluted\n```\nmore\n```\nAnswer text"
     stripped = strip_injected_context(raw)

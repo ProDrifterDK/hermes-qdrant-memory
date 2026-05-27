@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 from urllib.parse import unquote, urlsplit
 
+from .schema import valid_memory_kind, valid_relation_type
+
 
 DEFAULT_MAX_CHARS = 8000
 HARD_MAX_CHARS = 100_000
@@ -779,7 +781,9 @@ def _compact_status_response(result: dict[str, Any]) -> dict[str, Any]:
         "collection": EXPAND_METADATA_TOKEN_CAP,
         "collection_name": EXPAND_METADATA_STRING_CAP,
         "direction": EXPAND_METADATA_TOKEN_CAP,
+        "memory_kind": EXPAND_METADATA_TOKEN_CAP,
         "derivation_type": EXPAND_METADATA_TOKEN_CAP,
+        "relation_type": EXPAND_METADATA_TOKEN_CAP,
         "source_type": EXPAND_METADATA_TOKEN_CAP,
         "expand_hint": EXPAND_METADATA_STRING_CAP,
         "content_hash": EXPAND_METADATA_STRING_CAP,
@@ -851,6 +855,9 @@ def expand_source_metadata(payload: dict[str, Any]) -> dict[str, Any]:
         value = _compact_expand_string(payload.get(key))
         if value is not None:
             metadata[key] = value
+    memory_kind = valid_memory_kind(payload.get("memory_kind"))
+    if memory_kind is not None:
+        metadata["memory_kind"] = memory_kind
     for key in ("source_type", "derivation_type"):
         value = _compact_expand_token(payload.get(key))
         if value is not None:
@@ -996,6 +1003,9 @@ def _trace_edge(edge: Any, registry: SourceResolverRegistry) -> dict[str, Any]:
     derivation_type = _compact_expand_token(edge.get("derivation_type"))
     if derivation_type:
         result["derivation_type"] = derivation_type
+    relation_type = valid_relation_type(edge.get("relation_type"))
+    if relation_type:
+        result["relation_type"] = relation_type
     locator = expand_locator_metadata(edge.get("locator") if isinstance(edge.get("locator"), dict) else None)
     if locator:
         result["locator"] = locator
