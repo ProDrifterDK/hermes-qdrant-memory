@@ -10,6 +10,8 @@ DEFAULTS: dict[str, Any] = {
     "qdrant_url": "http://127.0.0.1:6333",
     "embedding_url": "http://127.0.0.1:8080/v1",
     "embedding_model": "bge-m3",
+    "embedding_max_input_chars": 12000,
+    "embedding_max_chunks": 16,
     "vector_size": 1024,
     "distance": "Cosine",
     "collection_name": "hermes_memory",
@@ -111,6 +113,8 @@ _BOOL_KEYS = {
 }
 _INT_KEYS = {
     "vector_size",
+    "embedding_max_input_chars",
+    "embedding_max_chunks",
     "auto_recall_top_k",
     "search_candidates",
     "max_chunk_tokens",

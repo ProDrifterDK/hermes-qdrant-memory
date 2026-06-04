@@ -148,7 +148,10 @@ Start llama.cpp as an embedding server:
   --port 8080 \
   --host 127.0.0.1 \
   -ngl 999 \
-  -c 4096
+  -c 4096 \
+  --batch-size 4096 \
+  --ubatch-size 4096 \
+  --parallel 1
 ```
 
 The currently tested Resyst Softwares service runs the same shape as a user systemd service:
@@ -167,7 +170,10 @@ ExecStart=/path/to/llama.cpp/build/bin/llama-server \
     --port 8080 \
     --host 127.0.0.1 \
     -ngl 999 \
-    -c 4096
+    -c 4096 \
+    --batch-size 4096 \
+    --ubatch-size 4096 \
+    --parallel 1
 Restart=on-failure
 RestartSec=3
 StartLimitBurst=5
@@ -193,13 +199,18 @@ hermes config set qdrant_memory.embedding_model bge-m3
 hermes config set qdrant_memory.vector_size 1024
 hermes config set qdrant_memory.query_prefix 'search_query: '
 hermes config set qdrant_memory.document_prefix 'search_document: '
+hermes config set qdrant_memory.embedding_max_input_chars 12000
+hermes config set qdrant_memory.embedding_max_chunks 16
 ```
 
-If llama.cpp returns an error like `input (...) is too large to process. increase the physical batch size`, reduce chunk size:
+If llama.cpp returns an error like `input (...) is too large to process. increase the physical batch size`, keep the server physical batch at a bounded value and tune the plugin-side embedding chunk guard instead of raising server memory indefinitely:
 
 ```bash
-hermes config set qdrant_memory.max_chunk_tokens 128
+hermes config set qdrant_memory.embedding_max_input_chars 8000
+hermes config set qdrant_memory.embedding_max_chunks 16
 ```
+
+`max_chunk_tokens` still controls file-indexing chunk preparation, but it does not protect conversation writes, learning writes, semantic duplicate checks, or search queries. Those paths are protected centrally by `EmbeddingClient`.
 
 Any embedding server is acceptable if it supports OpenAI-style requests:
 
@@ -241,6 +252,8 @@ hermes config set qdrant_memory.qdrant_url http://127.0.0.1:6333
 hermes config set qdrant_memory.embedding_url http://127.0.0.1:8080/v1
 hermes config set qdrant_memory.embedding_model bge-m3
 hermes config set qdrant_memory.vector_size 1024
+hermes config set qdrant_memory.embedding_max_input_chars 12000
+hermes config set qdrant_memory.embedding_max_chunks 16
 ```
 
 Start a fresh Hermes session or restart the gateway after changing memory provider/plugin configuration.

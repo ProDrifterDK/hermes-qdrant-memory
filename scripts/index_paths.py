@@ -31,6 +31,8 @@ def main() -> int:
         query_prefix=cfg["query_prefix"],
         document_prefix=cfg["document_prefix"],
         api_key=cfg.get("embedding_api_key", ""),
+        max_input_chars=cfg.get("embedding_max_input_chars", 12000),
+        max_chunks=cfg.get("embedding_max_chunks", 16),
     )
     indexer = FileIndexer(
         qdrant=qdrant,

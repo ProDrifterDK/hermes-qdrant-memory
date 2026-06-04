@@ -282,6 +282,8 @@ class QdrantMemoryProvider(MemoryProvider):
             query_prefix=self._config["query_prefix"],
             document_prefix=self._config["document_prefix"],
             api_key=self._config.get("embedding_api_key", ""),
+            max_input_chars=self._config.get("embedding_max_input_chars", 12000),
+            max_chunks=self._config.get("embedding_max_chunks", 16),
         )
         scope = self._scope_filter_values()
         self._retriever = MemoryRetriever(
