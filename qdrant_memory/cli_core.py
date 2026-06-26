@@ -1417,6 +1417,29 @@ def _format_source_status_summary(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_graph_search_summary(payload: dict[str, Any]) -> str:
+    results = payload.get("results") or []
+    lines = [f"Graph search: {len(results)} result(s)"]
+    for idx, item in enumerate(results[:10], 1):
+        score = item.get("final_score", 0.0)
+        dist = item.get("graph_distance", 0)
+        point_id = item.get("point_id", "?")
+        text = _one_line(item.get("text", ""))[:80]
+        lines.append(f"  {idx}. [score={score:.3f} dist={dist}] {point_id}: {text}")
+    debug = payload.get("debug")
+    if isinstance(debug, dict):
+        stages = debug.get("stages", {})
+        caps = debug.get("hard_caps_hit", {})
+        warnings = debug.get("warnings", [])
+        if stages:
+            lines.append(f"  stages: {json.dumps(stages, sort_keys=True)[:200]}")
+        if any(caps.values()):
+            lines.append(f"  hard_caps_hit: {json.dumps(caps, sort_keys=True)}")
+        if warnings:
+            lines.append(f"  warnings: {', '.join(str(w) for w in warnings[:5])}")
+    return "\n".join(lines)
+
+
 def _bool_line(value: Any) -> str:
     return str(bool(value)).lower()
 
@@ -1758,6 +1781,8 @@ def _format_human_payload(payload: Any, args: Namespace, tool_name: str) -> str:
         return _format_expand_summary(payload)
     if tool_name == "qdrant_memory_source_status":
         return _format_source_status_summary(payload)
+    if tool_name == "qdrant_memory_graph_search":
+        return _format_graph_search_summary(payload)
     if tool_name == "qdrant_learning_search":
         return _format_result_list(payload, label="learning", plural_label="learnings")
     if tool_name == "qdrant_memory_store":
@@ -1991,6 +2016,25 @@ def build_tool_call(args: Namespace) -> tuple[str, dict[str, Any]]:
                 "reconsolidation_max_candidates": args.reconsolidation_max_candidates,
             }
         raise CliUsageError("unsupported qdrant watcher command")
+
+    if subcommand == "graph-search":
+        tool_args: dict[str, Any] = {
+            "query": _non_empty(args.query, "query"),
+            "top_k": int(getattr(args, "top_k", 5) or 5),
+            "candidate_seed_top_k": int(getattr(args, "candidate_seed_top_k", 20) or 20),
+            "max_graph_results": int(getattr(args, "max_graph_results", 20) or 20),
+            "max_depth": int(getattr(args, "max_depth", 2) or 2),
+            "include_fact_history": bool(getattr(args, "include_fact_history", False)),
+            "debug": bool(getattr(args, "debug", True)),
+            "collection": getattr(args, "collection", "memory") or "memory",
+        }
+        entity_types = _split_tags(getattr(args, "entity_type", []))
+        if entity_types:
+            tool_args["entity_types"] = entity_types
+        relation_types = _split_tags(getattr(args, "relation_type", []))
+        if relation_types:
+            tool_args["relation_types"] = relation_types
+        return "qdrant_memory_graph_search", tool_args
 
     raise CliUsageError(f"unsupported qdrant command: {subcommand or '<missing>'}")
 

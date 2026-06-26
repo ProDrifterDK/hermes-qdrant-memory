@@ -30,6 +30,7 @@ except Exception:  # pragma: no cover - used only for standalone tests without H
 
         pass
 
+from qdrant_memory.graph_retriever import GraphExpansionPolicy, GraphMemoryRetriever
 from qdrant_memory.client import QdrantClient
 from qdrant_memory.backup import create_backup
 from qdrant_memory.config import load_config
@@ -1613,6 +1614,68 @@ class QdrantMemoryProvider(MemoryProvider):
         except Exception as exc:
             return _json_error(f"Extraction approval failed: {exc}")
 
+    def _tool_graph_search(self, args: dict) -> str:
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return _json_error("query is required")
+        collection = str(args.get("collection") or "memory").strip().lower()
+        if collection not in {"memory", "learning"}:
+            return _json_error("collection must be one of: memory, learning")
+        if not getattr(self, "_qdrant", None) or not getattr(self, "_embeddings", None):
+            return _json_error("Qdrant memory provider is not initialized")
+        collection_name = self._config["learning_collection_name"] if collection == "learning" else self._config["collection_name"]
+        try:
+            top_k = max(1, min(20, int(args.get("top_k", 5))))
+            candidate_seed_top_k = max(1, min(50, int(args.get("candidate_seed_top_k", 20))))
+            max_graph_results = max(1, min(50, int(args.get("max_graph_results", 20))))
+            max_depth = max(1, min(3, int(args.get("max_depth", 2))))
+        except Exception:
+            top_k, candidate_seed_top_k, max_graph_results, max_depth = 5, 20, 20, 2
+
+        include_fact_history = parse_bool_arg(args.get("include_fact_history"), default=False)
+        debug = parse_bool_arg(args.get("debug"), default=True)
+        entity_types = args.get("entity_types") or None
+        relation_types = args.get("relation_types") or None
+
+        retriever = GraphMemoryRetriever(
+            qdrant=self._qdrant,
+            embeddings=self._embeddings,
+            collection_name=collection_name,
+            expansion_policy=GraphExpansionPolicy(max_depth=max_depth),
+        )
+        try:
+            result = retriever.search(
+                query,
+                top_k=top_k,
+                candidate_seed_top_k=candidate_seed_top_k,
+                max_graph_results=max_graph_results,
+                entity_types=entity_types,
+                relation_types=relation_types,
+                include_fact_history=include_fact_history,
+                debug=debug,
+            )
+        except ValueError as exc:
+            return _json_error(str(exc))
+        except Exception as exc:
+            return _json_error(f"Graph search failed: {exc}")
+
+        results = []
+        for candidate in result.final:
+            item: dict[str, Any] = {
+                "point_id": candidate.point_id,
+                "final_score": round(candidate.final_score, 6),
+                "graph_distance": candidate.graph_distance,
+                "text": str(candidate.payload.get("text") or ""),
+                "path": candidate.path,
+                "relation_path": candidate.relation_path,
+            }
+            results.append(item)
+        return json.dumps({
+            "results": results,
+            "count": len(results),
+            "debug": result.debug,
+        })
+
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         args = args or {}
         if tool_name == "qdrant_memory_status":
@@ -1651,6 +1714,8 @@ class QdrantMemoryProvider(MemoryProvider):
             return self._tool_extraction_preview(args)
         if tool_name == "qdrant_memory_extraction_approve":
             return self._tool_extraction_approve(args)
+        if tool_name == "qdrant_memory_graph_search":
+            return self._tool_graph_search(args)
         return _json_error(f"Unknown tool: {tool_name}")
 
     def shutdown(self) -> None:
