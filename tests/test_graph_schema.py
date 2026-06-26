@@ -1177,6 +1177,54 @@ class TestExtraCannotInjectReservedKeys:
         assert payload["relation_type"] == "SUPPORTS"
         assert payload.get("safe_custom") == "allowed"
 
+    # -- Schema-shaped key injection (top-level) -------------------------
+
+    def test_entity_extra_cannot_inject_schema_keys(self):
+        """Extra must not be able to inject top-level schema-looking keys
+        (``schema``, ``schema_version``, ``version``) into a graph entity
+        payload.  These are reserved by the memory subsystem and any
+        caller-supplied value would be a forgery vector.
+        """
+        payload = build_entity_payload(
+            entity_type="concept",
+            label="Test",
+            source_uri="file:///docs/x.md",
+            extra={
+                "schema": "malicious_schema_name",
+                "schema_version": 999,
+                "version": "v9000",
+                "safe_custom": "allowed",
+            },
+        )
+        assert "schema" not in payload
+        assert "schema_version" not in payload
+        assert "version" not in payload
+        assert payload.get("safe_custom") == "allowed"
+
+    def test_edge_extra_cannot_inject_schema_keys(self):
+        """Extra must not be able to inject top-level schema-looking keys
+        (``schema``, ``schema_version``, ``version``) into a graph edge
+        payload.
+        """
+        src = make_entity_id("concept", "A")
+        tgt = make_entity_id("concept", "B")
+        payload = build_edge_payload(
+            source_entity_id=src,
+            target_entity_id=tgt,
+            relation_type="SUPPORTS",
+            source_uri="file:///docs/x.md",
+            extra={
+                "schema": "malicious_schema_name",
+                "schema_version": 999,
+                "version": "v9000",
+                "safe_custom": "allowed",
+            },
+        )
+        assert "schema" not in payload
+        assert "schema_version" not in payload
+        assert "version" not in payload
+        assert payload.get("safe_custom") == "allowed"
+
 
 # ---------------------------------------------------------------------------
 # Security: controlled-timestamp sanitization (created_at / updated_at)

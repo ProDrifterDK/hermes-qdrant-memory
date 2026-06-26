@@ -300,6 +300,16 @@ _RESERVED_PAYLOAD_KEYS = frozenset({
     "observed_at",
     "valid_from",
     "valid_until",
+    # Top-level schema-looking keys. ``extra`` must never be allowed to inject
+    # fields that look like schema metadata (e.g. ``schema``, ``schema_version``,
+    # ``version``) — those are owned by the memory subsystem itself and any
+    # caller-supplied value would be misleading at best and a forgery vector at
+    # worst.  Callers wanting to record schema annotations must use the proper
+    # keyword args (none exist today; if added, they will be promoted out of the
+    # reserved set).
+    "schema",
+    "schema_version",
+    "version",
     "extra",
 })
 
