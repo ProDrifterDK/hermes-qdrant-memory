@@ -2036,6 +2036,40 @@ def build_tool_call(args: Namespace) -> tuple[str, dict[str, Any]]:
             tool_args["relation_types"] = relation_types
         return "qdrant_memory_graph_search", tool_args
 
+    if subcommand == "improve":
+        improve_sub = getattr(args, "improve_subcommand", None)
+        if improve_sub == "preview":
+            tool_args: dict[str, Any] = {}
+            source_scope = getattr(args, "source_scope", None)
+            if source_scope:
+                tool_args["source_scope"] = source_scope
+            source_text = getattr(args, "source_text", None)
+            if source_text:
+                tool_args["source_text"] = source_text
+            source_uri = getattr(args, "source_uri", None)
+            if source_uri:
+                tool_args["source_uri"] = source_uri
+            point_ids = getattr(args, "point_ids", None)
+            if point_ids:
+                tool_args["point_ids"] = point_ids
+            session_id = getattr(args, "session_id", None)
+            if session_id:
+                tool_args["session_id"] = session_id
+            tool_args["max_candidates"] = int(getattr(args, "max_candidates", 20) or 20)
+            tool_args["persist"] = not bool(getattr(args, "no_persist", False))
+            tool_args["include_metadata"] = bool(getattr(args, "include_metadata", False))
+            return "qdrant_memory_improve_preview", tool_args
+        if improve_sub == "apply":
+            _require_live_approval(args)
+            tool_args = {
+                "report_id": _non_empty(args.report_id, "report_id"),
+                "candidate_id": _non_empty(args.candidate_id, "candidate_id"),
+                "dry_run": getattr(args, "dry_run", True),
+                "approve": getattr(args, "approve", False),
+            }
+            return "qdrant_memory_improve_apply", tool_args
+        raise CliUsageError(f"unsupported improve subcommand: {improve_sub or '<missing>'}")
+
     raise CliUsageError(f"unsupported qdrant command: {subcommand or '<missing>'}")
 
 

@@ -19,6 +19,8 @@ class ExtractionCandidateType(str, Enum):
     RISK = "risk_candidate"
     STATUS_UPDATE = "status_update_candidate"
     ONTOLOGY_SUGGESTION = "ontology_suggestion"
+    GRAPH_ENTITY = "graph_entity_candidate"
+    GRAPH_EDGE = "graph_edge_candidate"
 
 
 EXTRACTION_CANDIDATE_TYPES = tuple(candidate_type.value for candidate_type in ExtractionCandidateType)
