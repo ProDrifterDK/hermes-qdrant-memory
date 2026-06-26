@@ -12,6 +12,7 @@ if str(_PLUGIN_ROOT) not in sys.path:
 
 from qdrant_memory.cli_core import execute_command
 from qdrant_memory.recipes import list_recipe_names
+from qdrant_memory.schema import RELATION_TYPES
 
 
 def _top_k(value: str) -> int:
@@ -106,7 +107,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     graph_search.add_argument("--max-graph-results", type=_positive_int, default=20, help="Hard cap on expansion pool before reranking. Default: 20.")
     graph_search.add_argument("--max-depth", type=int, choices=[1, 2, 3], default=2, help="BFS depth for graph expansion. Default: 2.")
     graph_search.add_argument("--entity-type", action="append", default=[], help="Optional entity_type filter. Repeat or pass comma-separated values.")
-    graph_search.add_argument("--relation-type", action="append", default=[], help="Optional relation_type filter. Repeat or pass comma-separated values.")
+    graph_search.add_argument("--relation-type", action="append", default=[], choices=list(RELATION_TYPES), help="Optional relation_type filter. Repeat or pass comma-separated values.")
     graph_search.add_argument("--include-fact-history", action="store_true", help="Include deprecated/superseded graph edges in ranking.")
     try:
         graph_search.add_argument("--debug", action=argparse.BooleanOptionalAction, default=True, help="Include debug breakdown. Default: enabled.")

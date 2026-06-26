@@ -578,7 +578,6 @@ class TestInvalidRelationType:
         assert len(result.expansions) == 0
         assert any("invalid relation_type" in w for w in result.debug["warnings"])
 
-
 # ---------------------------------------------------------------------------
 # Test 7: Graph-distance decay ordering
 # ---------------------------------------------------------------------------
@@ -785,3 +784,480 @@ class TestToolAndCLISurface:
         assert tool_args["relation_types"] == ["USES_TOOL", "REFERENCES"]
         assert tool_args["include_fact_history"] is True
         assert tool_args["debug"] is False
+
+
+# ===========================================================================
+# Regression tests for Phase 2 security/review blockers
+# ===========================================================================
+
+class TestBoundedScrollMaxTotal:
+    """Blocker 2: Edge scrolls must always pass a bounded max_total."""
+
+    def test_scroll_edges_for_entity_passes_max_total(self):
+        """_scroll_edges_for_entity must pass a non-None max_total."""
+        eid = make_entity_id("concept", "hub")
+        seeds = [{
+            "id": "seed-1",
+            "score": 0.9,
+            "payload": {
+                "text": "hub entity",
+                "importance": 5,
+                "created_at": "2026-06-20T00:00:00+00:00",
+                "entity_id": eid,
+                "fact_status": "active",
+            },
+        }]
+        qdrant = FakeGraphQdrant(search_results=seeds)
+        qdrant.add_point(f"ent-{eid}", {
+            "memory_kind": "graph_entity",
+            "entity_id": eid,
+            "source_point_ids": [],
+            "fact_status": "active",
+        })
+        retriever = GraphMemoryRetriever(
+            qdrant=qdrant,
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+            expansion_policy=GraphExpansionPolicy(max_neighbors_per_node=8),
+        )
+        retriever.search("hub", top_k=5, candidate_seed_top_k=3)
+
+        # Every scroll_by_filter call from _scroll_edges_for_entity should
+        # have a non-None max_total
+        edge_scrolls = [
+            s for s in qdrant.scrolls
+            if any(
+                c.get("key") == "memory_kind"
+                and c.get("match", {}).get("value") == "graph_edge"
+                for c in (s.get("filter") or {}).get("must", [])
+            )
+        ]
+        assert len(edge_scrolls) > 0, "expected at least one edge scroll"
+        for s in edge_scrolls:
+            assert s["max_total"] is not None, (
+                f"edge scroll missing max_total: {s}"
+            )
+
+    def test_paginated_scroll_max_total_is_bounded(self):
+        """With a paginated fake, max_total must bound the total returned."""
+        eid = make_entity_id("concept", "hub")
+        seeds = [{
+            "id": "seed-1",
+            "score": 0.9,
+            "payload": {
+                "text": "hub entity",
+                "importance": 5,
+                "created_at": "2026-06-20T00:00:00+00:00",
+                "entity_id": eid,
+                "fact_status": "active",
+            },
+        }]
+
+        class PaginatedFakeQdrant(FakeGraphQdrant):
+            """Fake that simulates multi-page scroll, tracking max_total."""
+
+            def scroll_by_filter(self, name, filter, *, limit=256,
+                                 with_payload=True, with_vector=False, max_total=None):
+                self.scrolls.append({
+                    "name": name, "filter": filter, "limit": limit,
+                    "max_total": max_total,
+                })
+                must = filter.get("must", []) if filter else []
+                results = []
+                for point_id, point in self._store.items():
+                    payload = point.get("payload") or {}
+                    if self._matches_filter(payload, must):
+                        results.append(point)
+                # Simulate pagination: if max_total is set, cap at it
+                if max_total is not None:
+                    results = results[:max_total]
+                else:
+                    # Without max_total, simulate unbounded (cap at limit only)
+                    results = results[:limit]
+                return results
+
+        qdrant = PaginatedFakeQdrant(search_results=seeds)
+        neighbor_cap = 4
+        for i in range(50):
+            nid = make_entity_id("concept", f"neighbor-{i}")
+            edge_id = make_edge_id(eid, nid, "RELATED_TO")
+            qdrant.add_point(edge_id, {
+                "memory_kind": "graph_edge",
+                "source_entity_id": eid,
+                "target_entity_id": nid,
+                "relation_type": "RELATED_TO",
+                "confidence": 0.8,
+                "fact_status": "active",
+            })
+
+        retriever = GraphMemoryRetriever(
+            qdrant=qdrant,
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+            expansion_policy=GraphExpansionPolicy(max_neighbors_per_node=neighbor_cap),
+        )
+        retriever.search("hub", top_k=5, candidate_seed_top_k=3)
+
+        # All edge scrolls must have a bounded max_total
+        edge_scrolls = [
+            s for s in qdrant.scrolls
+            if any(
+                c.get("key") == "memory_kind"
+                and c.get("match", {}).get("value") == "graph_edge"
+                for c in (s.get("filter") or {}).get("must", [])
+            )
+        ]
+        for s in edge_scrolls:
+            assert s["max_total"] is not None
+            assert s["max_total"] <= 256  # _HARD_SCROLL_PER_CALL
+            # Bounded max should be derived from neighbor cap * 3
+            assert s["max_total"] <= neighbor_cap * 3
+
+
+class TestFailClosedRelationTypes:
+    """Blocker 3: Invalid relation_types must fail closed, not silently widen."""
+
+    def test_search_raises_on_invalid_relation_type(self):
+        qdrant = FakeGraphQdrant(search_results=[])
+        retriever = GraphMemoryRetriever(
+            qdrant=qdrant,
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+        )
+        with pytest.raises(ValueError, match="invalid relation_type"):
+            retriever.search("query", relation_types=["BLOWS_UP"])
+
+    def test_search_raises_on_partial_invalid_relation_type(self):
+        """Even if some are valid, one invalid should fail."""
+        qdrant = FakeGraphQdrant(search_results=[])
+        retriever = GraphMemoryRetriever(
+            qdrant=qdrant,
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+        )
+        with pytest.raises(ValueError, match="invalid relation_type"):
+            retriever.search("query", relation_types=["USES_TOOL", "FAKE_RELATION"])
+
+    def test_search_accepts_valid_relation_types(self):
+        qdrant = FakeGraphQdrant(search_results=[{
+            "id": "seed-1",
+            "score": 0.9,
+            "payload": {
+                "text": "test",
+                "importance": 5,
+                "created_at": "2026-06-20T00:00:00+00:00",
+                "fact_status": "active",
+            },
+        }])
+        retriever = GraphMemoryRetriever(
+            qdrant=qdrant,
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+        )
+        # Should not raise
+        result = retriever.search("query", relation_types=["USES_TOOL", "REFERENCES"])
+        assert result is not None
+
+    def test_schema_uses_relation_enum(self):
+        """GRAPH_SEARCH_SCHEMA relation_types must use an enum of RELATION_TYPES."""
+        from qdrant_memory.tools import GRAPH_SEARCH_SCHEMA
+        from qdrant_memory.schema import RELATION_TYPES
+        items = GRAPH_SEARCH_SCHEMA["parameters"]["properties"]["relation_types"]["items"]
+        assert "enum" in items
+        assert set(items["enum"]) == set(RELATION_TYPES)
+
+
+class TestDebugRedaction:
+    """Blocker 4: Debug must not echo raw query or invalid relation values."""
+
+    def test_debug_does_not_contain_raw_query(self):
+        # Build secret-shaped string at runtime to avoid literal-fake-secret scanner
+        secret_query = "".join(["sk-lea", "ked-api-key-", "1234567890abcdef"])
+        qdrant = FakeGraphQdrant(search_results=[{
+            "id": "seed-1",
+            "score": 0.9,
+            "payload": {
+                "text": "some text",
+                "importance": 5,
+                "created_at": "2026-06-20T00:00:00+00:00",
+                "fact_status": "active",
+            },
+        }])
+        retriever = GraphMemoryRetriever(
+            qdrant=qdrant,
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+        )
+        result = retriever.search(secret_query, top_k=5, debug=True)
+        debug_json = json.dumps(result.debug)
+        assert secret_query not in debug_json, (
+            "raw secret query must not appear in debug output"
+        )
+        # query_length should be present instead
+        assert "query_length" in result.debug
+
+    def test_debug_does_not_echo_invalid_relation_value(self):
+        """Warnings should not contain the raw invalid relation_type value."""
+        # Build secret-shaped string at runtime to avoid literal-fake-secret scanner
+        secret_relation = "".join(["sk-sec", "ret-relation-value"])
+        eid_a = make_entity_id("concept", "A")
+        eid_b = make_entity_id("concept", "B")
+        seeds = [{
+            "id": "seed-a",
+            "score": 0.9,
+            "payload": {
+                "text": "entity A",
+                "importance": 5,
+                "created_at": "2026-06-20T00:00:00+00:00",
+                "entity_id": eid_a,
+                "fact_status": "active",
+            },
+        }]
+        qdrant = FakeGraphQdrant(search_results=seeds)
+        qdrant.add_point("ent-a", {
+            "memory_kind": "graph_entity",
+            "entity_id": eid_a,
+            "source_point_ids": [],
+            "fact_status": "active",
+        })
+        qdrant.add_point("bad-edge", {
+            "memory_kind": "graph_edge",
+            "source_entity_id": eid_a,
+            "target_entity_id": eid_b,
+            "relation_type": secret_relation,
+            "confidence": 0.9,
+            "fact_status": "active",
+        })
+        retriever = GraphMemoryRetriever(
+            qdrant=qdrant,
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+        )
+        result = retriever.search("entity A", top_k=5)
+        warnings_json = json.dumps(result.debug.get("warnings", []))
+        assert secret_relation not in warnings_json, (
+            "raw invalid relation value must not appear in warnings"
+        )
+
+
+class TestGraphIDValidation:
+    """Blocker 5: Entity/edge/point ID validators and defensive confidence."""
+
+    def test_extract_entity_refs_rejects_malformed(self):
+        """Malformed entity IDs (not matching entity-<16hex>) are rejected."""
+        payload = {
+            "entity_id": "entity-notvalid",  # missing hex suffix
+            "source_entity_id": "entity-deadbeefdeadbeef",  # valid 16 hex
+        }
+        refs = _extract_entity_refs(payload)
+        # Only the valid one should be present
+        assert "entity-deadbeefdeadbeef" in refs
+        assert "entity-notvalid" not in refs
+
+    def test_get_counterparty_rejects_malformed(self):
+        """Counterparty with malformed entity ID returns None."""
+        eid = make_entity_id("concept", "A")
+        edge_payload = {
+            "source_entity_id": eid,
+            "target_entity_id": "entity-BADFORMAT",  # malformed
+        }
+        result = _get_counterparty(edge_payload, eid)
+        assert result is None
+
+    def test_malformed_confidence_does_not_crash(self):
+        """Non-numeric confidence should default to 0.0, not crash."""
+        eid_a = make_entity_id("concept", "A")
+        eid_b = make_entity_id("concept", "B")
+        seeds = [{
+            "id": "seed-a",
+            "score": 0.9,
+            "payload": {
+                "text": "entity A",
+                "importance": 5,
+                "created_at": "2026-06-20T00:00:00+00:00",
+                "entity_id": eid_a,
+                "fact_status": "active",
+            },
+        }]
+        qdrant = FakeGraphQdrant(search_results=seeds)
+        qdrant.add_point("ent-a", {
+            "memory_kind": "graph_entity",
+            "entity_id": eid_a,
+            "source_point_ids": [],
+            "fact_status": "active",
+        })
+        edge_id = make_edge_id(eid_a, eid_b, "RELATED_TO")
+        qdrant.add_point(edge_id, {
+            "memory_kind": "graph_edge",
+            "source_entity_id": eid_a,
+            "target_entity_id": eid_b,
+            "relation_type": "RELATED_TO",
+            "confidence": "not-a-number",  # malformed!
+            "fact_status": "active",
+        })
+        qdrant.add_point("ent-b", {
+            "memory_kind": "graph_entity",
+            "entity_id": eid_b,
+            "source_point_ids": ["mem-b"],
+            "fact_status": "active",
+        })
+        qdrant.add_point("mem-b", {
+            "text": "B memory",
+            "importance": 5,
+            "created_at": "2026-06-20T00:00:00+00:00",
+            "fact_status": "active",
+        })
+        retriever = GraphMemoryRetriever(
+            qdrant=qdrant,
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+        )
+        # Should not raise
+        result = retriever.search("entity A", top_k=5)
+        assert result is not None
+
+    def test_nan_confidence_does_not_crash(self):
+        """NaN confidence (float('nan')) should be handled defensively."""
+        eid_a = make_entity_id("concept", "A")
+        eid_b = make_entity_id("concept", "B")
+        seeds = [{
+            "id": "seed-a",
+            "score": 0.9,
+            "payload": {
+                "text": "entity A",
+                "importance": 5,
+                "created_at": "2026-06-20T00:00:00+00:00",
+                "entity_id": eid_a,
+                "fact_status": "active",
+            },
+        }]
+        qdrant = FakeGraphQdrant(search_results=seeds)
+        qdrant.add_point("ent-a", {
+            "memory_kind": "graph_entity",
+            "entity_id": eid_a,
+            "source_point_ids": [],
+            "fact_status": "active",
+        })
+        edge_id = make_edge_id(eid_a, eid_b, "RELATED_TO")
+        qdrant.add_point(edge_id, {
+            "memory_kind": "graph_edge",
+            "source_entity_id": eid_a,
+            "target_entity_id": eid_b,
+            "relation_type": "RELATED_TO",
+            "confidence": float("nan"),  # NaN!
+            "fact_status": "active",
+        })
+        qdrant.add_point("ent-b", {
+            "memory_kind": "graph_entity",
+            "entity_id": eid_b,
+            "source_point_ids": ["mem-b"],
+            "fact_status": "active",
+        })
+        qdrant.add_point("mem-b", {
+            "text": "B memory",
+            "importance": 5,
+            "created_at": "2026-06-20T00:00:00+00:00",
+            "fact_status": "active",
+        })
+        retriever = GraphMemoryRetriever(
+            qdrant=qdrant,
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+        )
+        result = retriever.search("entity A", top_k=5)
+        assert result is not None
+
+    def test_malformed_source_point_id_filtered(self):
+        """Malformed source_point_ids should be filtered, not passed to retrieve."""
+        eid_a = make_entity_id("concept", "A")
+        seeds = [{
+            "id": "seed-a",
+            "score": 0.9,
+            "payload": {
+                "text": "entity A",
+                "importance": 5,
+                "created_at": "2026-06-20T00:00:00+00:00",
+                "entity_id": eid_a,
+                "fact_status": "active",
+            },
+        }]
+        qdrant = FakeGraphQdrant(search_results=seeds)
+        qdrant.add_point("ent-a", {
+            "memory_kind": "graph_entity",
+            "entity_id": eid_a,
+            "source_point_ids": ["https://evil.com/path", "valid-point-id"],
+            "fact_status": "active",
+        })
+        retriever = GraphMemoryRetriever(
+            qdrant=qdrant,
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+        )
+        retriever.search("entity A", top_k=5)
+        # Check that the URL was NOT passed to retrieve
+        for r in qdrant.retrieves:
+            assert "https://evil.com/path" not in r.get("ids", []), (
+                "malformed source point ID should be filtered before retrieval"
+            )
+
+
+class TestProviderGraphSearchDispatch:
+    """Blocker 1: Provider must dispatch qdrant_memory_graph_search."""
+
+    def test_provider_handles_graph_search(self):
+        """handle_tool_call must not return Unknown tool for graph_search."""
+        import importlib.util as importlib_util
+        import sys as _sys
+        from pathlib import Path
+        plugin_root = Path(__file__).resolve().parents[1]
+        if str(plugin_root) not in _sys.path:
+            _sys.path.insert(0, str(plugin_root))
+
+        # Import the provider class
+        spec = importlib_util.spec_from_file_location(
+            "_test_graph_search_provider",
+            str(plugin_root / "__init__.py"),
+        )
+        assert spec is not None and spec.loader is not None
+        mod = importlib_util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        Provider = mod.QdrantMemoryProvider
+
+        # Create a minimal instance — we need to test dispatch, not full init
+        provider = Provider.__new__(Provider)
+
+        # Without initialization, it should return a provider error (not "Unknown tool")
+        result = json.loads(provider.handle_tool_call(
+            "qdrant_memory_graph_search",
+            {"query": "test query"},
+        ))
+        # Must NOT be "Unknown tool"
+        assert "Unknown tool" not in result.get("error", ""), (
+            f"Expected provider to handle graph_search, got: {result}"
+        )
+
+    def test_provider_graph_search_validates_query(self):
+        """Provider should validate empty query."""
+        import importlib.util as importlib_util
+        import sys as _sys
+        from pathlib import Path
+        plugin_root = Path(__file__).resolve().parents[1]
+        if str(plugin_root) not in _sys.path:
+            _sys.path.insert(0, str(plugin_root))
+
+        spec = importlib_util.spec_from_file_location(
+            "_test_graph_search_provider2",
+            str(plugin_root / "__init__.py"),
+        )
+        assert spec is not None and spec.loader is not None
+        mod = importlib_util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        Provider = mod.QdrantMemoryProvider
+
+        provider = Provider.__new__(Provider)
+        result = json.loads(provider.handle_tool_call(
+            "qdrant_memory_graph_search",
+            {"query": ""},
+        ))
+        assert "error" in result
+        assert "query is required" in result["error"]

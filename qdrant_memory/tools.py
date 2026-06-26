@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .recipes import list_recipe_names
+from .schema import RELATION_TYPES
 
 STATUS_SCHEMA = {
     "name": "qdrant_memory_status",
@@ -323,7 +324,7 @@ GRAPH_SEARCH_SCHEMA = {
                           "description": "BFS depth for graph expansion. Defaults to 2."},
             "entity_types": {"type": "array", "items": {"type": "string"},
                              "description": "Optional entity_type allowlist."},
-            "relation_types": {"type": "array", "items": {"type": "string"},
+            "relation_types": {"type": "array", "items": {"type": "string", "enum": list(RELATION_TYPES)},
                                "description": "Optional relation_type allowlist."},
             "include_fact_history": {"type": "boolean", "default": False,
                                      "description": "Include deprecated/superseded graph edges in ranking. Defaults to false."},

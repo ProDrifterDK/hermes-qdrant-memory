@@ -23,11 +23,12 @@ import math
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from .graph_schema import valid_edge_id, valid_entity_id
 from .lesson_extractor import contains_secret
 from .ranking import RankingContext, RankingPolicy, rank_memory_candidate
 from .retriever import MemoryRetriever, RetrievedMemory
 from .scoring import normalize_minmax, recency_score
-from .schema import RELATION_TYPES, valid_fact_status, valid_relation_type
+from .schema import RELATION_TYPES, valid_fact_status, valid_point_id_link, valid_relation_type
 
 # ---------------------------------------------------------------------------
 # Hard caps (non-negotiable)
@@ -152,16 +153,16 @@ def _extract_entity_refs(payload: dict[str, Any]) -> list[str]:
     """Extract entity references from a payload dict.
 
     Checks ``entity_id``, ``source_entity_id``, ``target_entity_id``, and
-    ``entity_ids`` (list) fields.
+    ``entity_ids`` (list) fields. Only well-formed entity IDs pass validation.
     """
     refs: list[str] = []
     seen: set[str] = set()
 
     def _add(value: Any) -> None:
-        if isinstance(value, str) and value.startswith("entity-"):
-            if value not in seen:
-                seen.add(value)
-                refs.append(value)
+        validated = valid_entity_id(value)
+        if validated and validated not in seen:
+            seen.add(validated)
+            refs.append(validated)
 
     _add(payload.get("entity_id"))
     _add(payload.get("source_entity_id"))
@@ -172,9 +173,12 @@ def _extract_entity_refs(payload: dict[str, Any]) -> list[str]:
 
 
 def _get_counterparty(edge_payload: dict[str, Any], entity_id: str) -> str | None:
-    """Given an edge payload and a known entity on one side, return the other."""
-    src = edge_payload.get("source_entity_id")
-    tgt = edge_payload.get("target_entity_id")
+    """Given an edge payload and a known entity on one side, return the other.
+
+    Both source and target IDs are validated; malformed values are dropped.
+    """
+    src = valid_entity_id(edge_payload.get("source_entity_id"))
+    tgt = valid_entity_id(edge_payload.get("target_entity_id"))
     if src == entity_id and tgt and tgt != entity_id:
         return tgt
     if tgt == entity_id and src and src != entity_id:
@@ -275,12 +279,18 @@ class GraphMemoryRetriever:
         max_graph_results = _clamp(max_graph_results, 1, _HARD_GRAPH_RESULTS)
         top_k = _clamp(top_k, 1, _HARD_GRAPH_RESULTS)
 
-        # Validate relation_types
+        # Validate relation_types — fail closed if any are invalid
         validated_relation_types: list[str] | None = None
         if relation_types:
-            validated_relation_types = [rt for rt in relation_types if valid_relation_type(rt)]
-            if not validated_relation_types:
-                validated_relation_types = None
+            invalid_rts = [rt for rt in relation_types if not valid_relation_type(rt)]
+            if invalid_rts:
+                raise ValueError(
+                    f"invalid relation_type(s): {', '.join(invalid_rts)}. "
+                    f"Valid types: {', '.join(RELATION_TYPES)}"
+                )
+            validated_relation_types = list(dict.fromkeys(
+                rt for rt in relation_types if valid_relation_type(rt)
+            ))
 
         # Entity type allowlist (length cap)
         validated_entity_types: list[str] | None = None
@@ -433,10 +443,10 @@ class GraphMemoryRetriever:
                     break
 
                 edge_payload = edge_point.get("payload") or {}
-                # Validate relation_type
+                # Validate relation_type — do not echo the raw invalid value
                 rel = edge_payload.get("relation_type")
                 if rel and not valid_relation_type(rel):
-                    warnings.append(f"dropped edge with invalid relation_type: {rel}")
+                    warnings.append("dropped edge with invalid relation_type")
                     continue
 
                 # Fact status filter
@@ -446,8 +456,14 @@ class GraphMemoryRetriever:
                         filtered_fact_status += 1
                         continue
 
-                # Confidence floor
-                edge_conf = float(edge_payload.get("confidence") or 0.0)
+                # Confidence floor — defensive parse (non-numeric/NaN → 0.0)
+                raw_conf = edge_payload.get("confidence")
+                try:
+                    edge_conf = float(raw_conf)
+                    if not math.isfinite(edge_conf):
+                        edge_conf = 0.0
+                except (TypeError, ValueError):
+                    edge_conf = 0.0
                 if edge_conf < self.expansion_policy.edge_confidence_floor:
                     filtered_confidence_floor += 1
                     continue
@@ -581,7 +597,7 @@ class GraphMemoryRetriever:
         if debug:
             result_debug = {
                 "algorithm": "graph_v1",
-                "query": query,
+                "query_length": len(query or ""),
                 "policy": asdict(self.expansion_policy),
                 "weights": asdict(self.rank_weights),
                 "stages": {
@@ -723,7 +739,11 @@ class GraphMemoryRetriever:
         side: str,
         relation_types: list[str] | None,
     ) -> list[dict[str, Any]]:
-        """Scroll for graph_edge points where the entity is on the given side."""
+        """Scroll for graph_edge points where the entity is on the given side.
+
+        The scroll is bounded by ``max_total`` derived from the per-node
+        neighbor cap to prevent unbounded pagination.
+        """
         key = "source_entity_id" if side == "source" else "target_entity_id"
         must: list[dict[str, Any]] = [
             {"key": "memory_kind", "match": {"value": "graph_edge"}},
@@ -734,11 +754,20 @@ class GraphMemoryRetriever:
 
         filt: dict[str, Any] = {"must": must}
 
+        # Bound the scroll: allow at most a small overfetch factor above the
+        # per-node neighbor cap so dedup/filtering can work without unbounded
+        # pagination. Hard cap at _HARD_SCROLL_PER_CALL as a safety ceiling.
+        bounded_max = min(
+            self.expansion_policy.max_neighbors_per_node * 3,
+            _HARD_SCROLL_PER_CALL,
+        )
+
         try:
             return self.qdrant.scroll_by_filter(
                 self.collection_name,
                 filt,
-                limit=_HARD_SCROLL_PER_CALL,
+                limit=min(bounded_max, _HARD_SCROLL_PER_CALL),
+                max_total=bounded_max,
             )
         except Exception:
             return []
@@ -778,10 +807,17 @@ class GraphMemoryRetriever:
             source_point_ids = ep_payload.get("source_point_ids") or []
             if not source_point_ids:
                 continue
+            # Validate each source point ID before retrieval
+            validated_pids = [
+                pid for pid in (valid_point_id_link(p) for p in source_point_ids[:8])
+                if pid
+            ]
+            if not validated_pids:
+                continue
             try:
                 points = self.qdrant.retrieve(
                     self.collection_name,
-                    [str(pid) for pid in source_point_ids[:8]],
+                    validated_pids,
                 )
             except Exception:
                 continue
