@@ -99,6 +99,23 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     search.add_argument("--include-fact-history", action="store_true", help="Include deprecated or superseded fact assertions in search results.")
     search.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
 
+    graph_search = subcommands.add_parser("graph-search", help="Read-only graph-aware search over entity/edge payloads with hybrid reranking.")
+    graph_search.add_argument("query", help="Search query.")
+    graph_search.add_argument("--top-k", type=_top_k, default=5, help="Maximum final results to return, 1 to 20. Default: 5.")
+    graph_search.add_argument("--candidate-seed-top-k", type=_positive_int, default=20, help="Semantic seeds for graph expansion. Default: 20.")
+    graph_search.add_argument("--max-graph-results", type=_positive_int, default=20, help="Hard cap on expansion pool before reranking. Default: 20.")
+    graph_search.add_argument("--max-depth", type=int, choices=[1, 2, 3], default=2, help="BFS depth for graph expansion. Default: 2.")
+    graph_search.add_argument("--entity-type", action="append", default=[], help="Optional entity_type filter. Repeat or pass comma-separated values.")
+    graph_search.add_argument("--relation-type", action="append", default=[], help="Optional relation_type filter. Repeat or pass comma-separated values.")
+    graph_search.add_argument("--include-fact-history", action="store_true", help="Include deprecated/superseded graph edges in ranking.")
+    try:
+        graph_search.add_argument("--debug", action=argparse.BooleanOptionalAction, default=True, help="Include debug breakdown. Default: enabled.")
+    except AttributeError:  # pragma: no cover - Python < 3.9 compatibility
+        graph_search.add_argument("--debug", action="store_true", default=True, help="Include debug breakdown. Default: enabled.")
+        graph_search.add_argument("--no-debug", dest="debug", action="store_false", help="Disable debug breakdown.")
+    graph_search.add_argument("--collection", choices=["memory", "learning"], default="memory", help="Collection to search. Default: memory.")
+    graph_search.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
+
     context = subcommands.add_parser("context", help="Build a read-only provenance-explicit context packet from a recipe template.")
     context.add_argument("--template", choices=list_recipe_names(), default="source_backed_answer", help="Context template/recipe. Default: source_backed_answer.")
     context.add_argument("--topic", required=True, help="Topic/query for the context packet.")

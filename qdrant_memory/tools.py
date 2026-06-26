@@ -302,6 +302,41 @@ CONSOLIDATION_APPLY_SCHEMA = {
     },
 }
 
+GRAPH_SEARCH_SCHEMA = {
+    "name": "qdrant_memory_graph_search",
+    "description": (
+        "Read-only graph-aware search. Combines semantic seed search with bounded "
+        "entity/edge neighbor expansion and hybrid reranking. Read-only — never "
+        "mutates Qdrant."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "What to search for."},
+            "top_k": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5,
+                      "description": "Final results returned. Defaults to 5."},
+            "candidate_seed_top_k": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20,
+                                     "description": "Semantic seeds for graph expansion. Defaults to 20."},
+            "max_graph_results": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20,
+                                  "description": "Hard cap on expansion pool before reranking. Defaults to 20."},
+            "max_depth": {"type": "integer", "enum": [1, 2, 3], "default": 2,
+                          "description": "BFS depth for graph expansion. Defaults to 2."},
+            "entity_types": {"type": "array", "items": {"type": "string"},
+                             "description": "Optional entity_type allowlist."},
+            "relation_types": {"type": "array", "items": {"type": "string"},
+                               "description": "Optional relation_type allowlist."},
+            "include_fact_history": {"type": "boolean", "default": False,
+                                     "description": "Include deprecated/superseded graph edges in ranking. Defaults to false."},
+            "debug": {"type": "boolean", "default": True,
+                      "description": "Include per-stage and per-candidate debug breakdown. Defaults to true."},
+            "collection": {"type": "string", "enum": ["memory", "learning"], "default": "memory",
+                           "description": "Collection to search. Defaults to memory."},
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    },
+}
+
 TOOL_SCHEMAS = [
     STATUS_SCHEMA,
     STORE_SCHEMA,
@@ -321,4 +356,5 @@ TOOL_SCHEMAS = [
     SOURCE_EXTRACTION_APPROVE_SCHEMA,
     CONSOLIDATE_SCHEMA,
     CONSOLIDATION_APPLY_SCHEMA,
+    GRAPH_SEARCH_SCHEMA,
 ]
