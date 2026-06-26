@@ -29,6 +29,7 @@ from qdrant_memory.graph_schema import (
     sanitize_profile_id,
     sanitize_source_point_ids,
     sanitize_tags,
+    sanitize_timestamp,
     valid_edge_id,
     valid_entity_id,
     validate_edge_id,
@@ -1034,3 +1035,305 @@ class TestSanitizeProfileId:
 
     def test_default_on_invalid_chars(self):
         assert sanitize_profile_id("../etc/passwd") == "default"
+
+
+# ---------------------------------------------------------------------------
+# Security: extra cannot inject reserved payload keys
+# ---------------------------------------------------------------------------
+
+class TestExtraCannotInjectReservedKeys:
+    """Regression: reserved provenance/schema fields must not be injectable
+    through ``extra`` after direct-field sanitization."""
+
+    # -- Entity payload --------------------------------------------------
+
+    def test_entity_extra_cannot_inject_content_hash(self):
+        """Extra with invalid/secret content_hash must not leak into payload."""
+        secret_hash = "".join(["password", "=", "supersecret1234567890"])
+        payload = build_entity_payload(
+            entity_type="concept",
+            label="Test",
+            source_uri="file:///docs/x.md",
+            extra={
+                "content_hash": secret_hash,
+                "safe_extra": "ok",
+            },
+        )
+        dumped = json.dumps(payload)
+        assert "supersecret" not in dumped
+        # content_hash must either be absent or equal the sanitized direct
+        # field value (empty string), not the injected one
+        assert payload.get("content_hash", "") != secret_hash
+
+    def test_entity_extra_cannot_inject_source_point_ids(self):
+        """Extra with invalid source_point_ids must not leak into payload."""
+        secret_ids = ["".join(["api", "_key=secret", "123"]), "http://evil.com/x"]
+        payload = build_entity_payload(
+            entity_type="concept",
+            label="Test",
+            source_uri="file:///docs/x.md",
+            extra={
+                "source_point_ids": secret_ids,
+                "safe_extra": "ok",
+            },
+        )
+        dumped = json.dumps(payload)
+        assert "api_key" not in dumped
+        assert "evil.com" not in dumped
+        # source_point_ids must be absent or only contain validated entries
+        if "source_point_ids" in payload:
+            for pid in payload["source_point_ids"]:
+                assert "api_key" not in pid
+                assert "evil.com" not in pid
+
+    def test_entity_extra_cannot_inject_other_reserved_keys(self):
+        """Spot-check that canonical, entity_id, memory_kind etc. cannot
+        be overridden through extra."""
+        payload = build_entity_payload(
+            entity_type="concept",
+            label="Test",
+            source_uri="file:///docs/x.md",
+            extra={
+                "canonical": True,  # must NOT override forced-False
+                "entity_id": "entity-malicious000000",
+                "memory_kind": "fake_kind",
+                "requires_review": False,  # must NOT override forced-True
+                "confidence": 999.0,
+                "safe_custom": "allowed",
+            },
+        )
+        assert payload["canonical"] is False
+        assert payload["requires_review"] is True
+        assert payload["confidence"] <= 1.0
+        assert payload["entity_id"] != "entity-malicious000000"
+        assert payload["memory_kind"] == "graph_entity"
+        assert payload.get("safe_custom") == "allowed"
+
+    # -- Edge payload ----------------------------------------------------
+
+    def test_edge_extra_cannot_inject_content_hash(self):
+        """Extra with invalid/secret content_hash must not leak into payload."""
+        src = make_entity_id("concept", "A")
+        tgt = make_entity_id("concept", "B")
+        secret_hash = "".join(["password", "=", "supersecret1234567890"])
+        payload = build_edge_payload(
+            source_entity_id=src,
+            target_entity_id=tgt,
+            relation_type="SUPPORTS",
+            source_uri="file:///docs/x.md",
+            extra={
+                "content_hash": secret_hash,
+                "safe_extra": "ok",
+            },
+        )
+        dumped = json.dumps(payload)
+        assert "supersecret" not in dumped
+        assert payload.get("content_hash", "") != secret_hash
+
+    def test_edge_extra_cannot_inject_source_point_ids(self):
+        """Extra with invalid source_point_ids must not leak into payload."""
+        src = make_entity_id("concept", "A")
+        tgt = make_entity_id("concept", "B")
+        secret_ids = ["".join(["api", "_key=secret", "123"]), "http://evil.com/x"]
+        payload = build_edge_payload(
+            source_entity_id=src,
+            target_entity_id=tgt,
+            relation_type="SUPPORTS",
+            source_uri="file:///docs/x.md",
+            extra={
+                "source_point_ids": secret_ids,
+                "safe_extra": "ok",
+            },
+        )
+        dumped = json.dumps(payload)
+        assert "api_key" not in dumped
+        assert "evil.com" not in dumped
+        if "source_point_ids" in payload:
+            for pid in payload["source_point_ids"]:
+                assert "api_key" not in pid
+                assert "evil.com" not in pid
+
+    def test_edge_extra_cannot_inject_other_reserved_keys(self):
+        """Spot-check that canonical, edge_id, relation_type etc. cannot
+        be overridden through extra."""
+        src = make_entity_id("concept", "A")
+        tgt = make_entity_id("concept", "B")
+        payload = build_edge_payload(
+            source_entity_id=src,
+            target_entity_id=tgt,
+            relation_type="SUPPORTS",
+            source_uri="file:///docs/x.md",
+            extra={
+                "canonical": True,
+                "edge_id": "edge-malicious0000000",
+                "relation_type": "HACKS",
+                "requires_review": False,
+                "safe_custom": "allowed",
+            },
+        )
+        assert payload["canonical"] is False
+        assert payload["requires_review"] is True
+        assert payload["edge_id"] != "edge-malicious0000000"
+        assert payload["relation_type"] == "SUPPORTS"
+        assert payload.get("safe_custom") == "allowed"
+
+
+# ---------------------------------------------------------------------------
+# Security: controlled-timestamp sanitization (created_at / updated_at)
+# ---------------------------------------------------------------------------
+
+class TestTimestampSanitization:
+    """Regression: created_at/updated_at must not persist secret-bearing
+    values on GraphEntity, GraphEdge, or the builder functions."""
+
+    _SECRET_TS = "".join(["api", "_key=secret123456789"])
+
+    # -- sanitize_timestamp unit tests ----------------------------------
+
+    def test_sanitize_timestamp_valid_iso(self):
+        ts = "2026-06-26T10:00:00Z"
+        assert sanitize_timestamp(ts) == ts
+
+    def test_sanitize_timestamp_valid_with_offset(self):
+        ts = "2026-06-26T10:00:00+03:00"
+        assert sanitize_timestamp(ts) == ts
+
+    def test_sanitize_timestamp_valid_with_microseconds(self):
+        ts = "2026-06-26T10:00:00.123456Z"
+        assert sanitize_timestamp(ts) == ts
+
+    def test_sanitize_timestamp_secret_replaced(self):
+        result = sanitize_timestamp(self._SECRET_TS)
+        assert result != self._SECRET_TS
+        assert "secret" not in result
+
+    def test_sanitize_timestamp_invalid_format_replaced(self):
+        result = sanitize_timestamp("not a timestamp at all!!")
+        assert result != "not a timestamp at all!!"
+
+    def test_sanitize_timestamp_non_string_replaced(self):
+        result = sanitize_timestamp(12345)
+        assert isinstance(result, str)
+
+    def test_sanitize_timestamp_empty_replaced(self):
+        result = sanitize_timestamp("")
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+    # -- GraphEntity dataclass -------------------------------------------
+
+    def test_entity_dataclass_secret_created_at_sanitized(self):
+        entity = GraphEntity(
+            entity_type="concept",
+            label="Test",
+            created_at=self._SECRET_TS,
+            updated_at=self._SECRET_TS,
+            content_hash="sha256:aabbccdd",
+        )
+        payload = entity.to_payload()
+        dumped = json.dumps(payload)
+        assert "secret" not in dumped
+        assert payload["created_at"] != self._SECRET_TS
+        assert payload["updated_at"] != self._SECRET_TS
+
+    def test_entity_dataclass_invalid_created_at_sanitized(self):
+        entity = GraphEntity(
+            entity_type="concept",
+            label="Test",
+            created_at="garbage!!",
+            updated_at="also garbage!!",
+            content_hash="sha256:aabbccdd",
+        )
+        payload = entity.to_payload()
+        assert payload["created_at"] != "garbage!!"
+        assert payload["updated_at"] != "also garbage!!"
+
+    def test_entity_dataclass_valid_timestamp_preserved(self):
+        ts = "2026-06-26T10:00:00Z"
+        entity = GraphEntity(
+            entity_type="concept",
+            label="Test",
+            created_at=ts,
+            updated_at=ts,
+            content_hash="sha256:aabbccdd",
+        )
+        payload = entity.to_payload()
+        assert payload["created_at"] == ts
+        assert payload["updated_at"] == ts
+
+    # -- GraphEdge dataclass --------------------------------------------
+
+    def test_edge_dataclass_secret_created_at_sanitized(self):
+        src = make_entity_id("concept", "A")
+        tgt = make_entity_id("concept", "B")
+        edge = GraphEdge(
+            source_entity_id=src,
+            target_entity_id=tgt,
+            relation_type="SUPPORTS",
+            created_at=self._SECRET_TS,
+            updated_at=self._SECRET_TS,
+            source_uri="file:///docs/x.md",
+        )
+        payload = edge.to_payload()
+        dumped = json.dumps(payload)
+        assert "secret" not in dumped
+        assert payload["created_at"] != self._SECRET_TS
+        assert payload["updated_at"] != self._SECRET_TS
+
+    def test_edge_dataclass_invalid_created_at_sanitized(self):
+        src = make_entity_id("concept", "A")
+        tgt = make_entity_id("concept", "B")
+        edge = GraphEdge(
+            source_entity_id=src,
+            target_entity_id=tgt,
+            relation_type="SUPPORTS",
+            created_at="garbage!!",
+            updated_at="also garbage!!",
+            source_uri="file:///docs/x.md",
+        )
+        payload = edge.to_payload()
+        assert payload["created_at"] != "garbage!!"
+        assert payload["updated_at"] != "also garbage!!"
+
+    def test_edge_dataclass_valid_timestamp_preserved(self):
+        src = make_entity_id("concept", "A")
+        tgt = make_entity_id("concept", "B")
+        ts = "2026-06-26T10:00:00Z"
+        edge = GraphEdge(
+            source_entity_id=src,
+            target_entity_id=tgt,
+            relation_type="SUPPORTS",
+            created_at=ts,
+            updated_at=ts,
+            source_uri="file:///docs/x.md",
+        )
+        payload = edge.to_payload()
+        assert payload["created_at"] == ts
+        assert payload["updated_at"] == ts
+
+    # -- Builder functions ----------------------------------------------
+
+    def test_build_entity_payload_secret_created_at_sanitized(self):
+        payload = build_entity_payload(
+            entity_type="concept",
+            label="Test",
+            created_at=self._SECRET_TS,
+            content_hash="sha256:aabbccdd",
+        )
+        dumped = json.dumps(payload)
+        assert "secret" not in dumped
+        assert payload["created_at"] != self._SECRET_TS
+
+    def test_build_edge_payload_secret_created_at_sanitized(self):
+        src = make_entity_id("concept", "A")
+        tgt = make_entity_id("concept", "B")
+        payload = build_edge_payload(
+            source_entity_id=src,
+            target_entity_id=tgt,
+            relation_type="SUPPORTS",
+            created_at=self._SECRET_TS,
+            source_uri="file:///docs/x.md",
+        )
+        dumped = json.dumps(payload)
+        assert "secret" not in dumped
+        assert payload["created_at"] != self._SECRET_TS

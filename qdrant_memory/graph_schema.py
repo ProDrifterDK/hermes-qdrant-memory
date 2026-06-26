@@ -265,6 +265,44 @@ _PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 # Max number of tags per entity/edge.
 _MAX_TAGS = 64
 
+# Reserved keys that ``extra`` must never inject into a graph payload.
+# These are the provenance, schema, and structural fields that have dedicated
+# sanitization paths in ``to_payload()``.  If ``extra`` contains any of these
+# keys, they are silently dropped — callers must use the proper keyword args.
+_RESERVED_PAYLOAD_KEYS = frozenset({
+    "entity_id",
+    "edge_id",
+    "entity_type",
+    "label",
+    "source_entity_id",
+    "target_entity_id",
+    "relation_type",
+    "text",
+    "source",
+    "source_type",
+    "chunk_type",
+    "memory_kind",
+    "confidence",
+    "canonical",
+    "requires_review",
+    "usefulness_weight",
+    "truth_confidence",
+    "created_at",
+    "updated_at",
+    "profile_id",
+    "tags",
+    "fact_status",
+    "aliases",
+    "description",
+    "source_uri",
+    "content_hash",
+    "source_point_ids",
+    "observed_at",
+    "valid_from",
+    "valid_until",
+    "extra",
+})
+
 
 def sanitize_tags(value: Any) -> list[str]:
     """Sanitize and deduplicate a list of tags.
@@ -332,6 +370,54 @@ def sanitize_profile_id(value: Any) -> str:
     if not _PROFILE_ID_RE.match(text):
         return "default"
     return text
+
+
+# -----------------------------------------------------------------------
+# Controlled-timestamp sanitization (created_at / updated_at)
+# -----------------------------------------------------------------------
+
+# Allowed pattern for ISO-8601-ish timestamps: dates, times, optional
+# fractional seconds, optional 'Z' or +HH:MM offset.  Deliberately
+# restrictive so secret-bearing strings (which tend to contain '=', '/',
+# spaces, etc.) are always rejected.
+_TIMESTAMP_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:?[0-9]{2})?$"
+)
+
+
+def sanitize_timestamp(value: Any) -> str:
+    """Sanitize a controlled timestamp value (created_at / updated_at).
+
+    These fields are caller-supplied and must not persist secret-bearing
+    values.  Returns the stripped, validated timestamp string if it matches
+    the ISO-8601-ish pattern and does not contain secrets; otherwise returns
+    the current UTC timestamp from :func:`now_iso`.
+    """
+    if not isinstance(value, str):
+        return now_iso()
+    text = value.strip()
+    if not text:
+        return now_iso()
+    if contains_secret(text):
+        return now_iso()
+    if not _TIMESTAMP_RE.match(text):
+        return now_iso()
+    return text
+
+
+def _filter_reserved_from_extra(extra: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of *extra* with all reserved payload keys removed.
+
+    This must be applied *before* ``_sanitize_source_metadata`` so that
+    reserved keys (e.g. ``relation_type``) cannot trigger schema-level
+    validation errors or bypass direct-field sanitization paths.
+    """
+    return {
+        key: val
+        for key, val in extra.items()
+        if key not in _RESERVED_PAYLOAD_KEYS
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -466,8 +552,8 @@ class GraphEntity:
             "requires_review": True,  # ALWAYS review-gated by default
             "usefulness_weight": _validate_weight(self.usefulness_weight, "usefulness_weight"),
             "truth_confidence": _validate_weight(self.truth_confidence, "truth_confidence"),
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
+            "created_at": sanitize_timestamp(self.created_at),
+            "updated_at": sanitize_timestamp(self.updated_at),
             "profile_id": profile_id,
             "tags": tags,
         }
@@ -500,13 +586,17 @@ class GraphEntity:
         if source_points:
             payload["source_point_ids"] = source_points
 
-        # Extra metadata (sanitized)
+        # Extra metadata (sanitized, reserved keys always excluded)
         if self.extra:
-            sanitized_extra = _sanitize_source_metadata(self.extra)
-            if isinstance(sanitized_extra, dict):
-                for key, val in sanitized_extra.items():
-                    if key not in payload and not _metadata_is_empty(val):
-                        payload[key] = val
+            safe_extra = _filter_reserved_from_extra(self.extra)
+            if safe_extra:
+                sanitized_extra = _sanitize_source_metadata(safe_extra)
+                if isinstance(sanitized_extra, dict):
+                    for key, val in sanitized_extra.items():
+                        if key in _RESERVED_PAYLOAD_KEYS:
+                            continue
+                        if key not in payload and not _metadata_is_empty(val):
+                            payload[key] = val
 
         return payload
 
@@ -608,8 +698,8 @@ class GraphEdge:
             "requires_review": True,  # ALWAYS review-gated by default
             "usefulness_weight": _validate_weight(self.usefulness_weight, "usefulness_weight"),
             "truth_confidence": _validate_weight(self.truth_confidence, "truth_confidence"),
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
+            "created_at": sanitize_timestamp(self.created_at),
+            "updated_at": sanitize_timestamp(self.updated_at),
             "profile_id": profile_id,
             "tags": tags,
         }
@@ -639,13 +729,17 @@ class GraphEdge:
                 if isinstance(sanitized, str) and sanitized:
                     payload[key] = sanitized
 
-        # Extra metadata (sanitized)
+        # Extra metadata (sanitized, reserved keys always excluded)
         if self.extra:
-            sanitized_extra = _sanitize_source_metadata(self.extra)
-            if isinstance(sanitized_extra, dict):
-                for key, val in sanitized_extra.items():
-                    if key not in payload and not _metadata_is_empty(val):
-                        payload[key] = val
+            safe_extra = _filter_reserved_from_extra(self.extra)
+            if safe_extra:
+                sanitized_extra = _sanitize_source_metadata(safe_extra)
+                if isinstance(sanitized_extra, dict):
+                    for key, val in sanitized_extra.items():
+                        if key in _RESERVED_PAYLOAD_KEYS:
+                            continue
+                        if key not in payload and not _metadata_is_empty(val):
+                            payload[key] = val
 
         return payload
 
