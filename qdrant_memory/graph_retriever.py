@@ -421,19 +421,30 @@ class GraphMemoryRetriever:
             scroll_calls += 1
             all_edges = edges_subject + edges_object
 
-            # Deduplicate edges by point id
+            # Deduplicate edges by validated edge id — drop invalid edge IDs.
             seen_edge_ids: set[str] = set()
-            deduped_edges: list[dict[str, Any]] = []
+            deduped_edges: list[tuple[str, dict[str, Any]]] = []
+            dropped_invalid_edge = 0
             for edge in all_edges:
-                eid_point = str(edge.get("id") or "")
-                if eid_point and eid_point not in seen_edge_ids:
-                    seen_edge_ids.add(eid_point)
-                    deduped_edges.append(edge)
-                elif not eid_point:
-                    deduped_edges.append(edge)
+                edge_payload_raw = edge.get("payload") or {}
+                # Validate edge id from payload.edge_id or point.id.
+                validated_edge_id = valid_edge_id(
+                    edge_payload_raw.get("edge_id") or edge.get("id")
+                )
+                if not validated_edge_id:
+                    dropped_invalid_edge += 1
+                    continue
+                if validated_edge_id not in seen_edge_ids:
+                    seen_edge_ids.add(validated_edge_id)
+                    deduped_edges.append((validated_edge_id, edge))
+
+            if dropped_invalid_edge:
+                warnings.append(
+                    f"dropped {dropped_invalid_edge} edge(s) with invalid edge_id"
+                )
 
             neighbor_count = 0
-            for edge_point in deduped_edges:
+            for validated_edge_id, edge_point in deduped_edges:
                 if neighbor_count >= per_node_cap:
                     hard_caps_hit["max_neighbors_per_node"] = True
                     break
@@ -458,12 +469,15 @@ class GraphMemoryRetriever:
 
                 # Confidence floor — defensive parse (non-numeric/NaN → 0.0)
                 raw_conf = edge_payload.get("confidence")
-                try:
-                    edge_conf = float(raw_conf)
-                    if not math.isfinite(edge_conf):
-                        edge_conf = 0.0
-                except (TypeError, ValueError):
+                if raw_conf is None:
                     edge_conf = 0.0
+                else:
+                    try:
+                        edge_conf = float(raw_conf)
+                        if not math.isfinite(edge_conf):
+                            edge_conf = 0.0
+                    except (TypeError, ValueError):
+                        edge_conf = 0.0
                 if edge_conf < self.expansion_policy.edge_confidence_floor:
                     filtered_confidence_floor += 1
                     continue
@@ -511,8 +525,9 @@ class GraphMemoryRetriever:
                 else:
                     # Even without resolved memory points, include the edge as an
                     # expansion candidate — it may still be useful context.
+                    # Use the validated edge id, never the raw point id.
                     expansions.append(GraphExpandedCandidate(
-                        point_id=str(edge_point.get("id") or ""),
+                        point_id=validated_edge_id,
                         payload=edge_payload,
                         vector_score=0.0,
                         graph_distance=next_depth,
@@ -727,7 +742,11 @@ class GraphMemoryRetriever:
         for point in points:
             payload = point.get("payload") or {}
             if _query_alias_matches(query_cf, payload):
-                eid = str(payload.get("entity_id") or point.get("id") or "")
+                # Validate entity_id — only accept IDs that pass valid_entity_id().
+                # Do not fall back to arbitrary point IDs unless they also validate.
+                eid = valid_entity_id(payload.get("entity_id"))
+                if eid is None:
+                    eid = valid_entity_id(point.get("id"))
                 if eid:
                     results.append((eid, payload))
         return results
@@ -744,6 +763,10 @@ class GraphMemoryRetriever:
         The scroll is bounded by ``max_total`` derived from the per-node
         neighbor cap to prevent unbounded pagination.
         """
+        # Defensive: refuse to scroll with an invalid entity_id.
+        if not valid_entity_id(entity_id):
+            return []
+
         key = "source_entity_id" if side == "source" else "target_entity_id"
         must: list[dict[str, Any]] = [
             {"key": "memory_kind", "match": {"value": "graph_edge"}},

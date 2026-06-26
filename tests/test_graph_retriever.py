@@ -556,9 +556,12 @@ class TestInvalidRelationType:
             "fact_status": "active",
         })
 
-        # Invalid relation type edge
-        qdrant.add_point("bad-edge", {
+        # Invalid relation type edge — must have a valid edge_id so it reaches
+        # the relation_type check (edges with invalid edge_id are dropped earlier).
+        bad_edge_id = make_edge_id(entity_a, entity_b, "BLOWS_UP")
+        qdrant.add_point(bad_edge_id, {
             "memory_kind": "graph_edge",
+            "edge_id": bad_edge_id,
             "source_entity_id": entity_a,
             "target_entity_id": entity_b,
             "relation_type": "BLOWS_UP",  # invalid!
@@ -1199,6 +1202,252 @@ class TestGraphIDValidation:
             assert "https://evil.com/path" not in r.get("ids", []), (
                 "malformed source point ID should be filtered before retrieval"
             )
+
+    def test_scroll_edges_rejects_malformed_entity_id(self):
+        """_scroll_edges_for_entity must return [] for malformed entity_id."""
+        retriever = GraphMemoryRetriever(
+            qdrant=FakeGraphQdrant(search_results=[]),
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+        )
+        result = retriever._scroll_edges_for_entity(
+            "entity-notvalid", side="source", relation_types=None,
+        )
+        assert result == [], "malformed entity_id should produce no edge scroll"
+
+    def test_scroll_edges_rejects_secret_shaped_entity_id(self):
+        """_scroll_edges_for_entity must return [] for secret-shaped entity_id."""
+        secret_eid = "".join(["sk-lea", "ked-entity-id"])
+        retriever = GraphMemoryRetriever(
+            qdrant=FakeGraphQdrant(search_results=[]),
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+        )
+        result = retriever._scroll_edges_for_entity(
+            secret_eid, side="target", relation_types=None,
+        )
+        assert result == [], "secret-shaped entity_id should produce no edge scroll"
+
+    def test_malformed_query_matched_entity_does_not_seed_bfs(self):
+        """Malformed graph_entity.entity_id from alias match must not seed BFS
+        or appear in edge-scroll filters."""
+        eid_a = make_entity_id("concept", "A")
+        eid_b = make_entity_id("concept", "B")
+        seeds = [{
+            "id": "seed-a",
+            "score": 0.9,
+            "payload": {
+                "text": "entity A",
+                "importance": 5,
+                "created_at": "2026-06-20T00:00:00+00:00",
+                "entity_id": eid_a,
+                "fact_status": "active",
+            },
+        }]
+        qdrant = FakeGraphQdrant(search_results=seeds)
+        qdrant.add_point("ent-a", {
+            "memory_kind": "graph_entity",
+            "entity_id": eid_a,
+            "source_point_ids": [],
+            "fact_status": "active",
+        })
+        # Malformed graph_entity whose alias matches the query
+        qdrant.add_point("bad-entity-point", {
+            "memory_kind": "graph_entity",
+            "entity_id": "entity-notvalid",  # malformed
+            "label": "entity A",  # matches query
+            "source_point_ids": [],
+            "fact_status": "active",
+        })
+        retriever = GraphMemoryRetriever(
+            qdrant=qdrant,
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+        )
+        result = retriever.search("entity A", top_k=5, debug=True)
+
+        # The malformed entity_id must NOT appear in any edge scroll filter
+        for s in qdrant.scrolls:
+            for cond in (s.get("filter") or {}).get("must", []):
+                match = cond.get("match", {})
+                if "value" in match:
+                    assert str(match["value"]) != "entity-notvalid", (
+                        f"malformed entity_id leaked into scroll filter: {s}"
+                    )
+
+        # The malformed entity_id must NOT appear in expansions or final
+        all_point_ids = (
+            [e.point_id for e in result.expansions]
+            + [c.point_id for c in result.final]
+        )
+        assert "entity-notvalid" not in all_point_ids, (
+            f"malformed entity_id leaked into results: {all_point_ids}"
+        )
+
+    def test_malformed_edge_id_dropped_not_traversed(self):
+        """A graph_edge with a malformed point ID and edge_id (but valid
+        endpoint entity IDs and relation_type) must be dropped before
+        traversal — no expansion through that edge."""
+        eid_a = make_entity_id("concept", "A")
+        eid_b = make_entity_id("concept", "B")
+        seeds = [{
+            "id": "seed-a",
+            "score": 0.9,
+            "payload": {
+                "text": "entity A",
+                "importance": 5,
+                "created_at": "2026-06-20T00:00:00+00:00",
+                "entity_id": eid_a,
+                "fact_status": "active",
+            },
+        }]
+        qdrant = FakeGraphQdrant(search_results=seeds)
+        qdrant.add_point("ent-a", {
+            "memory_kind": "graph_entity",
+            "entity_id": eid_a,
+            "source_point_ids": [],
+            "fact_status": "active",
+        })
+        qdrant.add_point("ent-b", {
+            "memory_kind": "graph_entity",
+            "entity_id": eid_b,
+            "source_point_ids": ["mem-b"],
+            "fact_status": "active",
+        })
+        qdrant.add_point("mem-b", {
+            "text": "B memory",
+            "importance": 5,
+            "created_at": "2026-06-20T00:00:00+00:00",
+            "fact_status": "active",
+        })
+        # Malformed edge: valid endpoints + relation, but bad point id + edge_id
+        secret_shaped_edge_id = "".join(["sk-sec", "ret-edge-id-1234"])
+        qdrant.add_point(secret_shaped_edge_id, {
+            "memory_kind": "graph_edge",
+            "edge_id": "also-not-valid",  # malformed edge_id
+            "source_entity_id": eid_a,
+            "target_entity_id": eid_b,
+            "relation_type": "RELATED_TO",
+            "confidence": 0.9,
+            "fact_status": "active",
+        })
+        retriever = GraphMemoryRetriever(
+            qdrant=qdrant,
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+        )
+        result = retriever.search("entity A", top_k=5, debug=True)
+
+        # mem-b must NOT be in expansions — the only edge to eid_b was invalid
+        exp_ids = [e.point_id for e in result.expansions]
+        assert "mem-b" not in exp_ids, (
+            f"malformed edge allowed traversal to mem-b: {exp_ids}"
+        )
+        # The secret-shaped edge ID must NOT appear in expansions or final
+        all_point_ids = exp_ids + [c.point_id for c in result.final]
+        assert secret_shaped_edge_id not in all_point_ids, (
+            f"malformed edge id leaked into results: {all_point_ids}"
+        )
+        assert "also-not-valid" not in all_point_ids
+
+    def test_warnings_do_not_echo_invalid_edge_values(self):
+        """Warning messages for dropped edges must not contain raw invalid values."""
+        eid_a = make_entity_id("concept", "A")
+        eid_b = make_entity_id("concept", "B")
+        seeds = [{
+            "id": "seed-a",
+            "score": 0.9,
+            "payload": {
+                "text": "entity A",
+                "importance": 5,
+                "created_at": "2026-06-20T00:00:00+00:00",
+                "entity_id": eid_a,
+                "fact_status": "active",
+            },
+        }]
+        qdrant = FakeGraphQdrant(search_results=seeds)
+        qdrant.add_point("ent-a", {
+            "memory_kind": "graph_entity",
+            "entity_id": eid_a,
+            "source_point_ids": [],
+            "fact_status": "active",
+        })
+        secret_shaped_edge_id = "".join(["sk-lea", "ked-edge-id-bad"])
+        qdrant.add_point(secret_shaped_edge_id, {
+            "memory_kind": "graph_edge",
+            "edge_id": secret_shaped_edge_id,  # malformed
+            "source_entity_id": eid_a,
+            "target_entity_id": eid_b,
+            "relation_type": "RELATED_TO",
+            "confidence": 0.9,
+            "fact_status": "active",
+        })
+        retriever = GraphMemoryRetriever(
+            qdrant=qdrant,
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+        )
+        result = retriever.search("entity A", top_k=5, debug=True)
+        warnings_json = json.dumps(result.debug.get("warnings", []))
+        assert secret_shaped_edge_id not in warnings_json, (
+            "raw invalid edge id must not appear in warnings"
+        )
+
+    def test_valid_edge_with_valid_endpoints_still_traversed(self):
+        """Regression: a valid edge with valid endpoint entity IDs must still
+        produce expansions — the new validation must not over-filter."""
+        eid_a = make_entity_id("concept", "A")
+        eid_b = make_entity_id("concept", "B")
+        seeds = [{
+            "id": "seed-a",
+            "score": 0.9,
+            "payload": {
+                "text": "entity A",
+                "importance": 5,
+                "created_at": "2026-06-20T00:00:00+00:00",
+                "entity_id": eid_a,
+                "fact_status": "active",
+            },
+        }]
+        qdrant = FakeGraphQdrant(search_results=seeds)
+        qdrant.add_point("ent-a", {
+            "memory_kind": "graph_entity",
+            "entity_id": eid_a,
+            "source_point_ids": [],
+            "fact_status": "active",
+        })
+        edge_id = make_edge_id(eid_a, eid_b, "RELATED_TO")
+        qdrant.add_point(edge_id, {
+            "memory_kind": "graph_edge",
+            "edge_id": edge_id,
+            "source_entity_id": eid_a,
+            "target_entity_id": eid_b,
+            "relation_type": "RELATED_TO",
+            "confidence": 0.9,
+            "fact_status": "active",
+        })
+        qdrant.add_point("ent-b", {
+            "memory_kind": "graph_entity",
+            "entity_id": eid_b,
+            "source_point_ids": ["mem-b"],
+            "fact_status": "active",
+        })
+        qdrant.add_point("mem-b", {
+            "text": "B memory",
+            "importance": 5,
+            "created_at": "2026-06-20T00:00:00+00:00",
+            "fact_status": "active",
+        })
+        retriever = GraphMemoryRetriever(
+            qdrant=qdrant,
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+        )
+        result = retriever.search("entity A", top_k=5, debug=True)
+        exp_ids = [e.point_id for e in result.expansions]
+        assert "mem-b" in exp_ids, (
+            f"valid edge should produce expansion to mem-b: {exp_ids}"
+        )
 
 
 class TestProviderGraphSearchDispatch:
