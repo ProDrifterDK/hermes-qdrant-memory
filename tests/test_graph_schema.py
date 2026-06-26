@@ -25,7 +25,10 @@ from qdrant_memory.graph_schema import (
     make_edge_id,
     make_entity_id,
     sanitize_aliases,
+    sanitize_content_hash,
+    sanitize_profile_id,
     sanitize_source_point_ids,
+    sanitize_tags,
     valid_edge_id,
     valid_entity_id,
     validate_edge_id,
@@ -48,6 +51,11 @@ def _contains_non_finite(value):
     if isinstance(value, list):
         return any(_contains_non_finite(v) for v in value)
     return False
+
+
+# Minimal provenance kwargs for tests that don't specifically test provenance.
+# Provides a valid content_hash so entity/edge construction doesn't raise.
+_PROV = {"content_hash": "sha256:aabbccdd"}
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +307,7 @@ class TestEntityPayload:
             entity_type="concept",
             label="Test",
             canonical=True,  # should be ignored
+            content_hash="sha256:aabbccdd",
         )
         payload = entity.to_payload()
         assert payload["canonical"] is False
@@ -323,6 +332,7 @@ class TestEntityPayload:
             entity_type="concept",
             label="Test",
             source_uri=secret_uri,
+            content_hash="sha256:aabbccdd",
         )
         assert "source_uri" not in payload
 
@@ -332,6 +342,7 @@ class TestEntityPayload:
             entity_type="concept",
             label="Test",
             description=secret_desc,
+            content_hash="sha256:aabbccdd",
         )
         assert "description" not in payload
 
@@ -341,6 +352,7 @@ class TestEntityPayload:
             entity_type="concept",
             label="Test",
             aliases=[secret_alias, "safe-alias"],
+            content_hash="sha256:aabbccdd",
         )
         assert payload["aliases"] == ["safe-alias"]
 
@@ -349,6 +361,7 @@ class TestEntityPayload:
             entity_type="concept",
             label="Test",
             confidence=5.0,
+            content_hash="sha256:aabbccdd",
         )
         assert payload["confidence"] == 1.0
 
@@ -356,6 +369,7 @@ class TestEntityPayload:
             entity_type="concept",
             label="Test",
             confidence=-1.0,
+            content_hash="sha256:aabbccdd",
         )
         assert payload["confidence"] == 0.0
 
@@ -365,6 +379,7 @@ class TestEntityPayload:
             label="Test",
             usefulness_weight=99.0,
             truth_confidence=-5.0,
+            content_hash="sha256:aabbccdd",
         )
         assert payload["usefulness_weight"] == 1.0
         assert payload["truth_confidence"] == 0.0
@@ -375,6 +390,7 @@ class TestEntityPayload:
             label="Test",
             usefulness_weight=0.9,
             truth_confidence=0.1,
+            content_hash="sha256:aabbccdd",
         )
         assert payload["usefulness_weight"] == 0.9
         assert payload["truth_confidence"] == 0.1
@@ -385,6 +401,7 @@ class TestEntityPayload:
             entity_type="concept",
             label="Test",
             fact_status="bogus",
+            content_hash="sha256:aabbccdd",
         )
         # Falls back to "active" for invalid status
         assert payload["fact_status"] == "active"
@@ -395,6 +412,7 @@ class TestEntityPayload:
                 entity_type="concept",
                 label="Test",
                 fact_status=status,
+                content_hash="sha256:aabbccdd",
             )
             assert payload["fact_status"] == status
 
@@ -408,6 +426,7 @@ class TestEntityPayload:
                 "secret_field": secret_uri,
                 "nested": {"deep": "value", "bad": "".join(["api", "_key=", "secret"])},
             },
+            content_hash="sha256:aabbccdd",
         )
         dumped = json.dumps(payload)
         assert secret_uri not in dumped
@@ -415,13 +434,13 @@ class TestEntityPayload:
         assert payload.get("safe_field") == "ok"
 
     def test_entity_payload_deterministic_id_across_calls(self):
-        p1 = build_entity_payload(entity_type="concept", label="Same Entity")
-        p2 = build_entity_payload(entity_type="concept", label="Same Entity")
+        p1 = build_entity_payload(entity_type="concept", label="Same Entity", content_hash="sha256:aabbccdd")
+        p2 = build_entity_payload(entity_type="concept", label="Same Entity", content_hash="sha256:aabbccdd")
         assert p1["entity_id"] == p2["entity_id"]
 
     def test_entity_payload_different_profile_different_id(self):
-        p1 = build_entity_payload(entity_type="concept", label="Entity", profile_id="default")
-        p2 = build_entity_payload(entity_type="concept", label="Entity", profile_id="work")
+        p1 = build_entity_payload(entity_type="concept", label="Entity", profile_id="default", content_hash="sha256:aabbccdd")
+        p2 = build_entity_payload(entity_type="concept", label="Entity", profile_id="work", content_hash="sha256:aabbccdd")
         assert p1["entity_id"] != p2["entity_id"]
 
 
@@ -642,7 +661,7 @@ class TestBackwardCompatibility:
         }
 
     def test_entity_payload_has_text_field_for_legacy_search(self):
-        payload = build_entity_payload(entity_type="concept", label="Searchable Label")
+        payload = build_entity_payload(entity_type="concept", label="Searchable Label", content_hash="sha256:aabbccdd")
         assert payload["text"] == "Searchable Label"
 
     def test_edge_payload_has_text_field_for_legacy_search(self):
@@ -688,6 +707,7 @@ class TestJSONSerialization:
             label="Test",
             aliases=["a", "b"],
             description="desc",
+            content_hash="sha256:aabbccdd",
         )
         # allow_nan=False ensures no inf/nan
         json.dumps(payload, allow_nan=False)
@@ -709,6 +729,7 @@ class TestJSONSerialization:
             label="Test",
             aliases=["a", "b"],
             confidence=0.5,
+            content_hash="sha256:aabbccdd",
         )
         json.dumps(payload, allow_nan=False)
         assert not _contains_non_finite(payload)
@@ -719,4 +740,297 @@ class TestJSONSerialization:
                 entity_type="concept",
                 label="Test",
                 confidence=float("nan"),
+                content_hash="sha256:aabbccdd",
             )
+
+
+# ---------------------------------------------------------------------------
+# Blocker 1: Entity provenance enforcement
+# ---------------------------------------------------------------------------
+
+class TestEntityProvenanceEnforcement:
+    """Regression: entities must require at least one safe provenance handle."""
+
+    def test_entity_without_provenance_raises(self):
+        with pytest.raises(ValueError, match="provenance"):
+            build_entity_payload(
+                entity_type="concept",
+                label="Test Entity",
+            )
+
+    def test_entity_with_source_uri_provenance(self):
+        payload = build_entity_payload(
+            entity_type="concept",
+            label="Test Entity",
+            source_uri="file:///docs/architecture.md",
+        )
+        assert payload["source_uri"] == "file:///docs/architecture.md"
+
+    def test_entity_with_content_hash_provenance(self):
+        payload = build_entity_payload(
+            entity_type="concept",
+            label="Test Entity",
+            content_hash="sha256:abcdef0123456789",
+        )
+        assert payload["content_hash"] == "sha256:abcdef0123456789"
+
+    def test_entity_with_source_point_ids_provenance(self):
+        payload = build_entity_payload(
+            entity_type="concept",
+            label="Test Entity",
+            source_point_ids=["point-001", "point-002"],
+        )
+        assert payload["source_point_ids"] == ["point-001", "point-002"]
+
+    def test_entity_with_only_secret_provenance_raises(self):
+        """If the only provenance handle contains secrets, it must be rejected."""
+        secret_uri = "https://" + "user" + ":" + "pass" + "@evil.test/x"
+        with pytest.raises(ValueError, match="provenance"):
+            build_entity_payload(
+                entity_type="concept",
+                label="Test Entity",
+                source_uri=secret_uri,
+            )
+
+    def test_entity_with_invalid_content_hash_and_no_other_provenance_raises(self):
+        with pytest.raises(ValueError, match="provenance"):
+            build_entity_payload(
+                entity_type="concept",
+                label="Test Entity",
+                content_hash="not-a-hash",
+            )
+
+    def test_entity_dataclass_without_provenance_raises(self):
+        entity = GraphEntity(
+            entity_type="concept",
+            label="Test",
+        )
+        with pytest.raises(ValueError, match="provenance"):
+            entity.to_payload()
+
+
+# ---------------------------------------------------------------------------
+# Blocker 2: Direct-field secret sanitization (tags, content_hash, profile_id)
+# ---------------------------------------------------------------------------
+
+class TestDirectFieldSanitizationEntity:
+    """Regression: tags, content_hash, profile_id must be sanitized."""
+
+    def test_entity_tags_with_secret_rejected(self):
+        secret_tag = "".join(["api", "_key=secret123"])
+        payload = build_entity_payload(
+            entity_type="concept",
+            label="Test",
+            tags=[secret_tag, "safe-tag"],
+            content_hash="sha256:aabbccdd",
+        )
+        assert "api_key" not in json.dumps(payload)
+        assert payload["tags"] == ["safe-tag"]
+
+    def test_entity_tags_with_invalid_chars_rejected(self):
+        payload = build_entity_payload(
+            entity_type="concept",
+            label="Test",
+            tags=["valid-tag", "bad tag with spaces", "also\nbad"],
+            content_hash="sha256:aabbccdd",
+        )
+        assert payload["tags"] == ["valid-tag"]
+
+    def test_entity_content_hash_with_secret_rejected(self):
+        secret_hash = "".join(["password", "=", "supersecret123456"])
+        payload = build_entity_payload(
+            entity_type="concept",
+            label="Test",
+            content_hash=secret_hash,
+            source_uri="file:///docs/x.md",
+        )
+        # Secret hash must be empty (sanitized away), but entity still has source_uri
+        assert payload.get("content_hash", "") == ""
+
+    def test_entity_content_hash_invalid_format_rejected(self):
+        payload = build_entity_payload(
+            entity_type="concept",
+            label="Test",
+            content_hash="garbage-not-hash-like",
+            source_uri="file:///docs/x.md",
+        )
+        assert "content_hash" not in payload
+
+    def test_entity_profile_id_with_secret_rejected(self):
+        secret_profile = "".join(["api", "_key=secret123"])
+        payload = build_entity_payload(
+            entity_type="concept",
+            label="Test",
+            profile_id=secret_profile,
+            content_hash="sha256:aabbccdd",
+        )
+        assert payload["profile_id"] == "default"
+
+    def test_entity_profile_id_with_invalid_chars_rejected(self):
+        payload = build_entity_payload(
+            entity_type="concept",
+            label="Test",
+            profile_id="../etc/passwd",
+            content_hash="sha256:aabbccdd",
+        )
+        assert payload["profile_id"] == "default"
+
+    def test_entity_profile_id_valid_passes_through(self):
+        payload = build_entity_payload(
+            entity_type="concept",
+            label="Test",
+            profile_id="work-profile-01",
+            content_hash="sha256:aabbccdd",
+        )
+        assert payload["profile_id"] == "work-profile-01"
+
+
+class TestDirectFieldSanitizationEdge:
+    """Regression: edge tags, content_hash, profile_id must be sanitized."""
+
+    def _make_entities(self):
+        src = make_entity_id("concept", "Source Concept")
+        tgt = make_entity_id("concept", "Target Concept")
+        return src, tgt
+
+    def test_edge_tags_with_secret_rejected(self):
+        src, tgt = self._make_entities()
+        secret_tag = "".join(["api", "_key=secret123"])
+        payload = build_edge_payload(
+            source_entity_id=src,
+            target_entity_id=tgt,
+            relation_type="SUPPORTS",
+            source_uri="file:///docs/x.md",
+            tags=[secret_tag, "safe-tag"],
+        )
+        assert "api_key" not in json.dumps(payload)
+        assert payload["tags"] == ["safe-tag"]
+
+    def test_edge_content_hash_with_secret_rejected(self):
+        src, tgt = self._make_entities()
+        secret_hash = "".join(["password", "=", "supersecret123456"])
+        payload = build_edge_payload(
+            source_entity_id=src,
+            target_entity_id=tgt,
+            relation_type="SUPPORTS",
+            content_hash=secret_hash,
+            source_uri="file:///docs/x.md",
+        )
+        assert payload.get("content_hash", "") == ""
+
+    def test_edge_content_hash_invalid_format_rejected(self):
+        src, tgt = self._make_entities()
+        payload = build_edge_payload(
+            source_entity_id=src,
+            target_entity_id=tgt,
+            relation_type="SUPPORTS",
+            content_hash="garbage",
+            source_uri="file:///docs/x.md",
+        )
+        assert "content_hash" not in payload
+
+    def test_edge_profile_id_with_secret_rejected(self):
+        src, tgt = self._make_entities()
+        secret_profile = "".join(["token", "=secret123"])
+        payload = build_edge_payload(
+            source_entity_id=src,
+            target_entity_id=tgt,
+            relation_type="SUPPORTS",
+            source_uri="file:///docs/x.md",
+            profile_id=secret_profile,
+        )
+        assert payload["profile_id"] == "default"
+
+    def test_edge_profile_id_with_invalid_chars_rejected(self):
+        src, tgt = self._make_entities()
+        payload = build_edge_payload(
+            source_entity_id=src,
+            target_entity_id=tgt,
+            relation_type="SUPPORTS",
+            source_uri="file:///docs/x.md",
+            profile_id="../etc/passwd",
+        )
+        assert payload["profile_id"] == "default"
+
+    def test_edge_provenance_via_content_hash_only(self):
+        """Edge should accept content_hash as provenance."""
+        src, tgt = self._make_entities()
+        payload = build_edge_payload(
+            source_entity_id=src,
+            target_entity_id=tgt,
+            relation_type="SUPPORTS",
+            content_hash="sha256:aabbccdd",
+        )
+        assert payload["content_hash"] == "sha256:aabbccdd"
+
+
+# ---------------------------------------------------------------------------
+# Sanitizer unit tests
+# ---------------------------------------------------------------------------
+
+class TestSanitizeTags:
+    def test_strips_whitespace(self):
+        assert sanitize_tags(["  a  ", " b "]) == ["a", "b"]
+
+    def test_deduplicates_case_insensitive(self):
+        assert sanitize_tags(["Python", "python", "PYTHON"]) == ["Python"]
+
+    def test_rejects_empty(self):
+        assert sanitize_tags(["", "   ", "valid"]) == ["valid"]
+
+    def test_rejects_non_strings(self):
+        assert sanitize_tags([1, None, "ok"]) == ["ok"]
+
+    def test_rejects_secret_bearing(self):
+        secret = "".join(["api", "_key=", "secret123"])
+        assert sanitize_tags([secret, "safe"]) == ["safe"]
+
+    def test_rejects_invalid_chars(self):
+        assert sanitize_tags(["good", "bad space", "also\nbad"]) == ["good"]
+
+    def test_rejects_non_list(self):
+        assert sanitize_tags("not a list") == []
+        assert sanitize_tags(None) == []
+
+    def test_caps_at_max(self):
+        tags = [f"tag-{i}" for i in range(100)]
+        assert len(sanitize_tags(tags)) == 64
+
+
+class TestSanitizeContentHash:
+    def test_valid_hash_with_prefix(self):
+        assert sanitize_content_hash("sha256:aabbccdd") == "sha256:aabbccdd"
+
+    def test_valid_plain_hex(self):
+        assert sanitize_content_hash("aabbccdd11223344") == "aabbccdd11223344"
+
+    def test_rejects_secret(self):
+        secret = "".join(["password", "=", "supersecret123456"])
+        assert sanitize_content_hash(secret) == ""
+
+    def test_rejects_empty(self):
+        assert sanitize_content_hash("") == ""
+
+    def test_rejects_non_string(self):
+        assert sanitize_content_hash(123) == ""
+
+    def test_rejects_invalid_format(self):
+        assert sanitize_content_hash("not-a-hash") == ""
+
+
+class TestSanitizeProfileId:
+    def test_valid_profile_id(self):
+        assert sanitize_profile_id("work-profile") == "work-profile"
+
+    def test_default_on_empty(self):
+        assert sanitize_profile_id("") == "default"
+
+    def test_default_on_secret(self):
+        secret = "".join(["api", "_key=secret123"])
+        assert sanitize_profile_id(secret) == "default"
+
+    def test_default_on_non_string(self):
+        assert sanitize_profile_id(123) == "default"
+
+    def test_default_on_invalid_chars(self):
+        assert sanitize_profile_id("../etc/passwd") == "default"

@@ -9,8 +9,10 @@ and review-gated by default.
 Safety invariants enforced here:
 - Entity/edge IDs are deterministic, safe (no secrets), and validated.
 - No entity or edge is ever auto-promoted to canonical truth.
-- Secret-bearing fields are redacted/rejected.
-- Provenance is required for edges.
+- Secret-bearing fields are redacted/rejected everywhere.
+- Provenance is required for both entities and edges (at least one safe
+  provenance handle: non-empty sanitized source_point_ids, a safe source_uri,
+  or a valid content_hash).
 - ``usefulness_weight`` and ``truth_confidence`` are kept separate.
 """
 
@@ -231,7 +233,7 @@ def sanitize_aliases(aliases: Any) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def sanitize_source_point_ids(value: Any) -> list[str]:
-    """Sanitize a list of source point IDs for an edge.
+    """Sanitize a list of source point IDs for an edge or entity.
 
     Reuses the existing ``valid_point_id_link`` helper for safety.
     """
@@ -245,6 +247,112 @@ def sanitize_source_point_ids(value: Any) -> list[str]:
             result.append(point_id)
             seen.add(point_id)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Direct-field sanitization (tags, content_hash, profile_id)
+# ---------------------------------------------------------------------------
+
+# Allowed characters for tag slugs.
+_TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-/]{0,127}$")
+# content_hash must look like a hash: prefix:hex or pure hex.
+_CONTENT_HASH_RE = re.compile(
+    r"^(?:[a-zA-Z0-9_-]{1,32}:)?[a-fA-F0-9]{6,256}$"
+)
+# profile_id is a simple slug, similar to point IDs but allows no separators
+# that could be path-traversal vectors.
+_PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+# Max number of tags per entity/edge.
+_MAX_TAGS = 64
+
+
+def sanitize_tags(value: Any) -> list[str]:
+    """Sanitize and deduplicate a list of tags.
+
+    - Strips whitespace.
+    - Rejects empty strings.
+    - Rejects tags containing secrets.
+    - Rejects tags that don't match the safe slug pattern.
+    - Deduplicates while preserving order (case-insensitive).
+    - Caps at _MAX_TAGS entries.
+    """
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if not text:
+            continue
+        if contains_secret(text):
+            continue
+        if not _TAG_RE.match(text):
+            continue
+        key = text.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+        if len(result) >= _MAX_TAGS:
+            break
+    return result
+
+
+def sanitize_content_hash(value: Any) -> str:
+    """Sanitize a content_hash value.
+
+    Returns the validated hash string or empty string if invalid/unsafe.
+    """
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text:
+        return ""
+    if contains_secret(text):
+        return ""
+    if not _CONTENT_HASH_RE.match(text):
+        return ""
+    return text
+
+
+def sanitize_profile_id(value: Any) -> str:
+    """Sanitize a profile_id value.
+
+    Returns the validated profile_id or "default" if invalid/unsafe.
+    """
+    if not isinstance(value, str):
+        return "default"
+    text = value.strip()
+    if not text:
+        return "default"
+    if contains_secret(text):
+        return "default"
+    if not _PROFILE_ID_RE.match(text):
+        return "default"
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Provenance validation
+# ---------------------------------------------------------------------------
+
+def _has_safe_provenance(
+    *,
+    source_point_ids: list[str] | None = None,
+    source_uri: str = "",
+    content_hash: str = "",
+) -> bool:
+    """Return True if at least one safe provenance handle is present."""
+    if source_point_ids and len(source_point_ids) > 0:
+        return True
+    if source_uri and not contains_secret(source_uri) and source_uri.strip():
+        return True
+    ch = sanitize_content_hash(content_hash)
+    if ch:
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +402,7 @@ class GraphEntity:
     truth_confidence: float = 0.0
     source_uri: str = ""
     content_hash: str = ""
+    source_point_ids: list[str] = field(default_factory=list)
     created_at: str = field(default_factory=now_iso)
     updated_at: str = field(default_factory=now_iso)
     tags: list[str] = field(default_factory=list)
@@ -304,7 +413,11 @@ class GraphEntity:
         return make_entity_id(self.entity_type, self.label, profile_id=self.profile_id)
 
     def to_payload(self) -> dict[str, Any]:
-        """Serialize to a safe, JSON-serializable Qdrant payload dict."""
+        """Serialize to a safe, JSON-serializable Qdrant payload dict.
+
+        Raises ValueError if required fields are missing/invalid, if any
+        direct field contains secrets, or if provenance is absent.
+        """
         etype = (self.entity_type or "").strip().lower()
         label_text = (self.label or "").strip()
         if not etype:
@@ -314,7 +427,31 @@ class GraphEntity:
         if contains_secret(label_text) or contains_secret(etype):
             raise ValueError("entity label/type must not contain secrets")
 
-        eid = self.entity_id
+        # Sanitize direct user-controlled fields
+        profile_id = sanitize_profile_id(self.profile_id)
+        tags = sanitize_tags(self.tags)
+        content_hash = sanitize_content_hash(self.content_hash)
+
+        # Provenance requirement: must have at least one safe provenance handle
+        source_points = sanitize_source_point_ids(
+            getattr(self, "source_point_ids", None)
+        )
+        has_uri = bool(
+            self.source_uri
+            and not contains_secret(self.source_uri)
+            and self.source_uri.strip()
+        )
+        if not _has_safe_provenance(
+            source_point_ids=source_points,
+            source_uri=self.source_uri,
+            content_hash=content_hash,
+        ):
+            raise ValueError(
+                "entity requires provenance via source_point_ids, "
+                "source_uri, or content_hash"
+            )
+
+        eid = make_entity_id(self.entity_type, self.label, profile_id=profile_id)
         payload: dict[str, Any] = {
             "text": label_text,  # legacy search compatibility
             "source": "graph_entity",
@@ -331,8 +468,8 @@ class GraphEntity:
             "truth_confidence": _validate_weight(self.truth_confidence, "truth_confidence"),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
-            "profile_id": self.profile_id,
-            "tags": list(self.tags),
+            "profile_id": profile_id,
+            "tags": tags,
         }
 
         # Validate fact_status
@@ -358,8 +495,10 @@ class GraphEntity:
             uri = self.source_uri.strip()
             if uri:
                 payload["source_uri"] = uri
-        if self.content_hash:
-            payload["content_hash"] = self.content_hash
+        if content_hash:
+            payload["content_hash"] = content_hash
+        if source_points:
+            payload["source_point_ids"] = source_points
 
         # Extra metadata (sanitized)
         if self.extra:
@@ -431,21 +570,36 @@ class GraphEdge:
         if rel is None:
             raise ValueError(f"unknown relation_type: {self.relation_type or '<empty>'}")
 
+        # Sanitize direct user-controlled fields
+        profile_id = sanitize_profile_id(self.profile_id)
+        tags = sanitize_tags(self.tags)
+        content_hash = sanitize_content_hash(self.content_hash)
+
         # Provenance requirement: must have at least one source
         source_points = sanitize_source_point_ids(self.source_point_ids)
         has_uri = bool(self.source_uri and not contains_secret(self.source_uri) and self.source_uri.strip())
-        if not source_points and not has_uri:
+        if not _has_safe_provenance(
+            source_point_ids=source_points,
+            source_uri=self.source_uri,
+            content_hash=content_hash,
+        ):
             raise ValueError(
-                "edge requires provenance via source_point_ids or source_uri"
+                "edge requires provenance via source_point_ids, source_uri, or content_hash"
             )
 
+        eid = make_edge_id(
+            self.source_entity_id,
+            self.target_entity_id,
+            self.relation_type,
+            profile_id=profile_id,
+        )
         payload: dict[str, Any] = {
             "text": f"{src} {rel} {tgt}",  # legacy search compatibility
             "source": "graph_edge",
             "source_type": "graph",
             "chunk_type": "edge",
             "memory_kind": MemoryKind.GRAPH_EDGE.value,
-            "edge_id": self.edge_id,
+            "edge_id": eid,
             "source_entity_id": src,
             "target_entity_id": tgt,
             "relation_type": rel,
@@ -456,8 +610,8 @@ class GraphEdge:
             "truth_confidence": _validate_weight(self.truth_confidence, "truth_confidence"),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
-            "profile_id": self.profile_id,
-            "tags": list(self.tags),
+            "profile_id": profile_id,
+            "tags": tags,
         }
 
         # Validate fact_status
@@ -474,8 +628,8 @@ class GraphEdge:
         # Provenance URI
         if has_uri:
             payload["source_uri"] = self.source_uri.strip()
-        if self.content_hash:
-            payload["content_hash"] = self.content_hash
+        if content_hash:
+            payload["content_hash"] = content_hash
 
         # Temporal fields
         for key in ("observed_at", "valid_from", "valid_until"):
@@ -513,6 +667,7 @@ def build_entity_payload(
     truth_confidence: float = 0.0,
     source_uri: str = "",
     content_hash: str = "",
+    source_point_ids: list[str] | None = None,
     tags: list[str] | None = None,
     extra: dict[str, Any] | None = None,
     created_at: str | None = None,
@@ -520,6 +675,8 @@ def build_entity_payload(
     """Build a graph entity payload dict without writing it anywhere.
 
     Entities are always ``canonical=False`` and ``requires_review=True``.
+    Provenance is required: at least one of ``source_uri``, ``content_hash``,
+    or ``source_point_ids`` must be provided and pass sanitization.
     """
     entity = GraphEntity(
         entity_type=entity_type,
@@ -533,6 +690,7 @@ def build_entity_payload(
         truth_confidence=truth_confidence,
         source_uri=source_uri,
         content_hash=content_hash,
+        source_point_ids=source_point_ids or [],
         tags=tags or [],
         extra=extra or {},
         created_at=created_at or now_iso(),
@@ -563,7 +721,8 @@ def build_edge_payload(
     """Build a graph edge payload dict without writing it anywhere.
 
     Edges are always ``canonical=False`` and ``requires_review=True``.
-    Provenance is required (source_point_ids or source_uri).
+    Provenance is required: at least one of ``source_point_ids``,
+    ``source_uri``, or ``content_hash`` must be provided and pass sanitization.
     """
     edge = GraphEdge(
         source_entity_id=source_entity_id,
