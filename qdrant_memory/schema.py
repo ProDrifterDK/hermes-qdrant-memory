@@ -35,6 +35,8 @@ class MemoryKind(str, Enum):
     RISK = "risk"
     PROPOSAL = "proposal"
     SUMMARY = "summary"
+    GRAPH_ENTITY = "graph_entity"
+    GRAPH_EDGE = "graph_edge"
 
 
 class RelationType(str, Enum):
@@ -49,6 +51,12 @@ class RelationType(str, Enum):
     USES_TOOL = "USES_TOOL"
     PREFERS = "PREFERS"
     BLOCKS = "BLOCKS"
+    IS_A = "IS_A"
+    PART_OF = "PART_OF"
+    RELATED_TO = "RELATED_TO"
+    CREATED_BY = "CREATED_BY"
+    DEPENDS_ON = "DEPENDS_ON"
+    LOCATED_IN = "LOCATED_IN"
 
 
 class FactStatus(str, Enum):
