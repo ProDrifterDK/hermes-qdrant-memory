@@ -350,6 +350,12 @@ def _build_edge_candidate(
     # Normalize volatile timestamps so candidate IDs are deterministic.
     payload["created_at"] = "2000-01-01T00:00:00Z"
     payload["updated_at"] = "2000-01-01T00:00:00Z"
+    # Store endpoint entity-type metadata (not raw labels) so the write gate
+    # can validate both endpoints against the safe allowlist.  Only the
+    # allowlisted type string is stored — hashed IDs are already in the
+    # payload via source_entity_id / target_entity_id.
+    payload["source_entity_type"] = src_type_clean
+    payload["target_entity_type"] = tgt_type_clean
     derived_from = [
         {
             "source_uri": safe_uri,

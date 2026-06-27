@@ -274,7 +274,6 @@ def evaluate_extraction_candidate_write(
                 is_identity_bearing_value,
                 is_identity_bearing_entity_type,
             )
-            entity_type_val = str(payload.get("entity_type") or "")
             label_val = str(payload.get("label") or payload.get("text") or "")
             source_uri_val = str(payload.get("source_uri") or "")
             if is_identity_bearing_value(label_val) or is_identity_bearing_value(source_uri_val):
@@ -285,15 +284,41 @@ def evaluate_extraction_candidate_write(
                     requires_review=True,
                     metadata={"candidate_type": candidate_type},
                 )
-            # Reject any entity type not in the safe allowlist (shared helper).
-            if is_identity_bearing_entity_type(entity_type_val):
-                return _decision(
-                    "reject",
-                    ["identity_bearing_graph_candidate"],
-                    confidence=1.0,
-                    requires_review=True,
-                    metadata={"candidate_type": candidate_type},
-                )
+            if candidate_type == "graph_edge_candidate":
+                # For graph edges, validate both endpoint entity types against
+                # the allowlist using source_entity_type / target_entity_type
+                # metadata.  If the metadata is absent or malformed, fail
+                # closed (reject) — never allow an edge without proven endpoint
+                # type safety.
+                src_etype = str(payload.get("source_entity_type") or "").strip().lower()
+                tgt_etype = str(payload.get("target_entity_type") or "").strip().lower()
+                if not src_etype or not tgt_etype:
+                    return _decision(
+                        "reject",
+                        ["identity_bearing_graph_candidate"],
+                        confidence=1.0,
+                        requires_review=True,
+                        metadata={"candidate_type": candidate_type},
+                    )
+                if is_identity_bearing_entity_type(src_etype) or is_identity_bearing_entity_type(tgt_etype):
+                    return _decision(
+                        "reject",
+                        ["identity_bearing_graph_candidate"],
+                        confidence=1.0,
+                        requires_review=True,
+                        metadata={"candidate_type": candidate_type},
+                    )
+            else:
+                # graph_entity_candidate: validate the entity_type field.
+                entity_type_val = str(payload.get("entity_type") or "")
+                if is_identity_bearing_entity_type(entity_type_val):
+                    return _decision(
+                        "reject",
+                        ["identity_bearing_graph_candidate"],
+                        confidence=1.0,
+                        requires_review=True,
+                        metadata={"candidate_type": candidate_type},
+                    )
         except ImportError:
             pass  # improve module not available; skip extra check
     if not _candidate_destination_valid(candidate_type, payload, target):

@@ -1375,3 +1375,220 @@ def test_safe_graph_entities_still_work_after_allowlist(tmp_path):
         )
         store_candidates = [c for c in result["candidates"] if c.get("would_store")]
         assert len(store_candidates) >= 1, f"{safe_type} should be store-eligible"
+
+
+# ===========================================================================
+# Fix3: Safe graph edges with allowlisted endpoint types must be store-eligible
+# and apply-eligible; unsafe endpoint types must remain rejected.
+# ===========================================================================
+
+def test_safe_graph_edge_is_store_eligible_and_apply_eligible(tmp_path):
+    """A graph edge with both endpoints in the safe allowlist (e.g.
+    project -> tool) must pass the write gate, be store-eligible in preview,
+    and successfully live-apply (dry-run + live upsert/embed)."""
+    provider = _provider_for_improve(tmp_path)
+    source = "Graph edge: project:Alpha -[DEPENDS_ON]-> tool:Beta"
+    preview = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_preview",
+            {"source_text": source, "source_uri": "session://test/safe-edge"},
+        )
+    )
+    # Exactly one store-eligible candidate
+    store_candidates = [c for c in preview["candidates"] if c.get("would_store")]
+    assert len(store_candidates) == 1, "safe graph edge must be store-eligible"
+    edge_cand = store_candidates[0]
+    assert edge_cand["candidate_type"] == "graph_edge_candidate"
+
+    # Payload must carry endpoint type metadata
+    payload = edge_cand.get("proposed_payload") or {}
+    assert payload.get("source_entity_type") == "project"
+    assert payload.get("target_entity_type") == "tool"
+
+    # No raw labels in the payload text — only hashed IDs
+    payload_json = json.dumps(payload)
+    assert "Alpha" not in payload_json
+    assert "Beta" not in payload_json
+
+    # Dry-run must succeed
+    report_id = preview["report_id"]
+    candidate_id = edge_cand["candidate_id"]
+    dry = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_apply",
+            {"report_id": report_id, "candidate_id": candidate_id},
+        )
+    )
+    assert dry.get("would_store") is True
+
+    # Live apply must succeed with exactly 1 upsert + 1 embedding
+    live = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_apply",
+            {"report_id": report_id, "candidate_id": candidate_id,
+             "dry_run": False, "approve": True},
+        )
+    )
+    assert live.get("saved") is True
+    assert "error" not in live
+    assert len(provider._qdrant.upserts) == 1
+    assert len(provider._embeddings.documents) == 1
+
+    # Verify the upserted point has no raw labels
+    upserted_point = provider._qdrant.upserts[0][1][0]
+    upserted_payload = upserted_point.get("payload", {})
+    upserted_json = json.dumps(upserted_payload)
+    assert "Alpha" not in upserted_json
+    assert "Beta" not in upserted_json
+    assert upserted_payload.get("source_entity_type") == "project"
+    assert upserted_payload.get("target_entity_type") == "tool"
+
+
+def test_graph_edge_with_unsafe_endpoint_type_is_rejected_at_extraction(tmp_path):
+    """Graph edges with unlisted/identity-bearing endpoint types (person,
+    client, etc.) must be dropped at extraction — no candidate, no raw labels
+    in preview/report."""
+    provider = _provider_for_improve(tmp_path)
+    source = "Graph edge: person:Alan -[KNOWS]-> person:Bob"
+    preview = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_preview",
+            {"source_text": source, "source_uri": "session://test/unsafe-edge"},
+        )
+    )
+    preview_json = json.dumps(preview)
+    # No raw names must leak
+    assert "Alan" not in preview_json
+    assert "Bob" not in preview_json
+    # No store-eligible candidates
+    store_candidates = [c for c in preview["candidates"] if c.get("would_store")]
+    assert len(store_candidates) == 0
+    # No upserts/embeddings
+    assert len(provider._qdrant.upserts) == 0
+    assert len(provider._embeddings.documents) == 0
+
+
+def test_graph_edge_mixed_safe_unsafe_endpoint_rejected(tmp_path):
+    """An edge with one safe and one unsafe endpoint type must be rejected."""
+    provider = _provider_for_improve(tmp_path)
+    source = "Graph edge: project:SafeProject -[DEPENDS_ON]-> client:UnsafeClient"
+    preview = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_preview",
+            {"source_text": source, "source_uri": "session://test/mixed-edge"},
+        )
+    )
+    preview_json = json.dumps(preview)
+    assert "SafeProject" not in preview_json
+    assert "UnsafeClient" not in preview_json
+    store_candidates = [c for c in preview["candidates"] if c.get("would_store")]
+    assert len(store_candidates) == 0
+
+
+def test_graph_edge_write_gate_validates_endpoint_types():
+    """Write gate must use source_entity_type / target_entity_type for
+    graph_edge_candidate, not the entity_type field."""
+    from qdrant_memory.extraction_candidates import ExtractionCandidate
+    from qdrant_memory.write_gate import evaluate_extraction_candidate_write
+
+    # Safe edge: both endpoint types allowlisted
+    safe_payload = {
+        "text": "entity-abc123def456abcd DEPENDS_ON entity-def789abc0123456",
+        "source": "graph_edge",
+        "memory_kind": "graph_edge",
+        "edge_id": "edge-abcdef1234567890",
+        "source_entity_id": "entity-abc123def456abcd",
+        "target_entity_id": "entity-def789abc0123456",
+        "relation_type": "DEPENDS_ON",
+        "source_entity_type": "project",
+        "target_entity_type": "tool",
+        "source_uri": "session://test",
+        "source_type": "graph",
+        "chunk_type": "edge",
+        "confidence": 0.8,
+    }
+    candidate = ExtractionCandidate(
+        candidate_id="test-safe-edge",
+        candidate_type="graph_edge_candidate",
+        source_uri="session://test",
+        locator={},
+        derived_from=[{"source_uri": "session://test", "relation_type": "EXTRACTED_FROM"}],
+        proposed_payload=safe_payload,
+        reason="test",
+        confidence=0.9,
+        risk="low",
+    )
+    decision = evaluate_extraction_candidate_write(candidate)
+    assert decision.decision == "store", f"safe edge should be store, got {decision.decision} ({decision.reasons})"
+
+    # Unsafe edge: person endpoint type
+    unsafe_payload = dict(safe_payload)
+    unsafe_payload["source_entity_type"] = "person"
+    candidate_unsafe = ExtractionCandidate(
+        candidate_id="test-unsafe-edge",
+        candidate_type="graph_edge_candidate",
+        source_uri="session://test",
+        locator={},
+        derived_from=[{"source_uri": "session://test", "relation_type": "EXTRACTED_FROM"}],
+        proposed_payload=unsafe_payload,
+        reason="test",
+        confidence=0.9,
+        risk="low",
+    )
+    decision_unsafe = evaluate_extraction_candidate_write(candidate_unsafe)
+    assert decision_unsafe.decision == "reject"
+    assert "identity_bearing_graph_candidate" in decision_unsafe.reasons
+
+
+def test_graph_edge_write_gate_fails_closed_without_endpoint_types():
+    """If source_entity_type / target_entity_type metadata is absent, the
+    write gate must fail closed (reject) — never allow an edge without
+    proven endpoint type safety."""
+    from qdrant_memory.extraction_candidates import ExtractionCandidate
+    from qdrant_memory.write_gate import evaluate_extraction_candidate_write
+
+    payload = {
+        "text": "entity-abc123def456abcd DEPENDS_ON entity-def789abc0123456",
+        "source": "graph_edge",
+        "memory_kind": "graph_edge",
+        "edge_id": "edge-abcdef1234567890",
+        "source_entity_id": "entity-abc123def456abcd",
+        "target_entity_id": "entity-def789abc0123456",
+        "relation_type": "DEPENDS_ON",
+        "source_uri": "session://test",
+        "source_type": "graph",
+        "chunk_type": "edge",
+        "confidence": 0.8,
+    }
+    candidate = ExtractionCandidate(
+        candidate_id="test-no-etype-edge",
+        candidate_type="graph_edge_candidate",
+        source_uri="session://test",
+        locator={},
+        derived_from=[{"source_uri": "session://test", "relation_type": "EXTRACTED_FROM"}],
+        proposed_payload=payload,
+        reason="test",
+        confidence=0.9,
+        risk="low",
+    )
+    decision = evaluate_extraction_candidate_write(candidate)
+    assert decision.decision == "reject"
+    assert "identity_bearing_graph_candidate" in decision.reasons
+
+
+def test_graph_edge_candidate_payload_has_endpoint_type_metadata():
+    """Extraction must store source_entity_type and target_entity_type in the
+    edge payload (not raw labels)."""
+    source = "Graph edge: project:TestProject -[DEPENDS_ON]-> tool:TestTool"
+    candidates = extract_improve_candidates_from_text(
+        source, source_uri="session://test/edge-meta", profile_id="default",
+    )
+    edge_candidates = [c for c in candidates if c.candidate_type == "graph_edge_candidate"]
+    assert len(edge_candidates) == 1
+    payload = edge_candidates[0].proposed_payload
+    assert payload.get("source_entity_type") == "project"
+    assert payload.get("target_entity_type") == "tool"
+    # No raw labels
+    payload_json = json.dumps(payload)
+    assert "TestProject" not in payload_json
+    assert "TestTool" not in payload_json
