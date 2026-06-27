@@ -1005,3 +1005,57 @@ def test_watcher_run_maps_to_report_only_consolidation():
             "reconsolidation_max_candidates": 4,
         },
     )
+
+
+# ===========================================================================
+# Fix2-2: CLI improve apply must reject whitespace-decorated report_id
+# ===========================================================================
+
+def test_cli_improve_apply_rejects_whitespace_report_id():
+    """build_tool_call must reject whitespace-decorated report_id for improve
+    apply, NOT normalize it."""
+    from qdrant_memory.cli_core import build_tool_call, CliUsageError
+
+    parser = _parser()
+
+    # Clean report_id should map correctly
+    clean = parser.parse_args([
+        "qdrant", "improve", "apply",
+        "--report-id", "improve-a00006317dca",
+        "--candidate-id", "cand-1",
+    ])
+    tool_name, tool_args = build_tool_call(clean)
+    assert tool_name == "qdrant_memory_improve_apply"
+    assert tool_args["report_id"] == "improve-a00006317dca"
+
+    # Whitespace-decorated report_id must be rejected by build_tool_call
+    for ws_id in [
+        " improve-a00006317dca",
+        "improve-a00006317dca ",
+        " improve-a00006317dca ",
+        "\timprove-a00006317dca",
+        "improve-a00006317dca\n",
+    ]:
+        ws_args = parser.parse_args([
+            "qdrant", "improve", "apply",
+            "--report-id", ws_id,
+            "--candidate-id", "cand-1",
+        ])
+        with pytest.raises(CliUsageError, match="whitespace"):
+            build_tool_call(ws_args)
+
+
+def test_cli_improve_apply_rejects_whitespace_candidate_id():
+    """build_tool_call must reject whitespace-decorated candidate_id for
+    improve apply."""
+    from qdrant_memory.cli_core import build_tool_call, CliUsageError
+
+    parser = _parser()
+
+    ws_args = parser.parse_args([
+        "qdrant", "improve", "apply",
+        "--report-id", "improve-a00006317dca",
+        "--candidate-id", " cand-1 ",
+    ])
+    with pytest.raises(CliUsageError, match="whitespace"):
+        build_tool_call(ws_args)

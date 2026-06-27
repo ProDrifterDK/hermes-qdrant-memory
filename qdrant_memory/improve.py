@@ -60,17 +60,19 @@ IMPROVE_MAX_CANDIDATES_HARD_CAP = 50
 REPORT_ID_RE = re.compile(r"^improve-[a-f0-9]{12}$")
 
 # ---------------------------------------------------------------------------
-# Identity-bearing detection for graph candidates
+# Safe graph entity-type allowlist (Phase 3)
 # ---------------------------------------------------------------------------
 
-# Entity types that are identity-bearing (person/role types).
-# These carry raw identity names and must not be stored as graph entities.
-_IDENTITY_ENTITY_TYPES = frozenset({
-    "person", "user", "customer", "account", "contact", "profile",
-    # Expanded person-role synonyms
-    "employee", "member", "owner", "author", "developer", "manager",
-    "admin", "maintainer", "teacher", "student", "operator",
-    "assignee", "reviewer",
+# Phase 3 uses an ALLOWLIST model: only known non-personal graph entity types
+# may be store-eligible via automatic improve extraction.  Any entity type not
+# in this set is treated as identity-bearing / unsafe and rejected at
+# construction so that raw labels never enter preview JSON, persisted report
+# JSON, draft artifacts, live errors, or Qdrant upsert payloads.
+#
+# To add a new safe type, append it here.  Unknown/unlisted types are rejected
+# by default — they are NOT assumed safe.
+_SAFE_GRAPH_ENTITY_TYPES = frozenset({
+    "project", "tool", "concept", "service", "repo", "package",
 })
 
 # Regex patterns for identity values in labels/source URIs
@@ -102,9 +104,24 @@ def is_identity_bearing_value(text: str) -> bool:
     return False
 
 
+def is_safe_graph_entity_type(entity_type: str) -> bool:
+    """Check if an entity type is in the Phase 3 safe allowlist.
+
+    Only allowlisted non-personal types (project, tool, concept, service, repo,
+    package) are store-eligible.  All other types — including unlisted
+    person/role/customer synonyms — are NOT safe.
+    """
+    return entity_type.strip().lower() in _SAFE_GRAPH_ENTITY_TYPES
+
+
 def is_identity_bearing_entity_type(entity_type: str) -> bool:
-    """Check if an entity type is itself identity-bearing (person/user/etc.)."""
-    return entity_type.strip().lower() in _IDENTITY_ENTITY_TYPES
+    """Check if an entity type is identity-bearing / NOT safe for Phase 3.
+
+    Under the allowlist model this returns True for any entity type that is
+    NOT in the safe allowlist.  This keeps the existing call-sites working
+    while switching from denylist to allowlist semantics.
+    """
+    return not is_safe_graph_entity_type(entity_type)
 
 
 def is_identity_bearing_graph_candidate(
@@ -118,7 +135,7 @@ def is_identity_bearing_graph_candidate(
     """Check if a graph entity/edge candidate is identity-bearing.
 
     Returns True if any label/value/source is identity-bearing, or if
-    the entity type itself is an identity type (person/user/customer/etc.).
+    the entity type itself is NOT in the safe allowlist.
     """
     if is_identity_bearing_entity_type(entity_type):
         return True

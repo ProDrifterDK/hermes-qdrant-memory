@@ -80,6 +80,20 @@ def _non_empty(value: Any, name: str) -> str:
     return text
 
 
+def _raw_exact(value: Any, name: str) -> str:
+    """Validate that a value is non-empty and has no leading/trailing whitespace.
+
+    Unlike ``_non_empty``, this does NOT strip — it rejects values with
+    leading/trailing whitespace so the raw input reaches the provider unmodified.
+    """
+    text = str(value or "")
+    if not text.strip():
+        raise CliUsageError(f"{name} is required")
+    if text != text.strip():
+        raise CliUsageError(f"{name} must not have leading or trailing whitespace")
+    return text
+
+
 _ARTIFACT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
@@ -2062,8 +2076,8 @@ def build_tool_call(args: Namespace) -> tuple[str, dict[str, Any]]:
         if improve_sub == "apply":
             _require_live_approval(args)
             tool_args = {
-                "report_id": _non_empty(args.report_id, "report_id"),
-                "candidate_id": _non_empty(args.candidate_id, "candidate_id"),
+                "report_id": _raw_exact(args.report_id, "report_id"),
+                "candidate_id": _raw_exact(args.candidate_id, "candidate_id"),
                 "dry_run": getattr(args, "dry_run", True),
                 "approve": getattr(args, "approve", False),
             }

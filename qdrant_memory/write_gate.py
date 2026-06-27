@@ -265,7 +265,9 @@ def evaluate_extraction_candidate_write(
             requires_review=True,
             metadata={"candidate_type": candidate_type},
         )
-    # Blocker 4: Reject identity-bearing graph candidates at the write gate
+    # Reject identity-bearing / non-allowlisted graph candidates at the write gate.
+    # Phase 3 uses an allowlist: only known non-personal entity types are safe.
+    # Any entity type NOT in the allowlist is rejected (no raw label in payload).
     if candidate_type in ("graph_entity_candidate", "graph_edge_candidate"):
         try:
             from qdrant_memory.improve import (
@@ -283,7 +285,7 @@ def evaluate_extraction_candidate_write(
                     requires_review=True,
                     metadata={"candidate_type": candidate_type},
                 )
-            # Check identity entity types via shared helper (same set as improve.py)
+            # Reject any entity type not in the safe allowlist (shared helper).
             if is_identity_bearing_entity_type(entity_type_val):
                 return _decision(
                     "reject",

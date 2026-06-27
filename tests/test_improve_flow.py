@@ -1225,3 +1225,153 @@ def test_safe_graph_entities_still_store_eligible(tmp_path):
     )
     store_candidates = [c for c in result["candidates"] if c.get("would_store")]
     assert len(store_candidates) == 6
+
+
+# ===========================================================================
+# Fix2-1: Allowlist model — unlisted entity types must NOT leak/store
+# ===========================================================================
+
+def test_unlisted_identity_types_rejected_by_allowlist():
+    """Person/role/customer terms NOT in the safe allowlist must be detected
+    as identity-bearing via the allowlist model."""
+    from qdrant_memory.improve import is_safe_graph_entity_type
+    # These must all be unsafe (not in allowlist)
+    for etype in [
+        "client", "contractor", "contributor", "collaborator", "personnel",
+        "colleague", "participant", "stakeholder", "vendor_contact",
+        "guardian", "parent", "employee", "member", "owner", "author",
+        "developer", "manager", "admin", "person", "user", "customer",
+        "account", "contact", "profile",
+    ]:
+        assert not is_safe_graph_entity_type(etype), f"{etype} should NOT be safe"
+        assert is_identity_bearing_entity_type(etype), f"{etype} should be identity-bearing"
+    # These must all be safe (in allowlist)
+    for etype in ["project", "tool", "concept", "service", "repo", "package"]:
+        assert is_safe_graph_entity_type(etype), f"{etype} should be safe"
+        assert not is_identity_bearing_entity_type(etype), f"{etype} should NOT be identity-bearing"
+
+
+def test_unlisted_role_types_not_in_preview_or_report(tmp_path):
+    """Raw names under unlisted role types (client, contractor, contributor,
+    collaborator, personnel, colleague, participant, stakeholder, etc.) must
+    NOT appear in preview JSON or persisted report JSON."""
+    provider = _provider_for_improve(tmp_path)
+    source = "\n".join([
+        "Graph entity: client: Alan Gárate",
+        "Graph entity: contractor: John Smith",
+        "Graph entity: contributor: Jane Doe",
+        "Graph entity: collaborator: Bob Wilson",
+        "Graph entity: personnel: Alice Brown",
+        "Graph entity: colleague: Carol Davis",
+        "Graph entity: participant: Dave Lee",
+        "Graph entity: stakeholder: Eve Martin",
+        "Graph entity: project: SafeProject",
+    ])
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_preview",
+            {"source_text": source, "source_uri": "session://test/unlisted"},
+        )
+    )
+    report_json = json.dumps(result)
+
+    # Raw identity names must NOT appear anywhere in the preview
+    assert "Alan Gárate" not in report_json
+    assert "John Smith" not in report_json
+    assert "Jane Doe" not in report_json
+    assert "Bob Wilson" not in report_json
+    assert "Alice Brown" not in report_json
+    assert "Carol Davis" not in report_json
+    assert "Dave Lee" not in report_json
+    assert "Eve Martin" not in report_json
+
+    # Only the safe project entity should be store-eligible
+    store_candidates = [c for c in result["candidates"] if c.get("would_store")]
+    assert len(store_candidates) == 1
+    labels = []
+    for c in result["candidates"]:
+        payload = c.get("proposed_payload") or {}
+        labels.append(payload.get("label") or payload.get("text") or "")
+    assert any("SafeProject" in l for l in labels)
+    assert not any("Alan" in l or "John" in l or "Jane" in l for l in labels)
+
+    # Verify persisted report also has no raw names
+    loaded = load_improve_report(result["report_id"], hermes_home=provider._hermes_home)
+    assert loaded is not None
+    loaded_json = json.dumps(loaded)
+    assert "Alan Gárate" not in loaded_json
+    assert "John Smith" not in loaded_json
+    assert "Jane Doe" not in loaded_json
+
+
+def test_unlisted_role_type_not_stored_via_apply(tmp_path):
+    """An unlisted identity-like role type (client) must not result in Qdrant
+    upsert/embed even if apply is attempted — candidate is rejected at extraction."""
+    provider = _provider_for_improve(tmp_path)
+    source = "Graph entity: client: Alan Gárate"
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_preview",
+            {"source_text": source, "source_uri": "session://test/client-apply"},
+        )
+    )
+    # No store-eligible candidates should exist
+    store_candidates = [c for c in result["candidates"] if c.get("would_store")]
+    assert len(store_candidates) == 0
+    assert "Alan Gárate" not in json.dumps(result)
+    assert len(provider._qdrant.upserts) == 0
+    assert len(provider._embeddings.documents) == 0
+
+
+def test_unlisted_role_type_rejected_at_write_gate():
+    """Write gate must reject unlisted identity-like entity types via shared
+    allowlist helper."""
+    from qdrant_memory.extraction_candidates import ExtractionCandidate
+    from qdrant_memory.write_gate import evaluate_extraction_candidate_write
+
+    for etype in ["client", "contractor", "contributor", "collaborator", "personnel"]:
+        candidate = ExtractionCandidate(
+            candidate_id=f"test-{etype}",
+            candidate_type="graph_entity_candidate",
+            source_uri="session://test",
+            locator={},
+            derived_from=[{"source_uri": "session://test", "relation_type": "EXTRACTED_FROM"}],
+            proposed_payload={
+                "text": f"{etype}: Some Name",
+                "label": f"{etype}: Some Name",
+                "entity_type": etype,
+                "memory_kind": "graph_entity",
+                "source_type": "graph",
+                "source_uri": "session://test",
+                "derivation_type": "source_extraction",
+            },
+            reason="test",
+            confidence=0.9,
+            risk="low",
+        )
+        decision = evaluate_extraction_candidate_write(candidate)
+        assert decision.decision == "reject", f"entity type '{etype}' should be rejected"
+        assert "identity_bearing_graph_candidate" in decision.reasons
+
+
+def test_unknown_entity_type_rejected():
+    """A completely arbitrary/unknown entity type must be rejected (not safe)."""
+    from qdrant_memory.improve import is_safe_graph_entity_type
+    for etype in ["foobar", "randomtype", "xyz", "organization", "company", "team"]:
+        assert not is_safe_graph_entity_type(etype), f"unknown type '{etype}' must NOT be safe"
+
+
+def test_safe_graph_entities_still_work_after_allowlist(tmp_path):
+    """Ensure all 6 safe types still produce store-eligible candidates after
+    switching to allowlist model."""
+    provider = _provider_for_improve(tmp_path)
+    for safe_type in ["project", "tool", "concept", "service", "repo", "package"]:
+        source = f"Graph entity: {safe_type}: TestEntity"
+        result = json.loads(
+            provider.handle_tool_call(
+                "qdrant_memory_improve_preview",
+                {"source_text": source, "source_uri": f"session://test/{safe_type}"},
+            )
+        )
+        store_candidates = [c for c in result["candidates"] if c.get("would_store")]
+        assert len(store_candidates) >= 1, f"{safe_type} should be store-eligible"
