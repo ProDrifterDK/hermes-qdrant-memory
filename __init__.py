@@ -65,12 +65,17 @@ from qdrant_memory.source_extraction import (
 from qdrant_memory.improve import (
     IMPROVE_MAX_CANDIDATES_DEFAULT,
     IMPROVE_MAX_CANDIDATES_HARD_CAP,
+    REPORT_ID_RE,
     build_improve_report,
     extract_improve_candidates_from_point,
     extract_improve_candidates_from_text,
+    is_candidate_applied,
+    is_identity_bearing_graph_candidate,
+    is_identity_bearing_value,
     load_improve_report,
     make_candidate_digest,
     persist_improve_report,
+    record_candidate_applied,
 )
 from qdrant_memory.write_gate import evaluate_write_candidate
 from qdrant_memory.tools import TOOL_SCHEMAS
@@ -1745,6 +1750,9 @@ class QdrantMemoryProvider(MemoryProvider):
         report_id = str(args.get("report_id") or "").strip()
         if not report_id:
             return _json_error("report_id is required")
+        # Blocker 1: strict canonical report ID validation
+        if not REPORT_ID_RE.match(report_id):
+            return _json_error("report_id must match canonical format improve-<12hex>")
         candidate_id = str(args.get("candidate_id") or "").strip()
         if not candidate_id:
             return _json_error("candidate_id is required")
@@ -1886,6 +1894,23 @@ class QdrantMemoryProvider(MemoryProvider):
         if write_decision.decision != "store":
             return _json_error("improve candidate requires manual review before storing")
 
+        # Blocker 2: Idempotency check — if this candidate was already applied
+        # for this report, return already_applied without embedding/upserting.
+        applied_record = is_candidate_applied(
+            report_id, candidate_id, hermes_home=self._hermes_home
+        )
+        if applied_record is not None:
+            self._reviewed_improve_candidate_keys.discard(review_key)
+            return json.dumps({
+                "dry_run": False,
+                "applied": True,
+                "saved": False,
+                "already_applied": True,
+                "id": str(applied_record.get("target_point_id") or ""),
+                "application_record": applied_record,
+                **base_result,
+            })
+
         # Store path: embed and upsert
         if not self._qdrant or not self._embeddings:
             return _json_error("Qdrant memory provider is not initialized")
@@ -1914,9 +1939,58 @@ class QdrantMemoryProvider(MemoryProvider):
             base_result["write_decision"] = persisted_decision.to_dict()
 
             target_pid = str(match_item.get("target_point_id") or candidate_id)
+
+            # Blocker 3: Conflict detection — retrieve existing point before upsert
+            existing_points = []
+            try:
+                existing_points = self._qdrant.retrieve(
+                    self._config["collection_name"], [target_pid], with_payload=True
+                )
+            except Exception:
+                pass  # Fail open on retrieval errors; proceed to store
+            if existing_points:
+                existing = existing_points[0]
+                existing_payload = existing.get("payload") if isinstance(existing, dict) else {}
+                # Check if it's an exact replay (same candidate/provenance marker)
+                if isinstance(existing_payload, dict):
+                    existing_candidate_id = str(existing_payload.get("improve_candidate_id") or "")
+                    existing_report_id = str(existing_payload.get("improve_report_id") or "")
+                    if existing_candidate_id == candidate_id and existing_report_id == report_id:
+                        # Exact replay — already applied
+                        record_candidate_applied(
+                            report_id, candidate_id,
+                            hermes_home=self._hermes_home,
+                            target_point_id=target_pid,
+                            candidate_digest=candidate_digest,
+                        )
+                        self._reviewed_improve_candidate_keys.discard(review_key)
+                        self._remove_candidate_from_report(report_id, candidate_id)
+                        return json.dumps({
+                            "dry_run": False,
+                            "applied": True,
+                            "saved": False,
+                            "already_applied": True,
+                            "id": target_pid,
+                            "collection_name": self._config["collection_name"],
+                            **base_result,
+                        })
+                    # Existing point differs — fail closed, do NOT overwrite
+                    return _json_error(
+                        f"Target point {target_pid} already exists with different "
+                        f"payload/provenance; refusing to overwrite (use manual review)"
+                    )
+
             text = str(payload.get("text") or payload.get("claim_text") or "")
             vector = self._embeddings.embed_document(text)
             self._qdrant.upsert(self._config["collection_name"], [{"id": target_pid, "vector": vector, "payload": payload}])
+
+            # Blocker 2: Persist application record for idempotent repeat
+            record_candidate_applied(
+                report_id, candidate_id,
+                hermes_home=self._hermes_home,
+                target_point_id=target_pid,
+                candidate_digest=candidate_digest,
+            )
 
             # Remove from pending state after successful apply
             self._reviewed_improve_candidate_keys.discard(review_key)

@@ -8,10 +8,18 @@ import pytest
 from __init__ import QdrantMemoryProvider
 from qdrant_memory.improve import (
     IMPROVE_EXTRACTOR_VERSION,
+    REPORT_ID_RE,
     _check_no_external_graph_deps,
     build_improve_report,
     extract_improve_candidates_from_text,
+    is_candidate_applied,
+    is_identity_bearing_entity_type,
+    is_identity_bearing_graph_candidate,
+    is_identity_bearing_value,
+    load_improve_report,
     make_candidate_digest,
+    persist_improve_report,
+    record_candidate_applied,
 )
 from qdrant_memory.schema import RELATION_TYPES
 
@@ -29,6 +37,7 @@ class FakeQdrant:
     def __init__(self):
         self.upserts = []
         self.scroll_results: dict[str, list[dict]] = {}
+        self.retrieve_results: dict[str, dict] = {}
 
     def upsert(self, name, points):
         self.upserts.append((name, points))
@@ -43,6 +52,13 @@ class FakeQdrant:
                     if pid in self.scroll_results:
                         return (self.scroll_results[pid], None)
         return ([], None)
+
+    def retrieve(self, name, ids, *, with_payload=True, with_vector=False):
+        results = []
+        for pid in ids:
+            if pid in self.retrieve_results:
+                results.append(self.retrieve_results[pid])
+        return results
 
 
 def _provider_for_improve(tmp_path: Path) -> QdrantMemoryProvider:
@@ -225,10 +241,11 @@ def test_live_apply_refuses_without_approve_true(tmp_path):
 def test_apply_rejects_unknown_report_and_candidate(tmp_path):
     provider = _provider_for_improve(tmp_path)
 
+    # Use canonical-format ID that does not exist
     unknown_report = json.loads(
         provider.handle_tool_call(
             "qdrant_memory_improve_apply",
-            {"report_id": "improve-nonexistent", "candidate_id": "fake"},
+            {"report_id": "improve-aaaaaaaaaaaa", "candidate_id": "fake"},
         )
     )
     assert "error" in unknown_report
@@ -552,3 +569,460 @@ def test_candidate_digest_detects_tampering():
     digest2 = make_candidate_digest(tampered)
 
     assert digest1 != digest2
+
+
+# ===========================================================================
+# Blocker 1: Persisted report exact-ID gate
+# ===========================================================================
+
+def test_report_id_regex_accepts_canonical():
+    assert REPORT_ID_RE.match("improve-82cf21a4bc3f")
+    assert REPORT_ID_RE.match("improve-9e065979c8b7")
+
+
+def test_report_id_regex_rejects_non_canonical():
+    # Punctuation
+    assert not REPORT_ID_RE.match("improve-82cf21a4bc3f!!!")
+    # Path separators
+    assert not REPORT_ID_RE.match("improve-82cf/../bc3f")
+    # Whitespace
+    assert not REPORT_ID_RE.match(" improve-82cf21a4bc3f")
+    assert not REPORT_ID_RE.match("improve-82cf21a4bc3f ")
+    # Partial ID
+    assert not REPORT_ID_RE.match("improve-82cf21a4")
+    # Non-hex chars
+    assert not REPORT_ID_RE.match("improve-82cf21a4bc3g")
+    # Missing prefix
+    assert not REPORT_ID_RE.match("82cf21a4bc3f")
+    # Empty
+    assert not REPORT_ID_RE.match("")
+
+
+def test_load_improve_report_rejects_non_exact_ids(tmp_path):
+    """Non-canonical IDs must return None even if a report artifact exists."""
+    report = {
+        "report_id": "improve-abcdef123456",
+        "report_type": "graph_improve_preview",
+        "candidates": [],
+        "profile_id": "default",
+    }
+    hermes_home = str(tmp_path)
+    persist_improve_report(report, hermes_home=hermes_home)
+
+    # Canonical ID loads
+    loaded = load_improve_report("improve-abcdef123456", hermes_home=hermes_home)
+    assert loaded is not None
+    assert loaded["report_id"] == "improve-abcdef123456"
+
+    # Non-exact IDs fail to load even though the file exists
+    assert load_improve_report("improve-abcdef123456!!!", hermes_home=hermes_home) is None
+    assert load_improve_report("improve-abcdef/../123456", hermes_home=hermes_home) is None
+    assert load_improve_report("improve-abcdef12345", hermes_home=hermes_home) is None  # partial
+
+
+def test_apply_rejects_non_canonical_report_id(tmp_path):
+    """Live apply must reject non-canonical report IDs at the gate."""
+    provider = _provider_for_improve(tmp_path)
+    source = "Graph entity: project: NonCanonical"
+    preview = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_preview",
+            {"source_text": source, "source_uri": "session://test/non-canonical"},
+        )
+    )
+    report_id = preview["report_id"]
+
+    # Aliased/decorated IDs that fail canonical regex
+    for alias in [report_id + "!!!", report_id + "/../", report_id + "zzz"]:
+        result = json.loads(
+            provider.handle_tool_call(
+                "qdrant_memory_improve_apply",
+                {"report_id": alias, "candidate_id": "fake"},
+            )
+        )
+        assert "error" in result
+        assert "canonical" in result["error"]
+
+
+def test_load_rejects_mismatched_report_id_in_file(tmp_path):
+    """Loaded report must have matching report_id or be rejected."""
+    import json as _json
+    from pathlib import Path as _Path
+
+    # Manually write a file whose report_id doesn't match its filename
+    artifact_dir = _Path(str(tmp_path)) / "qdrant_memory" / "improve_reports"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    mismatched = {"report_id": "improve-deadbeef0000", "candidates": []}
+    (artifact_dir / "improve-abcdef123456.json").write_text(
+        _json.dumps(mismatched), encoding="utf-8"
+    )
+    loaded = load_improve_report("improve-abcdef123456", hermes_home=str(tmp_path))
+    assert loaded is None  # report_id in file doesn't match
+
+
+# ===========================================================================
+# Blocker 2: Repeat apply / idempotency
+# ===========================================================================
+
+def test_repeat_live_apply_is_idempotent_after_persisted_reload(tmp_path):
+    """After a successful live apply, reloading from disk and re-applying
+    must return already_applied without additional upserts."""
+    provider = _provider_for_improve(tmp_path)
+    source = "Graph entity: project: IdempotencyTest"
+    preview = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_preview",
+            {"source_text": source, "source_uri": "session://test/idem"},
+        )
+    )
+    report_id = preview["report_id"]
+    store_candidate = next(c for c in preview["candidates"] if c["would_store"])
+    candidate_id = store_candidate["candidate_id"]
+
+    # Dry-run + live apply
+    provider.handle_tool_call(
+        "qdrant_memory_improve_apply",
+        {"report_id": report_id, "candidate_id": candidate_id},
+    )
+    live1 = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_apply",
+            {"report_id": report_id, "candidate_id": candidate_id, "dry_run": False, "approve": True},
+        )
+    )
+    assert live1["saved"] is True
+    assert live1["already_applied"] is False
+    upserts_after_live1 = len(provider._qdrant.upserts)
+    assert upserts_after_live1 == 1
+
+    # Simulate process restart: clear in-memory state, reload from disk
+    provider._pending_improve_reports.clear()
+    provider._reviewed_improve_candidate_keys.clear()
+
+    # Dry-run again from persisted report, then try to live apply again
+    provider.handle_tool_call(
+        "qdrant_memory_improve_apply",
+        {"report_id": report_id, "candidate_id": candidate_id},
+    )
+    live2 = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_apply",
+            {"report_id": report_id, "candidate_id": candidate_id, "dry_run": False, "approve": True},
+        )
+    )
+    # Must be already_applied, no new upsert
+    assert live2.get("already_applied") is True
+    assert live2.get("saved") is False
+    assert len(provider._qdrant.upserts) == upserts_after_live1  # no new upsert
+    assert len(provider._embeddings.documents) == 1  # no new embedding
+
+
+def test_application_record_persistence_and_check(tmp_path):
+    """Application record is persisted on disk and retrievable."""
+    hermes_home = str(tmp_path)
+    record = record_candidate_applied(
+        "improve-abcdef123456", "cand-1",
+        hermes_home=hermes_home,
+        target_point_id="entity-1",
+        candidate_digest="sha256:abc",
+    )
+    assert record["target_point_id"] == "entity-1"
+    loaded = is_candidate_applied("improve-abcdef123456", "cand-1", hermes_home=hermes_home)
+    assert loaded is not None
+    assert loaded["target_point_id"] == "entity-1"
+    # Different candidate has no record
+    assert is_candidate_applied("improve-abcdef123456", "cand-2", hermes_home=hermes_home) is None
+
+
+# ===========================================================================
+# Blocker 3: Existing point conflict safety
+# ===========================================================================
+
+def test_live_apply_exact_replay_existing_point_is_noop(tmp_path):
+    """If target_point_id exists with same candidate/provenance marker,
+    apply returns already_applied without embedding/upserting."""
+    provider = _provider_for_improve(tmp_path)
+    source = "Graph entity: project: ReplayTest"
+    preview = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_preview",
+            {"source_text": source, "source_uri": "session://test/replay"},
+        )
+    )
+    report_id = preview["report_id"]
+    store_candidate = next(c for c in preview["candidates"] if c["would_store"])
+    candidate_id = store_candidate["candidate_id"]
+    target_pid = store_candidate["target_point_id"]
+
+    # Pre-populate Qdrant with an existing point that has the same markers
+    provider._qdrant.retrieve_results[target_pid] = {
+        "id": target_pid,
+        "payload": {
+            "improve_candidate_id": candidate_id,
+            "improve_report_id": report_id,
+            "text": "project: ReplayTest",
+        },
+    }
+
+    # Dry-run + live apply
+    provider.handle_tool_call(
+        "qdrant_memory_improve_apply",
+        {"report_id": report_id, "candidate_id": candidate_id},
+    )
+    live = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_apply",
+            {"report_id": report_id, "candidate_id": candidate_id, "dry_run": False, "approve": True},
+        )
+    )
+    assert live.get("already_applied") is True
+    assert live.get("saved") is False
+    assert len(provider._qdrant.upserts) == 0
+    assert len(provider._embeddings.documents) == 0
+
+
+def test_live_apply_conflicting_existing_point_fails_closed(tmp_path):
+    """If target_point_id exists with DIFFERENT payload/provenance,
+    apply must fail closed and NOT overwrite."""
+    provider = _provider_for_improve(tmp_path)
+    source = "Graph entity: project: ConflictTest"
+    preview = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_preview",
+            {"source_text": source, "source_uri": "session://test/conflict"},
+        )
+    )
+    report_id = preview["report_id"]
+    store_candidate = next(c for c in preview["candidates"] if c["would_store"])
+    candidate_id = store_candidate["candidate_id"]
+    target_pid = store_candidate["target_point_id"]
+
+    # Pre-populate Qdrant with a DIFFERENT existing point (different markers)
+    provider._qdrant.retrieve_results[target_pid] = {
+        "id": target_pid,
+        "payload": {
+            "improve_candidate_id": "different-candidate-id",
+            "improve_report_id": "improve-000000000000",
+            "text": "old data",
+        },
+    }
+
+    # Dry-run + live apply
+    provider.handle_tool_call(
+        "qdrant_memory_improve_apply",
+        {"report_id": report_id, "candidate_id": candidate_id},
+    )
+    live = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_apply",
+            {"report_id": report_id, "candidate_id": candidate_id, "dry_run": False, "approve": True},
+        )
+    )
+    # Must fail closed
+    assert "error" in live
+    assert "refusing to overwrite" in live["error"]
+    assert len(provider._qdrant.upserts) == 0
+    assert len(provider._embeddings.documents) == 0
+
+
+def test_live_apply_no_conflict_stores_normally(tmp_path):
+    """If target_point_id does not exist, apply stores normally."""
+    provider = _provider_for_improve(tmp_path)
+    source = "Graph entity: project: NoConflict"
+    preview = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_preview",
+            {"source_text": source, "source_uri": "session://test/no-conflict"},
+        )
+    )
+    report_id = preview["report_id"]
+    store_candidate = next(c for c in preview["candidates"] if c["would_store"])
+    candidate_id = store_candidate["candidate_id"]
+
+    # No retrieve_results set -> retrieve returns empty -> no conflict
+
+    # Dry-run + live apply
+    provider.handle_tool_call(
+        "qdrant_memory_improve_apply",
+        {"report_id": report_id, "candidate_id": candidate_id},
+    )
+    live = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_apply",
+            {"report_id": report_id, "candidate_id": candidate_id, "dry_run": False, "approve": True},
+        )
+    )
+    assert live["saved"] is True
+    assert live["already_applied"] is False
+    assert len(provider._qdrant.upserts) == 1
+
+
+# ===========================================================================
+# Blocker 4: Identity-bearing graph inputs
+# ===========================================================================
+
+def test_identity_detection_for_emails():
+    assert is_identity_bearing_value("alan@example.com")
+    assert is_identity_bearing_value("contact: user@domain.org")
+
+
+def test_identity_detection_for_phone_like():
+    assert is_identity_bearing_value("+12345678901")
+    assert is_identity_bearing_value("phone: +56 9 8765 4321")
+
+
+def test_identity_detection_for_identity_keywords():
+    assert is_identity_bearing_value("my_email_field")
+    assert is_identity_bearing_value("user_phone_number")
+
+
+def test_identity_detection_for_safe_values():
+    assert not is_identity_bearing_value("Nucleogenesis")
+    assert not is_identity_bearing_value("project")
+    assert not is_identity_bearing_value("DEPENDS_ON")
+
+
+def test_identity_entity_types():
+    for etype in ["person", "user", "customer", "account", "contact", "profile"]:
+        assert is_identity_bearing_entity_type(etype), f"{etype} should be identity-bearing"
+    assert not is_identity_bearing_entity_type("project")
+    assert not is_identity_bearing_entity_type("concept")
+    assert not is_identity_bearing_entity_type("tool")
+
+
+def test_identity_bearing_graph_candidate_detection():
+    # Entity with identity type
+    assert is_identity_bearing_graph_candidate(entity_type="person", label="John")
+    # Entity with email label
+    assert is_identity_bearing_graph_candidate(entity_type="account", label="user@domain.com")
+    # Safe entity
+    assert not is_identity_bearing_graph_candidate(entity_type="project", label="Nucleogenesis")
+
+
+def test_identity_entity_rejected_in_preview(tmp_path):
+    """Graph entity with person/user/etc. type must not appear in preview."""
+    provider = _provider_for_improve(tmp_path)
+    source = "\n".join([
+        "Graph entity: person: Alan Gárate",
+        "Graph entity: account: alan@example.com",
+        "Graph entity: project: SafeProject",
+    ])
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_preview",
+            {"source_text": source, "source_uri": "session://test/identity"},
+        )
+    )
+    report_json = json.dumps(result)
+
+    # Identity strings must NOT appear anywhere in the report
+    assert "alan@example.com" not in report_json
+    assert "Alan Gárate" not in report_json
+
+    # The safe entity should still be present
+    labels = []
+    for c in result["candidates"]:
+        payload = c.get("proposed_payload") or {}
+        labels.append(payload.get("label") or payload.get("text") or "")
+    assert any("SafeProject" in l for l in labels), "Safe entity should survive"
+    assert not any("Alan" in l or "alan@" in l for l in labels)
+
+
+def test_identity_email_in_label_rejected_in_preview(tmp_path):
+    """Graph entity label containing email must not appear in preview."""
+    provider = _provider_for_improve(tmp_path)
+    source = "Graph entity: contact: support@company.com"
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_preview",
+            {"source_text": source, "source_uri": "session://test/email"},
+        )
+    )
+    assert result["counts"]["total"] == 0
+    assert "support@company.com" not in json.dumps(result)
+
+
+def test_identity_phone_in_label_rejected_in_preview(tmp_path):
+    """Graph entity label containing phone-like value must not appear in preview."""
+    provider = _provider_for_improve(tmp_path)
+    source = "Graph entity: account: +15551234567"
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_preview",
+            {"source_text": source, "source_uri": "session://test/phone"},
+        )
+    )
+    assert result["counts"]["total"] == 0
+    assert "+15551234567" not in json.dumps(result)
+
+
+def test_identity_bearing_entity_not_in_persisted_report(tmp_path):
+    """Identity strings must not appear in the persisted report JSON file."""
+    provider = _provider_for_improve(tmp_path)
+    source = "\n".join([
+        "Graph entity: user: john.doe@email.com",
+        "Graph entity: project: SafeEntity",
+    ])
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_preview",
+            {"source_text": source, "source_uri": "session://test/persist-id"},
+        )
+    )
+    report_id = result["report_id"]
+    # Load persisted report from disk
+    loaded = load_improve_report(report_id, hermes_home=provider._hermes_home)
+    assert loaded is not None
+    loaded_json = json.dumps(loaded)
+    assert "john.doe@email.com" not in loaded_json
+    # Safe entity should be present
+    assert "SafeEntity" in loaded_json
+
+
+def test_identity_entity_in_edge_rejected_in_preview(tmp_path):
+    """Graph edge with identity-bearing entity type must not appear in preview."""
+    provider = _provider_for_improve(tmp_path)
+    source = "Graph edge: person:John Doe -[WORKS_AT]-> company:AcmeCorp"
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_preview",
+            {"source_text": source, "source_uri": "session://test/edge-identity"},
+        )
+    )
+    # Should have 0 candidates since the edge has person type
+    edge_candidates = [
+        c for c in result["candidates"]
+        if c.get("candidate_type") == "graph_edge_candidate"
+    ]
+    assert len(edge_candidates) == 0
+    assert "John Doe" not in json.dumps(result)
+
+
+def test_identity_rejected_at_write_gate():
+    """Write gate must reject identity-bearing graph candidates even if
+    they somehow reach it via persisted payload."""
+    from qdrant_memory.extraction_candidates import ExtractionCandidate
+    from qdrant_memory.write_gate import evaluate_extraction_candidate_write
+
+    candidate = ExtractionCandidate(
+        candidate_id="test-id",
+        candidate_type="graph_entity_candidate",
+        source_uri="session://test",
+        locator={},
+        derived_from=[{"source_uri": "session://test", "relation_type": "EXTRACTED_FROM"}],
+        proposed_payload={
+            "text": "user@example.com",
+            "label": "user@example.com",
+            "entity_type": "account",
+            "memory_kind": "graph_entity",
+            "source_type": "graph",
+            "source_uri": "session://test",
+            "derivation_type": "source_extraction",
+        },
+        reason="test",
+        confidence=0.9,
+        risk="low",
+    )
+    decision = evaluate_extraction_candidate_write(candidate)
+    assert decision.decision == "reject"
+    assert "identity_bearing_graph_candidate" in decision.reasons

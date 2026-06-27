@@ -265,6 +265,35 @@ def evaluate_extraction_candidate_write(
             requires_review=True,
             metadata={"candidate_type": candidate_type},
         )
+    # Blocker 4: Reject identity-bearing graph candidates at the write gate
+    if candidate_type in ("graph_entity_candidate", "graph_edge_candidate"):
+        try:
+            from qdrant_memory.improve import is_identity_bearing_value
+            entity_type_val = str(payload.get("entity_type") or "")
+            label_val = str(payload.get("label") or payload.get("text") or "")
+            source_uri_val = str(payload.get("source_uri") or "")
+            if is_identity_bearing_value(label_val) or is_identity_bearing_value(source_uri_val):
+                return _decision(
+                    "reject",
+                    ["identity_bearing_graph_candidate"],
+                    confidence=1.0,
+                    requires_review=True,
+                    metadata={"candidate_type": candidate_type},
+                )
+            # Check identity entity types (person/user/customer/etc.)
+            _IDENTITY_ENTITY_TYPES = frozenset({
+                "person", "user", "customer", "account", "contact", "profile",
+            })
+            if entity_type_val.strip().lower() in _IDENTITY_ENTITY_TYPES:
+                return _decision(
+                    "reject",
+                    ["identity_bearing_graph_candidate"],
+                    confidence=1.0,
+                    requires_review=True,
+                    metadata={"candidate_type": candidate_type},
+                )
+        except ImportError:
+            pass  # improve module not available; skip extra check
     if not _candidate_destination_valid(candidate_type, payload, target):
         return _decision(
             "reject",

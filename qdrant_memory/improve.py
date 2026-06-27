@@ -56,6 +56,73 @@ IMPROVE_EXTRACTOR_VERSION = "graph_improve_v1"
 IMPROVE_MAX_CANDIDATES_DEFAULT = 20
 IMPROVE_MAX_CANDIDATES_HARD_CAP = 50
 
+# Strict canonical report ID format: improve-<12 hex chars>
+REPORT_ID_RE = re.compile(r"^improve-[a-f0-9]{12}$")
+
+# ---------------------------------------------------------------------------
+# Identity-bearing detection for graph candidates
+# ---------------------------------------------------------------------------
+
+# Entity types that are identity-bearing
+_IDENTITY_ENTITY_TYPES = frozenset({
+    "person", "user", "customer", "account", "contact", "profile",
+})
+
+# Regex patterns for identity values in labels/source URIs
+_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+# Phone-like: sequences of 7+ digits with optional +, separators, spaces
+_PHONE_RE = re.compile(r"(?:\+?\d[\d\s().-]{6,}\d)")
+# Identity-key labels (PII-ish field names in labels or entity types)
+_IDENTITY_VALUE_KEYWORDS = frozenset({
+    "email", "phone", "address", "ssn", "password", "credential",
+    "token", "api_key", "passport", "national_id", "tax_id",
+})
+
+
+def is_identity_bearing_value(text: str) -> bool:
+    """Check if a label/source value contains identity-bearing content.
+
+    Covers emails, phone-like values, and identity-value keywords.
+    """
+    s = str(text or "").strip()
+    if not s:
+        return False
+    if _EMAIL_RE.search(s):
+        return True
+    if _PHONE_RE.search(s):
+        return True
+    tokens = set(t.lower() for t in re.split(r"[\W_]+", s) if t)
+    if tokens & _IDENTITY_VALUE_KEYWORDS:
+        return True
+    return False
+
+
+def is_identity_bearing_entity_type(entity_type: str) -> bool:
+    """Check if an entity type is itself identity-bearing (person/user/etc.)."""
+    return entity_type.strip().lower() in _IDENTITY_ENTITY_TYPES
+
+
+def is_identity_bearing_graph_candidate(
+    *,
+    entity_type: str = "",
+    label: str = "",
+    source_uri: str = "",
+    src_label: str = "",
+    tgt_label: str = "",
+) -> bool:
+    """Check if a graph entity/edge candidate is identity-bearing.
+
+    Returns True if any label/value/source is identity-bearing, or if
+    the entity type itself is an identity type (person/user/customer/etc.).
+    """
+    if is_identity_bearing_entity_type(entity_type):
+        return True
+    for val in [label, source_uri, src_label, tgt_label]:
+        if is_identity_bearing_value(val):
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Deterministic graph-grammar markers
 # ---------------------------------------------------------------------------
@@ -158,6 +225,10 @@ def _build_entity_candidate(
         return None
     if _is_unsafe_text(label_clean) or _is_unsafe_text(entity_type_clean):
         return None
+    if is_identity_bearing_graph_candidate(
+        entity_type=entity_type_clean, label=label_clean, source_uri=source_uri
+    ):
+        return None
     safe_uri = _safe_source_uri(source_uri)
     if not safe_uri:
         return None
@@ -229,6 +300,13 @@ def _build_edge_candidate(
         return None
     if any(_is_unsafe_text(t) for t in [src_label_clean, tgt_label_clean, rel_clean]):
         return None
+    if is_identity_bearing_graph_candidate(
+        entity_type=src_type_clean, src_label=src_label_clean,
+        tgt_label=tgt_label_clean, source_uri=source_uri,
+    ) or is_identity_bearing_graph_candidate(
+        entity_type=tgt_type_clean, label=tgt_label_clean, source_uri=source_uri,
+    ):
+        return None
     safe_uri = _safe_source_uri(source_uri)
     if not safe_uri:
         return None
@@ -296,6 +374,8 @@ def _extract_graph_markers_from_text(
     candidates: list[ExtractionCandidate] = []
     for index, line in enumerate((text or "").splitlines(), start=1):
         if _is_unsafe_text(line):
+            continue
+        if is_identity_bearing_value(line):
             continue
         line_locator = dict(locator)
         line_locator.setdefault("line_start", index)
@@ -557,11 +637,9 @@ def persist_improve_report(
     dir_path = Path(artifact_dir)
     dir_path.mkdir(parents=True, exist_ok=True)
     report_id = report.get("report_id", "unknown")
-    # Sanitize: only allow known report_id format for filename
-    safe_id = re.sub(r"[^A-Za-z0-9_-]", "", report_id)
-    if not safe_id:
-        safe_id = "improve-unknown"
-    file_path = dir_path / f"{safe_id}.json"
+    if not REPORT_ID_RE.match(report_id):
+        raise ValueError(f"Refusing to persist report with non-canonical report_id: {report_id!r}")
+    file_path = dir_path / f"{report_id}.json"
     file_path.write_text(
         json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n",
         encoding="utf-8",
@@ -576,21 +654,91 @@ def load_improve_report(
     hermes_home: str,
     artifact_dir: str = "",
 ) -> dict[str, Any] | None:
-    """Load a persisted improve report by report_id. Returns None if not found."""
+    """Load a persisted improve report by report_id.
+
+    The report_id must match the strict canonical format ``improve-<12 hex>``.
+    Returns None if the ID is non-canonical or the report is not found.
+    """
     from pathlib import Path
 
+    if not REPORT_ID_RE.match(report_id):
+        return None
     if not artifact_dir:
         artifact_dir = str(Path(hermes_home) / "qdrant_memory" / "improve_reports")
-    safe_id = re.sub(r"[^A-Za-z0-9_-]", "", report_id)
-    if not safe_id:
-        return None
-    file_path = Path(artifact_dir) / f"{safe_id}.json"
+    file_path = Path(artifact_dir) / f"{report_id}.json"
     if not file_path.exists():
         return None
     try:
-        return json.loads(file_path.read_text(encoding="utf-8"))
+        loaded = json.loads(file_path.read_text(encoding="utf-8"))
     except Exception:
         return None
+    # Require exact report_id match after loading
+    if not isinstance(loaded, dict):
+        return None
+    if loaded.get("report_id") != report_id:
+        return None
+    return loaded
+
+
+# ---------------------------------------------------------------------------
+# Application record (idempotency)
+# ---------------------------------------------------------------------------
+
+def _application_record_path(report_id: str, candidate_id: str, *, hermes_home: str) -> Any:
+    """Return the path to an application record for a report+candidate."""
+    from pathlib import Path
+    return (
+        Path(hermes_home)
+        / "qdrant_memory"
+        / "improve_applied"
+        / f"{report_id}_{candidate_id}.json"
+    )
+
+
+def is_candidate_applied(report_id: str, candidate_id: str, *, hermes_home: str) -> dict[str, Any] | None:
+    """Check if a candidate has been applied for this report.
+
+    Returns the application record dict if applied, or None.
+    """
+    path = _application_record_path(report_id, candidate_id, hermes_home=hermes_home)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def record_candidate_applied(
+    report_id: str,
+    candidate_id: str,
+    *,
+    hermes_home: str,
+    target_point_id: str = "",
+    candidate_digest: str = "",
+    payload_digest: str = "",
+) -> dict[str, Any]:
+    """Persist an application record after successful live apply.
+
+    This enables idempotent repeat: a second apply for the same
+    report+candidate returns ``already_applied`` without touching Qdrant.
+    """
+    from datetime import datetime
+    record = {
+        "report_id": report_id,
+        "candidate_id": candidate_id,
+        "target_point_id": target_point_id,
+        "candidate_digest": candidate_digest,
+        "payload_digest": payload_digest,
+        "applied_at": datetime.utcnow().isoformat() + "Z",
+    }
+    path = _application_record_path(report_id, candidate_id, hermes_home=hermes_home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(record, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return record
 
 
 # ---------------------------------------------------------------------------
