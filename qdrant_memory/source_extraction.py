@@ -32,6 +32,8 @@ _CANDIDATE_KIND_TO_MEMORY_KIND = {
     "status_update_candidate": {"assertion"},
     "assertion_candidate": {"assertion"},
     "memory_candidate": {"decision", "tool_quirk", "workflow_lesson", "manual_fact", "source_chunk", "summary"},
+    "graph_entity_candidate": {"graph_entity"},
+    "graph_edge_candidate": {"graph_edge"},
 }
 
 

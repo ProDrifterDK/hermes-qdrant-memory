@@ -328,6 +328,28 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     watcher_reset.add_argument("--approve", action="store_true", help="Required to reset local watcher signatures.")
     watcher_reset.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
 
+    improve = subcommands.add_parser("improve", help="Post-session graph improve preview/apply. Preview is dry-run only.")
+    improve_subcommands = improve.add_subparsers(dest="improve_subcommand", required=True)
+
+    improve_preview = improve_subcommands.add_parser("preview", help="Preview improve candidates as a dry-run report. No Qdrant writes.")
+    improve_preview.set_defaults(qdrant_subcommand="improve")
+    improve_preview.add_argument("--source-scope", choices=["source_text", "point_ids", "pending_session"], default=None, help="Source scope for extraction.")
+    improve_preview.add_argument("--source-text", default=None, help="Explicit source text to extract from.")
+    improve_preview.add_argument("--source-uri", default=None, help="Source URI for explicit source text.")
+    improve_preview.add_argument("--point-ids", nargs="*", default=None, help="Qdrant point IDs to read as source (when scope=point_ids).")
+    improve_preview.add_argument("--session-id", default=None, help="Session ID. Defaults to current.")
+    improve_preview.add_argument("--max-candidates", type=_positive_int, default=20, help="Maximum candidates. Default: 20.")
+    improve_preview.add_argument("--no-persist", action="store_true", help="Do not persist report artifact.")
+    improve_preview.add_argument("--include-metadata", action="store_true", help="Include verbose metadata.")
+    improve_preview.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
+
+    improve_apply = improve_subcommands.add_parser("apply", help="Preview or apply one candidate from a report. Dry-run by default.")
+    improve_apply.set_defaults(qdrant_subcommand="improve")
+    improve_apply.add_argument("--report-id", required=True, help="Report ID from improve preview.")
+    improve_apply.add_argument("--candidate-id", required=True, help="Candidate ID from the report.")
+    _add_dry_run_flags(improve_apply)
+    improve_apply.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
+
 
 def qdrant_command(args) -> None:
     raise SystemExit(execute_command(args))

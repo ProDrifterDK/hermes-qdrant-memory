@@ -338,6 +338,87 @@ GRAPH_SEARCH_SCHEMA = {
     },
 }
 
+IMPROVE_PREVIEW_SCHEMA = {
+    "name": "qdrant_memory_improve_preview",
+    "description": (
+        "Preview post-session/source graph improve candidates as a dry-run report. "
+        "Does not embed, upsert, update, or delete Qdrant points."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "source_scope": {
+                "type": "string",
+                "enum": ["source_text", "point_ids", "pending_session"],
+                "description": "Source scope for candidate extraction. Defaults to source_text if source_text is given, else pending_session.",
+            },
+            "source_text": {
+                "type": "string",
+                "description": "Explicit source text to extract candidates from. Required when source_scope=source_text.",
+            },
+            "source_uri": {
+                "type": "string",
+                "description": "Source URI for explicit source_text. Defaults to session URI.",
+            },
+            "point_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Explicit Qdrant point IDs to read as source material when source_scope=point_ids.",
+            },
+            "session_id": {
+                "type": "string",
+                "description": "Optional exact session id. Defaults to current session.",
+            },
+            "max_candidates": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50,
+                "description": "Maximum candidates per report. Defaults to 20.",
+            },
+            "persist": {
+                "type": "boolean",
+                "description": "Persist the report as a local JSON artifact. Defaults to true.",
+            },
+            "include_metadata": {
+                "type": "boolean",
+                "description": "Include verbose metadata in report candidates. Defaults to false.",
+            },
+        },
+        "additionalProperties": False,
+    },
+}
+
+IMPROVE_APPLY_SCHEMA = {
+    "name": "qdrant_memory_improve_apply",
+    "description": (
+        "Preview or apply exactly one candidate from exactly one improve report. "
+        "Dry-run defaults to true; live apply requires approve=true and prior dry-run review."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "report_id": {
+                "type": "string",
+                "description": "Exact report id from qdrant_memory_improve_preview.",
+            },
+            "candidate_id": {
+                "type": "string",
+                "description": "Exact candidate id from the report.",
+            },
+            "dry_run": {
+                "type": "boolean",
+                "description": "When true, return the operation plan without mutating Qdrant. Defaults to true.",
+            },
+            "approve": {
+                "type": "boolean",
+                "description": "Required true when dry_run=false.",
+            },
+        },
+        "required": ["report_id", "candidate_id"],
+        "additionalProperties": False,
+    },
+}
+
 TOOL_SCHEMAS = [
     STATUS_SCHEMA,
     STORE_SCHEMA,
@@ -358,4 +439,6 @@ TOOL_SCHEMAS = [
     CONSOLIDATE_SCHEMA,
     CONSOLIDATION_APPLY_SCHEMA,
     GRAPH_SEARCH_SCHEMA,
+    IMPROVE_PREVIEW_SCHEMA,
+    IMPROVE_APPLY_SCHEMA,
 ]

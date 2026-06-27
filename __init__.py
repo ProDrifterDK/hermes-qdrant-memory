@@ -62,6 +62,21 @@ from qdrant_memory.source_extraction import (
     extract_source_candidates_from_messages,
     preview_source_extraction_candidates,
 )
+from qdrant_memory.improve import (
+    IMPROVE_MAX_CANDIDATES_DEFAULT,
+    IMPROVE_MAX_CANDIDATES_HARD_CAP,
+    REPORT_ID_RE,
+    build_improve_report,
+    extract_improve_candidates_from_point,
+    extract_improve_candidates_from_text,
+    is_candidate_applied,
+    is_identity_bearing_graph_candidate,
+    is_identity_bearing_value,
+    load_improve_report,
+    make_candidate_digest,
+    persist_improve_report,
+    record_candidate_applied,
+)
 from qdrant_memory.write_gate import evaluate_write_candidate
 from qdrant_memory.tools import TOOL_SCHEMAS
 from qdrant_memory.writer import ConversationWriter
@@ -246,6 +261,8 @@ class QdrantMemoryProvider(MemoryProvider):
         self._pending_learning_candidates: dict[str, LearningCandidate] = {}
         self._pending_extraction_candidates: dict[str, Any] = {}
         self._reviewed_extraction_candidate_ids: set[str] = set()
+        self._pending_improve_reports: dict[str, dict[str, Any]] = {}
+        self._reviewed_improve_candidate_keys: set[str] = set()
 
     @property
     def name(self) -> str:
@@ -424,6 +441,8 @@ class QdrantMemoryProvider(MemoryProvider):
             self._pending_learning_candidates.clear()
             self._pending_extraction_candidates.clear()
             self._reviewed_extraction_candidate_ids.clear()
+            self._pending_improve_reports.clear()
+            self._reviewed_improve_candidate_keys.clear()
 
     def _auto_learning_enabled(self) -> bool:
         return bool(self._config.get("learning_enabled", True)) and bool(self._config.get("learning_auto_extract_enabled", False))
@@ -1614,6 +1633,402 @@ class QdrantMemoryProvider(MemoryProvider):
         except Exception as exc:
             return _json_error(f"Extraction approval failed: {exc}")
 
+    def _tool_improve_preview(self, args: dict) -> str:
+        """Preview improve candidates as a dry-run report. No Qdrant writes."""
+        source_scope = str(args.get("source_scope") or "").strip()
+        source_text = str(args.get("source_text") or "")
+        source_uri_arg = str(args.get("source_uri") or "").strip()
+        point_ids = args.get("point_ids") or []
+        session_id = str(args.get("session_id") or self._session_id or "")
+        persist = parse_bool_arg(args.get("persist"), default=True)
+        include_metadata = parse_bool_arg(args.get("include_metadata"), default=False)
+        try:
+            max_candidates = max(1, min(IMPROVE_MAX_CANDIDATES_HARD_CAP, int(args.get("max_candidates") or IMPROVE_MAX_CANDIDATES_DEFAULT)))
+        except Exception:
+            max_candidates = IMPROVE_MAX_CANDIDATES_DEFAULT
+
+        # Determine effective scope
+        if not source_scope:
+            if source_text:
+                source_scope = "source_text"
+            elif point_ids:
+                source_scope = "point_ids"
+            else:
+                source_scope = "pending_session"
+
+        profile_id = self._profile_id
+        all_candidates: list[Any] = []
+        source_handles: list[str] = []
+
+        if source_scope == "source_text":
+            if not source_text.strip():
+                return _json_error("source_text is required when source_scope=source_text")
+            uri = source_uri_arg or f"session://{session_id or 'current'}/improve-source"
+            all_candidates = extract_improve_candidates_from_text(
+                source_text,
+                source_uri=uri,
+                source_type="source_text",
+                derivation_type="source_text",
+                confidence=0.85,
+                profile_id=profile_id,
+                lifecycle_id=session_id,
+                max_candidates=max_candidates,
+            )
+            source_handles = [uri]
+
+        elif source_scope == "point_ids":
+            if not point_ids or not isinstance(point_ids, list):
+                return _json_error("point_ids is required when source_scope=point_ids")
+            if not self._qdrant:
+                return _json_error("Qdrant memory provider is not initialized")
+            for pid in point_ids[:max_candidates]:
+                pid_str = str(pid).strip()
+                if not pid_str:
+                    continue
+                try:
+                    # Read-only retrieve
+                    results = self._qdrant.scroll(
+                        self._config["collection_name"],
+                        limit=1,
+                        with_payload=True,
+                        with_vectors=False,
+                        _filter={"must": [{"key": "id", "match": {"value": pid_str}}]},
+                    )
+                    points = results[0] if isinstance(results, (list, tuple)) and results else []
+                    for point in (points if isinstance(points, list) else []):
+                        cands = extract_improve_candidates_from_point(
+                            point,
+                            confidence=0.75,
+                            profile_id=profile_id,
+                            lifecycle_id=session_id,
+                            max_candidates=max_candidates,
+                        )
+                        all_candidates.extend(cands)
+                        source_handles.append(f"qdrant://memory/{pid_str}")
+                except Exception:
+                    pass
+            # Dedupe
+            seen_ids: set[str] = set()
+            deduped: list[Any] = []
+            for c in all_candidates:
+                if c.candidate_id not in seen_ids:
+                    seen_ids.add(c.candidate_id)
+                    deduped.append(c)
+            all_candidates = deduped[:max_candidates]
+
+        elif source_scope == "pending_session":
+            # Use already-pending extraction candidates from session hooks
+            all_candidates = list(self._pending_extraction_candidates.values())[:max_candidates]
+            source_handles = [f"session://{session_id or 'current'}"]
+
+        else:
+            return _json_error(f"unsupported source_scope: {source_scope}")
+
+        report = build_improve_report(
+            all_candidates,
+            profile_id=profile_id,
+            session_id=session_id,
+            source_scope=source_scope,
+            source_handles=source_handles,
+            persist=persist,
+            include_metadata=include_metadata,
+        )
+
+        if persist:
+            try:
+                persist_improve_report(report, hermes_home=self._hermes_home)
+            except Exception as exc:
+                logger.warning("Failed to persist improve report: %s", exc)
+
+        # Store in provider-local pending state
+        self._pending_improve_reports[report["report_id"]] = report
+
+        return json.dumps(report)
+
+    def _tool_improve_apply(self, args: dict) -> str:
+        """Preview or apply exactly one candidate from one report."""
+        # Blocker 1: validate raw report_id BEFORE any normalization.
+        # Leading/trailing whitespace must be rejected, not stripped.
+        raw_report_id = str(args.get("report_id") or "")
+        if not raw_report_id:
+            return _json_error("report_id is required")
+        if raw_report_id != raw_report_id.strip():
+            return _json_error("report_id must match canonical format improve-<12hex>")
+        report_id = raw_report_id.strip()
+        if not REPORT_ID_RE.match(report_id):
+            return _json_error("report_id must match canonical format improve-<12hex>")
+        candidate_id = str(args.get("candidate_id") or "").strip()
+        if not candidate_id:
+            return _json_error("candidate_id is required")
+        dry_run = parse_bool_arg(args.get("dry_run"), default=True)
+        approve = parse_bool_arg(args.get("approve"), default=False)
+
+        # Load report from in-memory state or persisted artifact
+        report = self._pending_improve_reports.get(report_id)
+        if not report:
+            report = load_improve_report(report_id, hermes_home=self._hermes_home)
+            if report:
+                self._pending_improve_reports[report_id] = report
+        if not report:
+            return _json_error(f"Unknown improve report: {report_id}")
+
+        # Profile scope check
+        if str(report.get("profile_id") or self._profile_id) != self._profile_id:
+            return _json_error("improve report belongs to a different profile scope")
+
+        # Find exactly one candidate
+        candidates_list = report.get("candidates") or []
+        match_item: dict[str, Any] | None = None
+        for item in candidates_list:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("candidate_id") or "") == candidate_id:
+                if match_item is not None:
+                    return _json_error("duplicate candidate_id in report")
+                match_item = item
+        if not match_item:
+            return _json_error(f"Unknown candidate_id in report: {candidate_id}")
+
+        candidate_digest = str(match_item.get("candidate_digest") or "")
+        review_key = f"{report_id}:{candidate_id}:{candidate_digest}"
+
+        # Reconstruct candidate from report item for write-gate evaluation
+        from qdrant_memory.extraction_candidates import ExtractionCandidate as _EC
+        candidate = _EC(
+            candidate_id=str(match_item.get("candidate_id") or ""),
+            candidate_type=str(match_item.get("candidate_type") or ""),
+            source_uri=str(match_item.get("source_uri") or ""),
+            locator=match_item.get("locator") or {},
+            derived_from=match_item.get("derived_from") or [],
+            proposed_payload=match_item.get("proposed_payload") or {},
+            reason=str(match_item.get("reason") or ""),
+            confidence=float(match_item.get("confidence") or 0.0),
+            risk=str(match_item.get("risk") or "unknown"),
+            requires_review=bool(match_item.get("requires_review", True)),
+            created_at=str(match_item.get("created_at") or ""),
+        )
+
+        # Evaluate write gate
+        write_decision = evaluate_source_extraction_candidate(candidate)
+
+        base_result: dict[str, Any] = {
+            "report_id": report_id,
+            "candidate_id": candidate_id,
+            "candidate_digest": candidate_digest,
+            "target_point_id": match_item.get("target_point_id") or "",
+            "target_memory_kind": match_item.get("target_memory_kind") or "",
+            "write_decision": write_decision.to_dict(),
+        }
+
+        # Dry-run path
+        if dry_run:
+            self._reviewed_improve_candidate_keys.add(review_key)
+            return json.dumps({
+                "dry_run": True,
+                "applied": False,
+                "saved": False,
+                "would_store": write_decision.decision == "store",
+                "would_create_proposal": write_decision.decision == "draft_review",
+                **base_result,
+            })
+
+        # Live apply path
+        if not approve:
+            return _json_error("approve=true is required when dry_run=false")
+        if review_key not in self._reviewed_improve_candidate_keys:
+            return _json_error("dry-run preview is required before live improve apply")
+
+        # Check digest hasn't changed (stale report)
+        fresh_digest = make_candidate_digest(match_item)
+        if fresh_digest != candidate_digest:
+            return _json_error("candidate digest mismatch; report may be stale")
+
+        # Route by write decision
+        if write_decision.decision == "reject":
+            reasons = ", ".join(write_decision.reasons)
+            return _json_error(f"write gate rejected improve candidate: {reasons}")
+
+        if write_decision.decision == "draft_review":
+            # Write a local proposal draft only; no Qdrant mutation
+            from qdrant_memory.proposals import write_proposal_draft
+            report_meta = {
+                "report_id": report_id,
+                "report_type": "improve_draft_review",
+                "source_uri": candidate.source_uri,
+                "dry_run_first": True,
+            }
+            proposal_meta = {
+                "proposal_id": candidate_id,
+                "proposal_type": "improve_candidate",
+                "candidate_type": candidate.candidate_type,
+                "suggested_action": "manual_review",
+                "affected_ids": [candidate_id],
+                "confidence": candidate.confidence,
+                "write_decision": write_decision.to_dict(),
+            }
+            point_data = {
+                "id": match_item.get("target_point_id") or candidate_id,
+                "text": str(candidate.proposed_payload.get("text") or ""),
+                "payload": {**candidate.proposed_payload, "improve_candidate_id": candidate_id},
+            }
+            try:
+                draft = write_proposal_draft(
+                    report=report_meta,
+                    proposal=proposal_meta,
+                    points=[point_data],
+                    hermes_home=self._hermes_home,
+                    config=self._config,
+                    write_decision=write_decision,
+                )
+            except Exception as exc:
+                return _json_error(f"Failed to write improve draft: {exc}")
+            # Remove from pending state
+            self._reviewed_improve_candidate_keys.discard(review_key)
+            self._remove_candidate_from_report(report_id, candidate_id)
+            return json.dumps({
+                "dry_run": False,
+                "applied": True,
+                "saved": False,
+                "proposal_created": True,
+                "proposal_id": candidate_id,
+                "proposal_draft_path": str(draft["path"]),
+                **base_result,
+            })
+
+        if write_decision.decision != "store":
+            return _json_error("improve candidate requires manual review before storing")
+
+        # Blocker 2: Idempotency check — if this candidate was already applied
+        # for this report, return already_applied without embedding/upserting.
+        applied_record = is_candidate_applied(
+            report_id, candidate_id, hermes_home=self._hermes_home
+        )
+        if applied_record is not None:
+            self._reviewed_improve_candidate_keys.discard(review_key)
+            return json.dumps({
+                "dry_run": False,
+                "applied": True,
+                "saved": False,
+                "already_applied": True,
+                "id": str(applied_record.get("target_point_id") or ""),
+                "application_record": applied_record,
+                **base_result,
+            })
+
+        # Store path: embed and upsert
+        if not self._qdrant or not self._embeddings:
+            return _json_error("Qdrant memory provider is not initialized")
+        try:
+            # Build persisted payload with provider metadata
+            payload = dict(candidate.proposed_payload)
+            payload.update({
+                "profile_id": self._profile_id,
+                "platform": self._platform,
+                "session_id": self._session_id,
+                "user_id_hash": self._user_id_hash,
+                "chat_id_hash": self._chat_id_hash,
+                "model": self._config.get("embedding_model", ""),
+                "provider": "qdrant",
+                "improve_candidate_id": candidate_id,
+                "improve_report_id": report_id,
+                "improve_applied_at": datetime.utcnow().isoformat() + "Z",
+            })
+            # Re-run write gate with persisted payload
+            persisted_decision = evaluate_source_extraction_candidate(candidate, persisted_payload=payload)
+            if persisted_decision.decision == "reject":
+                reasons = ", ".join(persisted_decision.reasons)
+                return _json_error(f"write gate rejected improve candidate: {reasons}")
+            if persisted_decision.decision != "store":
+                return _json_error("improve candidate requires manual review after payload enrichment")
+            base_result["write_decision"] = persisted_decision.to_dict()
+
+            target_pid = str(match_item.get("target_point_id") or candidate_id)
+
+            # Blocker 3: Conflict detection — retrieve existing point before upsert
+            # Fail closed on retrieval errors: cannot verify target absence.
+            try:
+                existing_points = self._qdrant.retrieve(
+                    self._config["collection_name"], [target_pid], with_payload=True
+                )
+            except Exception:
+                return _json_error(
+                    "Unable to verify target point absence; refusing to overwrite "
+                    "(Qdrant retrieval error)"
+                )
+            if existing_points:
+                existing = existing_points[0]
+                existing_payload = existing.get("payload") if isinstance(existing, dict) else {}
+                # Check if it's an exact replay (same candidate/provenance marker)
+                if isinstance(existing_payload, dict):
+                    existing_candidate_id = str(existing_payload.get("improve_candidate_id") or "")
+                    existing_report_id = str(existing_payload.get("improve_report_id") or "")
+                    if existing_candidate_id == candidate_id and existing_report_id == report_id:
+                        # Exact replay — already applied
+                        record_candidate_applied(
+                            report_id, candidate_id,
+                            hermes_home=self._hermes_home,
+                            target_point_id=target_pid,
+                            candidate_digest=candidate_digest,
+                        )
+                        self._reviewed_improve_candidate_keys.discard(review_key)
+                        self._remove_candidate_from_report(report_id, candidate_id)
+                        return json.dumps({
+                            "dry_run": False,
+                            "applied": True,
+                            "saved": False,
+                            "already_applied": True,
+                            "id": target_pid,
+                            "collection_name": self._config["collection_name"],
+                            **base_result,
+                        })
+                    # Existing point differs — fail closed, do NOT overwrite
+                    return _json_error(
+                        f"Target point {target_pid} already exists with different "
+                        f"payload/provenance; refusing to overwrite (use manual review)"
+                    )
+
+            text = str(payload.get("text") or payload.get("claim_text") or "")
+            vector = self._embeddings.embed_document(text)
+            self._qdrant.upsert(self._config["collection_name"], [{"id": target_pid, "vector": vector, "payload": payload}])
+
+            # Blocker 2: Persist application record for idempotent repeat
+            record_candidate_applied(
+                report_id, candidate_id,
+                hermes_home=self._hermes_home,
+                target_point_id=target_pid,
+                candidate_digest=candidate_digest,
+            )
+
+            # Remove from pending state after successful apply
+            self._reviewed_improve_candidate_keys.discard(review_key)
+            self._remove_candidate_from_report(report_id, candidate_id)
+
+            return json.dumps({
+                "dry_run": False,
+                "applied": True,
+                "saved": True,
+                "already_applied": False,
+                "id": target_pid,
+                "collection_name": self._config["collection_name"],
+                **base_result,
+            })
+        except Exception as exc:
+            return _json_error(f"Improve apply failed: {exc}")
+
+    def _remove_candidate_from_report(self, report_id: str, candidate_id: str) -> None:
+        """Remove a candidate from a pending report after successful apply."""
+        report = self._pending_improve_reports.get(report_id)
+        if not report:
+            return
+        candidates = report.get("candidates") or []
+        report["candidates"] = [c for c in candidates if isinstance(c, dict) and str(c.get("candidate_id") or "") != candidate_id]
+        counts = report.get("counts") or {}
+        if isinstance(counts, dict):
+            counts["total"] = max(0, int(counts.get("total") or 0) - 1)
+        # If no candidates left, remove the entire report
+        if not report["candidates"]:
+            self._pending_improve_reports.pop(report_id, None)
+
     def _tool_graph_search(self, args: dict) -> str:
         query = str(args.get("query") or "").strip()
         if not query:
@@ -1716,6 +2131,10 @@ class QdrantMemoryProvider(MemoryProvider):
             return self._tool_extraction_approve(args)
         if tool_name == "qdrant_memory_graph_search":
             return self._tool_graph_search(args)
+        if tool_name == "qdrant_memory_improve_preview":
+            return self._tool_improve_preview(args)
+        if tool_name == "qdrant_memory_improve_apply":
+            return self._tool_improve_apply(args)
         return _json_error(f"Unknown tool: {tool_name}")
 
     def shutdown(self) -> None:
