@@ -38,6 +38,7 @@ class FakeQdrant:
         self.upserts = []
         self.scroll_results: dict[str, list[dict]] = {}
         self.retrieve_results: dict[str, dict] = {}
+        self.retrieve_raises = False
 
     def upsert(self, name, points):
         self.upserts.append((name, points))
@@ -54,6 +55,8 @@ class FakeQdrant:
         return ([], None)
 
     def retrieve(self, name, ids, *, with_payload=True, with_vector=False):
+        if self.retrieve_raises:
+            raise RuntimeError("simulated Qdrant retrieval failure")
         results = []
         for pid in ids:
             if pid in self.retrieve_results:
@@ -1026,3 +1029,199 @@ def test_identity_rejected_at_write_gate():
     decision = evaluate_extraction_candidate_write(candidate)
     assert decision.decision == "reject"
     assert "identity_bearing_graph_candidate" in decision.reasons
+
+
+# ===========================================================================
+# Fix1: Whitespace-decorated report_id must be rejected (not normalized)
+# ===========================================================================
+
+def test_apply_rejects_whitespace_report_id(tmp_path):
+    """Leading/trailing whitespace in report_id must be rejected, not stripped."""
+    provider = _provider_for_improve(tmp_path)
+    source = "Graph entity: project: WhitespaceTest"
+    preview = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_preview",
+            {"source_text": source, "source_uri": "session://test/ws"},
+        )
+    )
+    report_id = preview["report_id"]
+
+    # Whitespace-decorated IDs — must be rejected
+    for ws_id in [" " + report_id, report_id + " ", " " + report_id + " ",
+                   "\t" + report_id, report_id + "\n"]:
+        result = json.loads(
+            provider.handle_tool_call(
+                "qdrant_memory_improve_apply",
+                {"report_id": ws_id, "candidate_id": "fake"},
+            )
+        )
+        assert "error" in result
+        assert "canonical" in result["error"]
+
+
+# ===========================================================================
+# Fix2: Retrieve error must fail closed (no embedding/upsert)
+# ===========================================================================
+
+def test_live_apply_retrieve_error_fails_closed(tmp_path):
+    """If Qdrant retrieve() raises during conflict check, apply must fail
+    closed — return error, no embedding, no upsert."""
+    provider = _provider_for_improve(tmp_path)
+    source = "Graph entity: project: RetrieveError"
+    preview = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_preview",
+            {"source_text": source, "source_uri": "session://test/retr-err"},
+        )
+    )
+    report_id = preview["report_id"]
+    store_candidate = next(c for c in preview["candidates"] if c["would_store"])
+    candidate_id = store_candidate["candidate_id"]
+
+    # Configure FakeQdrant to raise on retrieve
+    provider._qdrant.retrieve_raises = True
+
+    # Dry-run first (doesn't hit retrieve)
+    provider.handle_tool_call(
+        "qdrant_memory_improve_apply",
+        {"report_id": report_id, "candidate_id": candidate_id},
+    )
+
+    # Live apply — should fail closed
+    live = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_apply",
+            {"report_id": report_id, "candidate_id": candidate_id,
+             "dry_run": False, "approve": True},
+        )
+    )
+    assert "error" in live
+    assert "refusing to overwrite" in live["error"]
+    assert len(provider._qdrant.upserts) == 0
+    assert len(provider._embeddings.documents) == 0
+
+
+# ===========================================================================
+# Fix3: Expanded identity entity types must not leak/store raw names
+# ===========================================================================
+
+def test_expanded_identity_entity_types_rejected():
+    """Expanded person-role synonyms must be detected as identity-bearing."""
+    for etype in [
+        "employee", "member", "owner", "author", "developer",
+        "manager", "admin", "maintainer", "teacher", "student",
+        "operator", "assignee", "reviewer",
+    ]:
+        assert is_identity_bearing_entity_type(etype), f"{etype} should be identity-bearing"
+    # Safe types still allowed
+    for etype in ["project", "tool", "concept", "service", "repo", "package"]:
+        assert not is_identity_bearing_entity_type(etype), f"{etype} should NOT be identity-bearing"
+
+
+def test_employee_identity_not_in_preview_or_report(tmp_path):
+    """Raw name under employee/developer type must not appear in preview JSON
+    or persisted report JSON."""
+    provider = _provider_for_improve(tmp_path)
+    source = "\n".join([
+        "Graph entity: employee: Alan Gárate",
+        "Graph entity: developer: John Smith",
+        "Graph entity: project: SafeEntity",
+    ])
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_preview",
+            {"source_text": source, "source_uri": "session://test/emp"},
+        )
+    )
+    report_json = json.dumps(result)
+
+    # Raw identity names must NOT appear anywhere in the preview
+    assert "Alan Gárate" not in report_json
+    assert "John Smith" not in report_json
+
+    # Safe entity should still be present
+    labels = []
+    for c in result["candidates"]:
+        payload = c.get("proposed_payload") or {}
+        labels.append(payload.get("label") or payload.get("text") or "")
+    assert any("SafeEntity" in l for l in labels)
+    assert not any("Alan" in l or "John" in l for l in labels)
+
+    # Verify persisted report also has no raw names
+    loaded = load_improve_report(result["report_id"], hermes_home=provider._hermes_home)
+    assert loaded is not None
+    loaded_json = json.dumps(loaded)
+    assert "Alan Gárate" not in loaded_json
+    assert "John Smith" not in loaded_json
+
+
+def test_manager_identity_not_stored_via_apply(tmp_path):
+    """Identity-like entity type (manager) must not result in Qdrant upsert/embed
+    even if apply is attempted — candidate is filtered at extraction."""
+    provider = _provider_for_improve(tmp_path)
+    source = "Graph entity: manager: Jane Boss"
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_preview",
+            {"source_text": source, "source_uri": "session://test/mgr"},
+        )
+    )
+    # No store-eligible candidates should exist
+    store_candidates = [c for c in result["candidates"] if c.get("would_store")]
+    assert len(store_candidates) == 0
+    assert "Jane Boss" not in json.dumps(result)
+    assert len(provider._qdrant.upserts) == 0
+    assert len(provider._embeddings.documents) == 0
+
+
+def test_expanded_identity_rejected_at_write_gate():
+    """Write gate must reject expanded identity entity types via shared helper."""
+    from qdrant_memory.extraction_candidates import ExtractionCandidate
+    from qdrant_memory.write_gate import evaluate_extraction_candidate_write
+
+    for etype in ["employee", "developer", "manager"]:
+        candidate = ExtractionCandidate(
+            candidate_id=f"test-{etype}",
+            candidate_type="graph_entity_candidate",
+            source_uri="session://test",
+            locator={},
+            derived_from=[{"source_uri": "session://test", "relation_type": "EXTRACTED_FROM"}],
+            proposed_payload={
+                "text": f"{etype}: Some Name",
+                "label": f"{etype}: Some Name",
+                "entity_type": etype,
+                "memory_kind": "graph_entity",
+                "source_type": "graph",
+                "source_uri": "session://test",
+                "derivation_type": "source_extraction",
+            },
+            reason="test",
+            confidence=0.9,
+            risk="low",
+        )
+        decision = evaluate_extraction_candidate_write(candidate)
+        assert decision.decision == "reject", f"entity type '{etype}' should be rejected"
+        assert "identity_bearing_graph_candidate" in decision.reasons
+
+
+def test_safe_graph_entities_still_store_eligible(tmp_path):
+    """Safe graph entity types (project/tool/concept/service/repo/package)
+    must remain store-eligible."""
+    provider = _provider_for_improve(tmp_path)
+    source = "\n".join([
+        "Graph entity: project: Alpha",
+        "Graph entity: tool: Beta",
+        "Graph entity: concept: Gamma",
+        "Graph entity: service: Delta",
+        "Graph entity: repo: Epsilon",
+        "Graph entity: package: Zeta",
+    ])
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_preview",
+            {"source_text": source, "source_uri": "session://test/safe"},
+        )
+    )
+    store_candidates = [c for c in result["candidates"] if c.get("would_store")]
+    assert len(store_candidates) == 6

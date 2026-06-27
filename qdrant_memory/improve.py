@@ -63,9 +63,14 @@ REPORT_ID_RE = re.compile(r"^improve-[a-f0-9]{12}$")
 # Identity-bearing detection for graph candidates
 # ---------------------------------------------------------------------------
 
-# Entity types that are identity-bearing
+# Entity types that are identity-bearing (person/role types).
+# These carry raw identity names and must not be stored as graph entities.
 _IDENTITY_ENTITY_TYPES = frozenset({
     "person", "user", "customer", "account", "contact", "profile",
+    # Expanded person-role synonyms
+    "employee", "member", "owner", "author", "developer", "manager",
+    "admin", "maintainer", "teacher", "student", "operator",
+    "assignee", "reviewer",
 })
 
 # Regex patterns for identity values in labels/source URIs

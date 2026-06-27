@@ -1747,10 +1747,14 @@ class QdrantMemoryProvider(MemoryProvider):
 
     def _tool_improve_apply(self, args: dict) -> str:
         """Preview or apply exactly one candidate from one report."""
-        report_id = str(args.get("report_id") or "").strip()
-        if not report_id:
+        # Blocker 1: validate raw report_id BEFORE any normalization.
+        # Leading/trailing whitespace must be rejected, not stripped.
+        raw_report_id = str(args.get("report_id") or "")
+        if not raw_report_id:
             return _json_error("report_id is required")
-        # Blocker 1: strict canonical report ID validation
+        if raw_report_id != raw_report_id.strip():
+            return _json_error("report_id must match canonical format improve-<12hex>")
+        report_id = raw_report_id.strip()
         if not REPORT_ID_RE.match(report_id):
             return _json_error("report_id must match canonical format improve-<12hex>")
         candidate_id = str(args.get("candidate_id") or "").strip()
@@ -1941,13 +1945,16 @@ class QdrantMemoryProvider(MemoryProvider):
             target_pid = str(match_item.get("target_point_id") or candidate_id)
 
             # Blocker 3: Conflict detection — retrieve existing point before upsert
-            existing_points = []
+            # Fail closed on retrieval errors: cannot verify target absence.
             try:
                 existing_points = self._qdrant.retrieve(
                     self._config["collection_name"], [target_pid], with_payload=True
                 )
             except Exception:
-                pass  # Fail open on retrieval errors; proceed to store
+                return _json_error(
+                    "Unable to verify target point absence; refusing to overwrite "
+                    "(Qdrant retrieval error)"
+                )
             if existing_points:
                 existing = existing_points[0]
                 existing_payload = existing.get("payload") if isinstance(existing, dict) else {}

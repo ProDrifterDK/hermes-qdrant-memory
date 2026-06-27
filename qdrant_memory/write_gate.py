@@ -268,7 +268,10 @@ def evaluate_extraction_candidate_write(
     # Blocker 4: Reject identity-bearing graph candidates at the write gate
     if candidate_type in ("graph_entity_candidate", "graph_edge_candidate"):
         try:
-            from qdrant_memory.improve import is_identity_bearing_value
+            from qdrant_memory.improve import (
+                is_identity_bearing_value,
+                is_identity_bearing_entity_type,
+            )
             entity_type_val = str(payload.get("entity_type") or "")
             label_val = str(payload.get("label") or payload.get("text") or "")
             source_uri_val = str(payload.get("source_uri") or "")
@@ -280,11 +283,8 @@ def evaluate_extraction_candidate_write(
                     requires_review=True,
                     metadata={"candidate_type": candidate_type},
                 )
-            # Check identity entity types (person/user/customer/etc.)
-            _IDENTITY_ENTITY_TYPES = frozenset({
-                "person", "user", "customer", "account", "contact", "profile",
-            })
-            if entity_type_val.strip().lower() in _IDENTITY_ENTITY_TYPES:
+            # Check identity entity types via shared helper (same set as improve.py)
+            if is_identity_bearing_entity_type(entity_type_val):
                 return _decision(
                     "reject",
                     ["identity_bearing_graph_candidate"],
