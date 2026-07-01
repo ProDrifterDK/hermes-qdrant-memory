@@ -483,6 +483,94 @@ RAPTOR_STATUS_SCHEMA = {
     },
 }
 
+RETRIEVE_SCHEMA = {
+    "name": "qdrant_memory_retrieve",
+    "description": (
+        "Read-only hybrid retrieve. Combines dense+sparse seed hits, "
+        "graph expansion, and RAPTOR search/zoom into a single packer "
+        "output. Always reads; never writes."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "What to retrieve."},
+            "top_k": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 20,
+                "default": 5,
+                "description": "Maximum results per bucket, 1 to 20. Defaults to 5.",
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["hybrid", "evidence"],
+                "default": "hybrid",
+                "description": (
+                    "hybrid returns all lanes; evidence demotes RAPTOR "
+                    "parents without cited leaves. Defaults to hybrid."
+                ),
+            },
+            "include_fact_history": {
+                "type": "boolean",
+                "default": False,
+                "description": "Include deprecated/superseded history.",
+            },
+            "include_metadata": {
+                "type": "boolean",
+                "default": False,
+                "description": "Include raw RAPTOR payload metadata.",
+            },
+            "source_type": {"type": "string"},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "source": {"type": "string"},
+            "file_path": {"type": "string"},
+            "project_path": {"type": "string"},
+            "since": {"type": "string"},
+            "until": {"type": "string"},
+            "collection": {
+                "type": "string",
+                "enum": ["memory", "learning"],
+                "default": "memory",
+            },
+            "max_depth": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 3,
+                "default": 2,
+                "description": "RAPTOR BFS depth budget, 1 to 3. Defaults to 2.",
+            },
+            "max_children": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 16,
+                "default": 8,
+                "description": "RAPTOR children fanout budget, bounded to a hard cap. Defaults to 8.",
+            },
+            "max_source_chars": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 2400,
+                "default": 1200,
+                "description": "Per-result text cap, bounded to a hard cap. Defaults to 1200.",
+            },
+            "candidate_seed_top_k": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50,
+                "default": 20,
+            },
+            "max_graph_results": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50,
+                "default": 20,
+            },
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    },
+}
+
 TOOL_SCHEMAS = [
     STATUS_SCHEMA,
     STORE_SCHEMA,
@@ -507,4 +595,5 @@ TOOL_SCHEMAS = [
     IMPROVE_APPLY_SCHEMA,
     RAPTOR_APPLY_SCHEMA,
     RAPTOR_STATUS_SCHEMA,
-]
+    RETRIEVE_SCHEMA,
+]  # noqa: E501

@@ -281,3 +281,81 @@ def test_memory_search_sparse_lane_degrades_when_scroll_missing():
     # fake does not expose scroll_by_filter.
     results = retriever.search("550e8400-e29b-41d4-a716-446655440000", top_k=3)
     assert [result.id for result in results] == ["memory-1"]
+
+
+def test_memory_search_allow_sparse_scroll_false_skips_scroll():
+    """Phase 5 fix4: ``allow_sparse_scroll=False`` MUST suppress the
+    sparse scroll lane even for strong-signal queries, so callers like
+    ``HybridRouter.retrieve`` never invoke ``scroll_by_filter`` through
+    the Phase 5 retrieve path.
+    """
+
+    class StrictQdrant(FakeSparseAwareQdrant):
+        def scroll_by_filter(self, *args, **kwargs):  # pragma: no cover - failure sentinel
+            raise AssertionError(
+                "scroll_by_filter must NOT be invoked when allow_sparse_scroll=False"
+            )
+
+    qdrant = StrictQdrant(search_results=[
+        {
+            "id": "memory-1",
+            "score": 0.9,
+            "payload": {
+                "text": "incident notes",
+                "source_type": "project_doc",
+                "importance": 8,
+                "created_at": "2026-01-15T00:00:00+00:00",
+            },
+        }
+    ])
+    retriever = MemoryRetriever(qdrant=qdrant, embeddings=FakeEmbedding(), collection_name="memory", search_candidates=3)
+
+    # Strong-signal query (UUID) — would normally trigger the sparse lane.
+    results = retriever.search(
+        "550e8400-e29b-41d4-a716-446655440000",
+        top_k=3,
+        allow_sparse_scroll=False,
+    )
+    assert [result.id for result in results] == ["memory-1"]
+    assert qdrant.scroll_calls == []
+
+
+def test_memory_search_default_still_runs_sparse_when_signal_present():
+    """Phase 5 fix4: omitting ``allow_sparse_scroll`` (or passing ``True``)
+    keeps the existing ``qdrant_memory_search`` backward-compatible —
+    strong-signal queries still hit ``scroll_by_filter``.
+    """
+
+    qdrant = FakeSparseAwareQdrant(search_results=[], scroll_results=[
+        {
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "payload": {
+                "text": "incident notes",
+                "source_type": "project_doc",
+                "profile_id": "coder",
+                "importance": 8,
+                "created_at": "2026-01-15T00:00:00+00:00",
+                "fact_status": "active",
+            },
+        }
+    ])
+    retriever = MemoryRetriever(
+        qdrant=qdrant,
+        embeddings=FakeEmbedding(),
+        collection_name="memory",
+        scope={"profile_id": "coder"},
+        search_candidates=3,
+    )
+
+    # Default: scroll IS called for a strong-signal query.
+    retriever.search("550e8400-e29b-41d4-a716-446655440000", top_k=3)
+    assert len(qdrant.scroll_calls) == 1
+
+    qdrant.scroll_calls.clear()
+    # Explicit True: scroll IS called for a strong-signal query.
+    retriever.search(
+        "550e8400-e29b-41d4-a716-446655440000",
+        top_k=3,
+        allow_sparse_scroll=True,
+    )
+    assert len(qdrant.scroll_calls) == 1

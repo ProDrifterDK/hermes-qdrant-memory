@@ -90,6 +90,19 @@ def test_register_cli_adds_mvp_subcommands_and_safe_defaults():
     assert live_store.approve is True
     assert live_store.preview_duplicates is True
 
+    retrieve = parser.parse_args(["qdrant", "retrieve", "hybrid query", "--top-k", "3", "--json"])
+    assert retrieve.qdrant_subcommand == "retrieve"
+    assert retrieve.query == "hybrid query"
+    assert retrieve.top_k == 3
+    assert retrieve.json is True
+    assert retrieve.mode == "hybrid"
+
+    evidence_retrieve = parser.parse_args(
+        ["qdrant", "retrieve", "evidence only", "--mode", "evidence", "--max-depth", "1"]
+    )
+    assert evidence_retrieve.mode == "evidence"
+    assert evidence_retrieve.max_depth == 1
+
     index = parser.parse_args(["qdrant", "index", "docs", "README.md"])
     assert index.paths == ["docs", "README.md"]
     assert index.dry_run is True
@@ -156,6 +169,52 @@ def test_build_tool_call_maps_read_only_commands():
 
     source_status = parser.parse_args(["qdrant", "source-status", "point-1"])
     assert build_tool_call(source_status) == ("qdrant_memory_source_status", {"point_id": "point-1", "collection": "memory"})
+
+
+def test_build_tool_call_maps_retrieve_to_qdrant_memory_retrieve():
+    from qdrant_memory.cli_core import build_tool_call
+
+    parser = _parser()
+
+    retrieve = parser.parse_args(
+        [
+            "qdrant",
+            "retrieve",
+            "agent memory",
+            "--top-k",
+            "3",
+            "--mode",
+            "evidence",
+            "--include-metadata",
+            "--source-type",
+            "manual",
+            "--tag",
+            "api",
+            "--path",
+            "/repo/api.md",
+            "--collection",
+            "memory",
+            "--max-depth",
+            "2",
+            "--max-children",
+            "4",
+            "--max-source-chars",
+            "500",
+        ]
+    )
+    tool_name, tool_args = build_tool_call(retrieve)
+    assert tool_name == "qdrant_memory_retrieve"
+    assert tool_args["query"] == "agent memory"
+    assert tool_args["top_k"] == 3
+    assert tool_args["mode"] == "evidence"
+    assert tool_args["include_metadata"] is True
+    assert tool_args["source_type"] == "manual"
+    assert tool_args["tags"] == ["api"]
+    assert tool_args["file_path"] == "/repo/api.md"
+    assert tool_args["collection"] == "memory"
+    assert tool_args["max_depth"] == 2
+    assert tool_args["max_children"] == 4
+    assert tool_args["max_source_chars"] == 500
 
 
 def test_build_tool_call_maps_richer_search_filters_and_collection():

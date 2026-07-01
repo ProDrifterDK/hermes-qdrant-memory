@@ -2050,6 +2050,25 @@ def build_tool_call(args: Namespace) -> tuple[str, dict[str, Any]]:
             tool_args["relation_types"] = relation_types
         return "qdrant_memory_graph_search", tool_args
 
+    if subcommand == "retrieve":
+        tool_args: dict[str, Any] = {
+            "query": _non_empty(args.query, "query"),
+            "top_k": int(getattr(args, "top_k", 5) or 5),
+            "mode": getattr(args, "mode", "hybrid") or "hybrid",
+            "include_fact_history": bool(getattr(args, "include_fact_history", False)),
+            "include_metadata": bool(getattr(args, "include_metadata", False)),
+            "max_depth": int(getattr(args, "max_depth", 2) or 2),
+            "max_children": int(getattr(args, "max_children", 8) or 8),
+            "max_source_chars": int(getattr(args, "max_source_chars", 1200) or 1200),
+            "candidate_seed_top_k": int(getattr(args, "candidate_seed_top_k", 20) or 20),
+            "max_graph_results": int(getattr(args, "max_graph_results", 20) or 20),
+        }
+        source_type = getattr(args, "source_type", None)
+        if source_type:
+            tool_args["source_type"] = source_type
+        tool_args.update(_search_filter_tool_args(args, include_collection=True))
+        return "qdrant_memory_retrieve", tool_args
+
     if subcommand == "improve":
         improve_sub = getattr(args, "improve_subcommand", None)
         if improve_sub == "preview":

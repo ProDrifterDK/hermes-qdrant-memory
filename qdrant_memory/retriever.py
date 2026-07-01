@@ -308,6 +308,7 @@ class MemoryRetriever:
         canonical: Any = None,
         include_fact_history: bool = False,
         update_access: bool = True,
+        allow_sparse_scroll: bool = True,
     ) -> list[RetrievedMemory]:
         vector = self.embeddings.embed_query(query)
         active_scope = self.scope.copy()
@@ -343,9 +344,15 @@ class MemoryRetriever:
         # token (UUID, issue ID, route path, dotted/colon symbol, error literal,
         # HTTP status). Generic natural-language queries stay on dense-only so
         # broad semantic search is not flooded with literal-token matches.
+        #
+        # Phase 5 fix4: callers wired through the Phase 5 hybrid retrieve
+        # router (or any other read-only context where ``scroll_by_filter``
+        # is forbidden) pass ``allow_sparse_scroll=False`` to suppress this
+        # lane entirely; the default stays ``True`` so the existing
+        # ``qdrant_memory_search`` tool path remains backward-compatible.
         sparse_points: list[dict[str, Any]] = []
         sparse_scores = []
-        if self.sparse_enabled and has_strong_signal(query):
+        if self.sparse_enabled and allow_sparse_scroll and has_strong_signal(query):
             sparse_points = fetch_sparse_candidates(
                 self.qdrant,
                 collection_name=self.collection_name,

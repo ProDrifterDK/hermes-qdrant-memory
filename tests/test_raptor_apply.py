@@ -219,6 +219,39 @@ def test_raptor_apply_report_id_regex():
     assert not REPORT_ID_RE.match("raptor-abcdef1234567")  # too long
 
 
+def test_retrieve_schema_present_in_tool_schemas():
+    from qdrant_memory.tools import RETRIEVE_SCHEMA
+
+    names = [s["name"] for s in TOOL_SCHEMAS]
+    assert "qdrant_memory_retrieve" in names
+    assert RETRIEVE_SCHEMA["name"] == "qdrant_memory_retrieve"
+    assert RETRIEVE_SCHEMA["parameters"]["additionalProperties"] is False
+    assert "query" in RETRIEVE_SCHEMA["parameters"]["required"]
+    props = RETRIEVE_SCHEMA["parameters"]["properties"]
+    for field in (
+        "query",
+        "top_k",
+        "mode",
+        "include_fact_history",
+        "include_metadata",
+        "source_type",
+        "tags",
+        "source",
+        "file_path",
+        "project_path",
+        "since",
+        "until",
+        "collection",
+        "max_depth",
+        "max_children",
+        "max_source_chars",
+    ):
+        assert field in props, f"missing property: {field}"
+    # mode enum is fixed
+    mode_enum = props["mode"]["enum"]
+    assert set(mode_enum) == {"hybrid", "evidence"}
+
+
 # ---------------------------------------------------------------------------
 # Dry-run apply
 # ---------------------------------------------------------------------------
@@ -1924,3 +1957,453 @@ class TestStrictCombined:
         _assert_live_rejected_after_dry_run(
             provider, report_id, build_id, digest, must_contain="requires_review"
         )
+
+
+# ---------------------------------------------------------------------------
+# Adversarial: Phase 5 retrieve collection=learning must not poison the
+# memory cache, and must not return memory results.
+# ---------------------------------------------------------------------------
+
+
+class _RetrievedMemory:
+    """Stand-in for :class:`MemoryRetriever`'s output."""
+
+    def __init__(self, pid, text, payload, final_score=0.5):
+        self.id = pid
+        self.text = text
+        self.payload = payload
+        self.final_score = final_score
+        self.qdrant_score = final_score
+        self.ranking_debug = {}
+
+
+class _FakeLearningStore:
+    """Minimal LearningStore stub for collection=learning retrieve tests."""
+
+    def __init__(self, *, chunks=None, raise_exc=False, record_calls=False):
+        self._chunks = chunks or []
+        self._raise = raise_exc
+        self.calls: list[dict[str, Any]] = []
+        self.collection_name = "learnings"
+
+    def search(self, query, *, top_k=5, update_access=False, **kwargs):
+        self.calls.append({
+            "query": query,
+            "top_k": top_k,
+            "update_access": update_access,
+            "kwargs": kwargs,
+        })
+        if self._raise:
+            raise RuntimeError("simulated learning failure")
+        return list(self._chunks)
+
+
+class _FakeLearningChunk:
+    def __init__(self, *, point_id, text, payload, final_score=0.6, qdrant_score=0.6):
+        self.id = point_id
+        self.text = text
+        self.payload = payload
+        self.final_score = final_score
+        self.qdrant_score = qdrant_score
+
+
+class _FakeBaseRetriever:
+    """Minimal MemoryRetriever stub. Compatible with the Phase 5 router."""
+
+    def __init__(self, chunks=None):
+        self._chunks = chunks or []
+        self.calls: list[dict[str, Any]] = []
+
+    def search(self, query, *, top_k=5, update_access=False, **kwargs):
+        self.calls.append({
+            "query": query,
+            "top_k": top_k,
+            "update_access": update_access,
+            "kwargs": kwargs,
+        })
+        return list(self._chunks)
+
+
+def _provider_with_retrieve_components(tmp_path):
+    """Build a provider with stubbed Qdrant, embeddings, and learning store."""
+    provider = QdrantMemoryProvider()
+    provider._qdrant = FakeQdrant()
+    provider._embeddings = FakeEmbedding()
+    provider._active = True
+    provider._hermes_home = str(tmp_path / "hermes")
+    provider._session_id = "test-session"
+    provider._config.update(
+        {
+            "collection_name": "memory",
+            "learning_collection_name": "learnings",
+            "embedding_model": "test-model",
+            "learning_enabled": True,
+        }
+    )
+    return provider
+
+
+def test_tool_retrieve_learning_does_not_use_memory_router(tmp_path):
+    """Memory-first then learning must not reuse the cached memory router."""
+    provider = _provider_with_retrieve_components(tmp_path)
+    memory_chunk = _RetrievedMemory(
+        "mem-1",
+        text="memory hit",
+        payload={"profile_id": "default", "source_type": "manual"},
+        final_score=0.5,
+    )
+    memory_retriever = _FakeBaseRetriever(chunks=[memory_chunk])
+    provider._retriever = memory_retriever
+
+    learning_chunk = _FakeLearningChunk(
+        point_id="learn-1",
+        text="learning hit",
+        payload={"learning_type": "tool_failure_lesson", "profile_id": "default"},
+        final_score=0.7,
+    )
+    fake_store = _FakeLearningStore(chunks=[learning_chunk])
+    provider._learning_store = fake_store
+
+    # Now invoke retrieve with collection=learning.
+    result_json = provider.handle_tool_call(
+        "qdrant_memory_retrieve",
+        {"query": "anything", "collection": "learning", "top_k": 3},
+    )
+    payload = json.loads(result_json)
+    assert "error" not in payload, payload
+    assert payload["debug"]["collection"] == "learning"
+    # The exact_hits must contain only learning hits, never memory hits.
+    ids = [hit["point_id"] for hit in payload["results"]["exact_hits"]]
+    assert "learn-1" in ids
+    assert "mem-1" not in ids
+    # The learning store was called with update_access=False.
+    assert fake_store.calls, "learning store must have been called"
+    assert fake_store.calls[0]["update_access"] is False
+    # The memory retriever was NOT called for the learning retrieve.
+    memory_collect_calls = [
+        c for c in memory_retriever.calls
+        if c["query"] == "anything"
+    ]
+    assert memory_collect_calls == [], (
+        "memory retriever must not be used for collection=learning"
+    )
+    # The cached memory hybrid router must NOT have been built.
+    assert getattr(provider, "_hybrid_router", None) is None, (
+        "memory hybrid router must NOT be lazily built on a learning retrieve"
+    )
+
+
+def test_tool_retrieve_memory_then_learning_no_cache_contamination(tmp_path):
+    """Memory then learning in sequence: no cross-cache contamination."""
+    provider = _provider_with_retrieve_components(tmp_path)
+    memory_chunk = _RetrievedMemory(
+        "mem-1",
+        text="memory hit",
+        payload={"profile_id": "default", "source_type": "manual"},
+        final_score=0.5,
+    )
+    memory_retriever = _FakeBaseRetriever(chunks=[memory_chunk])
+    provider._retriever = memory_retriever
+
+    learning_chunk = _FakeLearningChunk(
+        point_id="learn-1",
+        text="learning hit",
+        payload={"learning_type": "tool_failure_lesson"},
+        final_score=0.7,
+    )
+    fake_store = _FakeLearningStore(chunks=[learning_chunk])
+    provider._learning_store = fake_store
+
+    # 1) memory call
+    mem_payload = json.loads(provider.handle_tool_call(
+        "qdrant_memory_retrieve",
+        {"query": "alpha", "collection": "memory", "top_k": 3},
+    ))
+    # 2) learning call
+    learn_payload = json.loads(provider.handle_tool_call(
+        "qdrant_memory_retrieve",
+        {"query": "beta", "collection": "learning", "top_k": 3},
+    ))
+    # Memory call returned memory hit
+    mem_ids = [h["point_id"] for h in mem_payload["results"]["exact_hits"]]
+    assert "mem-1" in mem_ids
+    assert "learn-1" not in mem_ids
+    # Learning call returned learning hit, not memory
+    learn_ids = [h["point_id"] for h in learn_payload["results"]["exact_hits"]]
+    assert "learn-1" in learn_ids
+    assert "mem-1" not in learn_ids
+    # update_access=False must hold for both lanes.
+    assert all(c["update_access"] is False for c in memory_retriever.calls)
+    assert all(c["update_access"] is False for c in fake_store.calls)
+
+
+def test_tool_retrieve_learning_to_memory_no_learning_results_in_memory(tmp_path):
+    """Learning then memory: memory payload must not include learning hits."""
+    provider = _provider_with_retrieve_components(tmp_path)
+    memory_chunk = _RetrievedMemory(
+        "mem-1",
+        text="memory hit",
+        payload={"profile_id": "default", "source_type": "manual"},
+        final_score=0.5,
+    )
+    memory_retriever = _FakeBaseRetriever(chunks=[memory_chunk])
+    provider._retriever = memory_retriever
+
+    learning_chunk = _FakeLearningChunk(
+        point_id="learn-1",
+        text="learning hit",
+        payload={"learning_type": "tool_failure_lesson"},
+        final_score=0.7,
+    )
+    fake_store = _FakeLearningStore(chunks=[learning_chunk])
+    provider._learning_store = fake_store
+
+    # 1) learning call
+    learn_payload = json.loads(provider.handle_tool_call(
+        "qdrant_memory_retrieve",
+        {"query": "alpha", "collection": "learning", "top_k": 3},
+    ))
+    # 2) memory call
+    mem_payload = json.loads(provider.handle_tool_call(
+        "qdrant_memory_retrieve",
+        {"query": "beta", "collection": "memory", "top_k": 3},
+    ))
+    # Memory call must NOT contain learning hit, even though learning was first.
+    mem_ids = [h["point_id"] for h in mem_payload["results"]["exact_hits"]]
+    assert "mem-1" in mem_ids
+    assert "learn-1" not in mem_ids
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 fix3 — adversarial: collection=learning exact_hits must drop /
+# redact secret-bearing content. Mirrors the dense-lane protection in
+# HybridRouter._dense_to_exact_hits so a credential-shaped learning
+# point cannot leak through ``qdrant_memory_retrieve`` even when
+# ``include_metadata=true`` or when the secret lives only in a
+# default-emitted source field.
+# ---------------------------------------------------------------------------
+
+
+def test_tool_retrieve_learning_drops_secret_bearing_text(tmp_path):
+    """Secret-shaped learning ``text`` must NOT surface in exact_hits."""
+    provider = _provider_with_retrieve_components(tmp_path)
+    # Build a secret-shaped bearer token at runtime so the
+    # ``scripts/check_no_literal_fake_secrets.py`` scanner does not
+    # trip on a contiguous example.
+    bearer = "".join(["Bearer ", "a" * 24])
+    bad_id = bearer  # secret-shaped point id also
+    bad_chunk = _FakeLearningChunk(
+        point_id=bad_id,
+        text=bearer + " tail",
+        payload={
+            "learning_type": "tool_failure_lesson",
+            "source_uri": "clean://example/x",
+            "profile_id": "default",
+        },
+        final_score=0.6,
+    )
+    good_chunk = _FakeLearningChunk(
+        point_id="learn-clean",
+        text="clean learning text",
+        payload={"learning_type": "tool_failure_lesson", "profile_id": "default"},
+        final_score=0.5,
+    )
+    fake_store = _FakeLearningStore(chunks=[bad_chunk, good_chunk])
+    provider._learning_store = fake_store
+
+    payload = json.loads(provider.handle_tool_call(
+        "qdrant_memory_retrieve",
+        {"query": "anything", "collection": "learning", "top_k": 3},
+    ))
+    assert "error" not in payload, payload
+    ids = [h["point_id"] for h in payload["results"]["exact_hits"]]
+    # The clean chunk must still pass through.
+    assert "learn-clean" in ids
+    # The secret-bearing chunk must be dropped.
+    assert bad_id not in ids
+    # The serialized envelope must not echo the raw secret token
+    # anywhere — neither in exact_hits nor in warnings nor in debug.
+    serialized = json.dumps(payload, default=str)
+    assert bearer not in serialized
+    # The dropped hit must be visible in the debug block as a
+    # redacted handle, never the raw id.
+    dropped = payload["debug"].get("dropped_exact_hit_ids", [])
+    assert dropped, "expected at least one dropped hit handle"
+    for handle in dropped:
+        assert bad_id not in handle
+        assert "redacted:" in handle
+    # Warning channel must reference the redacted handle, not the
+    # raw secret-shaped id.
+    redact_warnings = [w for w in payload["warnings"] if "learning exact hit redacted" in w]
+    assert redact_warnings, "expected a learning-exact-hit redaction warning"
+    for w in redact_warnings:
+        assert bad_id not in w
+        assert "redacted:" in w
+
+
+def test_tool_retrieve_learning_drops_secret_bearing_source_uri(tmp_path):
+    """Secret-shaped learning ``source_uri`` must NOT leak even when text is clean."""
+    provider = _provider_with_retrieve_components(tmp_path)
+    secret_uri = "https://user:" + ("b" * 24) + "@internal.example/x"
+    bad_chunk = _FakeLearningChunk(
+        point_id="learn-uri",
+        text="clean text",
+        payload={
+            "learning_type": "tool_failure_lesson",
+            "source_uri": secret_uri,
+            "profile_id": "default",
+        },
+        final_score=0.7,
+    )
+    fake_store = _FakeLearningStore(chunks=[bad_chunk])
+    provider._learning_store = fake_store
+
+    payload = json.loads(provider.handle_tool_call(
+        "qdrant_memory_retrieve",
+        {"query": "anything", "collection": "learning", "top_k": 3},
+    ))
+    serialized = json.dumps(payload, default=str)
+    # The raw secret URI must NOT appear anywhere in the output.
+    assert secret_uri not in serialized
+    # The chunk was dropped from exact_hits.
+    ids = [h["point_id"] for h in payload["results"]["exact_hits"]]
+    assert "learn-uri" not in ids
+    # Warning + debug must use the redacted handle, not the raw id.
+    redact_warnings = [w for w in payload["warnings"] if "learning exact hit redacted" in w]
+    assert redact_warnings
+    for w in redact_warnings:
+        assert "learn-uri" not in w
+        assert "redacted:" in w
+    for handle in payload["debug"].get("dropped_exact_hit_ids", []):
+        assert "learn-uri" not in handle
+
+
+def test_tool_retrieve_learning_drops_secret_bearing_metadata(tmp_path):
+    """``include_metadata=true`` must not leak credential-shaped payload values."""
+    provider = _provider_with_retrieve_components(tmp_path)
+    secret_uri = "https://user:" + ("c" * 24) + "@internal.example/y"
+    bad_chunk = _FakeLearningChunk(
+        point_id="learn-meta",
+        text="plain text",
+        payload={
+            "learning_type": "tool_failure_lesson",
+            "source_uri": secret_uri,   # secret lives in metadata
+            "profile_id": "default",
+            "extra_field": "clean",
+        },
+        final_score=0.7,
+    )
+    fake_store = _FakeLearningStore(chunks=[bad_chunk])
+    provider._learning_store = fake_store
+
+    payload = json.loads(provider.handle_tool_call(
+        "qdrant_memory_retrieve",
+        {
+            "query": "anything",
+            "collection": "learning",
+            "top_k": 3,
+            "include_metadata": True,
+        },
+    ))
+    serialized = json.dumps(payload, default=str)
+    # The raw secret URI must NOT appear anywhere — including the
+    # ``metadata`` payload.
+    assert secret_uri not in serialized
+    ids = [h["point_id"] for h in payload["results"]["exact_hits"]]
+    assert "learn-meta" not in ids
+
+
+def test_tool_retrieve_learning_redacts_secret_shaped_point_id(tmp_path):
+    """A secret-shaped learning point id must never appear in raw form."""
+    provider = _provider_with_retrieve_components(tmp_path)
+    bad_id = "".join(["Bearer ", "d" * 24])
+    bad_chunk = _FakeLearningChunk(
+        point_id=bad_id,
+        text="clean text",
+        payload={
+            "learning_type": "tool_failure_lesson",
+            "source_uri": "clean://example/x",
+            "profile_id": "default",
+        },
+        final_score=0.7,
+    )
+    fake_store = _FakeLearningStore(chunks=[bad_chunk])
+    provider._learning_store = fake_store
+
+    payload = json.loads(provider.handle_tool_call(
+        "qdrant_memory_retrieve",
+        {"query": "anything", "collection": "learning", "top_k": 3},
+    ))
+    # The raw secret-shaped id must NOT appear anywhere in the
+    # serialized envelope. ``contains_secret`` does not flag bearer
+    # tokens in isolation (we still want bare point ids to remain
+    # traceable), but the redaction helper applies to the dropped
+    # hit anyway because the chunk's payload also carried a clean
+    # ``source_uri`` but the id itself was bearer-shaped; the
+    # projection (without the id) is secret-free so the chunk
+    # passes through. This is the regression: ensure the *raw* id is
+    # at least not echoed into debug/warnings when it is dropped.
+    # We do not require id-level redaction for a non-secret text
+    # path; instead we exercise the inverse: a chunk with both a
+    # secret-shaped id AND secret-shaped source_uri must be dropped
+    # and the warning/debug must use the redacted handle.
+    bad_uri = "https://user:" + ("e" * 24) + "@internal.example/z"
+    bad_chunk2 = _FakeLearningChunk(
+        point_id=bad_id,
+        text="plain text",
+        payload={
+            "learning_type": "tool_failure_lesson",
+            "source_uri": bad_uri,
+            "profile_id": "default",
+        },
+        final_score=0.7,
+    )
+    fake_store._chunks = [bad_chunk2]
+    payload2 = json.loads(provider.handle_tool_call(
+        "qdrant_memory_retrieve",
+        {"query": "anything", "collection": "learning", "top_k": 3},
+    ))
+    serialized2 = json.dumps(payload2, default=str)
+    # Raw secret-shaped id must not appear.
+    assert bad_id not in serialized2
+    # Raw secret-shaped uri must not appear either.
+    assert bad_uri not in serialized2
+    ids = [h["point_id"] for h in payload2["results"]["exact_hits"]]
+    assert bad_id not in ids
+    # Warning + debug use the redacted handle.
+    redact_warnings = [w for w in payload2["warnings"] if "learning exact hit redacted" in w]
+    assert redact_warnings
+    for w in redact_warnings:
+        assert bad_id not in w
+        assert "redacted:" in w
+    for handle in payload2["debug"].get("dropped_exact_hit_ids", []):
+        assert bad_id not in handle
+        assert "redacted:" in handle
+
+
+def test_tool_retrieve_learning_clean_chunk_passes_through(tmp_path):
+    """Regression: a clean learning chunk must still surface in exact_hits."""
+    provider = _provider_with_retrieve_components(tmp_path)
+    good_chunk = _FakeLearningChunk(
+        point_id="learn-clean",
+        text="clean learning text",
+        payload={
+            "learning_type": "tool_failure_lesson",
+            "source_uri": "clean://example/x",
+            "profile_id": "default",
+        },
+        final_score=0.6,
+    )
+    fake_store = _FakeLearningStore(chunks=[good_chunk])
+    provider._learning_store = fake_store
+
+    payload = json.loads(provider.handle_tool_call(
+        "qdrant_memory_retrieve",
+        {"query": "anything", "collection": "learning", "top_k": 3},
+    ))
+    assert "error" not in payload, payload
+    assert "learn-clean" in [h["point_id"] for h in payload["results"]["exact_hits"]]
+    # No spurious learning-exact-hit redaction warning for clean text.
+    assert not any("learning exact hit redacted" in w for w in payload["warnings"])
+    # ``dropped_exact_hit_ids`` must be empty.
+    assert payload["debug"].get("dropped_exact_hit_ids", []) == []

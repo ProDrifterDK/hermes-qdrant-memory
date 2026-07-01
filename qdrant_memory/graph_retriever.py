@@ -314,16 +314,63 @@ class GraphMemoryRetriever:
         relation_types: list[str] | None = None,
         include_fact_history: bool = False,
         debug: bool = True,
+        max_depth: int | None = None,
+        # Phase 5 fix8 (final6): read-only contract enforcement knobs.
+        # The Phase 5 ``qdrant_memory_retrieve`` /
+        # ``HybridRouter.retrieve`` path must NEVER call
+        # ``scroll_by_filter``. Both the dense-seed sparse lane and the
+        # BFS graph/entity expansion use ``scroll_by_filter`` under the
+        # hood. Standalone graph search (e.g.
+        # ``qdrant_memory_graph_search``) keeps the default True so its
+        # behaviour is unchanged.
+        allow_sparse_scroll: bool = True,
+        allow_graph_scroll: bool = True,
     ) -> GraphSearchResult:
         """Execute a read-only graph-aware search.
 
         Returns a ``GraphSearchResult`` with seeds, expansions, and final
         reranked candidates.
+
+        ``max_depth`` (Phase 5 fix6 compatibility shim) is a kwarg-only
+        ``int | None`` that, when provided, overrides
+        :attr:`GraphExpansionPolicy.max_depth` for *this single call*
+        only. The default (``None``) preserves the expansion policy that
+        was configured at construction time. The override value is
+        clamped to the same hard cap the policy constructor enforces
+        (``[1, _HARD_MAX_DEPTH]``). This keeps downstream callers (Phase 5
+        ``HybridRouter``, Phase 6 tooling) from being forced to mutate
+        the persistent ``expansion_policy`` to vary BFS depth per
+        retrieve request.
+
+        ``allow_sparse_scroll`` (Phase 5 fix8, final6 finding #1) and
+        ``allow_graph_scroll`` are read-only contract enforcement
+        knobs. They are both ``True`` by default so the standalone
+        graph search behaviour is unchanged. The Phase 5 hybrid
+        retrieve router passes ``allow_sparse_scroll=False`` AND
+        ``allow_graph_scroll=False`` so the new ``qdrant_memory_retrieve``
+        path is guaranteed to never invoke ``scroll_by_filter`` (neither
+        via the dense+sparse seed lane nor via BFS graph expansion).
+        When ``allow_graph_scroll=False`` the graph expansion is
+        skipped fail-closed (empty seeds + empty final + sanitized
+        warning + debug counts), the function does NOT raise, and no
+        mutation is attempted on the underlying Qdrant collection.
         """
         # Clamp user-supplied caps to hard limits
         candidate_seed_top_k = _clamp(candidate_seed_top_k, 1, _HARD_SEED_TOP_K)
         max_graph_results = _clamp(max_graph_results, 1, _HARD_GRAPH_RESULTS)
         top_k = _clamp(top_k, 1, _HARD_GRAPH_RESULTS)
+
+        # Phase 5 fix6: per-call ``max_depth`` override. The Stage C+D
+        # BFS loop below reads from a *local* ``max_depth`` shadow so the
+        # constructor's ``expansion_policy`` is never permanently changed
+        # by a single retrieve call.
+        if max_depth is not None:
+            try:
+                override_depth = _clamp(int(max_depth), 1, _HARD_MAX_DEPTH)
+            except Exception:
+                override_depth = int(self.expansion_policy.max_depth)
+        else:
+            override_depth = int(self.expansion_policy.max_depth)
 
         # Validate relation_types — fail closed if any are invalid
         validated_relation_types: list[str] | None = None
@@ -350,28 +397,119 @@ class GraphMemoryRetriever:
             "max_total_expansion": False,
         }
 
+        # ``seeds`` is unconditionally initialised before either
+        # short-circuit so downstream stage bookkeeping never sees an
+        # unbound name (Pyright reportOptionalMemberAccess on the
+        # TypeError fail-closed arm).
+        seeds: list[Any] = []
+
+        # ===================================================================
+        # Phase 5 fix8 (final6 finding #1) — read-only short-circuit.
+        #
+        # When ``allow_graph_scroll=False`` (the Phase 5 hybrid retrieve
+        # router contract) the graph lane must not invoke
+        # ``scroll_by_filter`` for BFS entity/edge expansion. The dense
+        # seed search below is also gated through
+        # ``allow_sparse_scroll`` so the strong-signal sparse lane does
+        # not scroll either. We fail closed: return an empty
+        # ``GraphSearchResult`` with debug counts and a sanitized warning
+        # so the caller's read-only invariant is preserved and no
+        # mutation is attempted on the underlying Qdrant collection.
+        # ===================================================================
+        if not allow_graph_scroll:
+            warnings.append(
+                "graph lane disabled: scroll_by_filter suppressed "
+                "(no raw exception leaked; see server logs)"
+            )
+            empty_debug: dict[str, Any] = {}
+            if debug:
+                empty_debug = {
+                    "algorithm": "graph_v1",
+                    "query_length": len(query or ""),
+                    "policy": asdict(self.expansion_policy),
+                    "weights": asdict(self.rank_weights),
+                    "scope_keys": [k for k, v in self.scope.items() if v],
+                    "stages": {
+                        "A_seed_search": {
+                            "requested": candidate_seed_top_k,
+                            "returned": 0,
+                            "min_vector_score": 0.0,
+                            "scroll_skipped": True,
+                        },
+                        "B_entity_extraction": {
+                            "matched_from_seeds": 0,
+                            "matched_from_query_aliases": 0,
+                        },
+                        "C_edge_query": {
+                            "depth_1_edges": 0,
+                            "depth_2_edges": 0,
+                            "depth_3_edges": 0,
+                            "scroll_calls": 0,
+                            "filtered_fact_status": 0,
+                            "filtered_confidence_floor": 0,
+                            "total_expansions": 0,
+                        },
+                        "E_hybrid_rerank": {
+                            "candidates_in": 0,
+                            "candidates_out": 0,
+                            "dropped_zero_score": 0,
+                        },
+                    },
+                    "hard_caps_hit": hard_caps_hit,
+                    "warnings": warnings,
+                    "scroll_suppressed": True,
+                }
+            return GraphSearchResult(
+                query=query,
+                seeds=[],
+                expansions=[],
+                final=[],
+                debug=empty_debug,
+            )
+
         # ===================================================================
         # Stage A: Semantic seed search
         # ===================================================================
-        seeds = self._base_retriever.search(
-            query,
-            top_k=candidate_seed_top_k,
-            source_type=source_type,
-            scope=self.scope or None,
-            tags=tags,
-            source=source,
-            file_path=file_path,
-            project_path=project_path,
-            since=since,
-            until=until,
-            memory_kind=memory_kind,
-            fact_status_exclude=fact_status_exclude,
-            stale=stale,
-            requires_review=requires_review,
-            canonical=canonical,
-            include_fact_history=include_fact_history,
-            update_access=False,  # Phase 2: read-only — no access metadata mutation
-        )
+        # Phase 5 fix8 (final6 finding #1): the dense+sparse seed lane
+        # now receives ``allow_sparse_scroll`` so a strong-signal query
+        # cannot trigger a sparse ``scroll_by_filter`` from inside the
+        # graph retriever. Standalone graph search keeps the default
+        # ``True`` so its behaviour is unchanged.
+        try:
+            seeds = self._base_retriever.search(
+                query,
+                top_k=candidate_seed_top_k,
+                source_type=source_type,
+                scope=self.scope or None,
+                tags=tags,
+                source=source,
+                file_path=file_path,
+                project_path=project_path,
+                since=since,
+                until=until,
+                memory_kind=memory_kind,
+                fact_status_exclude=fact_status_exclude,
+                stale=stale,
+                requires_review=requires_review,
+                canonical=canonical,
+                include_fact_history=include_fact_history,
+                update_access=False,  # Phase 2: read-only — no access metadata mutation
+                allow_sparse_scroll=allow_sparse_scroll,
+            )
+        except TypeError:
+            # ``MemoryRetriever.search`` may predate the
+            # ``allow_sparse_scroll`` kwarg. Fail closed: return empty
+            # seeds + sanitized warning so the Phase 5 contract is
+            # preserved (no scroll_by_filter) without crashing the
+            # caller's read-only pipeline. The same defensive posture
+            # applies to older MemoryRetriever-like objects that the
+            # graph retriever is sometimes handed.
+            warnings.append(
+                "graph seed search: base retriever does not accept "
+                "allow_sparse_scroll; failing closed "
+                "(no raw exception leaked; see server logs)"
+            )
+            seeds = []
 
         stage_a = {
             "requested": candidate_seed_top_k,
@@ -447,7 +585,11 @@ class GraphMemoryRetriever:
 
         max_total = self.expansion_policy.max_total_expansion
         per_node_cap = self.expansion_policy.max_neighbors_per_node
-        max_depth = self.expansion_policy.max_depth
+        # Phase 5 fix6: use the per-call ``max_depth`` override
+        # (clamped above) instead of the persistent policy value. When
+        # no override was supplied, ``override_depth`` already mirrors
+        # ``expansion_policy.max_depth``.
+        max_depth = override_depth
 
         while frontier and len(expansions) < max_total:
             eid, depth, current_path, current_rel_path, current_confidences = frontier.pop(0)

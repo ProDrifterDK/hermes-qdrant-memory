@@ -401,7 +401,63 @@ Safety guarantees:
 
 ---
 
-## 20. Phase 3 boundary hardening — RAPTOR schema + dry-run builder (2026-07-01)
+## 20. Phase 4 boundary hardening — RAPTOR apply/status (2026-07-01)
+
+Phase 4 closes the build → apply loop for RAPTOR candidate summary trees.
+It owns the digest-gated apply path, the audit persistence, and the
+read-only status helper. See [RAPTOR.md](RAPTOR.md) for the full public
+surface.
+
+### Digest-gated apply path
+
+- `plan_apply(manifest, report_id, build_id, manifest_digest)` recomputes
+  the manifest digest, rejects altered manifests, fails closed on
+  shape/scope mismatches, and refuses any non-canonical
+  `report_id` / `build_id` / `node_id`. It runs the existing
+  write-gate before returning its write decisions.
+- Live apply requires an exact `report_id` / `build_id` / `manifest_digest`
+  triple, prior dry-run review, and explicit `approve=true`.
+- The persist step writes a JSON audit record to
+  `~/.hermes/qdrant_memory/raptor_applied/<report_id>.json` with exact
+  `applied_node_ids`, `applied_at`, profile scope, and an
+  `application_id` derived from `(applied_at, report_id, build_id, digest)`.
+- Idempotent repeat apply: a persisted apply record matching the
+  manifest's exact `(report_id, build_id, manifest_digest,
+  expected_node_ids)` short-circuits live apply without re-upserting.
+  Records whose `applied_node_ids` do not match the manifest fail closed
+  via `RaptorApplyError` so a tampered or stale record cannot silently
+  re-mark a manifest as applied.
+
+### Read-only status helper
+
+- `assess_leaf_safety(payload)` and `assess_parent_status(child_payloads)`
+  classify leaves and parents conservatively. They never call Qdrant.
+- `qdrant_memory_raptor_status` reads the persisted manifest, retrieves
+  parent node existence and the actual child leaf payloads, runs
+  `assess_parent_status` against the real children, and overlays a
+  conservative parent-status override when leaves are missing or
+  retrieval fails.
+- Live apply refuses to run when the persisted apply record is missing
+  required fields or has a record_type other than `raptor_apply`.
+
+### Exact-ID only
+
+- No `delete-by-filter`, no `delete_ids`, no broad `update_payload`, no
+  `upsert` of anything outside the candidate node-id set.
+- The retrieve-by-id path used by status post-filters by
+  `profile_id` / `user_id_hash` / `chat_id_hash` (Qdrant `retrieve()`
+  does not accept filters).
+
+### No public churn for `qdrant_memory_search`
+
+- Phase 4 only adds `qdrant_memory_raptor_apply`,
+  `qdrant_memory_raptor_status`, and the underlying RAPTOR audit
+  directories. Existing tool handlers, CLI commands, and schemas remain
+  backward compatible.
+
+---
+
+## 21. Phase 3 boundary hardening — RAPTOR schema + dry-run builder (2026-07-01)
 
 A new `qdrant_memory.raptor` package introduces the RAPTOR schema and a deterministic dry-run builder. Phase 3 **proposes** RAPTOR trees/manifests; it does **not** mutate Qdrant. See [RAPTOR.md](RAPTOR.md) for the full public surface.
 
@@ -466,3 +522,318 @@ Every candidate payload emitted by the builder contains at least:
 ### No public tool/handler churn
 
 - Phase 3 only adds `qdrant_memory.raptor`. No existing tool handler, CLI command, or schema field is modified. Phase 4 will own any new apply/status tools.
+
+---
+
+## 22. Phase 5 boundary hardening — RAPTOR search/zoom + hybrid retrieve (2026-07-01)
+
+Phase 5 adds the read-only search/zoom + hybrid retrieve path. It owns
+`qdrant_memory.raptor.search`, `qdrant_memory.hybrid`, and the
+`qdrant_memory_retrieve` Hermes tool. See [RAPTOR.md](RAPTOR.md) for the
+full public surface.
+
+### Read-only invariant
+
+- `RaptorSearcher` and `HybridRouter` only call
+  `MemoryRetriever.search(..., update_access=False, allow_sparse_scroll=False)`
+  and `QdrantClient.retrieve(...)`. They never call `upsert`,
+  `delete_ids`, `delete_filter`, `update_payload`, or
+  `scroll_by_filter`.
+- An AST-based test in `tests/test_raptor_search.py` walks the
+  `qdrant_memory.raptor.search` module and fails on any forbidden call.
+- `HybridRouter.retrieve` always forwards `update_access=False` and
+  `allow_sparse_scroll=False` (phase 5 fix5) to the base retriever, so
+  a hybrid call never bumps `last_accessed` / `access_count` access
+  metadata AND never invokes `scroll_by_filter` even when the query is
+  a strong-signal pattern (UUID, issue id, route path).
+- `RaptorSearcher.search` always forwards `update_access=False` AND
+  `allow_sparse_scroll=False` (phase 5 fix5) to its underlying
+  `MemoryRetriever` so the RAPTOR seed search cannot re-enable the
+  scroll-by-filter lane. If a custom retriever lacks the kwarg the
+  RAPTOR seed search fails closed (empty seeds + warning) instead of
+  silently retrying without the flag.
+- The RAPTOR seed-search warning (phase 5 fix7) is **sanitized**:
+  neither the `TypeError` (missing-kwarg) arm nor the generic
+  `Exception` arm interpolates `str(exc)`. Backend exceptions can
+  echo the requested query (which may carry a secret-shaped token)
+  or other raw backend strings into `warnings`. A stable
+  `debug.stages.seed_search.error` (`type_error` / `exception`) is
+  recorded server-side so operators correlate via debug logs
+  without leaking the raw exception into the JSON envelope.
+- **Graph lane `scroll_by_filter` suppression (phase 5 fix8, final6
+  finding #1).** `HybridRouter.retrieve` propagates two read-only
+  contract flags into the real `GraphMemoryRetriever.search`:
+  `allow_sparse_scroll=False` AND `allow_graph_scroll=False`. The
+  graph lane must never invoke `scroll_by_filter` from inside the
+  Phase 5 retrieve path — neither via the dense+sparse seed lane
+  nor via the BFS entity/edge expansion. When `allow_graph_scroll=False`
+  the graph lane short-circuits BEFORE the BFS expansion with an
+  empty result + sanitized warning + a `scroll_suppressed=True`
+  debug flag. When the wrapped `MemoryRetriever` predates the
+  `allow_sparse_scroll` kwarg the graph lane fails closed (empty
+  seeds + sanitized warning). Standalone `qdrant_memory_graph_search`
+  keeps the default `True/True` so its behaviour is unchanged. An
+  end-to-end regression in
+  `tests/test_raptor_search.py::TestHybridRouterNoScrollByFilterUnderStrongSignal`
+  wires a real `HybridRouter` + real `GraphMemoryRetriever` + real
+  `MemoryRetriever` + a strict fake Qdrant sentinel under a
+  UUID-shaped query and asserts **zero** `scroll_by_filter` calls
+  AND zero `update_payload` calls anywhere in the pipeline.
+
+### Scope isolation (retrieve-by-id has no filter)
+
+- Explicit `retrieve()` calls used by `RaptorSearcher` defensively
+  post-filter each returned payload against the configured
+  `profile_id` / `user_id_hash` / `chat_id_hash` scope. A payload
+  from a different scope is silently dropped before reaching the
+  output.
+- `HybridRouter.scope` is passed into every lazy-built lane
+  (`MemoryRetriever.search`, `GraphMemoryRetriever.search`,
+  `RaptorSearcher`).
+
+### Unsafe payloads stay hidden or warning-only
+
+- Every cited leaf is run through `assess_leaf_safety`. Unsafe markers
+  (`fact_status in {stale, deprecated, superseded, disputed,
+  review_required}`, `consolidation_quarantined`, `stale`,
+  `requires_review`, `raptor_excluded`, `raptor_forgotten`, secret-shaped
+  text/payload) demote the leaf from `cited_leaves` into a warning
+  entry.
+- Parent summaries whose own `text` triggers `contains_secret()` are
+  skipped entirely and surfaced only through warnings.
+- **Dense-lane secret scan (phase 5 fix5).** `_dense_chunk_payload_secret`
+  in `qdrant_memory.hybrid.router` scans `chunk.text`, the projected
+  payload fields, `chunk.id`, AND the full `chunk.ranking_debug` object
+  (including nested dicts and lists). If any field inside
+  `ranking_debug` is secret-shaped — for example a non-projected
+  payload field like `source_hash_current` that gets reflected into the
+  audit envelope via `rank_memory_candidate` — the entire dense hit is
+  dropped fail-closed and a redacted warning is emitted. Clean
+  `ranking_debug` objects are preserved verbatim on the emitted hit
+  so the audit envelope stays useful.
+
+### Redacted warning handles
+
+- Warning strings use the builder's stable redacted handle
+  (`redacted:<sha256[:16]>`) for secret-shaped point IDs so neither raw
+  IDs nor scanner-shaped literals can appear in JSON output.
+
+### Bounded budgets
+
+- Hard caps live in `qdrant_memory.raptor.search`:
+  `HARD_MAX_DEPTH=3`, `HARD_MAX_CHILDREN=16`,
+  `HARD_MAX_SOURCE_CHARS=2400`, `HARD_CONTEXT_CHAR_BUDGET=16000`,
+  `HARD_SEED_TOP_K=32`. The router mirrors these caps.
+- `top_k` is clamped 1..20. Caller-supplied `--max-depth`,
+  `--max-children`, `--max-source-chars` are clamped at the tool handler.
+
+### Evidence-mode demotion
+
+- When `mode="evidence"`, RAPTOR parent summaries that have no
+  cited leaf (`parent_point_id` referenced by zero leaves) are
+  demoted from `summaries` to a warning entry. Parents cannot stand
+  alone as authoritative evidence.
+
+### Missing-children parent demotion (phase 5 fix7)
+
+- `RaptorSearcher.search` tracks the per-parent **referenced**
+  child count (deduped across `raptor_child_ids` and
+  `raptor_summary_of`, capped by `safe_max_children`). When a
+  parent references a child that the backend never returns
+  (deleted, missing, scope-filtered by `_payload_matches_scope`,
+  or dropped by the `retrieve` exception path), the
+  `assess_parent_status` recomputation treats the missing child
+  as unsafe so the parent never remains `active` while its
+  evidence was silently dropped. Warnings cite the redacted
+  parent handle only — the raw missing child id is never echoed
+  through the JSON envelope.
+
+### Shared-child per-parent accounting (phase 5 fix8, final6 finding #2)
+
+- Pre-fix8, retrieval-pass dedupe used a single global
+  `seen_leaf_ids` set combined with `setdefault`-wins attribution
+  (`parent_point_for_leaf[child_id] = first_parent_seen`). When a
+  child was shared across multiple parents, only the first parent
+  counted the shared child in its per-parent referenced set, and
+  only the first parent absorbed unsafe/missing accounting. A
+  parent whose only child was shared with another parent could
+  remain `active` while its evidence was demoted.
+- Phase 5 fix8 separates **retrieval dedupe** from **per-parent
+  safety accounting**:
+  - `parents_for_leaf: dict[child_id, list[RaptorSummaryHit]]`
+    tracks every parent that referenced each child.
+  - `per_parent_referenced_children: dict[id(parent), set[child_id]]`
+    and `per_parent_retrieved_children: dict[id(parent), set[child_id]]`
+    track per-parent referenced / retrieved child sets.
+  - Each unique child is still retrieved exactly once
+    (`seen_leaf_ids`), but unsafe / safe / missing accounting is
+    applied to **every** parent in `parents_for_leaf[child_id]`,
+    not just the first parent.
+  - Missing-count is computed as
+    `max(0, len(referenced - retrieved))` against the parent's
+    own set, never against the global dedupe set.
+- Net effect: a shared unsafe child demotes every parent that
+  referenced it (both parents clear text + drop out of `summaries`
+  + appear in `unsafe_summary_ids`). A shared missing child does
+  the same. A shared safe child keeps every parent active (when
+  no other unsafe/missing children exist for those parents).
+  Warnings cite the redacted parent handle only — the raw shared
+  child id is never echoed through the JSON envelope, even when
+  the child id itself is secret-shaped. Regressions in
+  `tests/test_raptor_search.py::TestSharedUnsafeChildDemotesEveryParent`
+  cover the stale-share, missing-share, safe-share, and the
+  three-parent secret-shaped-share paths.
+
+### Fanout cap is not missing evidence (phase 5 fix9, final7 finding #1)
+
+- Pre-fix9, the per-parent referenced set recorded every child in
+  `raptor_child_ids` / `raptor_summary_of` BEFORE the
+  `safe_max_children` cap check. Children beyond the cap were
+  intentionally not retrieved because of the fanout budget, but
+  the subsequent `referenced_set - retrieved_set` treated them as
+  missing evidence. The parent-status recomputation would inject a
+  synthetic unsafe child, clear the parent text, and add the
+  parent to `unsafe_summary_ids` — a false demotion of a
+  perfectly safe parent.
+- Phase 5 fix9 moves the cap check ahead of the referenced-set
+  insertion: a child id is added to `referenced_for_parent` only
+  when the searcher has fanout budget for it (i.e. `enqueued <
+  safe_max_children`) or it was already enqueued by a previous
+  parent sharing the cap (`already_enqueued` branch). Children
+  that are also shared still count for the parent so the fix8
+  shared-child safety path stays intact.
+- A genuinely missing child within the cap (`referenced - retrieved`
+  is non-empty) still demotes the parent. Children beyond the cap
+  are explicitly excluded from `referenced` so they cannot
+  contribute to the missing-count.
+- Regressions in
+  `tests/test_raptor_search.py::TestFanoutCapNotCountedAsMissing`
+  cover: parent with >max_children all-safe children stays active
+  and cites at most cap leaves; parent with a missing child inside
+  the cap demotes; the fix8 shared-child safety path is preserved
+  under the new cap-aware accounting.
+
+### Dense exact_hits budgets (phase 5 fix9, final7 finding #2)
+
+- Pre-fix9, `_dense_to_exact_hits` emitted `chunk.text` verbatim
+  and the `debug.context_used_chars` counter only summed
+  summaries + cited_leaves, so a 5000-char dense hit with
+  `max_source_chars=10` would surface verbatim and not count
+  against the budget at all.
+- Phase 5 fix9 applies per-result truncation to dense exact_hits
+  text using the caller-clamped `safe_max_source_chars`. The
+  function also accepts a `hard_context_char_budget` kwarg; when
+  adding a new hit would push the running total past the budget,
+  the overflow hit is dropped and a sanitized warning is emitted
+  that carries only the redacted handle. The hybrid router passes
+  `_HARD_CONTEXT_CHAR_BUDGET` (16000) and the already-clamped
+  `safe_max_source_chars` into the dense lane, and the
+  `context_used_chars` debug counter now sums exact_hits text
+  length on top of summaries + leaves so the dense lane cannot
+  blow the RAPTOR-lane hard cap.
+- Regressions in
+  `tests/test_hybrid_retrieve.py::TestDenseExactHitsBudgetEnforcement`
+  cover: long dense hit (5000 chars) with `max_source_chars=10`
+  emits truncated text and `context_used_chars<=10`; many dense
+  hits are dropped at the hard context budget; the empty dense
+  lane produces `context_used_chars=0` (no regression on the
+  no-hit case); per-hit truncation takes effect before the
+  context counter runs.
+
+### Learning retrieve sanitized error (phase 5 fix7)
+
+- `_tool_retrieve_learning` no longer interpolates `str(exc)` into
+  the JSON error envelope on `LearningStore.search` failure.
+  Backend exceptions can echo the requested query (which may carry
+  a secret-shaped token) or other raw backend strings into
+  `__str__`; the JSON error is replaced with a sanitized message
+  (`"Learning retrieve failed (no raw exception leaked; see server
+  logs)"`). The raw exception remains available server-side via
+  Python logging for operator correlation.
+
+### Global hard context budget across lanes (phase 5 fix10, final8 finding #1)
+
+- Pre-fix10, the dense+sparse lane and the RAPTOR lane each
+  clamped their own content to `HARD_CONTEXT_CHAR_BUDGET` (16000)
+  independently and the hybrid router only reported
+  `debug.context_used_chars`. The union of `summaries` +
+  `cited_leaves` + `exact_hits` could therefore exceed 16000
+  chars (e.g. 15600 dense exact_hits + 1200 RAPTOR summary =
+  16800) and the debug counter was at most additive, not a hard
+  cap.
+- Phase 5 fix10 introduces `_enforce_global_context_budget` at
+  the final packing stage of `HybridRouter.retrieve`. The helper
+  enforces ONE hard budget across all three lanes. The
+  deterministic policy is **preserve RAPTOR summaries +
+  cited_leaves first** (tree evidence is more provenance-
+  anchored and harder to reconstruct than the dense lane's
+  exact_hits), **then fit dense exact_hits into the remaining
+  budget**. Overflow dense exact_hits are dropped first-seen-wins
+  with a sanitized warning per drop (redacted handle, no raw
+  text/ids). `context_used_chars` is recomputed from the actual
+  emitted text so the debug envelope cannot disagree with the
+  wire. The hard cap is non-negotiable: the caller's LLM context
+  window cannot grow past 16000 chars no matter how many lanes
+  fire.
+- Regressions in
+  `tests/test_hybrid_retrieve.py::TestHybridGlobalContextBudget`
+  cover: dense + RAPTOR combined exceeds 16000 → union is capped
+  to <=16000 with RAPTOR preserved; the RAPTOR-first policy
+  preserves summaries/leaves and drops dense hits to fit; under-
+  budget unions are unchanged (no spurious drop warning).
+
+### Learning active-context safety + per-hit cap + hard budget (phase 5 fix10, final8 finding #2)
+
+- Pre-fix10, `_tool_retrieve_learning` (collection=learning)
+  secret-scanned hits but did NOT apply the active-context
+  status vocabulary the dense memory lane enforces. A learning
+  hit with `requires_review=True`, `fact_status=review_required`,
+  `stale=True`, `consolidation_quarantined=True`,
+  `raptor_excluded=True` / `raptor_forgotten=True`, or unsafe
+  `fact_status` values (`stale`, `review_required`, `disputed`,
+  `deprecated`, `superseded`) would surface as a normal active
+  `results.exact_hit` despite the safety gate. The learning
+  path also did NOT enforce `max_source_chars` on a per-hit
+  basis, and did NOT enforce a cumulative hard context budget
+  across emitted hits. The probe emitted a learning hit with
+  `requires_review=true`, `fact_status=review_required`, and a
+  5000-char text as a normal active exact_hit despite
+  `max_source_chars=10`.
+- Phase 5 fix10:
+  - Reuses `_dense_payload_unsafe_for_active_context` from the
+    hybrid router so the learning path uses the SAME status
+    vocabulary as the dense memory lane. Unsafe-status hits are
+    demoted to warning-only (no active `results.exact_hits`).
+  - The caller-clamped `max_source_chars` (default 1200, hard
+    cap 2400) is applied to each learning exact_hit text via
+    `_truncate_dense_text` so a 5000-char learning hit is
+    truncated to a safe per-hit size.
+  - `_enforce_learning_context_budget` enforces a single
+    `HARD_CONTEXT_CHAR_BUDGET` (16000) across the union of
+    emitted learning exact_hits. Overflow hits are dropped
+    first-seen-wins with a sanitized per-hit warning (redacted
+    handle, no raw text/ids).
+  - `debug.context_used_chars` and `debug.max_source_chars` are
+    populated so an operator can correlate via debug without the
+    warning channel alone.
+  - `include_fact_history` is supported but the learning path
+    does not surface a fact history lane; the default active-
+    context gate holds. The hook is wired for symmetry with the
+    memory lane.
+- Regressions in
+  `tests/test_learning_retrieve.py::TestLearningActiveContextStatusSafety`,
+  `TestLearningMaxSourceCharsEnforcement`,
+  `TestLearningHardContextBudgetEnforcement`, and
+  `TestLearningWarningNoRawSecretLeak` cover: review-required,
+  stale, quarantined, and unsafe `fact_status` learning hits
+  are not active exact_hits by default; long learning hits are
+  capped to `max_source_chars`; many learning hits cannot
+  exceed the hard budget; per-hit drop warnings use the redacted
+  handle (no raw ids or secret-shaped text).
+
+### No public churn for `qdrant_memory_search`
+
+- Phase 5 only adds the `qdrant_memory_retrieve` tool, the
+  `HybridRouter` / `RaptorSearcher` modules, and the `hermes qdrant
+  retrieve` CLI subcommand. The existing `qdrant_memory_search` tool
+  schema and behavior are unchanged.
