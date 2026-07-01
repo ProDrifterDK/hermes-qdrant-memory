@@ -398,3 +398,71 @@ Safety guarantees:
 - **Degrades when scroll is absent**: if `QdrantClient.scroll_by_filter` is unavailable or raises, the sparse lane returns an empty list and the retriever falls back to dense-only without crashing.
 - **Access metadata is updated only for selected chunks**: `update_access_metadata()` continues to be called on the final selected top-k, never on sparse candidates the scorer inspected and rejected.
 - **No public API churn**: `qdrant_memory_search` arguments are unchanged; the sparse lane is internal and toggled per retriever via `sparse_enabled=True` (default).
+
+---
+
+## 20. Phase 3 boundary hardening — RAPTOR schema + dry-run builder (2026-07-01)
+
+A new `qdrant_memory.raptor` package introduces the RAPTOR schema and a deterministic dry-run builder. Phase 3 **proposes** RAPTOR trees/manifests; it does **not** mutate Qdrant. See [RAPTOR.md](RAPTOR.md) for the full public surface.
+
+### Pure dry-run contract
+
+- The builder accepts plain Python point dicts (`{"id": ..., "payload": {...}}`) only — no Qdrant client, no HTTP, no I/O. An AST check in `tests/test_raptor_builder.py` enforces the absence of `qdrant_client`, `upsert`, `delete_payload`, `delete_filter`, `delete_ids`, `update_payload`, `scroll`, `search`, `retrieve`, `query_points` reachable from the builder module.
+- Every manifest pins `dry_run=True` and `mutations_performed=False`. There is no apply/status tooling in Phase 3; Phase 4 will own that surface.
+
+### MVP summaries are extractive
+
+- Each cluster summary text is built from the child leaf snippets — one `- <point_id>: <snippet>` line per leaf, deterministic order, bounded by `summary_max_chars`. No LLM call, no abstractive freeform claims. Root summary enumerates cluster ids + first line of each cluster's extractive summary.
+
+### Skip rules (conservative)
+
+The builder drops, never re-emits, leaves that:
+
+- have a missing or malformed point `id`
+- have missing or empty `payload.text` / `payload.lesson`
+- have text or payload fields that match `contains_secret()` from `lesson_extractor`
+- carry `consolidation_quarantined=True`
+- carry `stale=True` or `requires_review=True`
+- carry `fact_status` in `{stale, deprecated, superseded, disputed, review_required}`
+
+Skipped leaves are recorded in `manifest.skipped_leaves` with their reason code; they never appear in cluster summaries, source hashes, or any candidate payload.
+
+### Cross-scope isolation
+
+- Different `profile_id` / `user_id_hash` / `chat_id_hash` tuples split into separate RAPTOR trees (separate `tree_id` and `root_id`).
+- Within a cluster, scope fields are propagated only when all leaves agree; disagreement yields a `scope_disagreement_across_clusters` warning and the manifest's top-level `scope` stays empty.
+
+### Manifest digest is deterministic
+
+- `compute_manifest_digest()` deliberately excludes volatile timestamps and only hashes structural inputs (`build_id`, `prompt_version`, `tree_id`, `root_id`, `config`, `leaf_count`, `node_count`, `skipped_leaves`, `warnings`, `candidate_node_payloads`). Repeating the build over the same inputs yields a byte-identical JSON manifest.
+
+### Caller-supplied extras are filtered
+
+- Any caller-supplied `extra` payload is filtered through `_safe_extra`, which drops reserved keys (all RAPTOR-owned structural fields, `fact_status`, `requires_review`, `canonical`, `profile_id` / `user_id_hash` / `chat_id_hash`, `schema` / `schema_version` / `version`, `source_uri` / `source_type` / `locator` / `content_hash` / `source_modified_at`, `derived_from`, `evidence`, plus obvious secret-shape names like `authorization`, `api_key`, `bearer`, `password`, `token`, `credential`, `private_key`) and any string value that matches `contains_secret()`. The denylist covers keys that the base payload *omits* on a given call as well as keys it owns, so callers cannot inject status, scope, provenance, schema, or trust fields through `extra`. Secret-shaped values cannot re-enter the candidate payload via the metadata path.
+
+### Secret-shaped point IDs are rejected
+
+- `_is_safe_leaf()` runs `contains_secret()` against the point id itself before accepting a leaf. Token-like ids (e.g. `sk-…`, `ghp_…`, `AKIA…`, `eyJ…`, `-----BEGIN … PRIVATE KEY-----`, basic-auth URLs) are skipped with reason `secret_id_bearing`.
+- Skipped leaves whose reason is `secret_id_bearing` carry a stable redacted handle (`redacted:<sha256[:16]>`) in `manifest.skipped_leaves` instead of the raw id. The original secret-shaped id never appears in `raptor_child_ids`, `derived_from.child_node_id`, the extractive summary text, or any other field of the manifest.
+
+### Manifest digest is stable under skipped-leaf reordering
+
+- After the leaf-acceptance pass, the builder sorts `skipped_leaves` by `(point_id, reason)` before computing `manifest_digest`. Reordering the same safe/unsafe input set (including secret-shaped ids) produces identical manifests, identical `manifest_digest`, and identical serialized `skipped_leaves`.
+
+### Required RAPTOR payload fields
+
+Every candidate payload emitted by the builder contains at least:
+
+`raptor_tree_id`, `raptor_node_id`, `raptor_level`, `raptor_parent_ids`,
+`raptor_child_ids`, `raptor_cluster_id`, `raptor_summary_of`,
+`raptor_root_id`, `raptor_build_id`, `raptor_prompt_version`,
+`source_hashes`, `derived_from`, `derivation_type`, `canonical=False`,
+`requires_review=True`.
+
+### Review-required status
+
+- Every RAPTOR candidate is `canonical=False` and `requires_review=True` (with `raptor_review_status="review_required"`). The Phase 1 RAPTOR summary write gate in `qdrant_memory.write_gate.evaluate_raptor_summary_write()` continues to enforce this on the apply path (Phase 4).
+
+### No public tool/handler churn
+
+- Phase 3 only adds `qdrant_memory.raptor`. No existing tool handler, CLI command, or schema field is modified. Phase 4 will own any new apply/status tools.
