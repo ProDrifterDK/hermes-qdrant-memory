@@ -381,3 +381,20 @@ Before RAPTOR persistence is added, the following safety boundaries are in place
   - `# Past Learnings` sections.
   - Fenced `qdrant-memory` code blocks.
 - These markers prevent memory ingestion from embedding prior retrieval output as new durable memory.
+
+---
+
+## 19. Phase 2 boundary hardening — Sparse / exact retrieval lane (2026-07-01)
+
+A stdlib-only sparse retrieval lane (`qdrant_memory/sparse_search.py`) was added alongside the existing dense lane. It only improves recall for **literal identifiers** (UUIDs, point IDs, `/api/...` routes, dotted/colon symbols, snake_case identifiers, `Error`-class names, issue IDs like `SMDFS-455`, HTTP status codes).
+
+Safety guarantees:
+
+- **Gated on exact-signal patterns**: `has_strong_signal()` only fires the sparse lane for queries that look like literal lookups. Broad natural-language queries stay dense-only and never touch `scroll_by_filter`.
+- **Same filter as dense search**: the sparse scroll reuses `_scope_filter()` so `profile_id` / `user_id_hash` / `chat_id_hash` / `source_type` / `tags` / `source` / `file_path` / `project_path` / `since` / `until` / `memory_kind` / `fact_status_exclude` / `stale` / `requires_review` / `canonical` / `include_fact_history` / quarantine are applied uniformly to both lanes.
+- **Hard candidate cap**: `sparse_candidate_cap` defaults to `min(256, max(32, search_candidates * 4))` so a manual search cannot scroll unbounded collections.
+- **Sparse secrets are rejected at scoring time**: `contains_secret()` is run on every indexed payload field; secret-bearing points receive `score=0.0` with `secret_blocked=True` and are never surfaced.
+- **Quarantine marker respected**: payloads with `consolidation_quarantined=True` are dropped before scoring with `quarantined=True` so a reversible quarantine cannot be bypassed by an exact identifier lookup.
+- **Degrades when scroll is absent**: if `QdrantClient.scroll_by_filter` is unavailable or raises, the sparse lane returns an empty list and the retriever falls back to dense-only without crashing.
+- **Access metadata is updated only for selected chunks**: `update_access_metadata()` continues to be called on the final selected top-k, never on sparse candidates the scorer inspected and rejected.
+- **No public API churn**: `qdrant_memory_search` arguments are unchanged; the sparse lane is internal and toggled per retriever via `sparse_enabled=True` (default).

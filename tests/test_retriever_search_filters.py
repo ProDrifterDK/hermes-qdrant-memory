@@ -160,3 +160,124 @@ def test_memory_search_hides_deprecated_and_superseded_fact_status_by_default():
     assert {"key": "fact_status", "match": {"value": "deprecated"}} in default_filter["must_not"]
     assert {"key": "fact_status", "match": {"value": "superseded"}} in default_filter["must_not"]
     assert "must_not" not in qdrant.searches[1]["filter"]
+
+
+class FakeSparseAwareQdrant(FakeFactStatusQdrant):
+    """Qdrant fake that exposes scroll_by_filter alongside the search() result list."""
+
+    def __init__(self, search_results=None, scroll_results=None):
+        super().__init__()
+        self.search_results = list(search_results or [])
+        self.scroll_results = list(scroll_results or [])
+        self.scroll_calls = []
+
+    def search(self, name, vector, limit, filter=None, with_payload=True, with_vector=False):
+        self.searches.append(
+            {
+                "name": name,
+                "vector": vector,
+                "limit": limit,
+                "filter": filter,
+                "with_payload": with_payload,
+                "with_vector": with_vector,
+            }
+        )
+        return list(self.search_results)
+
+    def scroll_by_filter(self, name, flt, *, limit=256, with_payload=True, with_vector=False, max_total=None):
+        self.scroll_calls.append({"name": name, "filter": flt, "limit": limit, "max_total": max_total})
+        return list(self.scroll_results)
+
+
+def test_memory_search_does_not_invoke_sparse_lane_for_broad_queries():
+    """The sparse lane is gated on exact-signal patterns; broad NL queries stay dense-only."""
+    qdrant = FakeSparseAwareQdrant(search_results=[
+        {
+            "id": "memory-1",
+            "score": 0.9,
+            "payload": {
+                "text": "Production API endpoint is /api/v2.",
+                "source_type": "project_doc",
+                "importance": 8,
+                "created_at": "2026-01-15T00:00:00+00:00",
+            },
+        }
+    ])
+    retriever = MemoryRetriever(qdrant=qdrant, embeddings=FakeEmbedding(), collection_name="memory", search_candidates=3)
+
+    results = retriever.search("how does the production endpoint behave?", top_k=3)
+
+    assert [result.id for result in results] == ["memory-1"]
+    # Sparse scroll must not have been called for a broad NL query.
+    assert qdrant.scroll_calls == []
+
+
+def test_memory_search_sparse_lane_reuses_scope_filter():
+    """The scroll filter must include the same profile / user / chat scope as dense search."""
+    scroll_results = [{
+        "id": "550e8400-e29b-41d4-a716-446655440000",
+        "payload": {
+            "text": "incident notes",
+            "source_type": "project_doc",
+            "profile_id": "coder",
+            "user_id_hash": "u1",
+            "chat_id_hash": "c1",
+            "importance": 8,
+            "created_at": "2026-01-15T00:00:00+00:00",
+            "fact_status": "active",
+        },
+    }]
+    qdrant = FakeSparseAwareQdrant(search_results=[], scroll_results=scroll_results)
+    retriever = MemoryRetriever(
+        qdrant=qdrant,
+        embeddings=FakeEmbedding(),
+        collection_name="memory",
+        scope={"profile_id": "coder", "user_id_hash": "u1", "chat_id_hash": "c1"},
+        search_candidates=3,
+    )
+
+    results = retriever.search("recall 550e8400-e29b-41d4-a716-446655440000", top_k=3)
+    assert [result.id for result in results] == ["550e8400-e29b-41d4-a716-446655440000"]
+    assert len(qdrant.scroll_calls) == 1
+    flt = qdrant.scroll_calls[0]["filter"]
+    must = flt.get("must", [])
+    for key, value in {"profile_id": "coder", "user_id_hash": "u1", "chat_id_hash": "c1"}.items():
+        assert {"key": key, "match": {"value": value}} in must
+
+
+def test_memory_search_sparse_lane_degrades_when_scroll_missing():
+    """If scroll_by_filter is absent, sparse lane is skipped and dense behavior is unchanged."""
+
+    class NoScrollQdrant(FakeFactStatusQdrant):
+        def __init__(self, search_results):
+            super().__init__()
+            self._search_results = list(search_results)
+
+        def search(self, name, vector, limit, filter=None, with_payload=True, with_vector=False):
+            self.searches.append({
+                "name": name, "vector": vector, "limit": limit, "filter": filter,
+                "with_payload": with_payload, "with_vector": with_vector,
+            })
+            return list(self._search_results)
+
+        def scroll_by_filter(self, *args, **kwargs):  # pragma: no cover - defined to fail loudly
+            raise AssertionError("scroll_by_filter should not be called when sparse is disabled")
+
+    qdrant = NoScrollQdrant(search_results=[
+        {
+            "id": "memory-1",
+            "score": 0.9,
+            "payload": {
+                "text": "Production API endpoint is /api/v2.",
+                "source_type": "project_doc",
+                "importance": 8,
+                "created_at": "2026-01-15T00:00:00+00:00",
+            },
+        }
+    ])
+    retriever = MemoryRetriever(qdrant=qdrant, embeddings=FakeEmbedding(), collection_name="memory", search_candidates=3)
+
+    # Even with a strong-signal query, no scroll happens because the qdrant
+    # fake does not expose scroll_by_filter.
+    results = retriever.search("550e8400-e29b-41d4-a716-446655440000", top_k=3)
+    assert [result.id for result in results] == ["memory-1"]

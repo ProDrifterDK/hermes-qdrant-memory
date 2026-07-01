@@ -6,6 +6,13 @@ from typing import Any
 from .schema import now_iso, valid_fact_status, valid_memory_kind
 from .ranking import RankingContext, RankingPolicy, query_requests_review_history, rank_memory_candidate
 from .scoring import final_memory_score, normalize_minmax, recency_score
+from .sparse_search import (
+    combine_score,
+    fetch_sparse_candidates,
+    has_strong_signal,
+    merge_candidates,
+    score_candidates,
+)
 
 
 @dataclass
@@ -259,6 +266,9 @@ class MemoryRetriever:
         min_raw_score: float = 0.0,
         min_final_score: float = 0.0,
         ranking_policy: RankingPolicy | None = None,
+        sparse_enabled: bool = True,
+        sparse_candidate_cap: int | None = None,
+        sparse_lift: float = 0.25,
     ):
         self.qdrant = qdrant
         self.embeddings = embeddings
@@ -269,6 +279,14 @@ class MemoryRetriever:
         self.min_raw_score = float(min_raw_score)
         self.min_final_score = float(min_final_score)
         self.ranking_policy = ranking_policy or RankingPolicy()
+        self.sparse_enabled = bool(sparse_enabled)
+        # Default the sparse candidate cap to the dense search_candidates * 4,
+        # bounded to a sane ceiling so a manual search cannot scan the entire
+        # collection even if `search_candidates` is unusually large.
+        self.sparse_candidate_cap = int(
+            sparse_candidate_cap if sparse_candidate_cap is not None else min(256, max(32, self.search_candidates * 4))
+        )
+        self.sparse_lift = float(sparse_lift)
 
     def search(
         self,
@@ -296,36 +314,72 @@ class MemoryRetriever:
         if scope:
             active_scope.update(scope)
         history_requested = include_fact_history or query_requests_review_history(query)
+        flt = _scope_filter(
+            active_scope,
+            source_type=source_type,
+            tags=tags,
+            source=source,
+            file_path=file_path,
+            project_path=project_path,
+            since=since,
+            until=until,
+            memory_kind=memory_kind,
+            fact_status_exclude=fact_status_exclude,
+            stale=stale,
+            requires_review=requires_review,
+            canonical=canonical,
+            include_fact_history=history_requested,
+        )
         raw = self.qdrant.search(
             self.collection_name,
             vector,
             limit=max(int(top_k), self.search_candidates),
-            filter=_scope_filter(
-                active_scope,
-                source_type=source_type,
-                tags=tags,
-                source=source,
-                file_path=file_path,
-                project_path=project_path,
-                since=since,
-                until=until,
-                memory_kind=memory_kind,
-                fact_status_exclude=fact_status_exclude,
-                stale=stale,
-                requires_review=requires_review,
-                canonical=canonical,
-                include_fact_history=history_requested,
-            ),
+            filter=flt,
             with_payload=True,
             with_vector=False,
         )
-        scores = normalize_minmax([float(item.get("score", 0.0)) for item in raw])
+
+        # Sparse lane: only run when the query carries a strong exact-signal
+        # token (UUID, issue ID, route path, dotted/colon symbol, error literal,
+        # HTTP status). Generic natural-language queries stay on dense-only so
+        # broad semantic search is not flooded with literal-token matches.
+        sparse_points: list[dict[str, Any]] = []
+        sparse_scores = []
+        if self.sparse_enabled and has_strong_signal(query):
+            sparse_points = fetch_sparse_candidates(
+                self.qdrant,
+                collection_name=self.collection_name,
+                flt=flt,
+                candidate_cap=self.sparse_candidate_cap,
+            )
+            if sparse_points:
+                sparse_scores = score_candidates(query, sparse_points)
+        sparse_by_id = {str(point.get("id") or ""): point for point in sparse_points}
+        merged = merge_candidates(
+            dense=raw,
+            sparse_scores=sparse_scores,
+            sparse_points_by_id=sparse_by_id,
+            sparse_lift=self.sparse_lift,
+        )
+
+        # Build score normalization against the dense distribution only so the
+        # existing importance/recency/ranking pipeline remains numerically
+        # comparable for the merged pool. Sparse lift is applied later.
+        dense_scores = [float(item.get("score", 0.0)) for item in raw]
+        normalized = normalize_minmax(dense_scores)
+        dense_norm_by_id: dict[str, float] = {}
+        for item, norm_score in zip(raw, normalized):
+            pid = str(item.get("id") or "")
+            if pid:
+                dense_norm_by_id[pid] = float(norm_score)
+
         chunks: list[RetrievedMemory] = []
-        for item, norm_score in zip(raw, scores):
-            raw_score = float(item.get("score", 0.0))
-            if raw_score < self.min_raw_score:
+        for candidate in merged:
+            if candidate.quarantined or candidate.secret_blocked:
+                # Never promote quarantined or secret-bearing payloads even if
+                # the dense lane surfaced them in error.
                 continue
-            payload = item.get("payload") or {}
+            payload = candidate.payload or {}
             if not history_requested and valid_fact_status(payload.get("fact_status")) in _HIDDEN_FACT_STATUSES:
                 continue
             if not _payload_allowed(
@@ -338,6 +392,19 @@ class MemoryRetriever:
                 canonical=canonical,
             ):
                 continue
+            raw_score = float(candidate.dense_score)
+            if raw_score and raw_score < self.min_raw_score:
+                # Only enforce min_raw_score when the candidate has a dense
+                # contribution. Sparse-only hits should still surface as long
+                # as the sparse score is meaningful.
+                continue
+            # Vector normalization only available when the dense lane scored
+            # the point; for sparse-only points, derive a synthetic value
+            # proportional to the combined score so importance/recency still
+            # contribute meaningfully.
+            norm_score = dense_norm_by_id.get(candidate.point_id)
+            if norm_score is None:
+                norm_score = max(0.0, min(1.0, candidate.sparse_score / 4.0))
             text = str(payload.get("text") or "")
             final = final_memory_score(
                 norm_score,
@@ -345,6 +412,11 @@ class MemoryRetriever:
                 payload.get("created_at", ""),
                 self.decay_rate,
             )
+            # Apply sparse lift additively so literal hits can outrank dense
+            # decoys without dominating importance/recency.
+            final += combine_score(candidate, sparse_lift=self.sparse_lift) - float(candidate.dense_score)
+            if final < 0.0:
+                final = 0.0
             ranked = rank_memory_candidate(
                 base_score=final,
                 vector_score=raw_score,
@@ -361,7 +433,21 @@ class MemoryRetriever:
             )
             if ranked.score < self.min_final_score:
                 continue
-            chunks.append(RetrievedMemory(str(item.get("id", "")), text, payload, raw_score, ranked.score, ranked.debug))
+            debug = dict(ranked.debug or {})
+            debug["sparse_score"] = float(candidate.sparse_score)
+            debug["sparse_literal_hit"] = bool(candidate.literal_hit)
+            debug["sparse_matched_tokens"] = list(candidate.matched_tokens)
+            debug["sparse_field_hits"] = dict(candidate.field_hits)
+            chunks.append(
+                RetrievedMemory(
+                    id=candidate.point_id,
+                    text=text,
+                    payload=payload,
+                    qdrant_score=raw_score,
+                    final_score=ranked.score,
+                    ranking_debug=debug,
+                )
+            )
         chunks.sort(key=lambda c: c.final_score, reverse=True)
         selected = chunks[: max(1, min(20, int(top_k)))]
         if update_access:
