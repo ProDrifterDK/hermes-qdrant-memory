@@ -2057,6 +2057,7 @@ class QdrantMemoryProvider(MemoryProvider):
             embeddings=self._embeddings,
             collection_name=collection_name,
             expansion_policy=GraphExpansionPolicy(max_depth=max_depth),
+            scope=self._scope_filter_values(),
         )
         try:
             result = retriever.search(

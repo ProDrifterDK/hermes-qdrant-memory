@@ -1510,3 +1510,358 @@ class TestProviderGraphSearchDispatch:
         ))
         assert "error" in result
         assert "query is required" in result["error"]
+
+
+# ===========================================================================
+# Phase 1 regression tests: cross-profile graph scope isolation
+# ===========================================================================
+
+class TestGraphScopeIsolation:
+    """Graph search must not leak entities, edges, or source memories across
+    profile_id / user_id_hash / chat_id_hash scope boundaries."""
+
+    def _make_scope_qdrant(self) -> tuple["FakeGraphQdrant", str]:
+        """Build a FakeGraphQdrant with points tagged to different scopes."""
+        eid_a = make_entity_id("concept", "Alpha")
+        eid_b = make_entity_id("concept", "Beta")
+        eid_c = make_entity_id("concept", "Gamma")  # different profile
+
+        seeds = [{
+            "id": "seed-alpha",
+            "score": 0.9,
+            "payload": {
+                "text": "alpha entity",
+                "importance": 5,
+                "created_at": "2026-06-20T00:00:00+00:00",
+                "entity_id": eid_a,
+                "fact_status": "active",
+                "profile_id": "profile-A",
+            },
+        }]
+        qdrant = FakeGraphQdrant(search_results=seeds)
+
+        # Entity Alpha (profile A)
+        qdrant.add_point("ent-alpha", {
+            "memory_kind": "graph_entity",
+            "entity_id": eid_a,
+            "source_point_ids": [],
+            "fact_status": "active",
+            "profile_id": "profile-A",
+        })
+        # Entity Beta (profile A)
+        qdrant.add_point("ent-beta", {
+            "memory_kind": "graph_entity",
+            "entity_id": eid_b,
+            "source_point_ids": ["mem-beta"],
+            "fact_status": "active",
+            "profile_id": "profile-A",
+        })
+        # Entity Gamma (profile B — different scope)
+        qdrant.add_point("ent-gamma", {
+            "memory_kind": "graph_entity",
+            "entity_id": eid_c,
+            "label": "alpha",  # alias matches query to trigger alias scroll
+            "source_point_ids": ["mem-gamma"],
+            "fact_status": "active",
+            "profile_id": "profile-B",  # different!
+        })
+        # Edge Alpha->Beta (profile A)
+        edge_ab = make_edge_id(eid_a, eid_b, "RELATED_TO")
+        qdrant.add_point(edge_ab, {
+            "memory_kind": "graph_edge",
+            "edge_id": edge_ab,
+            "source_entity_id": eid_a,
+            "target_entity_id": eid_b,
+            "relation_type": "RELATED_TO",
+            "confidence": 0.8,
+            "fact_status": "active",
+            "profile_id": "profile-A",
+        })
+        # Edge Alpha->Gamma (profile B — cross-profile!)
+        edge_ag = make_edge_id(eid_a, eid_c, "RELATED_TO")
+        qdrant.add_point(edge_ag, {
+            "memory_kind": "graph_edge",
+            "edge_id": edge_ag,
+            "source_entity_id": eid_a,
+            "target_entity_id": eid_c,
+            "relation_type": "RELATED_TO",
+            "confidence": 0.8,
+            "fact_status": "active",
+            "profile_id": "profile-B",  # different!
+        })
+        # Memory points
+        qdrant.add_point("mem-beta", {
+            "text": "beta memory in profile A",
+            "importance": 5,
+            "created_at": "2026-06-20T00:00:00+00:00",
+            "fact_status": "active",
+            "profile_id": "profile-A",
+        })
+        qdrant.add_point("mem-gamma", {
+            "text": "gamma memory in profile B",
+            "importance": 5,
+            "created_at": "2026-06-20T00:00:00+00:00",
+            "fact_status": "active",
+            "profile_id": "profile-B",  # different!
+        })
+        return qdrant, eid_c
+
+    def test_scope_filters_query_matched_entities(self):
+        """Entity alias scrolls must only return entities within scope."""
+        qdrant, eid_gamma = self._make_scope_qdrant()
+        retriever = GraphMemoryRetriever(
+            qdrant=qdrant,
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+            scope={"profile_id": "profile-A"},
+        )
+        result = retriever.search("alpha", top_k=10, debug=True)
+
+        # Gamma entity must NOT be in query-matched entities
+        matched_entities = self._get_matched_entities(result)
+        assert eid_gamma not in matched_entities, (
+            f"cross-profile entity leaked via alias match: {matched_entities}"
+        )
+
+    def test_scope_filters_edge_scrolls(self):
+        """Edge scrolls must only return edges within scope."""
+        qdrant, eid_gamma = self._make_scope_qdrant()
+        retriever = GraphMemoryRetriever(
+            qdrant=qdrant,
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+            scope={"profile_id": "profile-A"},
+        )
+        result = retriever.search("alpha entity", top_k=10, debug=True)
+
+        # Check all edge scrolls had profile_id in filter
+        edge_scrolls = [
+            s for s in qdrant.scrolls
+            if any(
+                c.get("key") == "memory_kind"
+                and c.get("match", {}).get("value") == "graph_edge"
+                for c in (s.get("filter") or {}).get("must", [])
+            )
+        ]
+        for s in edge_scrolls:
+            must = s.get("filter", {}).get("must", [])
+            scope_conds = [c for c in must if c.get("key") == "profile_id"]
+            assert len(scope_conds) == 1, f"edge scroll missing scope filter: {s}"
+
+    def test_scope_filters_entity_resolution_and_source_points(self):
+        """Retrieved source points must be within scope."""
+        qdrant, eid_gamma = self._make_scope_qdrant()
+        retriever = GraphMemoryRetriever(
+            qdrant=qdrant,
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+            scope={"profile_id": "profile-A"},
+        )
+        result = retriever.search("alpha entity", top_k=10, debug=True)
+
+        # mem-gamma must not appear in any expansion or final candidate
+        all_ids = (
+            [e.point_id for e in result.expansions]
+            + [c.point_id for c in result.final]
+        )
+        assert "mem-gamma" not in all_ids, (
+            f"cross-profile source memory leaked: {all_ids}"
+        )
+
+    def test_scope_filters_final_candidates(self):
+        """Final candidate list must not contain cross-profile content.
+
+        Scoped results must carry and match all active scope keys — a missing
+        ``profile_id`` on a scoped candidate is also a leak.
+        """
+        qdrant, eid_gamma = self._make_scope_qdrant()
+        retriever = GraphMemoryRetriever(
+            qdrant=qdrant,
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+            scope={"profile_id": "profile-A"},
+        )
+        result = retriever.search("alpha entity", top_k=10, debug=True)
+
+        for candidate in result.final:
+            payload = candidate.payload or {}
+            # Scoped candidates must carry the active scope key AND match it.
+            # Missing profile_id is a leak, not a pass.
+            assert str(payload.get("profile_id") or "") == "profile-A", (
+                f"candidate missing/mismatched scope key profile_id: {candidate.point_id}"
+            )
+
+    def test_no_scope_returns_everything(self):
+        """Without scope (global mode), all profiles are visible."""
+        qdrant, eid_gamma = self._make_scope_qdrant()
+        retriever = GraphMemoryRetriever(
+            qdrant=qdrant,
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+            scope={},  # global mode
+        )
+        result = retriever.search("alpha entity", top_k=10, debug=True)
+        # With no scope, Gamma entity should be visible via alias match
+        assert result is not None
+
+    def test_debug_shows_scope_keys(self):
+        """Debug must show active scope keys for auditability."""
+        qdrant, _ = self._make_scope_qdrant()
+        retriever = GraphMemoryRetriever(
+            qdrant=qdrant,
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+            scope={"profile_id": "profile-A", "user_id_hash": "hash123"},
+        )
+        result = retriever.search("alpha", top_k=5, debug=True)
+        assert "scope_keys" in result.debug
+        assert "profile_id" in result.debug["scope_keys"]
+        assert "user_id_hash" in result.debug["scope_keys"]
+
+    def _get_matched_entities(self, result: GraphSearchResult) -> set[str]:
+        """Extract entity IDs from all expansion and final candidate paths."""
+        entities: set[str] = set()
+        for exp in result.expansions:
+            entities.update(exp.path)
+        for c in result.final:
+            entities.update(c.path)
+        return entities
+
+    # ------------------------------------------------------------------
+    # P1 regression: source points with MISSING scope keys must not leak.
+    #
+    # These tests MUST create an in-scope graph edge from the seed entity to
+    # a second in-scope counterparty entity whose source_point_ids include
+    # both a missing-scope point and a matching-scope control point.  Only
+    # then does BFS call _resolve_entity_memories(), which invokes
+    # qdrant.retrieve() and applies the fail-closed _payload_in_scope()
+    # post-filter.  Without the edge the tests are vacuous (retrieves=[]).
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize("scope_key,scope_val,base_scope", [
+        ("profile_id", "profile-A", {"profile_id": "profile-A"}),
+        ("user_id_hash", "userhash123", {"profile_id": "profile-A", "user_id_hash": "userhash123"}),
+        ("chat_id_hash", "chathash456", {"profile_id": "profile-A", "chat_id_hash": "chathash456"}),
+    ])
+    def test_missing_scope_key_source_excluded(self, scope_key, scope_val, base_scope):
+        """Source point missing an active scope key must not leak into
+        expansions/final, while a matching in-scope control point must
+        survive — proving qdrant.retrieve() and _payload_in_scope() ran.
+        """
+        eid_a = make_entity_id("concept", "Alpha")
+        eid_b = make_entity_id("concept", "Beta")
+
+        # Build the base seed payload with the parametrized scope.
+        seed_payload = {
+            "text": "alpha entity",
+            "importance": 5,
+            "created_at": "2026-06-20T00:00:00+00:00",
+            "entity_id": eid_a,
+            "fact_status": "active",
+        }
+        seed_payload.update(base_scope)
+
+        seeds = [{
+            "id": "seed-alpha",
+            "score": 0.9,
+            "payload": seed_payload,
+        }]
+        qdrant = FakeGraphQdrant(search_results=seeds)
+
+        # Entity Alpha (seed) — in scope, no source_point_ids.
+        ent_alpha_payload = {
+            "memory_kind": "graph_entity",
+            "entity_id": eid_a,
+            "source_point_ids": [],
+            "fact_status": "active",
+        }
+        ent_alpha_payload.update(base_scope)
+        qdrant.add_point("ent-alpha", ent_alpha_payload)
+
+        # Entity Beta (counterparty) — in scope, references two source points:
+        #   1. "mem-missing-scope"  — MISSING the active scope key (must leak
+        #      under fail-open, must be filtered under fail-closed).
+        #   2. "mem-scoped"         — carries the matching scope value (control).
+        ent_beta_payload = {
+            "memory_kind": "graph_entity",
+            "entity_id": eid_b,
+            "source_point_ids": ["mem-missing-scope", "mem-scoped"],
+            "fact_status": "active",
+        }
+        ent_beta_payload.update(base_scope)
+        qdrant.add_point("ent-beta", ent_beta_payload)
+
+        # In-scope edge Alpha → Beta (BFS will traverse this, calling
+        # _resolve_entity_memories for counterparty Beta).
+        edge_ab = make_edge_id(eid_a, eid_b, "RELATED_TO")
+        edge_payload = {
+            "memory_kind": "graph_edge",
+            "edge_id": edge_ab,
+            "source_entity_id": eid_a,
+            "target_entity_id": eid_b,
+            "relation_type": "RELATED_TO",
+            "confidence": 0.8,
+            "fact_status": "active",
+        }
+        edge_payload.update(base_scope)
+        qdrant.add_point(edge_ab, edge_payload)
+
+        # Missing-scope source point: has other scope fields but is MISSING
+        # the parametrized scope_key entirely.
+        missing_payload = {
+            "text": f"memory missing {scope_key}",
+            "importance": 5,
+            "created_at": "2026-06-20T00:00:00+00:00",
+            "fact_status": "active",
+        }
+        # Include other scope keys so the ONLY deficiency is the missing key.
+        for k, v in base_scope.items():
+            if k != scope_key:
+                missing_payload[k] = v
+        qdrant.add_point("mem-missing-scope", missing_payload)
+
+        # In-scope control source point: carries ALL scope keys correctly.
+        scoped_payload = {
+            "text": f"scoped memory with {scope_key}",
+            "importance": 5,
+            "created_at": "2026-06-20T00:00:00+00:00",
+            "fact_status": "active",
+        }
+        scoped_payload.update(base_scope)
+        qdrant.add_point("mem-scoped", scoped_payload)
+
+        retriever = GraphMemoryRetriever(
+            qdrant=qdrant,
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+            scope=base_scope,
+        )
+        result = retriever.search("alpha", top_k=10, debug=True)
+
+        # 1. Prove the retrieve/post-filter path actually ran.
+        retrieve_ids: list[str] = []
+        for call in qdrant.retrieves:
+            retrieve_ids.extend(call.get("ids", []))
+        assert "mem-missing-scope" in retrieve_ids, (
+            f"qdrant.retrieve() was not called with mem-missing-scope "
+            f"(retrieves={qdrant.retrieves}) — test is vacuous"
+        )
+        assert "mem-scoped" in retrieve_ids, (
+            f"qdrant.retrieve() was not called with mem-scoped "
+            f"(retrieves={qdrant.retrieves}) — test is vacuous"
+        )
+
+        # 2. Missing-scope source point must NOT appear in expansions or final.
+        all_ids = (
+            [e.point_id for e in result.expansions]
+            + [c.point_id for c in result.final]
+        )
+        assert "mem-missing-scope" not in all_ids, (
+            f"source point missing {scope_key} leaked into results: {all_ids}"
+        )
+
+        # 3. Matching in-scope control point MUST survive in expansions/final.
+        assert "mem-scoped" in all_ids, (
+            f"in-scope control point 'mem-scoped' was incorrectly filtered "
+            f"out of expansions/final: {all_ids}"
+        )

@@ -18,6 +18,40 @@ EXPAND_METADATA_STRING_CAP = 512
 EXPAND_METADATA_TOKEN_CAP = 128
 EXPAND_LOCATOR_HEADING_CAP = 200
 MAX_SAFE_LINE_NUMBER = 2_147_483_647
+
+# Maximum number of approved roots to track.  Prevents unbounded memory growth.
+_MAX_APPROVED_ROOTS = 256
+
+
+def _normalize_file_root(root: str | Path) -> str:
+    """Normalize a directory path to a canonical absolute string for root matching."""
+    try:
+        path = Path(str(root)).expanduser().resolve(strict=False)
+    except Exception:
+        return ""
+    return str(path)
+
+
+def is_path_within_roots(file_path: Path, roots: list[str]) -> bool:
+    """Return True if *file_path* resolves under at least one approved *root*.
+
+    Used by strict source expansion to reject arbitrary ``file://`` URIs
+    that are not under an approved/indexed root.
+    """
+    try:
+        resolved = file_path.resolve(strict=False)
+    except Exception:
+        return False
+    for root in roots:
+        if not root:
+            continue
+        try:
+            resolved.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
 _BINARY_EXTENSIONS = {
     ".7z",
     ".bin",
@@ -618,6 +652,237 @@ class FileSourceResolver:
                 "file_size": file_stat.st_size,
             }
         )
+
+
+class StrictFileSourceResolver(FileSourceResolver):
+    """Strict file:// resolver for automatic/RAPTOR source expansion.
+
+    Extends :class:`FileSourceResolver` with three additional safety guarantees
+    that manual/explicit expansion is NOT required to enforce:
+
+    1. **Approved-root check.** Only ``file://`` URIs resolving under one of
+       the configured approved/indexed roots are accepted.
+    2. **Freshness verification mandatory.** ``stat()`` and ``expand()`` reject
+       if no ``content_hash`` or ``source_modified_at`` is provided.
+    3. **Changed sources rejected.** If the source content/hash/mtime does not
+       match expectations, the source is rejected rather than returned as-is.
+
+    Manual/explicit expansion (``qdrant_memory_expand``) continues to use the
+    base :class:`FileSourceResolver` which remains permissive about roots and
+    verification metadata.
+    """
+
+    def __init__(
+        self,
+        *,
+        approved_roots: list[str | Path] | None = None,
+        max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
+        max_line_span: int = DEFAULT_MAX_LINE_SPAN,
+    ):
+        super().__init__(max_file_bytes=max_file_bytes, max_line_span=max_line_span)
+        self._approved_roots: list[str] = []
+        for root in approved_roots or []:
+            normalized = _normalize_file_root(root)
+            if normalized and normalized not in self._approved_roots:
+                self._approved_roots.append(normalized)
+            if len(self._approved_roots) >= _MAX_APPROVED_ROOTS:
+                break
+
+    @property
+    def approved_roots(self) -> list[str]:
+        return list(self._approved_roots)
+
+    def _reject(self, source_uri: str, reason: str, message: str, *, include_path: bool = False) -> dict[str, Any]:
+        path = self._path_from_uri(source_uri)
+        base = self._base(source_uri, path, include_path=include_path)
+        return {
+            **base,
+            "supported": False,
+            "status": "unsupported",
+            "exists": False,
+            "changed": None,
+            "reason": reason,
+            "message": message,
+        }
+
+    def _check_approved(self, source_uri: str) -> dict[str, Any] | None:
+        """Return an error dict if source is outside approved roots, else None."""
+        if not self._approved_roots:
+            return self._reject(source_uri, "no_approved_roots",
+                                "Strict source expansion has no approved/indexed roots configured")
+        path = self._path_from_uri(source_uri)
+        if path is None:
+            return self._reject(source_uri, "invalid_file_uri",
+                                "Strict source expansion could not resolve the file URI")
+        if not is_path_within_roots(path, self._approved_roots):
+            return self._reject(source_uri, "outside_approved_roots",
+                                "Strict source expansion rejected: source is outside approved/indexed roots")
+        return None
+
+    def _check_verification(
+        self,
+        source_uri: str,
+        *,
+        content_hash: str | None,
+        source_modified_at: str | None,
+    ) -> dict[str, Any] | None:
+        """Return an error dict if verification metadata is missing, else None."""
+        if not (content_hash or source_modified_at):
+            return self._reject(source_uri, "missing_verification_metadata",
+                                "Strict source expansion requires content_hash or source_modified_at")
+        return None
+
+    def stat(
+        self,
+        source_uri: str,
+        locator: dict[str, Any] | None = None,
+        *,
+        content_hash: str | None = None,
+        source_modified_at: str | None = None,
+    ) -> dict[str, Any]:
+        path, uri_error = self._path_result_from_uri(source_uri)
+        if uri_error:
+            return {**uri_error, **self._base(source_uri, path)}
+        reject = self._check_approved(source_uri)
+        if reject:
+            return reject
+        reject = self._check_verification(source_uri, content_hash=content_hash, source_modified_at=source_modified_at)
+        if reject:
+            return reject
+        result = super().stat(
+            source_uri,
+            locator,
+            content_hash=content_hash,
+            source_modified_at=source_modified_at,
+        )
+        # In strict mode, changed/unknown sources are rejected.
+        if result.get("changed") is True or result.get("status") == "changed":
+            return self._reject(source_uri, "source_changed",
+                                "Strict source expansion rejected: source content changed since indexing")
+        if result.get("status") == "unknown":
+            reason = result.get("reason", "verification_failed")
+            return self._reject(source_uri, reason,
+                                f"Strict source expansion rejected: {reason}")
+        return result
+
+    def expand(
+        self,
+        source_uri: str,
+        locator: dict[str, Any] | None = None,
+        *,
+        mode: str = "excerpt",
+        max_chars: int = DEFAULT_MAX_CHARS,
+    ) -> dict[str, Any]:
+        """Fail-closed: direct expand() cannot verify freshness.
+
+        The base ``expand()`` signature does not accept ``content_hash`` or
+        ``source_modified_at``, so there is no way to perform freshness
+        verification.  Callers MUST use :meth:`strict_expand` (which accepts
+        verification metadata) or the :func:`strict_expand_source` wrapper
+        function.  Manual/explicit expansion continues to use the base
+        :class:`FileSourceResolver`.
+        """
+        budget = _normalize_max_chars(max_chars)
+        reject = self._check_approved(source_uri)
+        if reject:
+            return _compact_expand_response({
+                **reject,
+                "mode": mode, "text": "", "chars": 0, "max_chars": budget, "truncated": False,
+            })
+        # expand() has no verification kwargs — fail closed.
+        reject = self._reject(source_uri, "missing_verification_metadata",
+                              "StrictFileSourceResolver.expand() requires verification metadata; "
+                              "use strict_expand() or strict_expand_source() instead")
+        return _compact_expand_response({
+            **reject,
+            "mode": mode, "text": "", "chars": 0, "max_chars": budget, "truncated": False,
+        })
+
+    def strict_expand(
+        self,
+        source_uri: str,
+        locator: dict[str, Any] | None = None,
+        *,
+        content_hash: str | None = None,
+        source_modified_at: str | None = None,
+        mode: str = "excerpt",
+        max_chars: int = DEFAULT_MAX_CHARS,
+    ) -> dict[str, Any]:
+        """Expand with approved-root + freshness verification.
+
+        This is the safe class-level expansion path.  It performs the same
+        preflight checks as :func:`strict_expand_source` and then delegates
+        to the base ``expand()`` only after verification succeeds.
+        """
+        budget = _normalize_max_chars(max_chars)
+        reject = self._check_approved(source_uri)
+        if reject:
+            return _compact_expand_response({
+                **reject,
+                "mode": mode, "text": "", "chars": 0, "max_chars": budget, "truncated": False,
+            })
+        reject = self._check_verification(source_uri, content_hash=content_hash,
+                                         source_modified_at=source_modified_at)
+        if reject:
+            return _compact_expand_response({
+                **reject,
+                "mode": mode, "text": "", "chars": 0, "max_chars": budget, "truncated": False,
+            })
+        # Verify freshness via stat() before reading.
+        status = self.stat(source_uri, locator, content_hash=content_hash,
+                           source_modified_at=source_modified_at)
+        if not status.get("supported") or status.get("status") not in ("exists",):
+            return _compact_expand_response({
+                **status,
+                "mode": mode, "text": "", "chars": 0, "max_chars": budget, "truncated": False,
+            })
+        return super().expand(source_uri, locator, mode=mode, max_chars=budget)
+
+
+def strict_expand_source(
+    source_uri: str,
+    *,
+    approved_roots: list[str | Path],
+    content_hash: str | None = None,
+    source_modified_at: str | None = None,
+    locator: dict[str, Any] | None = None,
+    max_chars: int = DEFAULT_MAX_CHARS,
+    mode: str = "excerpt",
+    config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Expand a source URI with strict safety guarantees.
+
+    This is the safe entry point for automatic/RAPTOR source packing.
+    It enforces approved-root checking and freshness verification before
+    reading any file content.
+
+    Returns a compact expand response. Rejected sources return
+    ``supported=False`` with a descriptive ``reason``.
+    """
+    resolver = StrictFileSourceResolver(approved_roots=approved_roots)
+    # First verify the source is approved and verifiable
+    status = resolver.stat(
+        source_uri,
+        locator,
+        content_hash=content_hash,
+        source_modified_at=source_modified_at,
+    )
+    if not status.get("supported") or status.get("status") not in ("exists",):
+        # Return a compact expand-shaped rejection
+        budget = _normalize_max_chars(max_chars)
+        return _compact_expand_response({
+            **status,
+            "mode": mode, "text": "", "chars": 0, "max_chars": budget, "truncated": False,
+        })
+    # Source verified — expand it via the strict method (which re-verifies
+    # but this keeps the call chain consistent and safe).
+    return resolver.strict_expand(
+        source_uri, locator,
+        content_hash=content_hash,
+        source_modified_at=source_modified_at,
+        mode=mode,
+        max_chars=max_chars,
+    )
 
 
 class MemoryPointResolver:

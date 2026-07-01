@@ -872,3 +872,259 @@ def test_source_registry_stat_sanitizes_resolver_errors():
     assert len(status["source_uri"]) <= 512
     assert sentinel not in serialized
     assert len(serialized) < 2000
+
+
+# ===========================================================================
+# Phase 1 regression tests: strict source expansion safety
+# ===========================================================================
+
+from qdrant_memory.sources import StrictFileSourceResolver, is_path_within_roots, strict_expand_source
+
+
+class TestStrictSourceExpansionSafety:
+    """Strict source expansion for automatic/RAPTOR callers must enforce
+    approved roots and freshness verification."""
+
+    def test_strict_rejects_file_outside_approved_roots(self, tmp_path):
+        """A file:// URI outside approved roots is rejected."""
+        approved = tmp_path / "indexed"
+        approved.mkdir()
+        outside = tmp_path / "secret_dir"
+        outside.mkdir()
+        source = outside / "secret.txt"
+        source.write_text("secret content", encoding="utf-8")
+        expected_hash = _sha256_text("secret content")
+
+        result = strict_expand_source(
+            source.as_uri(),
+            approved_roots=[str(approved)],
+            content_hash=expected_hash,
+        )
+
+        assert result["supported"] is False
+        assert result["reason"] == "outside_approved_roots"
+        assert result["text"] == ""
+
+    def test_strict_allows_file_within_approved_roots(self, tmp_path):
+        """A file:// URI within approved roots with matching hash is expanded."""
+        approved = tmp_path / "indexed"
+        approved.mkdir()
+        source = approved / "note.txt"
+        source.write_text("indexed content", encoding="utf-8")
+        expected_hash = _sha256_text("indexed content")
+
+        result = strict_expand_source(
+            source.as_uri(),
+            approved_roots=[str(approved)],
+            content_hash=expected_hash,
+            max_chars=100,
+        )
+
+        assert result["supported"] is True
+        assert result["status"] == "exists"
+        assert result["text"] == "indexed content"
+
+    def test_strict_rejects_missing_verification_metadata(self, tmp_path):
+        """Strict expansion without content_hash or source_modified_at is rejected."""
+        approved = tmp_path / "indexed"
+        approved.mkdir()
+        source = approved / "note.txt"
+        source.write_text("some content", encoding="utf-8")
+
+        result = strict_expand_source(
+            source.as_uri(),
+            approved_roots=[str(approved)],
+        )
+
+        assert result["supported"] is False
+        assert result["reason"] == "missing_verification_metadata"
+        assert result["text"] == ""
+
+    def test_strict_rejects_changed_source(self, tmp_path):
+        """Strict expansion rejects if content hash doesn't match."""
+        approved = tmp_path / "indexed"
+        approved.mkdir()
+        source = approved / "note.txt"
+        source.write_text("modified content", encoding="utf-8")
+        stale_hash = _sha256_text("original different content")
+
+        result = strict_expand_source(
+            source.as_uri(),
+            approved_roots=[str(approved)],
+            content_hash=stale_hash,
+        )
+
+        assert result["supported"] is False
+        assert result["reason"] == "source_changed"
+        assert result["text"] == ""
+
+    def test_strict_rejects_with_no_approved_roots(self, tmp_path):
+        """Strict expansion with no approved roots rejects everything."""
+        source = tmp_path / "note.txt"
+        source.write_text("content", encoding="utf-8")
+
+        result = strict_expand_source(
+            source.as_uri(),
+            approved_roots=[],
+            content_hash=_sha256_text("content"),
+        )
+
+        assert result["supported"] is False
+        assert result["reason"] == "no_approved_roots"
+
+    def test_strict_rejects_malicious_path_traversal(self, tmp_path):
+        """Symlink-based path traversal outside approved roots is rejected."""
+        approved = tmp_path / "indexed"
+        approved.mkdir()
+        target = tmp_path / "secret.txt"
+        target.write_text("secret data", encoding="utf-8")
+
+        result = strict_expand_source(
+            target.as_uri(),
+            approved_roots=[str(approved)],
+            content_hash=_sha256_text("secret data"),
+        )
+
+        assert result["supported"] is False
+        assert result["reason"] == "outside_approved_roots"
+
+    def test_legacy_expansion_still_works_without_strict_mode(self, tmp_path):
+        """Manual/explicit qdrant_memory_expand must not require approved roots."""
+        source = tmp_path / "anywhere.txt"
+        source.write_text("unrestricted content", encoding="utf-8")
+        resolver = FileSourceResolver()
+
+        # Legacy expand works without approved roots or hash
+        expanded = resolver.expand(source.as_uri(), max_chars=100)
+
+        assert expanded["supported"] is True
+        assert expanded["status"] == "exists"
+        assert expanded["text"] == "unrestricted content"
+
+    def test_is_path_within_roots_basic(self, tmp_path):
+        """Helper function correctly identifies paths within roots."""
+        root = tmp_path / "root"
+        root.mkdir()
+        inside = root / "sub" / "file.txt"
+        inside.parent.mkdir(parents=True)
+        inside.write_text("x")
+        outside = tmp_path / "outside.txt"
+        outside.write_text("x")
+
+        assert is_path_within_roots(inside, [str(root)]) is True
+        assert is_path_within_roots(outside, [str(root)]) is False
+        assert is_path_within_roots(inside, []) is False
+
+    def test_strict_resolver_stat_outside_roots(self, tmp_path):
+        """StrictFileSourceResolver.stat rejects sources outside roots."""
+        approved = tmp_path / "indexed"
+        approved.mkdir()
+        outside = tmp_path / "outside.txt"
+        outside.write_text("x", encoding="utf-8")
+
+        resolver = StrictFileSourceResolver(approved_roots=[str(approved)])
+        status = resolver.stat(outside.as_uri(), content_hash=_sha256_text("x"))
+
+        assert status["supported"] is False
+        assert status["reason"] == "outside_approved_roots"
+
+
+class TestStrictResolverDirectExpandFailClosed:
+    """P2 regression: direct StrictFileSourceResolver.expand() must fail closed
+    without verification metadata. strict_expand() with metadata must succeed."""
+
+    def test_direct_expand_without_metadata_fails_closed(self, tmp_path):
+        """Direct StrictFileSourceResolver.expand() with no content_hash or
+        source_modified_at must return unsupported with missing_verification_metadata."""
+        approved = tmp_path / "indexed"
+        approved.mkdir()
+        source = approved / "note.txt"
+        source.write_text("freshness bypass demo", encoding="utf-8")
+
+        resolver = StrictFileSourceResolver(approved_roots=[str(approved)])
+        result = resolver.expand(source.as_uri(), max_chars=100)
+
+        assert result["supported"] is False
+        assert result["status"] == "unsupported"
+        assert result["reason"] == "missing_verification_metadata"
+        assert result["text"] == ""
+
+    def test_direct_expand_outside_roots_fails_closed(self, tmp_path):
+        """Direct expand() outside approved roots returns outside_approved_roots
+        (not missing_verification_metadata, since root check comes first)."""
+        approved = tmp_path / "indexed"
+        approved.mkdir()
+        outside = tmp_path / "secret.txt"
+        outside.write_text("secret", encoding="utf-8")
+
+        resolver = StrictFileSourceResolver(approved_roots=[str(approved)])
+        result = resolver.expand(outside.as_uri(), max_chars=100)
+
+        assert result["supported"] is False
+        assert result["reason"] == "outside_approved_roots"
+        assert result["text"] == ""
+
+    def test_strict_expand_with_matching_hash_succeeds(self, tmp_path):
+        """strict_expand() with matching content_hash should expand successfully."""
+        approved = tmp_path / "indexed"
+        approved.mkdir()
+        source = approved / "note.txt"
+        source.write_text("verified content", encoding="utf-8")
+        expected_hash = _sha256_text("verified content")
+
+        resolver = StrictFileSourceResolver(approved_roots=[str(approved)])
+        result = resolver.strict_expand(
+            source.as_uri(),
+            content_hash=expected_hash,
+            max_chars=100,
+        )
+
+        assert result["supported"] is True
+        assert result["status"] == "exists"
+        assert result["text"] == "verified content"
+
+    def test_strict_expand_rejects_changed_source(self, tmp_path):
+        """strict_expand() rejects when content hash does not match."""
+        approved = tmp_path / "indexed"
+        approved.mkdir()
+        source = approved / "note.txt"
+        source.write_text("modified content", encoding="utf-8")
+        stale_hash = _sha256_text("original different content")
+
+        resolver = StrictFileSourceResolver(approved_roots=[str(approved)])
+        result = resolver.strict_expand(
+            source.as_uri(),
+            content_hash=stale_hash,
+            max_chars=100,
+        )
+
+        assert result["supported"] is False
+        assert result["reason"] == "source_changed"
+        assert result["text"] == ""
+
+    def test_strict_expand_missing_metadata_fails_closed(self, tmp_path):
+        """strict_expand() without content_hash or source_modified_at fails closed."""
+        approved = tmp_path / "indexed"
+        approved.mkdir()
+        source = approved / "note.txt"
+        source.write_text("content", encoding="utf-8")
+
+        resolver = StrictFileSourceResolver(approved_roots=[str(approved)])
+        result = resolver.strict_expand(source.as_uri(), max_chars=100)
+
+        assert result["supported"] is False
+        assert result["reason"] == "missing_verification_metadata"
+        assert result["text"] == ""
+
+    def test_legacy_resolver_expand_still_permissive(self, tmp_path):
+        """Base FileSourceResolver.expand() must still work without verification
+        metadata — backward compatibility for manual/explicit expansion."""
+        source = tmp_path / "anywhere.txt"
+        source.write_text("unrestricted content", encoding="utf-8")
+
+        resolver = FileSourceResolver()
+        result = resolver.expand(source.as_uri(), max_chars=100)
+
+        assert result["supported"] is True
+        assert result["status"] == "exists"
+        assert result["text"] == "unrestricted content"

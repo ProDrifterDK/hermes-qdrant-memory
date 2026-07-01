@@ -2,7 +2,7 @@
 
 > **For Hermes:** This is the execution backlog for extending `hermes-qdrant-memory` with graph-aware retrieval primitives while preserving the plugin's safety contract: retrieved memory is context, not authority; broad mutation stays dry-run/review-gated; source/provenance beats model inference.
 
-**Goal:** Add graph-aware retrieval, post-session improvement, feedback weighting, and schema/ontology-grounded extraction to the Hermes Qdrant memory plugin without replacing Qdrant, Vault, or HDFP.
+**Goal:** Add graph-aware retrieval, post-session improvement, feedback weighting, and schema/ontology-grounded extraction to the Hermes Qdrant memory plugin without replacing Qdrant, Vault, or LCM.
 
 **Architecture stance:** Qdrant remains the primary local associative substrate. Graph memory starts as lightweight, source-backed payload/index primitives inside this plugin, not as a mandatory external graph database. The implementation must keep explicit provenance and review gates so graph edges never become unverified truth.
 
@@ -10,7 +10,7 @@
 
 **Non-goals:**
 
-- Do not replace LCM/HDFP current-session recovery or context governance.
+- Do not replace LCM current-session recovery or context governance. HDFP is no longer an active/default architecture component; LCM is the sole active-session context engine.
 - Do not introduce blind automatic ontology/schema mutation.
 - Do not auto-promote extracted entities/edges/facts to canonical truth.
 - Do not add broad query-based deletion or mutation.

@@ -345,3 +345,39 @@ The plugin must not:
 - let cron mutate Qdrant outside the explicit guarded-auto exact-ID policy and gated apply path;
 - add literal fake secrets to docs or tests;
 - persist unredacted scanner-sensitive examples in local reports.
+
+---
+
+## 18. Phase 1 boundary hardening — RAPTOR safety (2026-06-30)
+
+Before RAPTOR persistence is added, the following safety boundaries are in place:
+
+### Graph scope propagation
+
+- `GraphMemoryRetriever` applies `profile_id`, `user_id_hash`, and `chat_id_hash` scope conditions to **all** Qdrant scroll filters: semantic seeds (via base retriever), query-matched entity alias scrolls, graph edge scrolls, entity resolution scrolls, and retrieved source points.
+- The tool handler in `__init__.py` passes provider scope (`_scope_filter_values()`) into `GraphMemoryRetriever` at construction time.
+- Retrieved source points are defensively post-filtered in-memory (`_payload_in_scope`) in case Qdrant `retrieve()` (which does not accept a filter) returns points from a different scope.
+- Debug output includes `scope_keys` for auditability without leaking identity values.
+
+### Strict source expansion for automatic callers
+
+- `StrictFileSourceResolver` and `strict_expand_source()` enforce three guarantees for automatic/RAPTOR callers:
+  1. **Approved-root check**: only `file://` URIs resolving under configured approved/indexed roots are accepted (`outside_approved_roots` rejection).
+  2. **Freshness verification mandatory**: `content_hash` or `source_modified_at` must be provided (`missing_verification_metadata` rejection).
+  3. **Changed sources rejected**: mismatched hash/mtime is rejected, not returned as-is (`source_changed` rejection).
+- Manual/explicit `qdrant_memory_expand` continues to use the base `FileSourceResolver` which remains permissive — no regression for existing behavior.
+
+### RAPTOR summary write-gate
+
+- `evaluate_raptor_summary_write()` is a dedicated gate for model-authored RAPTOR summaries:
+  - Rejects secrets, `canonical=true`, and `requires_review=false`.
+  - Routes to `draft_review` if missing `raptor_node_id`, `raptor_child_ids`, `source_hashes`, or any citation key (`derived_from`, `evidence`, `source_uri`, `citations`).
+  - Even with full provenance, RAPTOR summaries always route to `draft_review` — they are never auto-stored as canonical facts.
+
+### Recursive contamination
+
+- `clean_text_for_memory()` strips:
+  - `# Relevant Long-Term Memory` sections.
+  - `# Past Learnings` sections.
+  - Fenced `qdrant-memory` code blocks.
+- These markers prevent memory ingestion from embedding prior retrieval output as new durable memory.

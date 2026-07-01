@@ -968,7 +968,7 @@ promote repeated fact_key pattern
 - No query-based deletion or broad status mutation.
 - No assertion without provenance.
 - No self-modifying ontology.
-- No current-session replacement: LCM/HDFP still owns active-session recovery.
+- No current-session replacement: LCM still owns active-session recovery. HDFP is no longer part of the active architecture.
 
 ---
 
@@ -1029,7 +1029,7 @@ promote repeated fact_key pattern
 - Do not adopt xino-mem as a runtime dependency.
 - Do not adopt Graphiti or any graph database as a runtime dependency for the base plugin.
 - Do not require Obsidian or any note-taking app.
-- Do not replace LCM/HDFP current-session recovery.
+- Do not replace LCM current-session recovery. HDFP is no longer part of the active architecture.
 - Do not make Qdrant memories instruction-authoritative.
 - Do not add query-based deletion.
 - Do not auto-rewrite canonical facts through reconsolidation or temporal assertions.
@@ -1072,4 +1072,4 @@ The feature set is successful when:
 - Recall can prefer canonical, fresh, source-backed facts while flagging stale or review-required material.
 - Extraction candidates remain preview/approval gated and cannot bypass write safety.
 - Obsidian-specific behavior is optional and never required for public plugin users.
-- The plugin remains a Hermes MemoryProvider, not a replacement for LCM/HDFP or a full note-taking system.
+- The plugin remains a Hermes MemoryProvider, not a replacement for LCM or a full note-taking system. HDFP is no longer part of the active architecture; LCM is the sole active-session context engine.

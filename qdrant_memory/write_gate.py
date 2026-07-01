@@ -392,3 +392,87 @@ def evaluate_extraction_candidate_write(
 
 def decision_to_json(decision: WriteDecision) -> str:
     return json.dumps(decision.to_dict(), sort_keys=True)
+
+
+# ---------------------------------------------------------------------------
+# RAPTOR summary write-gate helper
+# ---------------------------------------------------------------------------
+
+_RAPTOR_REQUIRED_FIELDS = ("raptor_node_id", "raptor_child_ids", "source_hashes")
+_RAPTOR_CITATION_KEYS = ("derived_from", "evidence", "source_uri", "citations")
+
+
+def _has_raptor_citations(metadata: dict[str, Any]) -> bool:
+    """Check that metadata contains at least one form of citation/provenance."""
+    for key in _RAPTOR_CITATION_KEYS:
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+        if isinstance(value, (list, dict)) and value:
+            return True
+    return False
+
+
+def evaluate_raptor_summary_write(
+    *,
+    text: str,
+    metadata: dict[str, Any] | None = None,
+    confidence: float | None = None,
+) -> WriteDecision:
+    """Evaluate a model-authored RAPTOR summary for write acceptance.
+
+    RAPTOR summaries are always derived content — they must route to
+    review/reject unless they carry full provenance:
+
+    - Required RAPTOR node fields: ``raptor_node_id``, ``raptor_child_ids``,
+      ``source_hashes``.
+    - At least one citation/provenance key: ``derived_from``, ``evidence``,
+      ``source_uri``, or ``citations``.
+    - Must NOT set ``canonical=True`` or ``requires_review=False``.
+    - Must not contain secrets or recursive contamination markers.
+
+    Returns a :class:`WriteDecision` — never mutates anything.
+    """
+    metadata = metadata or {}
+    candidate_confidence = _clamp_confidence(confidence)
+    cleaned = clean_text_for_memory(text or "")
+
+    # Empty text
+    if not cleaned:
+        return _decision("skip", ["empty_text"], confidence=1.0, requires_review=False)
+
+    # Secret check — on text and metadata
+    if contains_secret(cleaned) or _metadata_contains_secret(metadata):
+        return _decision("reject", ["possible_secret"], confidence=1.0, requires_review=True,
+                         metadata={"raptor": True})
+
+    # Canonical must never be True for RAPTOR summaries
+    if metadata.get("canonical") is True:
+        return _decision("reject", ["raptor_summary_must_not_be_canonical"],
+                         confidence=1.0, requires_review=True,
+                         metadata={"raptor": True})
+
+    # requires_review=False must never be allowed for RAPTOR summaries
+    if metadata.get("requires_review") is False:
+        return _decision("reject", ["raptor_summary_must_not_skip_review"],
+                         confidence=1.0, requires_review=True,
+                         metadata={"raptor": True})
+
+    # Check required RAPTOR fields
+    missing_fields = [f for f in _RAPTOR_REQUIRED_FIELDS if not metadata.get(f)]
+    if missing_fields:
+        return _decision("draft_review", ["missing_raptor_provenance"],
+                         confidence=candidate_confidence, requires_review=True,
+                         metadata={"raptor": True, "missing_fields": missing_fields})
+
+    # Check for at least one citation/provenance
+    if not _has_raptor_citations(metadata):
+        return _decision("draft_review", ["missing_raptor_citations"],
+                         confidence=candidate_confidence, requires_review=True,
+                         metadata={"raptor": True})
+
+    # All checks passed — route to review for human/automation approval.
+    # RAPTOR summaries are never auto-stored as canonical facts.
+    return _decision("draft_review", ["raptor_summary_review_required"],
+                     confidence=candidate_confidence, requires_review=True,
+                     metadata={"raptor": True})

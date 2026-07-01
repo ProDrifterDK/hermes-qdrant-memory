@@ -139,6 +139,52 @@ class GraphSearchResult:
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Scope keys that partition memory by profile/user/chat.  These are the same
+# keys used by ``retriever._scope_filter``; enumerated here so the graph
+# retriever can apply identical conditions to every Qdrant scroll.
+_SCOPE_KEYS = ("profile_id", "user_id_hash", "chat_id_hash")
+
+
+def _scope_filter_conditions(scope: dict[str, str] | None) -> list[dict[str, Any]]:
+    """Return Qdrant ``must`` conditions derived from *scope*.
+
+    Only well-formed scope keys (``profile_id``, ``user_id_hash``,
+    ``chat_id_hash``) with truthy values are included.  The returned list can
+    be appended to any scroll filter's ``must`` array to enforce cross-profile
+    isolation.
+    """
+    if not scope:
+        return []
+    conditions: list[dict[str, Any]] = []
+    for key in _SCOPE_KEYS:
+        value = scope.get(key)
+        if value:
+            conditions.append({"key": key, "match": {"value": str(value)}})
+    return conditions
+
+
+def _payload_in_scope(payload: dict[str, Any], scope: dict[str, str] | None) -> bool:
+    """In-memory scope check for retrieved points that bypass scroll filters.
+
+    This is a defensive post-filter used when a Qdrant ``retrieve()`` call does
+    not accept a filter (e.g. fetching by point ID).  It verifies that the
+    point payload carries the same scope values as *scope*.
+
+    Fail-closed semantics: when *scope* has a truthy value for a key, the
+    payload must carry that exact key with a matching value.  A missing or
+    empty payload field is rejected, matching Qdrant scroll-filter behavior.
+    """
+    if not scope:
+        return True
+    for key in _SCOPE_KEYS:
+        expected = scope.get(key)
+        if expected:
+            actual = str(payload.get(key) or "")
+            if actual != str(expected):
+                return False
+    return True
+
+
 def _clamp(value: int, lo: int, hi: int) -> int:
     return max(lo, min(value, hi))
 
@@ -615,6 +661,7 @@ class GraphMemoryRetriever:
                 "query_length": len(query or ""),
                 "policy": asdict(self.expansion_policy),
                 "weights": asdict(self.rank_weights),
+                "scope_keys": [k for k, v in self.scope.items() if v],
                 "stages": {
                     "A_seed_search": stage_a,
                     "B_entity_extraction": stage_b,
@@ -719,10 +766,15 @@ class GraphMemoryRetriever:
         *,
         relation_types: list[str] | None = None,
     ) -> list[tuple[str, dict[str, Any]]]:
-        """Scroll for graph_entity points whose label/aliases match query tokens."""
+        """Scroll for graph_entity points whose label/aliases match query tokens.
+
+        Scope conditions (``profile_id`` / ``user_id_hash`` / ``chat_id_hash``)
+        are always appended to prevent cross-profile entity leakage.
+        """
         must: list[dict[str, Any]] = [
             {"key": "memory_kind", "match": {"value": "graph_entity"}},
         ]
+        must.extend(_scope_filter_conditions(self.scope))
         if entity_types:
             must.append({"key": "entity_type", "match": {"any": entity_types}})
 
@@ -772,6 +824,7 @@ class GraphMemoryRetriever:
             {"key": "memory_kind", "match": {"value": "graph_edge"}},
             {"key": key, "match": {"value": entity_id}},
         ]
+        must.extend(_scope_filter_conditions(self.scope))
         if relation_types:
             must.append({"key": "relation_type", "match": {"any": relation_types}})
 
@@ -805,10 +858,15 @@ class GraphMemoryRetriever:
 
         Returns a list of (point_id, payload) tuples for memory points that
         reference this entity.
+
+        Scope conditions are applied to both the entity scroll and as a
+        defensive post-filter on retrieved source points to prevent
+        cross-profile memory leakage.
         """
         must: list[dict[str, Any]] = [
             {"key": "entity_id", "match": {"value": entity_id}},
         ]
+        must.extend(_scope_filter_conditions(self.scope))
         if entity_types:
             must.append({"key": "entity_type", "match": {"any": entity_types}})
 
@@ -846,6 +904,11 @@ class GraphMemoryRetriever:
                 continue
             for point in points:
                 p_payload = point.get("payload") or {}
+                # Defensive: reject source points from a different scope even if
+                # the entity scroll matched — Qdrant retrieve() does not accept
+                # a filter, so we verify scope in-memory.
+                if not _payload_in_scope(p_payload, self.scope):
+                    continue
                 p_fs = valid_fact_status(p_payload.get("fact_status")) or "active"
                 if (
                     not include_fact_history
