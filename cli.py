@@ -228,6 +228,39 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     proposals_show.add_argument("proposal_id", help="Proposal ID to inspect.")
     proposals_show.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
 
+    eval_parser = subcommands.add_parser(
+        "eval",
+        help="Offline Phase 6A evaluation of captured retrieval packets. No Qdrant calls.",
+    )
+    eval_parser.set_defaults(qdrant_subcommand="eval")
+    eval_parser.add_argument(
+        "--cases",
+        required=True,
+        help="Path to eval-cases JSONL artifact (case_id, query, expected_*, forbidden_*).",
+    )
+    eval_parser.add_argument(
+        "--runs",
+        required=True,
+        help="Path to eval-runs JSONL artifact (case_id, variant, packet, latency_ms, error).",
+    )
+    eval_parser.add_argument(
+        "--top-k",
+        type=_positive_int,
+        default=5,
+        help="Per-lane top-k cutoff for hit metrics. Default: 5.",
+    )
+    eval_parser.add_argument(
+        "--latency-budget-ms",
+        type=int,
+        default=750,
+        help="Latency budget in ms; rows above this fail the latency_budget check. Default: 750.",
+    )
+    eval_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON output (default: human summary).",
+    )
+
     learning = subcommands.add_parser("learning", help="Search or preview procedural learnings.")
     learning_subcommands = learning.add_subparsers(dest="learning_subcommand", required=True)
 

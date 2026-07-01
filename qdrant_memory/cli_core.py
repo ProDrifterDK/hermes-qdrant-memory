@@ -17,6 +17,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from qdrant_memory.guarded_auto import GuardedAutoPolicy, apply_guarded_auto
+from qdrant_memory import evaluation as _evaluation
 
 
 class CliUsageError(ValueError):
@@ -1835,6 +1836,51 @@ def _print_cli_error(message: str, args: Namespace, stderr) -> None:
         print(f"Error: {message}", file=stderr)
 
 
+def _execute_eval_command(args: Namespace, stdout) -> int:
+    """Run the offline Phase 6A evaluator over local JSONL artifacts.
+
+    This handler is intentionally local-only: it does not import
+    :class:`QdrantMemoryProvider`, does not touch any Qdrant client,
+    and never mutates memory. All input is read from disk via
+    :mod:`qdrant_memory.evaluation`. Errors from the evaluator
+    surface as a single-line user-facing message and a nonzero exit
+    code so callers can detect failure.
+    """
+
+    cases_path = str(getattr(args, "cases", "") or "")
+    runs_path = str(getattr(args, "runs", "") or "")
+    if not cases_path:
+        raise CliUsageError("--cases is required")
+    if not runs_path:
+        raise CliUsageError("--runs is required")
+    top_k = int(getattr(args, "top_k", _evaluation.DEFAULT_TOP_K) or _evaluation.DEFAULT_TOP_K)
+    latency_budget_ms_raw = getattr(args, "latency_budget_ms", _evaluation.DEFAULT_LATENCY_BUDGET_MS)
+    if latency_budget_ms_raw is None or int(latency_budget_ms_raw) <= 0:
+        latency_budget_ms: float | None = None
+    else:
+        latency_budget_ms = float(int(latency_budget_ms_raw))
+
+    try:
+        report = _evaluation.evaluate(
+            cases_path,
+            runs_path,
+            top_k=top_k,
+            latency_budget_ms=latency_budget_ms,
+        )
+    except _evaluation.EvaluationError as exc:
+        # Treat every evaluator-side validation problem as a CLI
+        # usage error so :func:`execute_command` prints a clean
+        # single-line error envelope (JSON when --json is on) and
+        # returns a nonzero exit code. The original message
+        # already carries the offending line number.
+        raise CliUsageError(str(exc)) from exc
+    if _json_flag(args):
+        print(json.dumps(report, sort_keys=True), file=stdout)
+    else:
+        stdout.write(_evaluation._format_human_summary(report))
+    return 0
+
+
 def _execute_local_command(args: Namespace, stdout) -> int | None:
     inspection_exit = _execute_inspection_command(args, stdout)
     if inspection_exit is not None:
@@ -1846,6 +1892,8 @@ def _execute_local_command(args: Namespace, stdout) -> int | None:
     if subcommand == "config" and getattr(args, "config_subcommand", None) == "show":
         _print_payload(_redacted_config(), args, stdout, _format_config_summary)
         return 0
+    if subcommand == "eval":
+        return _execute_eval_command(args, stdout)
     if subcommand == "watcher":
         watcher_subcommand = getattr(args, "watcher_subcommand", None)
         if watcher_subcommand == "status":
@@ -1881,6 +1929,13 @@ def build_tool_call(args: Namespace) -> tuple[str, dict[str, Any]]:
 
     if subcommand == "config":
         raise CliUsageError("unsupported qdrant config command")
+
+    if subcommand == "eval":
+        # The eval subcommand is local-only by design; it must not
+        # fall through to the provider/tool dispatch path. Surface
+        # the same CliUsageError that ``_execute_local_command`` would
+        # have already handled so callers get a uniform error shape.
+        raise CliUsageError("eval is handled by _execute_local_command")
 
     if subcommand == "store":
         _require_live_approval(args)

@@ -1,5 +1,6 @@
 import argparse
 import importlib.util
+import io
 import json
 import shutil
 import subprocess
@@ -491,6 +492,391 @@ def test_execute_command_reports_usage_errors_without_provider(capsys):
     error = json.loads(capsys.readouterr().err)
     assert error["error"] is True
     assert "--approve is required" in error["message"]
+
+
+def _write_eval_fixtures(tmp_path):
+    """Write small fake eval fixtures to disk for CLI tests.
+
+    The fixtures are intentionally short and fake (no secret-shaped
+    values, no real memory content) so the tests can run without
+    touching any live system.
+    """
+
+    cases_path = tmp_path / "cases.jsonl"
+    runs_path = tmp_path / "runs.jsonl"
+    cases_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "case_id": "c1",
+                        "query": "where is the raptor retrieve contract",
+                        "expected_file_paths": ["docs/RAPTOR.md"],
+                        "expected_terms": ["phase 5"],
+                        "forbidden_terms": ["never-emit-this"],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "case_id": "c2",
+                        "query": "how does the apply gate work",
+                        "expected_terms": ["apply"],
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    runs_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "case_id": "c1",
+                        "variant": "hybrid",
+                        "latency_ms": 220,
+                        "packet": {
+                            "results": {
+                                "exact_hits": [
+                                    {
+                                        "point_id": "p1",
+                                        "text": "phase 5 hybrid details",
+                                        "file_path": "docs/RAPTOR.md",
+                                        "score": 0.9,
+                                    }
+                                ],
+                                "summaries": [],
+                                "cited_leaves": [],
+                                "graph_relations": [],
+                            }
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "case_id": "c1",
+                        "variant": "raptor-only",
+                        "latency_ms": 410,
+                        "packet": {
+                            "results": {
+                                "summaries": [
+                                    {
+                                        "point_id": "s1",
+                                        "text": "raptor summary with never-emit-this",
+                                    }
+                                ],
+                                "exact_hits": [],
+                                "cited_leaves": [],
+                                "graph_relations": [],
+                            }
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "case_id": "c2",
+                        "variant": "hybrid",
+                        "error": "retrieval timed out",
+                        "packet": {"results": {}},
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return cases_path, runs_path
+
+
+def test_register_cli_adds_eval_subcommand_with_local_only_defaults():
+    parser = _parser()
+
+    args = parser.parse_args(
+        [
+            "qdrant",
+            "eval",
+            "--cases",
+            "cases.jsonl",
+            "--runs",
+            "runs.jsonl",
+        ]
+    )
+    assert args.qdrant_subcommand == "eval"
+    assert args.cases == "cases.jsonl"
+    assert args.runs == "runs.jsonl"
+    assert args.top_k == 5
+    assert args.latency_budget_ms == 750
+    assert getattr(args, "json", False) is False
+
+    json_args = parser.parse_args(
+        [
+            "qdrant",
+            "eval",
+            "--cases",
+            "cases.jsonl",
+            "--runs",
+            "runs.jsonl",
+            "--top-k",
+            "3",
+            "--latency-budget-ms",
+            "1200",
+            "--json",
+        ]
+    )
+    assert json_args.top_k == 3
+    assert json_args.latency_budget_ms == 1200
+    assert json_args.json is True
+
+
+def test_eval_local_command_does_not_instantiate_provider(
+    tmp_path, capsys,
+):
+    from qdrant_memory.cli_core import execute_command
+
+    cases_path, runs_path = _write_eval_fixtures(tmp_path)
+    parser = _parser()
+    args = parser.parse_args(
+        [
+            "qdrant",
+            "eval",
+            "--cases",
+            str(cases_path),
+            "--runs",
+            str(runs_path),
+            "--json",
+        ]
+    )
+
+    exit_code = execute_command(
+        args,
+        provider_factory=lambda: pytest.fail("provider should not be constructed"),
+    )
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    # stdout must be valid JSON, not human output
+    report = json.loads(out)
+    assert report["summary"]["totals"]["case_count"] == 2
+    assert report["summary"]["totals"]["run_count"] == 3
+    assert report["summary"]["totals"]["scored_count"] == 3
+    hybrid = report["summary"]["variants"]["hybrid"]
+    raptor = report["summary"]["variants"]["raptor-only"]
+    assert hybrid["hit_at_k_rate"] == 100.0
+    assert hybrid["wrong_memory_rate"] == 0.0
+    assert hybrid["errored_count"] == 1
+    assert raptor["wrong_memory_rate"] == 100.0
+    # No raw packet dumps and no raw query text from retrieval
+    # packets must leak into stdout. Forbidden labels (the strings
+    # the operator intentionally declared) are expected to appear
+    # inside ``wrong_reasons`` because that is the diagnostic that
+    # explains the wrong_memory flag; we do NOT assert they are
+    # absent.
+    assert "packet" not in out
+    # The benign errored row's payload is the sentinel, not the raw
+    # captured error string (Phase 6A fix3 P2-2 contract).
+    err_rows = [row for row in report["rows"] if row.get("errored")]
+    assert err_rows, "expected one errored row in the report"
+    assert err_rows[0]["error"] == "<redacted>"
+    assert "retrieval timed out" not in out
+
+
+def test_eval_local_command_default_json_does_not_leak_raw_error_text(
+    tmp_path, capsys,
+):
+    """Phase 6A fix3 P2-2: a captured ``error`` string that contains
+    a raw retrieval query, packet body snippet, or Qdrant endpoint
+    detail must NOT appear anywhere in the default ``--json`` report.
+    The errored row is still flagged (errored_count, error_present,
+    error_redacted) but its payload is the constant sentinel, not the
+    raw text.
+    """
+
+    import json as _json
+
+    from qdrant_memory.cli_core import execute_command
+
+    cases_path = tmp_path / "cases.jsonl"
+    runs_path = tmp_path / "runs.jsonl"
+    cases_path.write_text(
+        _json.dumps({"case_id": "c1", "query": "q"}) + "\n",
+        encoding="utf-8",
+    )
+    raw_error = (
+        "query=what is alan private packet=SECRET_SNIPPET "
+        "endpoint=http://qdrant.internal:6333"
+    )
+    runs_path.write_text(
+        _json.dumps(
+            {
+                "case_id": "c1",
+                "variant": "hybrid",
+                "error": raw_error,
+                "packet": {"results": {}},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    parser = _parser()
+    args = parser.parse_args(
+        [
+            "qdrant",
+            "eval",
+            "--cases",
+            str(cases_path),
+            "--runs",
+            str(runs_path),
+            "--json",
+        ]
+    )
+    exit_code = execute_command(
+        args,
+        provider_factory=lambda: pytest.fail("provider should not be constructed"),
+    )
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    report = _json.loads(out)
+    # ``errored_count`` lives on each variant aggregate, not at totals.
+    variants = report["summary"]["variants"]
+    total_errored = sum(v.get("errored_count", 0) for v in variants.values())
+    assert total_errored == 1
+    err_row = report["rows"][0]
+    assert err_row["errored"] is True
+    assert err_row["error_present"] is True
+    assert err_row["error_redacted"] is True
+    assert err_row["error"] == "<redacted>"
+    # And no raw fragment may survive anywhere in the JSON dump.
+    for needle in (
+        "what is alan private",
+        "SECRET_SNIPPET",
+        "http://qdrant.internal:6333",
+        raw_error,
+    ):
+        assert needle not in out, f"raw error fragment leaked: {needle!r}"
+
+
+def test_eval_local_command_human_summary_is_not_json(
+    tmp_path, capsys,
+):
+    from qdrant_memory.cli_core import execute_command
+
+    cases_path, runs_path = _write_eval_fixtures(tmp_path)
+    parser = _parser()
+    args = parser.parse_args(
+        [
+            "qdrant",
+            "eval",
+            "--cases",
+            str(cases_path),
+            "--runs",
+            str(runs_path),
+        ]
+    )
+
+    exit_code = execute_command(
+        args,
+        provider_factory=lambda: pytest.fail("provider should not be constructed"),
+    )
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Phase 6A offline eval report" in out
+    assert "variants:" in out
+    # Without --json the output is human summary, so it must NOT
+    # be valid JSON.
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(out)
+
+
+def test_eval_local_command_reports_invalid_jsonl_as_user_facing_error(
+    tmp_path, capsys,
+):
+    from qdrant_memory.cli_core import execute_command
+
+    cases_path = tmp_path / "cases.jsonl"
+    runs_path = tmp_path / "runs.jsonl"
+    cases_path.write_text(
+        json.dumps({"case_id": "c1", "query": "q"}) + "\n", encoding="utf-8",
+    )
+    runs_path.write_text(
+        json.dumps({"case_id": "c1", "variant": "hybrid", "packet": {}})
+        + "\n"
+        + "{not-json\n",
+        encoding="utf-8",
+    )
+    parser = _parser()
+    args = parser.parse_args(
+        [
+            "qdrant",
+            "eval",
+            "--cases",
+            str(cases_path),
+            "--runs",
+            str(runs_path),
+            "--json",
+        ]
+    )
+
+    exit_code = execute_command(
+        args,
+        provider_factory=lambda: pytest.fail("provider should not be constructed"),
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    # JSON error envelope on stderr when --json is on.
+    error = json.loads(captured.err)
+    assert error["error"] is True
+    assert "line 2" in error["message"]
+
+
+def test_eval_local_command_missing_required_args_is_usage_error():
+    """argparse must reject ``hermes qdrant eval`` without --cases/--runs.
+
+    The required=True argparse flag fires before the local command
+    is invoked, so a missing --cases or --runs surfaces as a clean
+    SystemExit(2) with the standard argparse usage error. The local
+    command itself also defensively raises :class:`CliUsageError`
+    if a caller bypasses argparse, but the parser is the
+    authoritative gate.
+    """
+
+    parser = _parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["qdrant", "eval"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["qdrant", "eval", "--runs", "runs.jsonl"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["qdrant", "eval", "--cases", "cases.jsonl"])
+
+    from qdrant_memory.cli_core import CliUsageError, _execute_eval_command
+
+    args = argparse.Namespace(
+        cases="",
+        runs="runs.jsonl",
+        top_k=5,
+        latency_budget_ms=750,
+    )
+    with pytest.raises(CliUsageError, match="--cases is required"):
+        _execute_eval_command(args, stdout=io.StringIO())
+
+
+def test_eval_blocked_in_provider_dispatch():
+    from qdrant_memory.cli_core import CliUsageError, build_tool_call
+
+    parser = _parser()
+    args = parser.parse_args(
+        [
+            "qdrant",
+            "eval",
+            "--cases",
+            "cases.jsonl",
+            "--runs",
+            "runs.jsonl",
+        ]
+    )
+    with pytest.raises(CliUsageError, match="handled by"):
+        build_tool_call(args)
 
 
 def test_cli_module_loads_when_plugin_dir_is_not_on_sys_path(tmp_path):
