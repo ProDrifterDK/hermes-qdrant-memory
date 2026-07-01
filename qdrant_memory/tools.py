@@ -419,6 +419,70 @@ IMPROVE_APPLY_SCHEMA = {
     },
 }
 
+RAPTOR_APPLY_SCHEMA = {
+    "name": "qdrant_memory_raptor_apply",
+    "description": (
+        "Preview or apply a RAPTOR summary manifest by exact report_id, build_id, "
+        "and manifest_digest. Dry-run defaults to true; live apply requires "
+        "approve=true and a prior dry-run preview. Explicit-ID only — no "
+        "delete-by-filter or broad update."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "report_id": {
+                "type": "string",
+                "description": "Exact RAPTOR report id (raptor-<12hex>).",
+            },
+            "build_id": {
+                "type": "string",
+                "description": "Exact build_id from the manifest (raptor-build-<hex>).",
+            },
+            "manifest_digest": {
+                "type": "string",
+                "description": "Exact manifest digest (sha256 hex) from the manifest.",
+            },
+            "dry_run": {
+                "type": "boolean",
+                "description": "When true, return the apply plan without mutating Qdrant. Defaults to true.",
+            },
+            "approve": {
+                "type": "boolean",
+                "description": "Required true when dry_run=false.",
+            },
+        },
+        "required": ["report_id", "build_id", "manifest_digest"],
+        "additionalProperties": False,
+    },
+}
+
+RAPTOR_STATUS_SCHEMA = {
+    "name": "qdrant_memory_raptor_status",
+    "description": (
+        "Read-only RAPTOR tree/node status. Reports leaf safety and parent "
+        "stale/excluded assessment conservatively. Never mutates Qdrant."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "report_id": {
+                "type": "string",
+                "description": "Exact RAPTOR report id (raptor-<12hex>).",
+            },
+            "build_id": {
+                "type": "string",
+                "description": "Exact build_id from the manifest (raptor-build-<hex>).",
+            },
+            "manifest_digest": {
+                "type": "string",
+                "description": "Exact manifest digest (sha256 hex) from the manifest.",
+            },
+        },
+        "required": ["report_id", "build_id", "manifest_digest"],
+        "additionalProperties": False,
+    },
+}
+
 TOOL_SCHEMAS = [
     STATUS_SCHEMA,
     STORE_SCHEMA,
@@ -441,4 +505,6 @@ TOOL_SCHEMAS = [
     GRAPH_SEARCH_SCHEMA,
     IMPROVE_PREVIEW_SCHEMA,
     IMPROVE_APPLY_SCHEMA,
+    RAPTOR_APPLY_SCHEMA,
+    RAPTOR_STATUS_SCHEMA,
 ]

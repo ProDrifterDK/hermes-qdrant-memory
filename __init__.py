@@ -10,7 +10,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 # User plugins may be imported outside Hermes' package context during tests.
 _HERMES_AGENT = Path.home() / ".hermes" / "hermes-agent"
@@ -77,7 +77,18 @@ from qdrant_memory.improve import (
     persist_improve_report,
     record_candidate_applied,
 )
-from qdrant_memory.write_gate import evaluate_write_candidate
+from qdrant_memory.raptor.apply import (
+    RaptorApplyError,
+    assess_leaf_safety,
+    assess_parent_status,
+    extract_manifest,
+    is_already_applied,
+    load_manifest_report,
+    persist_apply_record,
+    plan_apply,
+    validate_manifest,
+)
+from qdrant_memory.write_gate import evaluate_raptor_summary_write, evaluate_write_candidate
 from qdrant_memory.tools import TOOL_SCHEMAS
 from qdrant_memory.writer import ConversationWriter
 
@@ -263,6 +274,8 @@ class QdrantMemoryProvider(MemoryProvider):
         self._reviewed_extraction_candidate_ids: set[str] = set()
         self._pending_improve_reports: dict[str, dict[str, Any]] = {}
         self._reviewed_improve_candidate_keys: set[str] = set()
+        self._reviewed_raptor_keys: set[str] = set()
+        self._pending_raptor_manifests: dict[str, dict[str, Any]] = {}
 
     @property
     def name(self) -> str:
@@ -443,6 +456,8 @@ class QdrantMemoryProvider(MemoryProvider):
             self._reviewed_extraction_candidate_ids.clear()
             self._pending_improve_reports.clear()
             self._reviewed_improve_candidate_keys.clear()
+            self._reviewed_raptor_keys.clear()
+            self._pending_raptor_manifests.clear()
 
     def _auto_learning_enabled(self) -> bool:
         return bool(self._config.get("learning_enabled", True)) and bool(self._config.get("learning_auto_extract_enabled", False))
@@ -2015,6 +2030,509 @@ class QdrantMemoryProvider(MemoryProvider):
         except Exception as exc:
             return _json_error(f"Improve apply failed: {exc}")
 
+    def _load_raptor_manifest(self, report_id: str) -> dict[str, Any] | None:
+        """Load a RAPTOR manifest wrapper from memory or persisted artifact."""
+        wrapper = self._pending_raptor_manifests.get(report_id)
+        if wrapper:
+            return wrapper
+        wrapper = load_manifest_report(
+            report_id,
+            hermes_home=self._hermes_home,
+            configured_dir=str(self._config.get("raptor_artifact_dir") or ""),
+        )
+        if wrapper:
+            self._pending_raptor_manifests[report_id] = wrapper
+        return wrapper
+
+    def _tool_raptor_apply(self, args: dict) -> str:
+        """Preview or apply a RAPTOR summary manifest by exact IDs."""
+        try:
+            raw_report_id = str(args.get("report_id") or "")
+            if not raw_report_id:
+                return _json_error("report_id is required")
+            if raw_report_id != raw_report_id.strip():
+                return _json_error("report_id must match canonical format raptor-<12hex>")
+            report_id = raw_report_id.strip()
+            build_id = str(args.get("build_id") or "")
+            if not build_id:
+                return _json_error("build_id is required")
+            manifest_digest = str(args.get("manifest_digest") or "")
+            if not manifest_digest:
+                return _json_error("manifest_digest is required")
+
+            dry_run = parse_bool_arg(args.get("dry_run"), default=True)
+            approve = parse_bool_arg(args.get("approve"), default=False)
+
+            # Load manifest wrapper (from memory or disk)
+            wrapper = self._load_raptor_manifest(report_id)
+            if not wrapper:
+                return _json_error(f"Unknown RAPTOR report: {report_id}")
+            manifest = extract_manifest(wrapper)
+
+            # Build the review key — must be set by a prior dry-run
+            review_key = f"{report_id}:{build_id}:{manifest_digest}"
+
+            # Produce the dry-run plan (validates manifest, digests, payloads)
+            try:
+                plan = plan_apply(
+                    manifest,
+                    report_id=report_id,
+                    build_id=build_id,
+                    manifest_digest=manifest_digest,
+                )
+            except RaptorApplyError as exc:
+                return _json_error(f"RAPTOR apply validation failed: {exc}")
+
+            # Dry-run path
+            if dry_run:
+                self._reviewed_raptor_keys.add(review_key)
+                return json.dumps(plan)
+
+            # Live apply path
+            if not approve:
+                return _json_error("approve=true is required when dry_run=false")
+            if review_key not in self._reviewed_raptor_keys:
+                return _json_error("dry-run preview is required before live RAPTOR apply")
+
+            # Idempotency: check if already applied
+            #
+            # Strict match: the persisted apply record must match the exact
+            # report_id / build_id / manifest_digest / expected node IDs of
+            # the manifest we are about to apply. Any malformed or
+            # mismatched record fails closed with RaptorApplyError.
+            expected_node_ids = {
+                str(p.get("raptor_node_id") or "")
+                for p in (manifest.get("candidate_node_payloads") or [])
+            }
+            expected_node_ids.discard("")
+            try:
+                existing_record = is_already_applied(
+                    report_id,
+                    hermes_home=self._hermes_home,
+                    configured_dir=str(self._config.get("raptor_artifact_dir") or ""),
+                    build_id=build_id,
+                    manifest_digest=manifest_digest,
+                    expected_node_ids=expected_node_ids,
+                )
+            except RaptorApplyError as exc:
+                return _json_error(
+                    f"Refusing live RAPTOR apply: persisted apply record is "
+                    f"malformed or does not match this manifest ({exc})"
+                )
+            if existing_record is not None:
+                self._reviewed_raptor_keys.discard(review_key)
+                return json.dumps({
+                    "dry_run": False,
+                    "applied": True,
+                    "already_applied": True,
+                    "report_id": report_id,
+                    "build_id": build_id,
+                    "manifest_digest": manifest_digest,
+                    "applied_node_ids": existing_record.get("applied_node_ids") or [],
+                    "application_record": existing_record,
+                })
+
+            if not self._qdrant or not self._embeddings:
+                return _json_error("Qdrant memory provider is not initialized")
+
+            payloads = manifest.get("candidate_node_payloads") or []
+            collection_name = self._config["collection_name"]
+
+            # Check all target node IDs — retrieve existing points
+            node_ids_to_check = [str(p.get("raptor_node_id") or "") for p in payloads]
+            existing_node_ids: set[str] = set()
+            conflicting_node_ids: set[str] = set()
+
+            try:
+                existing_points = self._qdrant.retrieve(
+                    collection_name, node_ids_to_check, with_payload=True
+                )
+            except Exception:
+                return _json_error(
+                    "Unable to verify target node absence; refusing to upsert "
+                    "(Qdrant retrieval error)"
+                )
+
+            for ep in (existing_points or []):
+                if isinstance(ep, dict):
+                    ep_id = str(ep.get("id") or "")
+                    ep_raw_payload = ep.get("payload")
+                    ep_payload: dict[str, Any] = ep_raw_payload if isinstance(ep_raw_payload, dict) else {}
+                    # Check if it's an exact replay (same report/build/digest)
+                    ep_report = str(ep_payload.get("raptor_report_id") or "")
+                    ep_build = str(ep_payload.get("raptor_build_id") or "")
+                    ep_digest = str(ep_payload.get("raptor_manifest_digest") or "")
+                    if ep_report == report_id and ep_build == build_id and ep_digest == manifest_digest:
+                        existing_node_ids.add(ep_id)
+                    else:
+                        conflicting_node_ids.add(ep_id)
+
+            if conflicting_node_ids:
+                return _json_error(
+                    f"Target node(s) already exist with different RAPTOR metadata; "
+                    f"refusing to overwrite: {sorted(conflicting_node_ids)}"
+                )
+
+            # Determine which nodes to actually upsert
+            would_upsert_ids = plan.get("would_upsert_ids") or []
+            # Only upsert nodes not already present with identical metadata
+            to_upsert_ids = [nid for nid in would_upsert_ids if nid not in existing_node_ids]
+
+            if not to_upsert_ids:
+                # All nodes already present — idempotent
+                applied_ids = sorted(existing_node_ids | set(plan.get("already_present_ids") or []))
+                record = persist_apply_record(
+                    report_id=report_id,
+                    build_id=build_id,
+                    manifest_digest=manifest_digest,
+                    applied_node_ids=applied_ids,
+                    hermes_home=self._hermes_home,
+                    configured_dir=str(self._config.get("raptor_artifact_dir") or ""),
+                    profile_id=self._profile_id,
+                )
+                self._reviewed_raptor_keys.discard(review_key)
+                return json.dumps({
+                    "dry_run": False,
+                    "applied": True,
+                    "already_applied": True,
+                    "report_id": report_id,
+                    "build_id": build_id,
+                    "manifest_digest": manifest_digest,
+                    "applied_node_ids": applied_ids,
+                    "application_id": record.get("application_id"),
+                    "application_artifact": record.get("artifact_path"),
+                })
+
+            # Enrich payloads with provider metadata and re-validate through write gate
+            applied_node_ids: list[str] = []
+            raptor_applied_at = datetime.utcnow().isoformat() + "Z"
+            for payload in payloads:
+                node_id = str(payload.get("raptor_node_id") or "")
+                if node_id not in to_upsert_ids:
+                    continue
+
+                enriched = dict(payload)
+                enriched.update({
+                    "profile_id": self._profile_id,
+                    "platform": self._platform,
+                    "session_id": self._session_id,
+                    "user_id_hash": self._user_id_hash,
+                    "chat_id_hash": self._chat_id_hash,
+                    "model": self._config.get("embedding_model", ""),
+                    "provider": "qdrant",
+                    "raptor_report_id": report_id,
+                    "raptor_manifest_digest": manifest_digest,
+                    "raptor_applied_at": raptor_applied_at,
+                })
+
+                # Re-run write gate after enrichment
+                enriched_decision = evaluate_raptor_summary_write(
+                    text=str(enriched.get("text") or ""),
+                    metadata=enriched,
+                    confidence=1.0,
+                )
+                if enriched_decision.decision == "reject":
+                    reasons = ", ".join(enriched_decision.reasons)
+                    return _json_error(
+                        f"write gate rejected RAPTOR node {node_id} after enrichment: {reasons}"
+                    )
+
+                text = str(enriched.get("text") or "")
+                vector = self._embeddings.embed_document(text)
+                self._qdrant.upsert(
+                    collection_name,
+                    [{"id": node_id, "vector": vector, "payload": enriched}],
+                )
+                applied_node_ids.append(node_id)
+
+            # Persist audit record. The full now-applied manifest node set
+            # is the union of nodes that already existed with matching
+            # RAPTOR metadata and the nodes we just upserted; persisting
+            # only the newly upserted subset would write a record that
+            # fails the strict exact-match idempotency loader on the
+            # next repeat apply. ``upserted_count`` stays as the count
+            # of nodes newly upserted in this invocation.
+            applied_node_ids_all = sorted(
+                set(applied_node_ids) | existing_node_ids
+            )
+            record = persist_apply_record(
+                report_id=report_id,
+                build_id=build_id,
+                manifest_digest=manifest_digest,
+                applied_node_ids=applied_node_ids_all,
+                hermes_home=self._hermes_home,
+                configured_dir=str(self._config.get("raptor_artifact_dir") or ""),
+                profile_id=self._profile_id,
+            )
+
+            self._reviewed_raptor_keys.discard(review_key)
+            return json.dumps({
+                "dry_run": False,
+                "applied": True,
+                "already_applied": False,
+                "report_id": report_id,
+                "build_id": build_id,
+                "manifest_digest": manifest_digest,
+                "applied_node_ids": applied_node_ids_all,
+                "upserted_count": len(applied_node_ids),
+                "application_id": record.get("application_id"),
+                "application_artifact": record.get("artifact_path"),
+                "collection_name": collection_name,
+            })
+        except Exception as exc:
+            return _json_error(f"RAPTOR apply failed: {exc}")
+
+    def _tool_raptor_status(self, args: dict) -> str:
+        """Read-only RAPTOR tree/node status — never mutates Qdrant."""
+        try:
+            raw_report_id = str(args.get("report_id") or "")
+            if not raw_report_id:
+                return _json_error("report_id is required")
+            report_id = raw_report_id.strip()
+            build_id = str(args.get("build_id") or "")
+            if not build_id:
+                return _json_error("build_id is required")
+            manifest_digest = str(args.get("manifest_digest") or "")
+            if not manifest_digest:
+                return _json_error("manifest_digest is required")
+
+            wrapper = self._load_raptor_manifest(report_id)
+            if not wrapper:
+                return _json_error(f"Unknown RAPTOR report: {report_id}")
+            manifest = extract_manifest(wrapper)
+
+            # Validate manifest integrity
+            try:
+                validate_manifest(
+                    manifest,
+                    report_id=report_id,
+                    build_id=build_id,
+                    manifest_digest=manifest_digest,
+                )
+            except RaptorApplyError as exc:
+                return _json_error(f"RAPTOR status validation failed: {exc}")
+
+            payloads = manifest.get("candidate_node_payloads") or []
+
+            # Collect every child leaf ID referenced by the manifest, both
+            # explicit ``raptor_child_ids`` and the ``raptor_summary_of``
+            # summarization list. Each child ID must be retrieved with its
+            # payload so we can assess the actual leaf state, not the
+            # candidate parent payload's own metadata.
+            all_child_ids: set[str] = set()
+            for payload in payloads:
+                if not isinstance(payload, Mapping):
+                    continue
+                for cid in (payload.get("raptor_child_ids") or []):
+                    cid_s = str(cid or "")
+                    if cid_s:
+                        all_child_ids.add(cid_s)
+                for sid in (payload.get("raptor_summary_of") or []):
+                    sid_s = str(sid or "")
+                    if sid_s:
+                        all_child_ids.add(sid_s)
+
+            # If Qdrant is available, check which parent nodes exist and
+            # fetch the child leaf payloads so we can assess the real state.
+            existing_node_ids: set[str] = set()
+            child_retrieval_error: str = ""
+            child_payloads_by_id: dict[str, dict[str, Any]] = {}
+            missing_child_ids: set[str] = set()  # populated below after retrieval
+            if self._qdrant:
+                node_ids = [str(p.get("raptor_node_id") or "") for p in payloads]
+                try:
+                    existing_points = self._qdrant.retrieve(
+                        self._config["collection_name"], node_ids, with_payload=True
+                    )
+                    for ep in (existing_points or []):
+                        if isinstance(ep, dict):
+                            existing_node_ids.add(str(ep.get("id") or ""))
+                except Exception as exc:
+                    # Retrieval failure for parent existence check is
+                    # conservative: report it as an error and treat every
+                    # node as missing rather than silently falling back.
+                    child_retrieval_error = (
+                        f"failed to retrieve parent node existence from Qdrant: {exc}"
+                    )
+
+                # Now retrieve the actual child leaves.
+                child_retrieval_error_detail = ""
+                if all_child_ids:
+                    try:
+                        child_points = self._qdrant.retrieve(
+                            self._config["collection_name"],
+                            sorted(all_child_ids),
+                            with_payload=True,
+                        )
+                        for cp in (child_points or []):
+                            if isinstance(cp, dict):
+                                cp_id = str(cp.get("id") or "")
+                                cp_payload = cp.get("payload")
+                                if cp_id and isinstance(cp_payload, dict):
+                                    child_payloads_by_id[cp_id] = dict(cp_payload)
+                    except Exception as exc:
+                        child_retrieval_error_detail = (
+                            f"failed to retrieve child leaf payloads from Qdrant: {exc}"
+                        )
+                if child_retrieval_error_detail:
+                    child_retrieval_error = (
+                        child_retrieval_error + "; " + child_retrieval_error_detail
+                        if child_retrieval_error else child_retrieval_error_detail
+                    )
+
+            missing_child_ids = {
+                cid for cid in all_child_ids if cid not in child_payloads_by_id
+            }
+
+            # Assess leaf safety and parent status for each candidate
+            # parent node, using the ACTUAL retrieved child leaf payloads.
+            node_statuses: list[dict[str, Any]] = []
+            for payload in payloads:
+                if not isinstance(payload, Mapping):
+                    # Defensive: a non-dict candidate is itself unsafe.
+                    node_statuses.append({
+                        "raptor_node_id": "",
+                        "raptor_level": None,
+                        "child_ids": [],
+                        "exists_in_qdrant": False,
+                        "leaf_safety": {"safe": False, "reasons": ["payload_not_dict"]},
+                        "parent_status": "stale",
+                        "child_status_error": "",
+                    })
+                    continue
+
+                node_id = str(payload.get("raptor_node_id") or "")
+                child_ids = payload.get("raptor_child_ids") or []
+                summary_of = payload.get("raptor_summary_of") or []
+                # Leaf safety on the candidate's own metadata (for the
+                # self-row; this is independent from the parent's
+                # leaf-safety aggregation below).
+                leaf_safety = assess_leaf_safety(payload)
+
+                # Build the ordered list of actual child leaf payloads
+                # referenced by this parent. We use both raptor_child_ids
+                # and raptor_summary_of, deduplicated, in stable order.
+                seen_cids: set[str] = set()
+                ordered_cids: list[str] = []
+                for cid in list(child_ids) + list(summary_of):
+                    cid_s = str(cid or "")
+                    if cid_s and cid_s not in seen_cids:
+                        seen_cids.add(cid_s)
+                        ordered_cids.append(cid_s)
+
+                actual_child_payloads: list[dict[str, Any]] = []
+                missing_for_parent: list[str] = []
+                for cid in ordered_cids:
+                    if cid in child_payloads_by_id:
+                        actual_child_payloads.append(child_payloads_by_id[cid])
+                    else:
+                        missing_for_parent.append(cid)
+
+                # Conservative handling: any missing child, retrieval
+                # error, or inaccessible child payload must make the
+                # parent non-active. We assemble the parent assessment
+                # by running assess_parent_status on the payloads we DO
+                # have, then overriding the result if any signal above
+                # indicates the tree is incomplete.
+                child_status_error = ""
+                if missing_for_parent:
+                    child_status_error = (
+                        f"{len(missing_for_parent)} child leaf(ves) missing from Qdrant"
+                    )
+                if child_retrieval_error:
+                    child_status_error = (
+                        child_status_error + "; " + child_retrieval_error
+                        if child_status_error else child_retrieval_error
+                    )
+
+                parent_assessment = assess_parent_status(actual_child_payloads)
+
+                # If we expected children but couldn't verify them, force
+                # the parent to a conservative non-active state. Prefer
+                # the more severe status already computed, but never
+                # override an "excluded" verdict to a milder one.
+                if missing_for_parent or child_retrieval_error:
+                    current = parent_assessment.get("parent_status", "active")
+                    if current == "active":
+                        parent_assessment = dict(parent_assessment)
+                        parent_assessment["parent_status"] = "stale"
+                        # Mark the unsafe-children list with the missing
+                        # /errored children so callers can see why.
+                        existing_unsafe = list(
+                            parent_assessment.get("unsafe_children") or []
+                        )
+                        for cid in missing_for_parent:
+                            existing_unsafe.append({
+                                "child_index": len(existing_unsafe),
+                                "child_id": cid,
+                                "reasons": ["child_missing_from_qdrant"],
+                            })
+                        if child_retrieval_error:
+                            existing_unsafe.append({
+                                "child_index": len(existing_unsafe),
+                                "reasons": ["child_retrieval_error"],
+                            })
+                        parent_assessment["unsafe_children"] = existing_unsafe
+                        parent_assessment["safe_children_count"] = sum(
+                            1 for c in actual_child_payloads
+                            if assess_leaf_safety(c)["safe"]
+                        )
+
+                node_statuses.append({
+                    "raptor_node_id": node_id,
+                    "raptor_level": payload.get("raptor_level"),
+                    "child_ids": list(ordered_cids),
+                    "missing_child_ids": list(missing_for_parent),
+                    "exists_in_qdrant": node_id in existing_node_ids,
+                    "leaf_safety": leaf_safety,
+                    "parent_status": parent_assessment["parent_status"],
+                    "parent_assessment": parent_assessment,
+                    "child_status_error": child_status_error,
+                })
+
+            # Check apply status — strict match against the supplied
+            # report_id / build_id / manifest_digest / expected node-id
+            # set. A typed record whose ``applied_node_ids`` is wrong
+            # for this manifest must surface as ``apply_record_error``
+            # rather than reporting ``applied: true``.
+            expected_node_ids_status = {
+                str(p.get("raptor_node_id") or "")
+                for p in (manifest.get("candidate_node_payloads") or [])
+            }
+            expected_node_ids_status.discard("")
+            try:
+                apply_record = is_already_applied(
+                    report_id,
+                    hermes_home=self._hermes_home,
+                    configured_dir=str(self._config.get("raptor_artifact_dir") or ""),
+                    build_id=build_id,
+                    manifest_digest=manifest_digest,
+                    expected_node_ids=expected_node_ids_status,
+                )
+            except RaptorApplyError as exc:
+                apply_record = None
+                apply_record_error = (
+                    f"persisted apply record is malformed or does not match "
+                    f"this manifest: {exc}"
+                )
+            else:
+                apply_record_error = ""
+
+            return json.dumps({
+                "read_only": True,
+                "report_id": report_id,
+                "build_id": build_id,
+                "manifest_digest": manifest_digest,
+                "node_count": len(payloads),
+                "applied": apply_record is not None,
+                "apply_record": apply_record,
+                "apply_record_error": apply_record_error,
+                "node_statuses": node_statuses,
+                "existing_node_count": len(existing_node_ids),
+            })
+        except Exception as exc:
+            return _json_error(f"RAPTOR status failed: {exc}")
+
     def _remove_candidate_from_report(self, report_id: str, candidate_id: str) -> None:
         """Remove a candidate from a pending report after successful apply."""
         report = self._pending_improve_reports.get(report_id)
@@ -2136,6 +2654,10 @@ class QdrantMemoryProvider(MemoryProvider):
             return self._tool_improve_preview(args)
         if tool_name == "qdrant_memory_improve_apply":
             return self._tool_improve_apply(args)
+        if tool_name == "qdrant_memory_raptor_apply":
+            return self._tool_raptor_apply(args)
+        if tool_name == "qdrant_memory_raptor_status":
+            return self._tool_raptor_status(args)
         return _json_error(f"Unknown tool: {tool_name}")
 
     def shutdown(self) -> None:

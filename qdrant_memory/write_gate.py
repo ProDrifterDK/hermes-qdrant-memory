@@ -1,11 +1,54 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Mapping
 
 from qdrant_memory.lesson_extractor import contains_secret
 from qdrant_memory.schema import clean_text_for_memory, score_importance
+
+# Regex for a 64-char lowercase hex SHA-256 hash (matches the RAPTOR
+# builder's ``hashlib.sha256(...).hexdigest()`` output). Defined here
+# (rather than imported from ``qdrant_memory.raptor``) to keep
+# ``write_gate`` free of circular imports and to guarantee the same
+# shape is enforced by both the pre- and post-enrichment gates.
+_SHA256_HEX_RE = re.compile(r"^[a-f0-9]{64}$")
+# RAPTOR derivation/relation types for provenance edges. Mirrored from
+# ``qdrant_memory.raptor.schema`` to keep the post-enrichment gate
+# self-contained.
+_RAPTOR_DERIVATION_TYPE = "raptor_summary"
+_RAPTOR_RELATION_TYPE = "SUMMARIZES"
+
+
+def _is_sha256_hex(value: Any) -> bool:
+    """Return True iff *value* is a 64-char lowercase hex SHA-256 string."""
+    return isinstance(value, str) and bool(_SHA256_HEX_RE.match(value))
+
+
+def _is_raptor_provenance_edge(edge: Any) -> bool:
+    """Return True iff *edge* is a structurally valid RAPTOR provenance edge.
+
+    A RAPTOR provenance edge is a mapping with:
+    - non-empty string ``source_uri``
+    - non-empty string ``child_node_id``
+    - ``derivation_type`` exactly equal to ``"raptor_summary"``
+    - ``relation_type`` exactly equal to ``"SUMMARIZES"``
+    """
+    if not isinstance(edge, Mapping):
+        return False
+    source_uri = edge.get("source_uri")
+    child_node_id = edge.get("child_node_id")
+    derivation_type = edge.get("derivation_type")
+    relation_type = edge.get("relation_type")
+    return (
+        isinstance(source_uri, str)
+        and bool(source_uri.strip())
+        and isinstance(child_node_id, str)
+        and bool(child_node_id.strip())
+        and derivation_type == _RAPTOR_DERIVATION_TYPE
+        and relation_type == _RAPTOR_RELATION_TYPE
+    )
 
 WRITE_DECISIONS = {"store", "skip", "draft_review", "learning_candidate", "skill_candidate", "reject"}
 _DERIVED_TYPES = {"summary", "consolidation_summary", "proposal", "draft", "reconsolidation", "derived_memory"}
@@ -426,12 +469,27 @@ def evaluate_raptor_summary_write(
 
     - Required RAPTOR node fields: ``raptor_node_id``, ``raptor_child_ids``,
       ``source_hashes``.
+    - ``canonical`` MUST be exactly the boolean ``False`` (any other value
+      is rejected — type-loose checks let tampered digest-consistent
+      manifests bypass this invariant).
+    - ``requires_review`` MUST be exactly the boolean ``True`` (any other
+      value is rejected).
+    - ``source_hashes`` MUST be a non-empty list of 64-char lowercase hex
+      SHA-256 strings (matches the builder's ``hashlib.sha256(...).hexdigest()``).
+      Lists like ``[None]``, ``[{}]``, ``[""]``, or short/non-hex strings
+      are rejected.
+    - ``derived_from`` MUST be a non-empty list of RAPTOR provenance
+      edges, each with non-empty string ``source_uri`` and
+      ``child_node_id``, ``derivation_type == "raptor_summary"``, and
+      ``relation_type == "SUMMARIZES"``.
     - At least one citation/provenance key: ``derived_from``, ``evidence``,
       ``source_uri``, or ``citations``.
-    - Must NOT set ``canonical=True`` or ``requires_review=False``.
     - Must not contain secrets or recursive contamination markers.
 
-    Returns a :class:`WriteDecision` — never mutates anything.
+    Returns a :class:`WriteDecision` — never mutates anything. Trust-flag
+    and source/provenance violations are returned as ``decision="reject"``
+    so the post-enrichment gate cannot diverge from the pre-enrichment
+    gate in :mod:`qdrant_memory.raptor.apply`.
     """
     metadata = metadata or {}
     candidate_confidence = _clamp_confidence(confidence)
@@ -446,17 +504,23 @@ def evaluate_raptor_summary_write(
         return _decision("reject", ["possible_secret"], confidence=1.0, requires_review=True,
                          metadata={"raptor": True})
 
-    # Canonical must never be True for RAPTOR summaries
-    if metadata.get("canonical") is True:
+    # Canonical must be exactly the boolean False for RAPTOR summaries.
+    # Reject every other value (strings, ints, None, True) — type-loose
+    # checks let tampered digest-consistent manifests bypass the trust
+    # flag invariant during the post-enrichment gate.
+    if metadata.get("canonical") is not False:
         return _decision("reject", ["raptor_summary_must_not_be_canonical"],
                          confidence=1.0, requires_review=True,
-                         metadata={"raptor": True})
+                         metadata={"raptor": True,
+                                   "bad_canonical": repr(metadata.get("canonical"))})
 
-    # requires_review=False must never be allowed for RAPTOR summaries
-    if metadata.get("requires_review") is False:
+    # requires_review must be exactly the boolean True. Reject every other
+    # value so RAPTOR summaries cannot be silently marked auto-store.
+    if metadata.get("requires_review") is not True:
         return _decision("reject", ["raptor_summary_must_not_skip_review"],
                          confidence=1.0, requires_review=True,
-                         metadata={"raptor": True})
+                         metadata={"raptor": True,
+                                   "bad_requires_review": repr(metadata.get("requires_review"))})
 
     # Check required RAPTOR fields
     missing_fields = [f for f in _RAPTOR_REQUIRED_FIELDS if not metadata.get(f)]
@@ -465,7 +529,36 @@ def evaluate_raptor_summary_write(
                          confidence=candidate_confidence, requires_review=True,
                          metadata={"raptor": True, "missing_fields": missing_fields})
 
-    # Check for at least one citation/provenance
+    # Strict source-hash shape: a non-empty list of 64-char lowercase hex
+    # SHA-256 strings. Type-loose checks let ``[None]``, ``[{}]``, ``[""]``,
+    # or short/non-hex values pass.
+    source_hashes = metadata.get("source_hashes")
+    if not isinstance(source_hashes, list) or not source_hashes:
+        return _decision("reject", ["raptor_source_hashes_malformed"],
+                         confidence=1.0, requires_review=True,
+                         metadata={"raptor": True})
+    if not all(_is_sha256_hex(h) for h in source_hashes):
+        return _decision("reject", ["raptor_source_hashes_malformed"],
+                         confidence=1.0, requires_review=True,
+                         metadata={"raptor": True})
+
+    # Strict provenance-edge shape: a non-empty list of mappings with the
+    # exact RAPTOR provenance schema. The pre-enrichment gate enforces this
+    # in ``qdrant_memory/raptor/apply.py``; the post-enrichment gate must
+    # not allow the same payloads through after provider metadata is
+    # added.
+    derived_from = metadata.get("derived_from")
+    if not isinstance(derived_from, list) or not derived_from:
+        return _decision("reject", ["raptor_derived_from_malformed"],
+                         confidence=1.0, requires_review=True,
+                         metadata={"raptor": True})
+    if not all(_is_raptor_provenance_edge(edge) for edge in derived_from):
+        return _decision("reject", ["raptor_derived_from_malformed"],
+                         confidence=1.0, requires_review=True,
+                         metadata={"raptor": True})
+
+    # Check for at least one citation/provenance (legacy fallback for
+    # other citation shapes, retained from Phase 1).
     if not _has_raptor_citations(metadata):
         return _decision("draft_review", ["missing_raptor_citations"],
                          confidence=candidate_confidence, requires_review=True,

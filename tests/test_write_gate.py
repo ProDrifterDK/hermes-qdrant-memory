@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from qdrant_memory.write_gate import WriteDecision, decision_to_json, evaluate_write_candidate
 
 
@@ -104,13 +106,37 @@ from qdrant_memory.schema import clean_text_for_memory
 class TestRaptorSummaryWriteGate:
     """Model-authored RAPTOR summaries must route to review/reject unless
     they carry full provenance (child hashes, citations) and never claim
-    canonical=true or requires_review=false."""
+    canonical=true or requires_review=false.
 
+    Phase 4 fix4 tightens the post-enrichment gate to mirror the
+    pre-enrichment gate: ``canonical`` must be exactly the boolean
+    ``False``, ``requires_review`` must be exactly the boolean ``True``,
+    ``source_hashes`` must be a non-empty list of 64-char lowercase hex
+    SHA-256 strings, and ``derived_from`` must be a non-empty list of
+    RAPTOR provenance edges with non-empty ``source_uri``/``child_node_id``,
+    ``derivation_type == "raptor_summary"``, and ``relation_type ==
+    "SUMMARIZES"``.
+    """
+
+    # 64-char lowercase hex SHA-256 strings (matches the builder's
+    # ``hashlib.sha256(...).hexdigest()`` output).
+    _GOOD_HASH_A = "a" * 64
+    _GOOD_HASH_B = "b" * 64
     _GOOD_METADATA = {
         "raptor_node_id": "raptor-node-001",
         "raptor_child_ids": ["child-1", "child-2"],
-        "source_hashes": ["sha256:abc123", "sha256:def456"],
-        "derived_from": [{"source_uri": "memory://point/source-1"}],
+        "source_hashes": [_GOOD_HASH_A, _GOOD_HASH_B],
+        "derived_from": [
+            {
+                "source_uri": "raptor://node/raptor-tree-x/child-1",
+                "derivation_type": "raptor_summary",
+                "relation_type": "SUMMARIZES",
+                "child_node_id": "child-1",
+            }
+        ],
+        # Pre-enrichment gate mirrors the post-enrichment gate in fix4.
+        "canonical": False,
+        "requires_review": True,
     }
 
     def test_raptor_rejects_canonical_true(self):
@@ -130,29 +156,36 @@ class TestRaptorSummaryWriteGate:
         assert "raptor_summary_must_not_skip_review" in decision.reasons
 
     def test_raptor_draft_review_missing_provenance(self):
+        # With fix4 strict checks, a metadata dict that omits the
+        # required trust flags is rejected on the canonical check first
+        # (canonical is missing, not exactly False). The decision is
+        # still non-store and requires_review=True.
         decision = evaluate_raptor_summary_write(
             text="Summary of cluster alpha with enough text to matter.",
             metadata={
                 "raptor_node_id": "raptor-node-001",
-                # Missing raptor_child_ids and source_hashes
+                # Missing raptor_child_ids, source_hashes, and the trust
+                # flags (canonical, requires_review) — strict gate rejects.
             },
         )
-        assert decision.decision == "draft_review"
-        assert "missing_raptor_provenance" in decision.reasons
         assert decision.requires_review is True
+        assert decision.decision in {"draft_review", "reject"}
 
     def test_raptor_draft_review_missing_citations(self):
+        # With strict source-hash + derived_from checks, a metadata dict
+        # with a valid raptor_node_id + raptor_child_ids but no
+        # source_hashes/derived_from fails on the strict hash/edge gate
+        # first. We still expect ``requires_review`` is True.
         decision = evaluate_raptor_summary_write(
             text="Summary of cluster alpha with enough text to matter.",
             metadata={
                 "raptor_node_id": "raptor-node-001",
                 "raptor_child_ids": ["child-1"],
-                "source_hashes": ["sha256:abc123"],
-                # No derived_from/evidence/source_uri/citations
+                # No source_hashes or derived_from — strict gate rejects.
             },
         )
-        assert decision.decision == "draft_review"
-        assert "missing_raptor_citations" in decision.reasons
+        assert decision.requires_review is True
+        assert decision.decision in {"draft_review", "reject"}
 
     def test_raptor_routes_to_review_with_full_provenance(self):
         """Even with full provenance, RAPTOR summaries go to draft_review —
@@ -188,6 +221,283 @@ class TestRaptorSummaryWriteGate:
             metadata=self._GOOD_METADATA,
         )
         assert decision.metadata.get("raptor") is True
+
+
+# ===========================================================================
+# Phase 4 fix4 regression tests: post-enrichment gate strict trust/provenance
+# ===========================================================================
+
+
+class TestRaptorStrictTrustFlags:
+    """fix4: ``canonical`` must be exactly ``False`` and ``requires_review``
+    must be exactly ``True``. Every other value must produce a
+    ``decision="reject"`` so the post-enrichment gate cannot diverge from
+    the pre-enrichment gate in :mod:`qdrant_memory.raptor.apply`.
+    """
+
+    _BASE = {
+        "raptor_node_id": "raptor-node-strict",
+        "raptor_child_ids": ["child-x"],
+        "source_hashes": ["a" * 64],
+        "derived_from": [
+            {
+                "source_uri": "raptor://node/raptor-tree-x/child-x",
+                "derivation_type": "raptor_summary",
+                "relation_type": "SUMMARIZES",
+                "child_node_id": "child-x",
+            }
+        ],
+    }
+
+    @pytest.mark.parametrize("bad_value", ["true", "false", "1", "0", 1, 0, None, "yes", "no", 0.0])
+    def test_raptor_rejects_non_boolean_canonical(self, bad_value):
+        decision = evaluate_raptor_summary_write(
+            text="Summary of cluster alpha with enough text to matter.",
+            metadata={**self._BASE, "canonical": bad_value, "requires_review": True},
+        )
+        assert decision.decision == "reject"
+        assert "raptor_summary_must_not_be_canonical" in decision.reasons
+        assert decision.requires_review is True
+
+    @pytest.mark.parametrize("bad_value", ["false", "0", 0, None, "yes", 0.0, "no"])
+    def test_raptor_rejects_non_true_requires_review(self, bad_value):
+        decision = evaluate_raptor_summary_write(
+            text="Summary of cluster alpha with enough text to matter.",
+            metadata={**self._BASE, "canonical": False, "requires_review": bad_value},
+        )
+        assert decision.decision == "reject"
+        assert "raptor_summary_must_not_skip_review" in decision.reasons
+        assert decision.requires_review is True
+
+    def test_raptor_rejects_missing_canonical_key(self):
+        # No canonical key at all: ``metadata.get("canonical")`` is None,
+        # which is not exactly False, so the strict gate rejects.
+        decision = evaluate_raptor_summary_write(
+            text="Summary of cluster alpha with enough text to matter.",
+            metadata={**self._BASE, "requires_review": True},
+        )
+        assert decision.decision == "reject"
+        assert "raptor_summary_must_not_be_canonical" in decision.reasons
+
+    def test_raptor_rejects_missing_requires_review_key(self):
+        decision = evaluate_raptor_summary_write(
+            text="Summary of cluster alpha with enough text to matter.",
+            metadata={**self._BASE, "canonical": False},
+        )
+        assert decision.decision == "reject"
+        assert "raptor_summary_must_not_skip_review" in decision.reasons
+
+
+class TestRaptorStrictSourceHashes:
+    """fix4: ``source_hashes`` must be a non-empty list of 64-char
+    lowercase hex SHA-256 strings."""
+
+    _BASE = {
+        "raptor_node_id": "raptor-node-hash",
+        "raptor_child_ids": ["child-x"],
+        "canonical": False,
+        "requires_review": True,
+        "derived_from": [
+            {
+                "source_uri": "raptor://node/raptor-tree-x/child-x",
+                "derivation_type": "raptor_summary",
+                "relation_type": "SUMMARIZES",
+                "child_node_id": "child-x",
+            }
+        ],
+    }
+
+    def test_raptor_rejects_source_hashes_with_none_entry(self):
+        decision = evaluate_raptor_summary_write(
+            text="Summary of cluster alpha with enough text to matter.",
+            metadata={**self._BASE, "source_hashes": [None]},
+        )
+        assert decision.decision == "reject"
+        assert "raptor_source_hashes_malformed" in decision.reasons
+
+    def test_raptor_rejects_source_hashes_with_dict_entry(self):
+        decision = evaluate_raptor_summary_write(
+            text="Summary of cluster alpha with enough text to matter.",
+            metadata={**self._BASE, "source_hashes": [{}]},
+        )
+        assert decision.decision == "reject"
+        assert "raptor_source_hashes_malformed" in decision.reasons
+
+    def test_raptor_rejects_source_hashes_with_empty_string(self):
+        decision = evaluate_raptor_summary_write(
+            text="Summary of cluster alpha with enough text to matter.",
+            metadata={**self._BASE, "source_hashes": [""]},
+        )
+        assert decision.decision == "reject"
+        assert "raptor_source_hashes_malformed" in decision.reasons
+
+    def test_raptor_rejects_source_hashes_short(self):
+        decision = evaluate_raptor_summary_write(
+            text="Summary of cluster alpha with enough text to matter.",
+            metadata={**self._BASE, "source_hashes": ["abcdef"]},
+        )
+        assert decision.decision == "reject"
+        assert "raptor_source_hashes_malformed" in decision.reasons
+
+    def test_raptor_rejects_source_hashes_non_hex(self):
+        # 64 chars but contains a non-hex character.
+        bad = "z" * 64
+        decision = evaluate_raptor_summary_write(
+            text="Summary of cluster alpha with enough text to matter.",
+            metadata={**self._BASE, "source_hashes": [bad]},
+        )
+        assert decision.decision == "reject"
+        assert "raptor_source_hashes_malformed" in decision.reasons
+
+    def test_raptor_rejects_source_hashes_uppercase(self):
+        # 64 hex chars but uppercase — strict pattern is lowercase.
+        bad = "A" * 64
+        decision = evaluate_raptor_summary_write(
+            text="Summary of cluster alpha with enough text to matter.",
+            metadata={**self._BASE, "source_hashes": [bad]},
+        )
+        assert decision.decision == "reject"
+        assert "raptor_source_hashes_malformed" in decision.reasons
+
+    def test_raptor_rejects_source_hashes_with_prefixed_string(self):
+        # Old shape: "sha256:..." prefix is no longer accepted.
+        decision = evaluate_raptor_summary_write(
+            text="Summary of cluster alpha with enough text to matter.",
+            metadata={**self._BASE, "source_hashes": ["sha256:" + "a" * 60]},
+        )
+        assert decision.decision == "reject"
+        assert "raptor_source_hashes_malformed" in decision.reasons
+
+
+class TestRaptorStrictDerivedFrom:
+    """fix4: ``derived_from`` must be a non-empty list of structurally
+    valid RAPTOR provenance edges."""
+
+    _BASE = {
+        "raptor_node_id": "raptor-node-edge",
+        "raptor_child_ids": ["child-x"],
+        "source_hashes": ["a" * 64],
+        "canonical": False,
+        "requires_review": True,
+    }
+
+    def test_raptor_rejects_derived_from_with_dict(self):
+        decision = evaluate_raptor_summary_write(
+            text="Summary of cluster alpha with enough text to matter.",
+            metadata={**self._BASE, "derived_from": [{}]},
+        )
+        assert decision.decision == "reject"
+        assert "raptor_derived_from_malformed" in decision.reasons
+
+    def test_raptor_rejects_derived_from_with_none(self):
+        decision = evaluate_raptor_summary_write(
+            text="Summary of cluster alpha with enough text to matter.",
+            metadata={**self._BASE, "derived_from": [None]},
+        )
+        assert decision.decision == "reject"
+        assert "raptor_derived_from_malformed" in decision.reasons
+
+    def test_raptor_rejects_derived_from_with_string(self):
+        decision = evaluate_raptor_summary_write(
+            text="Summary of cluster alpha with enough text to matter.",
+            metadata={**self._BASE, "derived_from": ["not-a-provenance-edge"]},
+        )
+        assert decision.decision == "reject"
+        assert "raptor_derived_from_malformed" in decision.reasons
+
+    def test_raptor_rejects_derived_from_wrong_derivation_type(self):
+        decision = evaluate_raptor_summary_write(
+            text="Summary of cluster alpha with enough text to matter.",
+            metadata={
+                **self._BASE,
+                "derived_from": [
+                    {
+                        "source_uri": "raptor://node/raptor-tree-x/child-x",
+                        "derivation_type": "summary",  # wrong type
+                        "relation_type": "SUMMARIZES",
+                        "child_node_id": "child-x",
+                    }
+                ],
+            },
+        )
+        assert decision.decision == "reject"
+        assert "raptor_derived_from_malformed" in decision.reasons
+
+    def test_raptor_rejects_derived_from_wrong_relation_type(self):
+        decision = evaluate_raptor_summary_write(
+            text="Summary of cluster alpha with enough text to matter.",
+            metadata={
+                **self._BASE,
+                "derived_from": [
+                    {
+                        "source_uri": "raptor://node/raptor-tree-x/child-x",
+                        "derivation_type": "raptor_summary",
+                        "relation_type": "REFERENCES",  # wrong relation
+                        "child_node_id": "child-x",
+                    }
+                ],
+            },
+        )
+        assert decision.decision == "reject"
+        assert "raptor_derived_from_malformed" in decision.reasons
+
+    def test_raptor_rejects_derived_from_empty_source_uri(self):
+        decision = evaluate_raptor_summary_write(
+            text="Summary of cluster alpha with enough text to matter.",
+            metadata={
+                **self._BASE,
+                "derived_from": [
+                    {
+                        "source_uri": "",
+                        "derivation_type": "raptor_summary",
+                        "relation_type": "SUMMARIZES",
+                        "child_node_id": "child-x",
+                    }
+                ],
+            },
+        )
+        assert decision.decision == "reject"
+        assert "raptor_derived_from_malformed" in decision.reasons
+
+    def test_raptor_rejects_derived_from_empty_child_node_id(self):
+        decision = evaluate_raptor_summary_write(
+            text="Summary of cluster alpha with enough text to matter.",
+            metadata={
+                **self._BASE,
+                "derived_from": [
+                    {
+                        "source_uri": "raptor://node/raptor-tree-x/child-x",
+                        "derivation_type": "raptor_summary",
+                        "relation_type": "SUMMARIZES",
+                        "child_node_id": "",
+                    }
+                ],
+            },
+        )
+        assert decision.decision == "reject"
+        assert "raptor_derived_from_malformed" in decision.reasons
+
+    def test_raptor_accepts_valid_derived_from_edge(self):
+        decision = evaluate_raptor_summary_write(
+            text="Summary of cluster alpha with enough text to matter.",
+            metadata={
+                **self._BASE,
+                "derived_from": [
+                    {
+                        "source_uri": "raptor://node/raptor-tree-x/child-x",
+                        "derivation_type": "raptor_summary",
+                        "relation_type": "SUMMARIZES",
+                        "child_node_id": "child-x",
+                    }
+                ],
+            },
+        )
+        # Even with full provenance, RAPTOR summaries go to review
+        # (never auto-store as canonical). The new strict gate routes
+        # this to ``draft_review`` with requires_review=True.
+        assert decision.decision == "draft_review"
+        assert decision.requires_review is True
+        assert "raptor_summary_review_required" in decision.reasons
 
 
 class TestRecursiveContamination:
