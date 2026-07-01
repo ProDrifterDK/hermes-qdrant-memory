@@ -1136,6 +1136,30 @@ class RaptorSearcher:
                         # referenced. The parent is not responsible
                         # for retrieving it.
                         continue
+                    # Phase 6 P3 audit precision: the same clean child
+                    # id can appear in BOTH ``raptor_child_ids`` and
+                    # ``raptor_summary_of`` for one parent. The pre-P3
+                    # loop iterated ``child_ids + summary_of`` and
+                    # appended ``hit`` to ``parents_for_leaf[cid]``
+                    # twice, so the Stage 5 ``attributed_parents``
+                    # loop saw the same parent twice for one unique
+                    # child. That double-appended: (a) the same safe
+                    # payload to ``per_parent_safe_payloads``
+                    # (inflating ``safe_children_count`` and
+                    # ``total_children`` in ``parent_assessment``), and
+                    # (b) the unsafe counter / missing count for the
+                    # same cid. We dedupe per parent per child here so
+                    # a unique child is attributed to this parent
+                    # exactly once while still being attributed to
+                    # every OTHER parent that references it (the
+                    # cross-parent ``parents_for_leaf`` entries for
+                    # other hits remain untouched). The
+                    # first-iteration bookkeeping
+                    # (``referenced_for_parent.add``, fanout enqueue,
+                    # ``seen_leaf_ids`` / ``all_leaf_ids`` append) is
+                    # preserved.
+                    if cid in referenced_for_parent:
+                        continue
                     referenced_for_parent.add(cid)
                     # Every parent that references a leaf is appended
                     # to ``parents_for_leaf`` so safety accounting

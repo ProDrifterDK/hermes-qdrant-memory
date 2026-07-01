@@ -4452,3 +4452,300 @@ class TestTrustGatedChildlessParentExcluded:
         assert "parent-approved-clean" not in result.unsafe_summary_ids
         promoted = {l.point_id for l in result.cited_leaves}
         assert "leaf-ok" in promoted
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 P3 audit precision: per-parent per-child dedupe.
+#
+# Pre-P3 the Stage 4a loop iterated ``child_ids + summary_of`` and
+# appended the parent to ``parents_for_leaf[cid]`` on EVERY iteration
+# (no per-parent per-child guard). When the same clean child id
+# appeared in BOTH lists the same parent was attributed twice to the
+# same child, and Stage 5 then:
+#
+# * appended the same safe payload to ``per_parent_safe_payloads``
+#   twice (inflating ``safe_children_count`` / ``total_children``
+#   in ``parent_assessment``);
+# * bumped ``per_parent_unsafe_count`` twice for a shared unsafe
+#   child (inflating the missing / unsafe accounting).
+#
+# The minimal fix (in ``search.py``) checks ``cid in
+# referenced_for_parent`` before appending so each unique child is
+# attributed to its parent exactly once while preserving
+# cross-parent ``parents_for_leaf`` entries for shared children
+# (fix8 contract). These tests pin the post-fix behavior across the
+# three reviewer-listed cases:
+#
+# 1. Duplicate clean child in both ``raptor_child_ids`` and
+#    ``raptor_summary_of`` for a single parent — counters stay at 1,
+#    parent stays active with original text, the leaf appears once in
+#    ``cited_leaves``.
+# 2. Duplicate unsafe child in both lists — parent non-active / text
+#    cleared, the unsafe / missing accounting reaches ``1`` for the
+#    single unique child (not ``2``), the unsafe child id is present
+#    once in the audit-relevant collections.
+# 3. Shared unsafe child across two different parents — both parents
+#    still demote (fix8 contract preserved by the minimal fix).
+# ---------------------------------------------------------------------------
+
+
+class TestDuplicateChildRefAuditPrecision:
+    """Regression for Phase 6 P3 audit-counter precision.
+
+    Pre-P3 the same clean child appearing in BOTH
+    ``raptor_child_ids`` and ``raptor_summary_of`` for one parent
+    made ``parent_assessment`` report ``safe_children_count == 2``
+    and ``total_children == 2`` for one unique source-backed leaf,
+    and made Stage 5 append the same safe payload to
+    ``per_parent_safe_payloads`` twice. The fix dedupes per-parent
+    per-child so the unique child is attributed to the parent
+    exactly once.
+    """
+
+    def test_duplicate_clean_child_in_both_lists_counted_once(self):
+        # Parent declares the same clean child in both
+        # ``raptor_child_ids`` and ``raptor_summary_of``. The unique
+        # child must be attributed to the parent exactly once:
+        # ``safe_children_count == 1``, ``total_children == 1``,
+        # parent stays ``active`` with original text intact, and
+        # ``cited_leaves`` contains the leaf exactly once.
+        original_text = "parent summary about deploy"
+        dense_seeds = [
+            _RetrievedMemory(
+                "parent-dup",
+                text=original_text,
+                payload=_raptor_parent_payload(
+                    node_id="parent-dup",
+                    text=original_text,
+                    children=["leaf-dup"],
+                    summary_of=["leaf-dup"],
+                    level=2,
+                ),
+                final_score=0.9,
+            )
+        ]
+        qdrant = FakeRaptorQdrant()
+        qdrant.add_point("parent-dup", dense_seeds[0].payload)
+        qdrant.add_point(
+            "leaf-dup",
+            _leaf_payload(point_id="leaf-dup", text="clean leaf about deploy"),
+        )
+        retriever = FakeRetriever(dense_seeds)
+        searcher = RaptorSearcher(
+            qdrant=qdrant, retriever=retriever, collection_name="memory"
+        )
+        result = searcher.search("anything", top_k=3)
+
+        target = next(
+            (s for s in result.summaries if s.raptor_node_id == "parent-dup"),
+            None,
+        )
+        assert target is not None, "parent-dup must be promoted"
+        # Parent status and text survive untouched.
+        assert target.parent_status == "active", (
+            "parent must stay active when the only unique child is clean; "
+            f"got {target.parent_status!r}"
+        )
+        assert target.text == original_text, (
+            "parent text must survive when the only unique child is clean"
+        )
+
+        # The audit counters must reflect ONE unique child, not two.
+        pa = target.parent_assessment or {}
+        assert pa.get("safe_children_count") == 1, (
+            "safe_children_count must be 1 for a single unique clean child; "
+            f"got parent_assessment={pa!r}"
+        )
+        assert pa.get("total_children") == 1, (
+            "total_children must be 1 for a single unique child; "
+            f"got parent_assessment={pa!r}"
+        )
+        # No unsafe / missing accounting for a clean child.
+        assert pa.get("unsafe_children") == [], (
+            "unsafe_children must be empty when the only child is clean; "
+            f"got parent_assessment={pa!r}"
+        )
+
+        # The leaf is cited exactly once in ``cited_leaves``.
+        cited_ids = [l.point_id for l in result.cited_leaves]
+        assert cited_ids.count("leaf-dup") == 1, (
+            f"leaf-dup must appear exactly once in cited_leaves; got {cited_ids!r}"
+        )
+
+        # Parent is NOT in unsafe_summary_ids.
+        assert "parent-dup" not in result.unsafe_summary_ids
+
+    def test_duplicate_unsafe_child_in_both_lists_counted_once(self):
+        # Same setup, but the leaf is unsafe (``stale=True``). The
+        # parent must demote, the unsafe / missing counters must reach
+        # ``1`` (one unique child, not two), and the leaf id must not
+        # be double-accounted.
+        original_text = "parent summary about deploy"
+        dense_seeds = [
+            _RetrievedMemory(
+                "parent-dup",
+                text=original_text,
+                payload=_raptor_parent_payload(
+                    node_id="parent-dup",
+                    text=original_text,
+                    children=["leaf-dup"],
+                    summary_of=["leaf-dup"],
+                    level=2,
+                ),
+                final_score=0.9,
+            )
+        ]
+        qdrant = FakeRaptorQdrant()
+        qdrant.add_point("parent-dup", dense_seeds[0].payload)
+        qdrant.add_point(
+            "leaf-dup",
+            _leaf_payload(
+                point_id="leaf-dup",
+                text="stale child",
+                stale=True,
+            ),
+        )
+        retriever = FakeRetriever(dense_seeds)
+        searcher = RaptorSearcher(
+            qdrant=qdrant, retriever=retriever, collection_name="memory"
+        )
+        result = searcher.search("anything", top_k=3)
+
+        target = next(
+            (s for s in result.summaries if s.raptor_node_id == "parent-dup"),
+            None,
+        )
+        assert target is not None, "parent-dup must still appear in summaries"
+        # Non-active parent with cleared text (per unsafe-leaf demotion).
+        assert target.parent_status != "active", (
+            "parent must be non-active when its only unique child is unsafe; "
+            f"got {target.parent_status!r}"
+        )
+        assert target.text == "", (
+            "parent text must be cleared when its only unique child is unsafe"
+        )
+
+        # Audit counters: one unique child means exactly one unsafe
+        # child entry, total_children == 1, no safe_children.
+        pa = target.parent_assessment or {}
+        assert pa.get("total_children") == 1, (
+            "total_children must reflect one unique child even when that "
+            f"child is unsafe; got parent_assessment={pa!r}"
+        )
+        assert pa.get("safe_children_count") == 0, (
+            "safe_children_count must be 0 when the unique child is unsafe; "
+            f"got parent_assessment={pa!r}"
+        )
+        # ``unsafe_children`` is the list of safety dicts returned by
+        # ``assess_parent_status``; each unsafe child gets one entry
+        # so a single unique unsafe child must produce a length-1
+        # list (no inflation from duplicate cid appearances).
+        unsafe_list = pa.get("unsafe_children") or []
+        assert len(unsafe_list) == 1, (
+            "unsafe_children list must have one entry for one unique unsafe "
+            f"child; got parent_assessment={pa!r}"
+        )
+
+        # The leaf is NOT cited (it's unsafe) but its id surfaces
+        # exactly once in the audit envelope, not twice.
+        assert "leaf-dup" not in {l.point_id for l in result.cited_leaves}
+        unsafe_leaf_handles = list(result.unsafe_leaf_ids)
+        assert unsafe_leaf_handles.count("leaf-dup") == 1, (
+            "leaf-dup must appear exactly once in unsafe_leaf_ids for one "
+            f"unique unsafe child; got {unsafe_leaf_handles!r}"
+        )
+        # Parent is tracked as unsafe.
+        assert "parent-dup" in result.unsafe_summary_ids
+
+    def test_shared_unsafe_child_across_two_parents_still_demotes_both(self):
+        # fix8 contract regression guard: a unique unsafe child shared
+        # across two different parents (each parent declares the child
+        # in BOTH ``raptor_child_ids`` and ``raptor_summary_of`` to
+        # also exercise the new per-parent dedupe) must still demote
+        # BOTH parents. This is the cross-parent half of the fix8
+        # contract — the per-parent per-child dedupe MUST NOT collapse
+        # two parents into one attribution row.
+        shared_leaf = "shared-unsafe-leaf"
+        dense_seeds = [
+            _RetrievedMemory(
+                "parent-A",
+                text="parent A summary",
+                payload=_raptor_parent_payload(
+                    node_id="parent-A",
+                    text="parent A summary",
+                    children=[shared_leaf],
+                    summary_of=[shared_leaf],
+                    level=2,
+                ),
+                final_score=0.91,
+            ),
+            _RetrievedMemory(
+                "parent-B",
+                text="parent B summary",
+                payload=_raptor_parent_payload(
+                    node_id="parent-B",
+                    text="parent B summary",
+                    children=[shared_leaf],
+                    summary_of=[shared_leaf],
+                    level=2,
+                ),
+                final_score=0.9,
+            ),
+        ]
+        qdrant = FakeRaptorQdrant()
+        for seed in dense_seeds:
+            qdrant.add_point(seed.id, seed.payload)
+        qdrant.add_point(
+            shared_leaf,
+            _leaf_payload(
+                point_id=shared_leaf,
+                text="stale shared leaf",
+                stale=True,
+            ),
+        )
+        retriever = FakeRetriever(dense_seeds)
+        searcher = RaptorSearcher(
+            qdrant=qdrant, retriever=retriever, collection_name="memory"
+        )
+        result = searcher.search("anything", top_k=3)
+
+        # BOTH parents must be demoted (fix8 contract).
+        assert "parent-A" in result.unsafe_summary_ids, (
+            "parent-A must demote because its unique unsafe child is unsafe"
+        )
+        assert "parent-B" in result.unsafe_summary_ids, (
+            "parent-B must also demote — fix8 contract must not regress "
+            "when the per-parent per-child dedupe is applied"
+        )
+
+        # Each parent's audit envelope shows ONE unique child
+        # (total_children == 1) and ONE unsafe entry — even though the
+        # shared unsafe leaf appears in both lists for both parents.
+        for parent_id in ("parent-A", "parent-B"):
+            target = next(
+                (s for s in result.summaries if s.raptor_node_id == parent_id),
+                None,
+            )
+            assert target is not None
+            assert target.parent_status != "active"
+            assert target.text == ""
+            pa = target.parent_assessment or {}
+            assert pa.get("total_children") == 1, (
+                f"{parent_id} must report total_children == 1 for one "
+                f"unique shared child; got parent_assessment={pa!r}"
+            )
+            assert len(pa.get("unsafe_children") or []) == 1, (
+                f"{parent_id} must report exactly one unsafe_children entry "
+                f"for one unique unsafe child; got parent_assessment={pa!r}"
+            )
+            assert pa.get("safe_children_count") == 0, (
+                f"{parent_id} must report safe_children_count == 0 when its "
+                f"only unique child is unsafe; got parent_assessment={pa!r}"
+            )
+
+        # The unsafe shared child id surfaces exactly once across the
+        # audit envelope, not twice per parent.
+        assert list(result.unsafe_leaf_ids).count(shared_leaf) == 1, (
+            "shared unsafe child must appear once in unsafe_leaf_ids "
+            f"(set semantics); got {result.unsafe_leaf_ids!r}"
+        )
