@@ -261,6 +261,85 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
         help="Emit machine-readable JSON output (default: human summary).",
     )
 
+    eval_capture = subcommands.add_parser(
+        "eval-capture",
+        help="Phase 6B read-only capture of retrieval variants for offline eval. Constructs provider; never mutates Qdrant.",
+    )
+    eval_capture.set_defaults(qdrant_subcommand="eval-capture")
+    eval_capture.add_argument(
+        "--cases",
+        required=True,
+        help="Path to eval-cases JSONL artifact (case_id, query, expected_*, forbidden_*).",
+    )
+    eval_capture.add_argument(
+        "--runs-out",
+        required=True,
+        help="Output path for the captured eval-runs JSONL artifact.",
+    )
+    eval_capture.add_argument(
+        "--variants",
+        default="all",
+        help="Comma-separated variant list or 'all'. Default: all.",
+    )
+    eval_capture.add_argument(
+        "--top-k",
+        type=_positive_int,
+        default=5,
+        help="Per-lane top-k for retrieval. Default: 5.",
+    )
+    eval_capture.add_argument(
+        "--mode",
+        choices=["hybrid", "evidence"],
+        default="hybrid",
+        help="Hybrid router mode. Default: hybrid.",
+    )
+    eval_capture.add_argument(
+        "--max-depth",
+        type=int,
+        choices=[1, 2, 3],
+        default=2,
+        help="RAPTOR/graph BFS depth budget. Default: 2.",
+    )
+    eval_capture.add_argument(
+        "--max-children",
+        type=_positive_int,
+        default=8,
+        help="RAPTOR children fanout budget. Default: 8.",
+    )
+    eval_capture.add_argument(
+        "--max-source-chars",
+        type=_positive_int,
+        default=1200,
+        help="Per-result text cap. Default: 1200.",
+    )
+    eval_capture.add_argument(
+        "--candidate-seed-top-k",
+        type=_positive_int,
+        default=20,
+        help="Semantic seeds for graph expansion. Default: 20.",
+    )
+    eval_capture.add_argument(
+        "--max-graph-results",
+        type=_positive_int,
+        default=20,
+        help="Hard cap on graph expansion pool before reranking. Default: 20.",
+    )
+    eval_capture.add_argument(
+        "--include-fact-history",
+        action="store_true",
+        help="Include deprecated/superseded history in retrieval.",
+    )
+    eval_capture.add_argument(
+        "--include-metadata",
+        action="store_true",
+        help="Include raw RAPTOR payload metadata in summaries/leaves.",
+    )
+    eval_capture.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON output (default: human summary).",
+    )
+
     learning = subcommands.add_parser("learning", help="Search or preview procedural learnings.")
     learning_subcommands = learning.add_subparsers(dest="learning_subcommand", required=True)
 

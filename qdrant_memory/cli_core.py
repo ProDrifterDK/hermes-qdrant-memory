@@ -1881,7 +1881,133 @@ def _execute_eval_command(args: Namespace, stdout) -> int:
     return 0
 
 
-def _execute_local_command(args: Namespace, stdout) -> int | None:
+def _execute_eval_capture_command(args: Namespace, stdout, *, provider_factory: Callable[[], Any]) -> int:
+    """Run the Phase 6B capture command for retrieval eval variants.
+
+    Unlike the offline Phase 6A ``eval`` command, this command
+    **constructs the provider** and contacts live local Qdrant/embeddings.
+    It does so **read-only**: every retrieval call passes
+    ``update_access=False`` and no mutation path is reachable. The
+    command is CLI/operator-initiated only — it is not wired to
+    auto-recall or cron, and it is not registered as a Hermes tool.
+
+    The capture core (:mod:`qdrant_memory.eval_capture`) emits JSONL
+    run rows whose ``packet`` shape is compatible with the Phase 6A
+    evaluator. Run rows never carry raw query text; captured errors
+    are sanitized to ``<redacted>`` plus a stable error kind.
+    """
+
+    from qdrant_memory import eval_capture as _eval_capture
+    from qdrant_memory import evaluation as _evaluation
+
+    cases_path = str(getattr(args, "cases", "") or "")
+    runs_out_path = str(getattr(args, "runs_out", "") or "")
+    if not cases_path:
+        raise CliUsageError("--cases is required")
+    if not runs_out_path:
+        raise CliUsageError("--runs-out is required")
+
+    variants_value = getattr(args, "variants", "all") or "all"
+    try:
+        variants = _eval_capture.parse_variants(variants_value)
+    except ValueError as exc:
+        raise CliUsageError(str(exc)) from exc
+
+    top_k = int(getattr(args, "top_k", _evaluation.DEFAULT_TOP_K) or _evaluation.DEFAULT_TOP_K)
+    mode = str(getattr(args, "mode", "hybrid") or "hybrid")
+    max_depth = int(getattr(args, "max_depth", 2) or 2)
+    max_children = int(getattr(args, "max_children", 8) or 8)
+    max_source_chars = int(getattr(args, "max_source_chars", 1200) or 1200)
+    candidate_seed_top_k = int(getattr(args, "candidate_seed_top_k", 20) or 20)
+    max_graph_results = int(getattr(args, "max_graph_results", 20) or 20)
+    include_fact_history = bool(getattr(args, "include_fact_history", False))
+    include_metadata = bool(getattr(args, "include_metadata", False))
+
+    # Load and validate cases through the Phase 6A evaluator's own
+    # loader/validators so the cases file format is identical. We use
+    # the validator to ensure each case has the required fields, but
+    # we do NOT run the full evaluate() here (that is the next step).
+    try:
+        raw_cases = _evaluation.load_jsonl(cases_path)
+    except _evaluation.EvaluationError as exc:
+        raise CliUsageError(str(exc)) from exc
+
+    cases: list[dict[str, Any]] = []
+    for index, raw in enumerate(raw_cases, start=1):
+        try:
+            case = _evaluation._validate_case_dict(raw, line=index)
+        except _evaluation.EvaluationError as exc:
+            raise CliUsageError(str(exc)) from exc
+        cases.append(case)
+
+    if not cases:
+        raise CliUsageError("cases file contains no valid eval cases")
+
+    # Construct the provider. This is the key difference from Phase 6A
+    # eval: capture needs the provider for live read-only retrieval.
+    provider = provider_factory()
+
+    result = _eval_capture.capture_eval_runs(
+        provider,
+        cases,
+        variants=variants,
+        top_k=top_k,
+        mode=mode,
+        max_depth=max_depth,
+        max_children=max_children,
+        max_source_chars=max_source_chars,
+        candidate_seed_top_k=candidate_seed_top_k,
+        max_graph_results=max_graph_results,
+        include_fact_history=include_fact_history,
+        include_metadata=include_metadata,
+    )
+
+    # Write the JSONL runs file.
+    _eval_capture.write_runs_jsonl(runs_out_path, result["rows"])
+
+    summary = result["summary"]
+    if _json_flag(args):
+        payload = {
+            "runs_out": runs_out_path,
+            "summary": summary,
+        }
+        print(json.dumps(payload, sort_keys=True), file=stdout)
+    else:
+        _print_eval_capture_summary(summary, runs_out_path, variants, stdout)
+    return 0
+
+
+def _print_eval_capture_summary(
+    summary: dict[str, Any],
+    runs_out_path: str,
+    variants: list[str],
+    stdout,
+) -> None:
+    """Print a compact human summary that never echoes raw query text."""
+
+    lines: list[str] = [
+        "Phase 6B eval-capture report",
+        f"variants: {', '.join(variants)}",
+        f"cases: {summary.get('cases', 0)}",
+        f"rows: {summary.get('total_rows', 0)}",
+        f"errored: {summary.get('errored_rows', 0)}",
+        f"runs written to: {runs_out_path}",
+    ]
+    variant_counts = summary.get("variants", {})
+    if variant_counts:
+        lines.append("per-variant:")
+        for variant_name in variants:
+            counts = variant_counts.get(variant_name, {})
+            if isinstance(counts, dict):
+                lines.append(
+                    f"  - {variant_name}: "
+                    f"rows={counts.get('rows', 0)}, "
+                    f"errored={counts.get('errored', 0)}"
+                )
+    stdout.write("\n".join(lines) + "\n")
+
+
+def _execute_local_command(args: Namespace, stdout, *, provider_factory: Callable[[], Any] | None = None) -> int | None:
     inspection_exit = _execute_inspection_command(args, stdout)
     if inspection_exit is not None:
         return inspection_exit
@@ -1894,6 +2020,10 @@ def _execute_local_command(args: Namespace, stdout) -> int | None:
         return 0
     if subcommand == "eval":
         return _execute_eval_command(args, stdout)
+    if subcommand == "eval-capture":
+        if provider_factory is None:
+            raise CliUsageError("eval-capture requires a provider factory")
+        return _execute_eval_capture_command(args, stdout, provider_factory=provider_factory)
     if subcommand == "watcher":
         watcher_subcommand = getattr(args, "watcher_subcommand", None)
         if watcher_subcommand == "status":
@@ -1936,6 +2066,13 @@ def build_tool_call(args: Namespace) -> tuple[str, dict[str, Any]]:
         # the same CliUsageError that ``_execute_local_command`` would
         # have already handled so callers get a uniform error shape.
         raise CliUsageError("eval is handled by _execute_local_command")
+
+    if subcommand == "eval-capture":
+        # The eval-capture subcommand is CLI-only: it constructs the
+        # provider and runs read-only retrieval, but it is NOT a Hermes
+        # tool and must not be routed through provider dispatch. Fail
+        # closed just like the Phase 6A ``eval`` guard.
+        raise CliUsageError("eval-capture is CLI-only; use the CLI subcommand directly")
 
     if subcommand == "store":
         _require_live_approval(args)
@@ -2197,7 +2334,7 @@ def execute_command(
     provider_factory = provider_factory or default_provider_factory
 
     try:
-        local_exit = _execute_local_command(args, stdout)
+        local_exit = _execute_local_command(args, stdout, provider_factory=provider_factory)
     except CliUsageError as exc:
         _print_cli_error(str(exc), args, stderr)
         return 2

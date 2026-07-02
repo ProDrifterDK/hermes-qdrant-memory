@@ -382,3 +382,140 @@ Expected outcome (illustrative):
 - `tests/test_cli.py` — `eval` parser mapping, local-command
   tests, and the `build_tool_call` block.
 - `docs/RAPTOR_EVAL.md` — this document.
+
+---
+
+# Phase 6B — read-only variant capture for offline eval
+
+Phase 6B adds a **CLI/operator-initiated capture** command that runs
+read-only retrieval across seven comparison variants and writes JSONL
+run rows directly consumable by the Phase 6A evaluator. This closes
+the loop: Phase 6A scores already-captured packets; Phase 6B produces
+those packets from live local Qdrant.
+
+## What is in scope
+
+- `qdrant_memory/eval_capture.py` — a capture core that accepts an
+  initialized provider and validated Phase 6A cases, then runs
+  read-only retrieval for each `(case, variant)` pair and emits JSONL
+  run rows.
+- `hermes qdrant eval-capture --cases CASES.jsonl --runs-out
+  RUNS.jsonl [--variants all|comma-list] [--top-k N] [--mode
+  hybrid|evidence] [--max-depth ...] [--max-children ...]
+  [--max-source-chars ...] [--candidate-seed-top-k ...]
+  [--max-graph-results ...] [--include-fact-history]
+  [--include-metadata] [--json]` — a CLI subcommand that constructs
+  the provider (unlike offline `eval`), runs the capture core, and
+  writes the runs file.
+- `build_tool_call` raises `CliUsageError` for `eval-capture` so
+  provider dispatch fails closed (capture is CLI-only, not a Hermes
+  tool).
+- `tests/test_eval_capture.py` — focused unit tests.
+- Additional CLI mapping tests in `tests/test_cli.py`.
+
+## Variants
+
+| variant           | what it runs                                                        |
+|-------------------|---------------------------------------------------------------------|
+| `dense-only`      | `MemoryRetriever.search(..., sparse suppressed, update_access=False)` |
+| `dense+sparse`    | `MemoryRetriever.search(..., sparse allowed, update_access=False)`    |
+| `graph`           | `GraphMemoryRetriever.search(...)` read-only with graph expansion     |
+| `raptor-only`     | `RaptorSearcher.search(...)` → summaries + cited_leaves only          |
+| `hybrid`          | `HybridRouter` dense seed (sparse suppressed by design) + graph + RAPTOR |
+| `hybrid-no-graph` | `HybridRouter` with `graph_retriever=None`                            |
+| `hybrid-no-raptor`| `HybridRouter` with `raptor_searcher=None`                           |
+
+All variants use `update_access=False` on every retrieval call. The
+`dense-only` variant suppresses sparse scroll
+(`allow_sparse_scroll=False`); `dense+sparse` allows it
+(`allow_sparse_scroll=True`) so the literal sparse baseline can run.
+The sparse lane uses Qdrant `scroll`, which is a read operation.
+
+> **Variant wording note:** `hybrid` does **not** mean "dense+sparse +
+> graph + RAPTOR". The read-only `HybridRouter` always passes
+> `allow_sparse_scroll=False` to the dense seed search (the sparse
+> scroll lane is intentionally suppressed in the router to keep the
+> read-only invariant tight). If you want a literal dense+sparse
+> baseline, run the `dense+sparse` variant — that path is the one
+> that actually invokes the Qdrant sparse `scroll`. The `hybrid`
+> variant captures whatever the live router returns, which is dense
+> seed (sparse suppressed) + graph + RAPTOR.
+
+## Privacy and safety rules
+
+- Run rows identify a capture by `case_id`, `variant`, `packet`,
+  `latency_ms`, and a sanitized `capture` metadata dict only.
+- **Raw query text is NEVER serialized** into run rows. The cases file
+  already contains query text by operator design; the runs file must
+  not duplicate it.
+- Captured errors are sanitized to `<redacted>` plus a stable error
+  kind (exception class name, with `timeout`/`connection` collapsed),
+  never raw exception strings.
+- The capture command is CLI/operator-initiated only. It is not
+  auto-recall, not cron, and not a Hermes tool.
+- It MAY read live local Qdrant/embeddings when the operator
+  explicitly runs the command.
+- It MUST NOT mutate Qdrant: no `upsert`, `delete`, `update_payload`,
+  access metadata updates, or write-side tools.
+
+## Creating local private eval cases
+
+Create your eval cases JSONL **outside the repo** so private queries
+and labels are never committed. Recommended path:
+
+```
+~/.hermes/qdrant_memory/eval/phase6b/cases.jsonl
+```
+
+Each line is one case (same schema as Phase 6A):
+
+```json
+{"case_id":"smoke-001","query":"your private query here","expected_file_paths":["docs/RAPTOR.md"],"expected_terms":["Phase 5"]}
+```
+
+> **Never commit private cases or runs.** Add the directory to your
+> global gitignore or keep it entirely outside the repo working tree.
+> The `.gitignore` in this repo does NOT cover `~/.hermes/` paths.
+
+## Running eval-capture
+
+```bash
+# Capture all variants for all cases:
+hermes qdrant eval-capture \
+  --cases ~/.hermes/qdrant_memory/eval/phase6b/cases.jsonl \
+  --runs-out ~/.hermes/qdrant_memory/eval/phase6b/runs.jsonl \
+  --json
+
+# Capture a subset of variants:
+hermes qdrant eval-capture \
+  --cases ~/.hermes/qdrant_memory/eval/phase6b/cases.jsonl \
+  --runs-out ~/.hermes/qdrant_memory/eval/phase6b/runs.jsonl \
+  --variants dense-only,hybrid,hybrid-no-graph
+```
+
+## Running eval to compare
+
+After capture, run the Phase 6A evaluator over the same cases and the
+captured runs:
+
+```bash
+hermes qdrant eval \
+  --cases ~/.hermes/qdrant_memory/eval/phase6b/cases.jsonl \
+  --runs ~/.hermes/qdrant_memory/eval/phase6b/runs.jsonl \
+  --json
+```
+
+The runs file produced by `eval-capture` is directly compatible with
+the Phase 6A `eval` command — same `case_id`/`variant`/`packet`/
+`latency_ms` schema.
+
+## Files (Phase 6B additions)
+
+- `qdrant_memory/eval_capture.py` — the capture core.
+- `qdrant_memory/cli_core.py` — `_execute_eval_capture_command` wired
+  into `_execute_local_command`. `build_tool_call` raises
+  `CliUsageError` for `eval-capture` to block provider dispatch.
+- `cli.py` — `hermes qdrant eval-capture` subcommand registration.
+- `tests/test_eval_capture.py` — focused unit tests for the capture
+  core and CLI integration.
+- `docs/RAPTOR_EVAL.md` — Phase 6B section (this section).
