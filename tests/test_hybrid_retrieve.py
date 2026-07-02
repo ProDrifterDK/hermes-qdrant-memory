@@ -2670,3 +2670,216 @@ class TestRetrieveTopLevelErrorNoRawException:
         )
         d = json.loads(raw)
         assert "Retrieve failed" in d["error"]
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6G: exact-signal output packer guard
+# --------------------------------------------------------------------------- #
+
+
+class TestExactSignalPruning:
+    """Test the :func:`_exact_signal_prune` helper directly and through
+    :func:`_dense_to_exact_hits` / :func:`_graph_to_relations`."""
+
+    def _make_item(
+        self,
+        pid: str,
+        text: str,
+        file_path: str = "",
+        source_uri: str = "",
+        heading: str = "",
+    ) -> dict[str, Any]:
+        return {
+            "point_id": pid,
+            "text": text,
+            "score": 0.8,
+            "source_type": "manual",
+            "source_uri": source_uri,
+            "file_path": file_path,
+            "heading": heading,
+        }
+
+    def test_no_strong_signal_unchanged(self):
+        """Natural-language query with no strong exact signal → items
+        returned unchanged."""
+        from qdrant_memory.hybrid.router import _exact_signal_prune
+
+        items = [self._make_item("doc-1", "some prose about foo")]
+        result = _exact_signal_prune(
+            "what is the meaning of life", items, "test_lane",
+        )
+        assert result == items
+        # No warning emitted because signal is absent.
+
+    def test_empty_items_unchanged(self):
+        """Empty item list should return unchanged."""
+        from qdrant_memory.hybrid.router import _exact_signal_prune
+
+        result = _exact_signal_prune(
+            "/api/v1/projects", [], "test_lane",
+        )
+        assert result == []
+
+    def test_strong_signal_keeps_matching_items(self):
+        """Strong-signal query with items that have literal overlap
+        → non-matching items pruned, matching items kept."""
+        from qdrant_memory.hybrid.router import _exact_signal_prune
+
+        items = [
+            self._make_item("doc-1", "some random prose"),
+            self._make_item(
+                "doc-2", "the file path is /api/v1/projects",
+                file_path="/repo/docs/api/v1/projects.md",
+            ),
+        ]
+        result = _exact_signal_prune(
+            "/api/v1/projects", items, "test_lane",
+        )
+        assert len(result) == 1
+        assert result[0]["point_id"] == "doc-2"
+
+    def test_strong_signal_prunes_all_non_matching(self):
+        """Strong-signal query where no item carries literal overlap
+        → fallback: full list returned unchanged."""
+        from qdrant_memory.hybrid.router import _exact_signal_prune
+
+        items = [
+            self._make_item("doc-1", "just random text here"),
+            self._make_item("doc-2", "more random text"),
+        ]
+        result = _exact_signal_prune(
+            "/api/v1/does-not-exist", items, "test_lane",
+        )
+        # Fallback: unchanged (no match, but we don't starve the caller).
+        assert result == items
+
+    def test_strong_signal_all_items_match(self):
+        """All items match the query signal; all kept."""
+        from qdrant_memory.hybrid.router import _exact_signal_prune
+
+        items = [
+            self._make_item("doc-1", "ref to /api/v1/projects here"),
+            self._make_item("doc-2", "also /api/v1/projects here"),
+        ]
+        result = _exact_signal_prune(
+            "/api/v1/projects", items, "test_lane",
+        )
+        assert len(result) == 2
+
+    def test_with_strong_signal_warnings(self):
+        """Warnings emitted for pruning events, never raw tokens/paths."""
+        from qdrant_memory.hybrid.router import _exact_signal_prune
+
+        items = [
+            self._make_item("doc-1", "some random text"),
+            self._make_item(
+                "doc-2", "api route present",
+                source_uri="file:///api/v1/projects",
+            ),
+        ]
+        warnings: list[str] = []
+        result = _exact_signal_prune(
+            "/api/v1/projects", items, "test_lane",
+            warnings=warnings,
+        )
+        assert len(result) == 1
+        assert warnings
+        # Warning must only contain count, never raw query/tokens/paths.
+        for w in warnings:
+            assert "/api/v1/projects" not in w
+            assert "exact-signal" in w
+
+    def test_zero_match_fallback_warning(self):
+        """Zero-match fallback emits a count-only warning."""
+        from qdrant_memory.hybrid.router import _exact_signal_prune
+
+        items = [self._make_item("doc-1", "plain text")]
+        warnings: list[str] = []
+        result = _exact_signal_prune(
+            "/api/v1/unknown-route", items, "test_lane",
+            warnings=warnings,
+        )
+        assert result == items
+        assert warnings
+        for w in warnings:
+            assert "fallback" in w
+            assert "1" in w  # count only
+
+    def test_through_dense_to_exact_hits_natural_language(self):
+        """Natural-language query through _dense_to_exact_hits
+        preserves all items."""
+        from qdrant_memory.hybrid.router import _dense_to_exact_hits
+
+        chunks = [
+            _Chunk("doc-1", "prose about cats", {"source_type": "manual"}),
+        ]
+        result = _dense_to_exact_hits(chunks, query="tell me about cats")
+        assert len(result) == 1
+        assert result[0]["point_id"] == "doc-1"
+
+    def test_through_dense_to_exact_hits_strong_signal_prunes(self):
+        """Strong-signal query through _dense_to_exact_hits prunes
+        non-literal items."""
+        from qdrant_memory.hybrid.router import _dense_to_exact_hits
+
+        chunks = [
+            _Chunk("doc-1", "just some story", {"source_type": "manual"}),
+            _Chunk(
+                "doc-2",
+                "handling /api/v1/users",
+                {"source_type": "code", "file_path": "/repo/api/v1/users.md"},
+            ),
+        ]
+        result = _dense_to_exact_hits(chunks, query="/api/v1/users")
+        assert len(result) >= 1
+        ids = [r["point_id"] for r in result]
+        # doc-2 must survive because it carries the literal signal path
+        # in its text or payload.
+        assert "doc-2" in ids
+
+    def test_through_dense_to_exact_hits_fallback(self):
+        """Strong-signal query through _dense_to_exact_hits where no
+        item matches falls back to the full list unchanged."""
+        from qdrant_memory.hybrid.router import _dense_to_exact_hits
+
+        chunks = [
+            _Chunk("doc-1", "completely unrelated", {"source_type": "manual"}),
+        ]
+        result = _dense_to_exact_hits(chunks, query="/api/v1/unknown")
+        # Fallback: item is preserved even though no literal match.
+        assert len(result) == 1
+        assert result[0]["point_id"] == "doc-1"
+
+    def test_through_graph_to_relations_strong_signal(self):
+        """Strong-signal query through _graph_to_relations prunes."""
+        candidates = [
+            FakeGraphCandidate(
+                "graph-1", graph_distance=1, final_score=0.7,
+                payload={"text": "plain text", "source_uri": "file://a.md"},
+            ),
+            FakeGraphCandidate(
+                "graph-2", graph_distance=1, final_score=0.7,
+                payload={
+                    "text": "ref to /api/v1/users",
+                    "source_uri": "file://b.md",
+                },
+            ),
+        ]
+        graph = FakeGraphResult(final=candidates)
+        result = _graph_to_relations(graph, query="/api/v1/users")
+        ids = [r["point_id"] for r in result]
+        assert "graph-2" in ids
+
+    def test_through_graph_to_relations_fallback(self):
+        """Strong-signal query through _graph_to_relations with no
+        match falls back unchanged."""
+        candidates = [
+            FakeGraphCandidate(
+                "graph-1", graph_distance=1, final_score=0.7,
+                payload={"text": "plain text", "source_uri": "file://a.md"},
+            ),
+        ]
+        graph = FakeGraphResult(final=candidates)
+        result = _graph_to_relations(graph, query="/api/v1/unknown")
+        assert len(result) == 1
+        assert result[0]["point_id"] == "graph-1"

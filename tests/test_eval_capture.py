@@ -1071,3 +1071,106 @@ class TestCliEvalCapture:
         error = json.loads(captured.err)
         assert error["error"] is True
         assert "unknown capture variant" in error["message"]
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6G: exact-signal pruning through eval-capture projections
+# --------------------------------------------------------------------------- #
+
+
+class TestExactSignalPruningCapture:
+    """Exact-signal pruning must be applied through _dense_projection
+    and _graph_projection so eval-capture rows get the same gate."""
+
+    def test_dense_projection_natural_language_preserved(self):
+        """Natural-language query preserves all items through
+        _dense_projection."""
+        from qdrant_memory.eval_capture import _dense_projection
+
+        chunks = [FakeChunk("doc-1", "story about cats")]
+        result = _dense_projection(
+            chunks, query="tell me about cats", max_source_chars=1200,
+        )
+        assert len(result) == 1
+
+    def test_dense_projection_strong_signal_prunes(self):
+        """Strong-signal query through _dense_projection prunes
+        non-literal items."""
+        from qdrant_memory.eval_capture import _dense_projection
+
+        chunks = [
+            FakeChunk("doc-1", "random prose"),
+            FakeChunk(
+                "doc-2", "handling /api/v1/users",
+                {"file_path": "/repo/api/v1/users.md"},
+            ),
+        ]
+        result = _dense_projection(
+            chunks, query="/api/v1/users", max_source_chars=1200,
+        )
+        ids = [r["point_id"] for r in result]
+        assert "doc-2" in ids
+
+    def test_dense_projection_fallback(self):
+        """Strong-signal query with no match falls back to full list."""
+        from qdrant_memory.eval_capture import _dense_projection
+
+        chunks = [FakeChunk("doc-1", "completely unrelated")]
+        result = _dense_projection(
+            chunks, query="/api/v1/nonexistent", max_source_chars=1200,
+        )
+        assert len(result) == 1
+        assert result[0]["point_id"] == "doc-1"
+
+    def test_graph_projection_natural_language_preserved(self):
+        """Natural-language query preserves all items through
+        _graph_projection."""
+        from qdrant_memory.eval_capture import _graph_projection
+
+        candidate = FakeGraphCandidate(
+            "graph-1", graph_distance=1, final_score=0.7,
+            payload={"text": "plain text", "source_uri": "file://a.md"},
+        )
+        graph = FakeGraphResult(final=[candidate])
+        result = _graph_projection(graph, query="tell me about stuff")
+        assert len(result) == 1
+        assert result[0]["point_id"] == "graph-1"
+
+    def test_graph_projection_strong_signal_prunes(self):
+        """Strong-signal query through _graph_projection prunes
+        non-literal items."""
+        from qdrant_memory.eval_capture import _graph_projection
+
+        candidates = [
+            FakeGraphCandidate(
+                "graph-1", graph_distance=1, final_score=0.7,
+                payload={"text": "plain text", "source_uri": "file://a.md"},
+            ),
+            FakeGraphCandidate(
+                "graph-2", graph_distance=1, final_score=0.7,
+                payload={
+                    "text": "ref to /api/v1/users",
+                    "source_uri": "file://b.md",
+                },
+            ),
+        ]
+        graph = FakeGraphResult(final=candidates)
+        result = _graph_projection(graph, query="/api/v1/users")
+        ids = [r["point_id"] for r in result]
+        assert "graph-2" in ids
+
+    def test_graph_projection_fallback(self):
+        """Strong-signal query through _graph_projection with no
+        match falls back unchanged."""
+        from qdrant_memory.eval_capture import _graph_projection
+
+        candidates = [
+            FakeGraphCandidate(
+                "graph-1", graph_distance=1, final_score=0.7,
+                payload={"text": "plain text", "source_uri": "file://a.md"},
+            ),
+        ]
+        graph = FakeGraphResult(final=candidates)
+        result = _graph_projection(graph, query="/api/v1/nonexistent")
+        assert len(result) == 1
+        assert result[0]["point_id"] == "graph-1"

@@ -28,6 +28,7 @@ from qdrant_memory.hybrid.fusion import deduplicate_by_point_id, rrf_fuse
 from qdrant_memory.lesson_extractor import contains_secret
 from qdrant_memory.raptor.builder import _safe_handle_for_point_id
 from qdrant_memory.raptor.search import RaptorSearcher, RaptorSearchResult
+from qdrant_memory.sparse_search import has_strong_signal, score_candidates
 
 
 # Hard caps (non-negotiable, shared with RAPTOR search module)
@@ -56,6 +57,83 @@ _HARD_MAX_SOURCE_CHARS = 2400
 # ``_redact_query_metadata`` helper is the single source of truth so
 # the memory hybrid lane and the learning lane stay aligned.
 _QUERY_REDACTED_SENTINEL = "[redacted: query omitted from retrieve output]"
+
+
+def _exact_signal_prune(
+    query: str | None,
+    items: list[dict[str, Any]],
+    lane_name: str,
+    *,
+    warnings: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Filter items by exact-signal scoring when the query carries a
+    high-confidence literal signal.
+
+    No strong signal or empty items → items returned unchanged.
+    Each item is converted to a ``{"id": ..., "payload": {...}}`` dict
+    and scored via :func:`score_candidates`. An item is a "match" when
+    its :class:`SparseScore` has ``score > 0`` AND at least one of
+    ``matched_tokens`` or ``literal_hit`` is populated.
+
+    If at least one candidate matches, only matches survive pruning.
+    If *no* candidate matches, the full list is returned unchanged
+    (fallback — the dense vector similarity still produced plausible
+    items; the exact-signal gate should not starve the caller).
+
+    Warnings/debug carry only count metadata — never the raw query,
+    tokens, snippets, or paths.
+
+    This guard prevents exact-signal queries (UUIDs, file paths,
+    issue IDs, code identifiers) from returning dense-only hits that
+    have no literal overlap with the query, reducing noise in
+    ``exact_hits`` and ``graph_relations`` when the sparse lane is
+    unavailable or the dense vector space returns unrelated items.
+    """
+    if not query or not has_strong_signal(query):
+        return items
+    if not items:
+        return items
+
+    points: list[dict[str, Any]] = []
+    for item in items:
+        pid = str(item.get("point_id") or item.get("id") or "")
+        payload = {
+            "text": str(item.get("text") or ""),
+            "file_path": str(item.get("file_path") or ""),
+            "source_uri": str(item.get("source_uri") or ""),
+            "heading": str(item.get("heading") or ""),
+            "source": str(item.get("source") or ""),
+            "project_path": str(item.get("project_path") or ""),
+            "subject": str(item.get("subject") or ""),
+            "fact_key": str(item.get("fact_key") or ""),
+        }
+        points.append({"id": pid, "payload": payload})
+
+    scores = score_candidates(query, points)
+
+    matched_indices: list[int] = []
+    for idx, score in enumerate(scores):
+        if score.score > 0 and (score.matched_tokens or score.literal_hit):
+            matched_indices.append(idx)
+
+    if matched_indices:
+        before = len(items)
+        pruned = [items[i] for i in matched_indices]
+        if warnings is not None:
+            warnings.append(
+                f"{lane_name}: exact-signal pruned {before} -> {len(pruned)}"
+            )
+        return pruned
+
+    # Fallback: no match, return unchanged so the caller still gets
+    # dense / graph results even when the exact-signal tokens do not
+    # appear in any candidate payload.
+    if warnings is not None:
+        warnings.append(
+            f"{lane_name}: exact-signal prune found no matches, "
+            f"fallback unchanged ({len(items)})"
+        )
+    return items
 
 
 def _redact_query_metadata(query: Any) -> dict[str, Any]:
@@ -328,6 +406,7 @@ def _dense_chunk_payload_secret(
 def _dense_to_exact_hits(
     dense_chunks: list[Any],
     *,
+    query: str | None = None,
     warnings: list[str] | None = None,
     include_fact_history: bool = False,
     max_source_chars: int | None = None,
@@ -488,6 +567,9 @@ def _dense_to_exact_hits(
             "dense exact hits: hard context budget enforced "
             f"({overflow_count} dropped)"
         )
+    final = _exact_signal_prune(
+        query, final, "dense_exact_hits", warnings=warnings,
+    )
     return final
 
 
@@ -788,6 +870,7 @@ def _truncate_graph_text(text: str, max_chars: int) -> str:
 def _graph_to_relations(
     graph_result: Any,
     *,
+    query: str | None = None,
     warnings: list[str] | None = None,
     max_source_chars: int | None = None,
     include_fact_history: bool = False,
@@ -919,6 +1002,9 @@ def _graph_to_relations(
             "text": truncated_text,
         }
         out.append(item)
+    out = _exact_signal_prune(
+        query, out, "graph_relations", warnings=warnings,
+    )
     return out
 
 
@@ -1034,6 +1120,7 @@ class HybridRouter:
 
         dense_hits = _dense_to_exact_hits(
             dense_chunks,
+            query=query,
             warnings=warnings,
             include_fact_history=include_fact_history,
             # Phase 5 fix9 (final7 finding #2): pass the per-result
@@ -1078,6 +1165,7 @@ class HybridRouter:
                 )
                 graph_relations = _graph_to_relations(
                     graph_result,
+                    query=query,
                     warnings=warnings,
                     # Phase 6E: pass the per-relation truncation
                     # budget and the ``include_fact_history`` opt-in

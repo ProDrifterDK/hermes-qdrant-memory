@@ -322,6 +322,7 @@ def _dense_chunk_to_exact_hit(chunk: Any) -> dict[str, Any]:
 def _dense_projection(
     dense_chunks: list[Any],
     *,
+    query: str | None = None,
     include_fact_history: bool = False,
     max_source_chars: int,
 ) -> list[dict[str, Any]]:
@@ -347,6 +348,7 @@ def _dense_projection(
 
     return _dense_to_exact_hits(
         dense_chunks,
+        query=query,
         warnings=None,
         include_fact_history=include_fact_history,
         max_source_chars=max_source_chars,
@@ -416,6 +418,7 @@ def _graph_result_to_relations(graph_result: Any) -> list[dict[str, Any]]:
 def _graph_projection(
     graph_result: Any,
     *,
+    query: str | None = None,
     max_source_chars: int | None = None,
     include_fact_history: bool = False,
 ) -> list[dict[str, Any]]:
@@ -439,6 +442,7 @@ def _graph_projection(
 
     return _graph_to_relations(
         graph_result,
+        query=query,
         warnings=None,
         max_source_chars=max_source_chars,
         include_fact_history=include_fact_history,
@@ -557,6 +561,7 @@ def _run_dense_only(
     # before the run row is serialized.
     exact_hits = _dense_projection(
         chunks,
+        query=query,
         include_fact_history=include_fact_history,
         max_source_chars=max_source_chars,
     )
@@ -589,6 +594,7 @@ def _run_dense_sparse(
     )
     exact_hits = _dense_projection(
         chunks,
+        query=query,
         include_fact_history=include_fact_history,
         max_source_chars=max_source_chars,
     )
@@ -635,6 +641,7 @@ def _run_graph(
     # cap is enforced identically to the live HybridRouter path.
     relations = _graph_projection(
         graph_result,
+        query=query,
         max_source_chars=max_source_chars,
         include_fact_history=include_fact_history,
     )
