@@ -133,6 +133,15 @@ class SparseScore:
     payload_invisible: bool = False
 
 
+# Trailing file-extension pattern matched against the LAST component of a
+# slash-path candidate when computing component-aligned substring matches.
+# The pattern intentionally matches common short extensions (``.md``,
+# ``.markdown`` …) and avoids stripping hyphenated suffixes like
+# ``Nucleogenesis-extra``, which would otherwise let a broad directory
+# prefix promote unrelated sibling paths.
+_PATH_EXT_RE = re.compile(r"\.[A-Za-z0-9]{1,10}$")
+
+
 # ---------------------------------------------------------------------------
 # Tokenization
 # ---------------------------------------------------------------------------
@@ -214,6 +223,28 @@ _STOPWORDS: frozenset[str] = frozenset(
 )
 
 
+def _is_code_like_identifier(token: str) -> bool:
+    """Heuristic: is ``token`` a code-like identifier rather than plain prose?
+
+    Promotes snake_case (``CODEGRAPH_PROJECT``, ``active_notes``), camelCase /
+    PascalCase boundaries (``userId``, ``MemoryRetriever``) and digit-bearing
+    identifiers (``Qwen3``, ``bge_m3``). Does NOT promote plain prose words or
+    acronyms such as ``CMPC``, ``Nucleogenesis``, ``mcp``, ``home``,
+    ``projects``, ``Documentos`` — those carry no structural signal that a
+    candidate is the exact identifier the user is looking for, so promoting on
+    them alone floods the sparse lane with same-scope but unrelated hits.
+    """
+    if "_" in token:
+        return True
+    # digit adjacent to a letter (e.g. Qwen3, v2, utf8)
+    if re.search(r"[A-Za-z]\d|\d[A-Za-z]", token):
+        return True
+    # camelCase boundary: lowercase immediately followed by uppercase
+    if re.search(r"[a-z][A-Z]", token):
+        return True
+    return False
+
+
 # Patterns that are treated as "strong" exact-signal indicators. A query that
 # matches at least one of these is a candidate for the sparse lane; a query
 # that only matches plain words should stay on the dense lane.
@@ -229,14 +260,41 @@ _STRONG_SIGNAL_PATTERNS: tuple[re.Pattern[str], ...] = (
     _HTTP_STATUS_RE,
 )
 
+# Strong patterns split by the matching strategy the scorer uses.
+#
+# ``_EXACT_SCORING_PATTERNS`` produce tokens matched by exact token equality
+# (UUIDs, issue IDs, error literals, HTTP statuses). Code-like identifiers are
+# also matched by equality (added separately by ``_collect_scoring_signals``).
+#
+# ``_SUBSTRING_SCORING_PATTERNS`` produce compound path-like tokens that are
+# matched by safe substring containment inside indexed fields, so a query for
+# ``/api/v1/projects`` can match a longer indexed file path such as
+# ``/repo/docs/api/v1/projects.md``. These tokens all contain structural
+# delimiters (``/``, ``.``, ``::``) which keeps substring matching specific and
+# prevents broad single-word collateral hits.
+_EXACT_SCORING_PATTERNS: tuple[re.Pattern[str], ...] = (
+    _UUID_RE,
+    _HEX32_RE,
+    _ISSUE_ID_RE,
+    _ERROR_RE,
+    _HTTP_STATUS_RE,
+)
+_SUBSTRING_SCORING_PATTERNS: tuple[re.Pattern[str], ...] = (
+    _API_ROUTE_RE,
+    _SLASH_PATH_RE,
+    _DOTTED_RE,
+    _COLON_PATH_RE,
+)
+
 
 def has_strong_signal(text: str) -> bool:
     """Return True if ``text`` carries at least one high-confidence exact signal.
 
     The sparse lane should only fire on queries that look like literal /
     identifier lookups (UUID, issue ID, /api/... route, dotted/colon symbol,
-    error literal, HTTP status code). Generic natural-language queries should
-    fall back to dense-only so broad semantic search is not flooded with
+    error literal, HTTP status code, or a code-like identifier such as
+    ``CODEGRAPH_PROJECT`` / ``active_notes``). Generic natural-language queries
+    should fall back to dense-only so broad semantic search is not flooded with
     literal-token matches.
     """
     if not text:
@@ -244,12 +302,112 @@ def has_strong_signal(text: str) -> bool:
     for pattern in _STRONG_SIGNAL_PATTERNS:
         if pattern.search(text):
             return True
+    # Code-like identifiers (snake_case, camelCase, digit-bearing) are also
+    # strong-signal indicators worth a sparse lookup even when no other
+    # structural pattern matches.
+    for match in _IDENT_RE.finditer(text):
+        token = match.group(0)
+        if len(token) < 3:
+            continue
+        if token.lower() in _STOPWORDS:
+            continue
+        if _is_code_like_identifier(token):
+            return True
     return False
 
 
 def extract_signals(text: str, *, max_tokens: int = _MAX_QUERY_TOKENS) -> SparseSignals:
     """Extract exact-signal tokens from ``text`` (query string or payload)."""
     return SparseSignals(tokens=tuple(_collect_tokens(text, max_tokens=max_tokens)), raw=text or "")
+
+
+@dataclass(frozen=True)
+class ScoringSignals:
+    """Tokens the scorer uses to decide whether a candidate is a literal hit.
+
+    ``exact`` are matched by token equality (UUIDs, issue IDs, error literals,
+    HTTP statuses, and code-like identifiers). ``substring`` are compound
+    path-like tokens matched by safe substring containment inside indexed
+    fields. Broad plain words / path components are deliberately excluded so
+    the sparse lane can no longer promote candidates based solely on generic
+    identifier overlap (e.g. ``CMPC``, ``mcp``, ``projects``).
+    """
+
+    exact: tuple[str, ...] = ()
+    substring: tuple[str, ...] = ()
+
+    @property
+    def token_set(self) -> set[str]:
+        return set(self.exact)
+
+    def __bool__(self) -> bool:  # pragma: no cover - trivial
+        return bool(self.exact) or bool(self.substring)
+
+
+def _collect_scoring_signals(text: str, *, max_tokens: int = _MAX_QUERY_TOKENS) -> ScoringSignals:
+    """Extract the subset of tokens the sparse scorer may match on.
+
+    Unlike :func:`extract_signals` (which returns every token including broad
+    plain words), this helper returns only high-confidence tokens:
+
+    * strong exact tokens from :data:`_EXACT_SCORING_PATTERNS` (UUID, issue
+      ID, error literal, HTTP status);
+    * compound path-like tokens from :data:`_SUBSTRING_SCORING_PATTERNS`
+      (``/api/...`` routes, slash paths, dotted symbols, colon paths);
+    * code-like identifiers (snake_case, camelCase, digit-bearing) such as
+      ``CODEGRAPH_PROJECT``, ``active_notes``, ``userId``, ``Qwen3``.
+
+    Broad plain words / path components (``CMPC``, ``Nucleogenesis``, ``mcp``,
+    ``home``, ``projects``, ``Documentos``, ``implementation``) are dropped
+    because matching on them alone floods the sparse lane with same-scope but
+    unrelated candidates.
+    """
+    if not text:
+        return ScoringSignals()
+
+    seen_exact: set[str] = set()
+    exact: list[str] = []
+    seen_sub: set[str] = set()
+    substring: list[str] = []
+
+    def add_exact(token: str) -> None:
+        norm = _normalize_token(token)
+        if norm and norm not in seen_exact:
+            seen_exact.add(norm)
+            exact.append(norm)
+
+    def add_sub(token: str) -> None:
+        norm = _normalize_token(token)
+        if norm and norm not in seen_sub:
+            seen_sub.add(norm)
+            substring.append(norm)
+
+    for pattern in _EXACT_SCORING_PATTERNS:
+        for match in pattern.finditer(text):
+            add_exact(match.group(0))
+
+    for pattern in _SUBSTRING_SCORING_PATTERNS:
+        for match in pattern.finditer(text):
+            add_sub(match.group(0))
+
+    # Code-like identifiers from the generic identifier regex. These are
+    # matched by exact equality; broad plain words are skipped.
+    for match in _IDENT_RE.finditer(text):
+        token = match.group(0)
+        if len(token) < 3:
+            continue
+        if token.lower() in _STOPWORDS:
+            continue
+        if _is_code_like_identifier(token):
+            add_exact(token)
+
+    # Bound the combined token list to keep scoring CPU bounded.
+    if len(exact) + len(substring) > max_tokens:
+        keep = max(1, max_tokens // 2)
+        exact = exact[:keep]
+        substring = substring[: (max_tokens - keep)]
+
+    return ScoringSignals(exact=tuple(exact), substring=tuple(substring))
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +442,160 @@ def _payload_field_has_secret(value: Any) -> bool:
         return any(_payload_field_has_secret(item) for item in value)
     if isinstance(value, dict):
         return any(_payload_field_has_secret(item) for item in value.values())
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Structural substring matching for compound query tokens
+# ---------------------------------------------------------------------------
+
+
+def _split_structural_components(token: str, delim: str) -> list[str]:
+    """Split ``token`` on ``delim`` and drop empty parts (e.g. leading ``/``).
+
+    Used to compare slash paths, dotted symbols, and ``::``-separated FQNs
+    at a structural-component level rather than at the raw-character level.
+    """
+    if not token or not delim:
+        return []
+    return [part for part in token.split(delim) if part]
+
+
+def _strip_trailing_extension(component: str) -> str:
+    """Strip a trailing file-extension-like suffix from a single path component.
+
+    ``foo.md`` → ``foo``; ``foo.json`` → ``foo``; ``Nucleogenesis-extra`` is
+    returned unchanged (the ``-`` separator is intentionally preserved so
+    a broad hyphen-delimited sibling segment does not collapse onto a
+    shorter query segment). Returns ``component`` unchanged when stripping
+    would leave an empty fragment.
+    """
+    if not component or "." not in component:
+        return component
+    match = _PATH_EXT_RE.search(component)
+    if not match:
+        return component
+    base = component[: match.start()]
+    return base if base else component
+
+
+def _candidate_structural_components(
+    field_text: str, delim: str
+) -> list[list[str]]:
+    """Return component lists for every structural token in ``field_text``.
+
+    ``delim`` selects the matching regex family (``/`` for slash paths and
+    API routes, ``.`` for dotted symbols, ``::`` for FQNs). The LAST path
+    component of each token has its trailing extension stripped so a query
+    like ``/api/v1/projects`` matches a candidate ``/repo/api/v1/projects.md``.
+    Hyphenated suffixes are NOT stripped, so ``Nucleogenesis-extra`` stays
+    distinct from ``Nucleogenesis``.
+    """
+    if not field_text:
+        return []
+    tokens: list[list[str]] = []
+    if delim == "/":
+        seen: set[tuple[str, ...]] = set()
+        for match in _SLASH_PATH_RE.finditer(field_text):
+            comps = _split_structural_components(match.group(0), "/")
+            if not comps:
+                continue
+            comps[-1] = _strip_trailing_extension(comps[-1])
+            if comps[-1] and tuple(comps) not in seen:
+                seen.add(tuple(comps))
+                tokens.append(comps)
+        for match in _API_ROUTE_RE.finditer(field_text):
+            comps = _split_structural_components(match.group(0), "/")
+            if not comps:
+                continue
+            comps[-1] = _strip_trailing_extension(comps[-1])
+            if comps[-1] and tuple(comps) not in seen:
+                seen.add(tuple(comps))
+                tokens.append(comps)
+        return tokens
+    if delim == "::":
+        for match in _COLON_PATH_RE.finditer(field_text):
+            comps = _split_structural_components(match.group(0), "::")
+            if comps:
+                tokens.append(comps)
+        return tokens
+    if delim == ".":
+        for match in _DOTTED_RE.finditer(field_text):
+            comps = _split_structural_components(match.group(0), ".")
+            if comps:
+                tokens.append(comps)
+        return tokens
+    return []
+
+
+def _substring_token_aligned(query_sub: str, field_text: str) -> bool:
+    """Return True when ``query_sub`` is a structural-aligned substring of ``field_text``.
+
+    The query token is decomposed into its own structural components
+    (slash-delimited path, dot-delimited symbol, or ``::``-delimited FQN).
+    The candidate's indexed structural tokens are decomposed the same way.
+    A match is recorded when the query's components appear as a contiguous
+    slice — in order, but not necessarily at the very start — of some
+    candidate token's component list.
+
+    Comparison is case-insensitive on both sides so ``/api/v1/projects``
+    continues to match ``/repo/docs/API/V1/PROJECTS.md`` (a candidate
+    indexed in uppercase or with mixed casing).
+
+    This replaces raw ``sub.lower() in lowered`` substring containment,
+    which suffered from these near-prefix false positives:
+
+    * ``/api/v1/project`` matching ``/repo/docs/api/v1/projects.md``;
+    * ``pkg.mod`` matching ``pkg.module.Class``;
+    * ``/home/.../Nucleogenesis`` matching
+      ``/home/.../Nucleogenesis-extra/README.md``.
+
+    Tokens with a single structural component (e.g. bare ``CMPC`` or
+    ``projects`` with no delimiter) cannot be aligned structurally and fall
+    back to the existing exact-equality branch, so broad plain words never
+    promote unrelated candidates.
+    """
+    if not query_sub or not field_text:
+        return False
+    # Pick the strongest structural delimiter the query carries; the
+    # ordering prefers slash, then FQN ``::``, then dotted, because each
+    # regex set may produce overlapping matches and we want slash-path
+    # tokens evaluated against slash-path tokens.
+    if "/" in query_sub:
+        delim = "/"
+    elif "::" in query_sub:
+        delim = "::"
+    elif "." in query_sub:
+        delim = "."
+    else:
+        return False
+
+    qcomps = _split_structural_components(query_sub, delim)
+    if len(qcomps) < 2:
+        # A single-component query cannot anchor a substring match: it
+        # would either match the entire candidate (handled by exact
+        # equality elsewhere) or nothing. Returning False keeps broad
+        # plain words from promoting unrelated paths.
+        return False
+    # Lowercase the query components for case-insensitive comparison.
+    qcomps_lc = [c.lower() for c in qcomps]
+    # Also strip trailing extension on the query's last component so a
+    # user-typed ``/api/v1/projects.md`` matches the same files as
+    # ``/api/v1/projects``.
+    if delim == "/":
+        qcomps_lc[-1] = _strip_trailing_extension(qcomps_lc[-1])
+        if not qcomps_lc[-1]:
+            return False
+
+    qlen = len(qcomps_lc)
+    candidates = _candidate_structural_components(field_text, delim)
+    for ccomps in candidates:
+        ccomps_lc = [c.lower() for c in ccomps]
+        if len(ccomps_lc) < qlen:
+            continue
+        for start in range(0, len(ccomps_lc) - qlen + 1):
+            if ccomps_lc[start : start + qlen] == qcomps_lc:
+                return True
     return False
 
 
@@ -332,12 +644,21 @@ def score_candidates(
     input. Hidden / quarantined / secret-bearing candidates are returned with
     a score of 0.0 and the appropriate diagnostic flag set so the retriever can
     decide whether to drop them entirely or simply not promote them.
+
+    Phase 6D hardening: scoring only matches high-confidence exact/literal
+    signals (UUIDs, issue IDs, error literals, HTTP statuses, code-like
+    identifiers, and compound path-like tokens by structural-component
+    alignment). Broad plain words / generic path components (``CMPC``,
+    ``mcp``, ``projects``, ``home``, ``Documentos``) are NOT scored on
+    their own, so a candidate can no longer be promoted based solely on
+    generic identifier overlap with the query.
     """
-    signals = extract_signals(query)
-    token_set = set(signals.tokens)
+    signals = _collect_scoring_signals(query)
+    exact_set = signals.token_set
+    substring_tokens = signals.substring
     out: list[SparseScore] = []
-    if not token_set:
-        # No exact signals to match; return zero scores so callers can short
+    if not exact_set and not substring_tokens:
+        # No scoring signals to match; return zero scores so callers can short
         # circuit cleanly without re-iterating.
         for point in points:
             pid = _point_id(point, point_id_getter)
@@ -385,25 +706,41 @@ def score_candidates(
             )
             continue
 
-        # Tokenize the candidate's compact metadata and accumulate hits.
-        # We deliberately cap per-field token count to bound CPU on large
-        # payloads.
-        field_tokens: dict[str, list[str]] = {}
+        # Exact-equality matches come from tokenizing the candidate's compact
+        # metadata (e.g. an issue ID appearing in ``heading``). Substring
+        # matches come from a structural-component alignment between a
+        # compound path-like query token (e.g. ``/api/v1/projects``) and the
+        # candidate's indexed structural tokens (e.g. the slash-path token
+        # ``/repo/docs/api/v1/projects.md`` inside the candidate's
+        # ``file_path`` field).
         field_hits: dict[str, int] = {}
+        matched: set[str] = set()
         for field_name, field_text in _iter_candidate_text_fields(payload):
+            field_hit_count = 0
+            # Exact-equality: tokenize the field and intersect with exact_set.
             tokens = _collect_tokens(field_text, max_tokens=_MAX_CANDIDATE_TOKENS)
-            field_tokens[field_name] = tokens
-            hits = [tok for tok in tokens if tok in token_set]
-            if hits:
-                field_hits[field_name] = len(hits)
-        matched = sorted({tok for toks in field_tokens.values() for tok in toks if tok in token_set})
+            for tok in tokens:
+                if tok in exact_set:
+                    field_hit_count += 1
+                    matched.add(tok)
+            # Substring containment: structural alignment of compound query
+            # tokens against the candidate's structural tokens. Replaces the
+            # previous raw ``sub.lower() in lowered`` check, which produced
+            # near-prefix false positives on path-like tokens.
+            if substring_tokens:
+                for sub in substring_tokens:
+                    if _substring_token_aligned(sub, field_text):
+                        field_hit_count += 1
+                        matched.add(sub)
+            if field_hit_count:
+                field_hits[field_name] = field_hit_count
 
         # Point ID literal hit is a strong signal.
         literal_hit = False
-        for tok in token_set:
+        for tok in exact_set:
             if pid and tok and (tok == pid or tok in pid):
                 literal_hit = True
-                matched.append(tok)
+                matched.add(tok)
                 field_hits.setdefault("point_id", 0)
                 field_hits["point_id"] += 1
                 break
@@ -436,7 +773,7 @@ def score_candidates(
             SparseScore(
                 point_id=pid,
                 score=float(score),
-                matched_tokens=sorted(set(matched)),
+                matched_tokens=sorted(matched),
                 field_hits=field_hits,
                 literal_hit=literal_hit,
             )
@@ -655,6 +992,7 @@ def combine_score(candidate: MergedCandidate, *, sparse_lift: float = _DEFAULT_S
 __all__ = [
     "DEFAULT_QUARANTINE_KEY",
     "MergedCandidate",
+    "ScoringSignals",
     "SparseCandidate",
     "SparseScore",
     "SparseSignals",

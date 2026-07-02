@@ -991,3 +991,576 @@ def test_sparse_lane_does_not_promote_secret_buried_in_non_indexed_metadata():
     # And access metadata must not have been written for the blocked target.
     updated_ids = {update[1] for update in qdrant.payload_updates}
     assert target_id not in updated_ids
+
+
+# ---------------------------------------------------------------------------
+# Phase 6D: sparse exact-signal hardening
+#
+# The sparse scorer must only promote candidates on high-confidence exact /
+# literal signals (UUIDs, issue IDs, routes, paths, code-like identifiers).
+# It must NOT promote candidates based solely on broad plain words or generic
+# path/project components such as CMPC, mcp, projects, home, Documentos —
+# otherwise unrelated same-scope candidates flood the sparse lane and produce
+# wrong-memory hits.
+# ---------------------------------------------------------------------------
+
+
+def test_score_candidates_does_not_promote_on_generic_path_component():
+    """A query containing a full file path + issue ID must NOT score a candidate
+    whose only overlap is a generic project/path component such as ``CMPC``.
+    """
+    candidates = [
+        {
+            "id": "wrong-cmpc",
+            "payload": {
+                "text": "CMPC design system notes about layout tokens",
+                "file_path": "/home/prodrifterdk/projects/CMPC/design-system/README.md",
+            },
+        },
+        {
+            "id": "exact-issue",
+            "payload": {
+                "text": "SMDFS-455 fix for the chat MF note history",
+                "file_path": "/repo/issues/SMDFS-455.md",
+            },
+        },
+    ]
+    scores = score_candidates("recall SMDFS-455 in /repo/issues/SMDFS-455.md", candidates)
+    by_id = {score.point_id: score for score in scores}
+    # The exact issue candidate scores positively.
+    assert by_id["exact-issue"].score > 0
+    # The generic CMPC-only candidate does NOT score.
+    assert by_id["wrong-cmpc"].score == 0.0
+    assert by_id["wrong-cmpc"].matched_tokens == []
+
+
+def test_score_candidates_does_not_promote_on_generic_project_word():
+    """Query about ``mcp`` as a generic word must not promote a candidate that
+    only happens to contain ``mcp`` in its text/path. ``mcp`` is a broad plain
+    word, not a code-like identifier (no underscore, no digit, no camelCase).
+    """
+    candidates = [
+        {
+            "id": "mcp-decoy",
+            "payload": {
+                "text": "the mcp server is configured in the home directory",
+                "file_path": "/home/prodrifterdk/projects/mcp/README.md",
+            },
+        },
+        {
+            "id": "code-like-target",
+            "payload": {
+                "text": "set CODEGRAPH_PROJECT to index the repo",
+                "source": "docs/setup.md",
+            },
+        },
+    ]
+    # Query references the code-like identifier CODEGRAPH_PROJECT plus the
+    # generic word ``mcp``.
+    scores = score_candidates("how do I set CODEGRAPH_PROJECT for the mcp setup", candidates)
+    by_id = {score.point_id: score for score in scores}
+    # The code-like identifier candidate scores.
+    assert by_id["code-like-target"].score > 0
+    # The generic mcp-only decoy does NOT.
+    assert by_id["mcp-decoy"].score == 0.0
+
+
+def test_score_candidates_code_like_identifier_still_scores():
+    """Code-like identifiers (snake_case, camelCase, digit-bearing) must still
+    be promoted by the sparse lane.
+    """
+    candidates = [
+        {
+            "id": "codegraph-doc",
+            "payload": {
+                "text": "configure CODEGRAPH_PROJECT before indexing",
+                "heading": "CODEGRAPH_PROJECT setup",
+            },
+        },
+        {
+            "id": "camel-doc",
+            "payload": {
+                "text": "the userId field is stored in active_notes",
+            },
+        },
+        {
+            "id": "digit-doc",
+            "payload": {
+                "text": "Qwen3-TTS voice preset Ryan",
+            },
+        },
+        {
+            "id": "unrelated",
+            "payload": {
+                "text": "general deployment notes",
+            },
+        },
+    ]
+    scores = score_candidates("recall CODEGRAPH_PROJECT setup", candidates)
+    by_id = {score.point_id: score for score in scores}
+    assert by_id["codegraph-doc"].score > 0
+    assert by_id["unrelated"].score == 0.0
+
+    scores_camel = score_candidates("find the userId in active_notes", candidates)
+    by_id_camel = {score.point_id: score for score in scores_camel}
+    assert by_id_camel["camel-doc"].score > 0
+    assert by_id_camel["unrelated"].score == 0.0
+
+    scores_digit = score_candidates("Qwen3-TTS preset", candidates)
+    by_id_digit = {score.point_id: score for score in scores_digit}
+    assert by_id_digit["digit-doc"].score > 0
+    assert by_id_digit["unrelated"].score == 0.0
+
+
+def test_score_candidates_api_route_substring_matches_longer_path():
+    """``/api/v1/projects`` should match a candidate whose file_path is a longer
+    path that contains it as a substring (substring containment), and must NOT
+    match a candidate that only shares a generic component like ``mcp``.
+    """
+    candidates = [
+        {
+            "id": "mcp-only",
+            "payload": {
+                "text": "mcp tool docs",
+                "file_path": "/repo/mcp/tools.md",
+            },
+        },
+        {
+            "id": "route-doc",
+            "payload": {
+                "text": "endpoint docs",
+                "file_path": "/repo/docs/api/v1/projects.md",
+            },
+        },
+    ]
+    scores = score_candidates("see /api/v1/projects", candidates)
+    by_id = {score.point_id: score for score in scores}
+    assert by_id["route-doc"].score > 0
+    assert by_id["mcp-only"].score == 0.0
+
+
+def test_scoring_signals_excludes_broad_words():
+    """The internal scoring-signal collector must exclude broad plain words."""
+    from qdrant_memory.sparse_search import _collect_scoring_signals
+
+    signals = _collect_scoring_signals(
+        "recall SMDFS-455 in /home/prodrifterdk/projects/CMPC/Nucleogenesis notes"
+    )
+    exact = set(signals.exact)
+    sub = set(signals.substring)
+    # Strong signals present.
+    assert "SMDFS-455" in exact
+    # Broad plain words / path components excluded from exact scoring set.
+    for broad in ("CMPC", "Nucleogenesis", "home", "projects", "recall", "notes"):
+        assert broad not in exact, f"{broad!r} should not be in exact scoring set"
+    # Slash-path query token present as substring signal.
+    assert any("projects" in s or "CMPC" in s for s in sub) or any(
+        "/" in s for s in sub
+    )
+
+
+def test_has_strong_signal_promotes_code_like_identifiers():
+    """Code-like-only queries should now trigger the sparse lane."""
+    assert has_strong_signal("how do I configure CODEGRAPH_PROJECT")
+    assert has_strong_signal("find active_notes")
+    assert has_strong_signal("where is the userId stored")
+    assert has_strong_signal("Qwen3-TTS setup")
+    # But plain prose still does not.
+    assert not has_strong_signal("how do we deploy this thing?")
+    assert not has_strong_signal("general notes about CMPC and mcp")
+
+
+# ---------------------------------------------------------------------------
+# Phase 6D fix1: bounded structural substring matching
+#
+# The previous scorer used raw ``sub.lower() in lowered`` containment for
+# compound path-like tokens. That produced near-prefix false positives:
+#
+#   * ``/api/v1/project``  matching ``/repo/docs/api/v1/projects.md``;
+#   * ``pkg.mod``          matching ``pkg.module.Class``;
+#   * ``/home/.../Nucleogenesis``  matching
+#     ``/home/.../Nucleogenesis-extra/README.md``.
+#
+# The structural-alignment replacement requires the query's components
+# (split on ``/``, ``.``, or ``::``) to appear as a contiguous slice of
+# the candidate's indexed structural tokens. Trailing file extensions
+# (``.md``, ``.json`` …) on the LAST path component are stripped so
+# ``/api/v1/projects`` still matches ``/repo/docs/api/v1/projects.md``.
+# ---------------------------------------------------------------------------
+
+
+def test_p2_does_not_promote_broad_prefix_api_route():
+    """Query ``/api/v1/project`` (singular) must NOT match a candidate whose
+    path is ``/repo/docs/api/v1/projects.md``: only ``projects`` matches
+    ``projects.md`` after the structural-alignment replacement.
+    """
+    candidates = [
+        {
+            "id": "projects-md",
+            "payload": {
+                "text": "endpoint docs",
+                "file_path": "/repo/docs/api/v1/projects.md",
+            },
+        },
+        {
+            "id": "exact-issue",
+            "payload": {
+                "text": "SMDFS-455 clean fix",
+                "file_path": "/repo/issues/SMDFS-455.md",
+            },
+        },
+    ]
+    scores = score_candidates("see /api/v1/project", candidates)
+    by_id = {score.point_id: score for score in scores}
+    # ``projects.md`` is not promoted by a singular ``project`` query
+    # anymore. The exact-issue candidate stays at zero (its only token is
+    # the issue ID, which is not present in the query).
+    assert by_id["projects-md"].score == 0.0
+    assert by_id["projects-md"].matched_tokens == []
+    assert by_id["exact-issue"].score == 0.0
+
+
+def test_p2_does_match_api_route_with_extension():
+    """Query ``/api/v1/projects`` (plural, no extension) DOES match the
+    candidate whose path is ``/repo/docs/api/v1/projects.md``: the trailing
+    file-extension on the LAST path component is stripped before the
+    component-aligned comparison.
+    """
+    candidates = [
+        {
+            "id": "projects-md",
+            "payload": {
+                "text": "endpoint docs",
+                "file_path": "/repo/docs/api/v1/projects.md",
+            },
+        },
+        {
+            "id": "mcp-only",
+            "payload": {
+                "text": "mcp tool notes",
+                "file_path": "/repo/mcp/tools.md",
+            },
+        },
+    ]
+    scores = score_candidates("see /api/v1/projects", candidates)
+    by_id = {score.point_id: score for score in scores}
+    assert by_id["projects-md"].score > 0
+    assert "/api/v1/projects" in by_id["projects-md"].matched_tokens
+    assert by_id["mcp-only"].score == 0.0
+
+
+def test_p2_does_not_promote_broad_prefix_dotted_symbol():
+    """Query ``pkg.mod`` must NOT match ``pkg.module.Class``: in the
+    candidate's dotted token, ``module`` is a single component so the
+    query's ``[pkg, mod]`` components are NOT a contiguous slice of
+    ``[pkg, module, Class]``.
+    """
+    candidates = [
+        {
+            "id": "pkg-mod-extra",
+            "payload": {
+                "text": "see pkg.module.Class for the runtime notes",
+            },
+        },
+        {
+            "id": "exact-issue",
+            "payload": {
+                "text": "unrelated notes",
+            },
+        },
+    ]
+    scores = score_candidates("see pkg.mod", candidates)
+    by_id = {score.point_id: score for score in scores}
+    assert by_id["pkg-mod-extra"].score == 0.0
+    assert by_id["pkg-mod-extra"].matched_tokens == []
+
+
+def test_p2_does_match_dotted_symbol_prefix():
+    """Query ``pkg.mod`` DOES match a candidate containing the longer
+    dotted symbol ``pkg.mod.Class`` (two component match: ``[pkg, mod]``
+    is a contiguous slice of ``[pkg, mod, Class]``).
+    """
+    candidates = [
+        {
+            "id": "pkg-mod-class",
+            "payload": {
+                "text": "see pkg.mod.Class for runtime notes",
+            },
+        },
+        {
+            "id": "pkg-module-class",
+            "payload": {
+                "text": "see pkg.module.Class for runtime notes",
+            },
+        },
+    ]
+    scores = score_candidates("see pkg.mod", candidates)
+    by_id = {score.point_id: score for score in scores}
+    assert by_id["pkg-mod-class"].score > 0
+    assert "pkg.mod" in by_id["pkg-mod-class"].matched_tokens
+    # ``pkg.module.Class`` must NOT be promoted by ``pkg.mod`` alone.
+    assert by_id["pkg-module-class"].score == 0.0
+    assert by_id["pkg-module-class"].matched_tokens == []
+
+
+def test_p2_does_not_promote_broad_prefix_long_path():
+    """Query ``/home/prodrifterdk/projects/CMPC/Nucleogenesis`` must NOT
+    match the sibling ``/home/prodrifterdk/projects/CMPC/Nucleogenesis-extra/README.md``:
+    hyphen-separated siblings (``Nucleogenesis-extra``) are kept distinct
+    from ``Nucleogenesis`` because the structural component difference
+    no longer collapses under a raw substring match.
+    """
+    candidates = [
+        {
+            "id": "nucleogenesis-sibling",
+            "payload": {
+                "text": "sibling repo notes",
+                "file_path": "/home/prodrifterdk/projects/CMPC/Nucleogenesis-extra/README.md",
+            },
+        },
+        {
+            "id": "nucleogenesis-exact",
+            "payload": {
+                "text": "real Nucleogenesis notes",
+                "file_path": "/home/prodrifterdk/projects/CMPC/Nucleogenesis/README.md",
+            },
+        },
+    ]
+    scores = score_candidates(
+        "see /home/prodrifterdk/projects/CMPC/Nucleogenesis", candidates
+    )
+    by_id = {score.point_id: score for score in scores}
+    # Sibling ``Nucleogenesis-extra`` must NOT be promoted by the query
+    # about ``Nucleogenesis``.
+    assert by_id["nucleogenesis-sibling"].score == 0.0
+    assert by_id["nucleogenesis-sibling"].matched_tokens == []
+    # The genuine ``Nucleogenesis/README.md`` IS promoted: its
+    # ``[home, prodrifterdk, projects, CMPC, Nucleogenesis, README]``
+    # components contain the query's
+    # ``[home, prodrifterdk, projects, CMPC, Nucleogenesis]`` slice.
+    assert by_id["nucleogenesis-exact"].score > 0
+    assert "/home/prodrifterdk/projects/CMPC/Nucleogenesis" in by_id[
+        "nucleogenesis-exact"
+    ].matched_tokens
+
+
+def test_p2_does_not_promote_broad_prefix_long_path_without_trailing_file():
+    """The same broad-prefix protection applies when the sibling path is a
+    directory rather than a file: ``.../Nucleogenesis-extra/`` is a sibling
+    directory under the same parent and must NOT be promoted by a query
+    about ``Nucleogenesis``.
+    """
+    candidates = [
+        {
+            "id": "extra-dir",
+            "payload": {
+                "text": "sibling dir notes",
+                "file_path": "/home/prodrifterdk/projects/CMPC/Nucleogenesis-extra",
+            },
+        },
+    ]
+    scores = score_candidates(
+        "see /home/prodrifterdk/projects/CMPC/Nucleogenesis", candidates
+    )
+    assert scores[0].score == 0.0
+    assert scores[0].matched_tokens == []
+
+
+def test_p2_does_not_promote_broad_prefix_on_bare_directory_query():
+    """A bare directory prefix like ``/home/prodrifterdk/projects/CMPC`` must
+    NOT promote sibling paths whose top-level component is a near-prefix
+    but differs (``CMPC-tokens`` is a sibling of ``CMPC``, not a child of
+    it). A genuine child of ``CMPC`` IS still promoted.
+
+    The previous raw-substring scorer wrongly promoted ``CMPC-tokens``
+    because its lowercase substring ``/home/.../projects/CMPC`` is a
+    literal substring of ``/home/.../projects/CMPC-tokens/notes.md``.
+    The structural-alignment replacement rejects it because ``CMPC`` is
+    not equal to ``CMPC-tokens`` at the third component slot.
+    """
+    candidates = [
+        {
+            "id": "cmpc-sibling",
+            "payload": {
+                "text": "CMPC docs about tokens",
+                "file_path": "/home/prodrifterdk/projects/CMPC-tokens/notes.md",
+            },
+        },
+    ]
+    scores = score_candidates(
+        "see /home/prodrifterdk/projects/CMPC", candidates
+    )
+    by_id = {score.point_id: score for score in scores}
+    # Sibling ``CMPC-tokens`` must NOT be promoted by a CMPC query.
+    assert by_id["cmpc-sibling"].score == 0.0
+    assert by_id["cmpc-sibling"].matched_tokens == []
+
+
+def test_p2_does_match_genuine_child_of_bare_directory_query():
+    """A genuine child path of a directory prefix IS promoted: matching
+    ``/home/.../CMPC`` against ``/home/.../CMPC/design-system/README.md``
+    is correct because the candidate's path components (with extension
+    stripped) align as a strict prefix of the query's components.
+    """
+    candidates = [
+        {
+            "id": "design-system",
+            "payload": {
+                "text": "design system notes",
+                "file_path": "/home/prodrifterdk/projects/CMPC/design-system/README.md",
+            },
+        },
+    ]
+    scores = score_candidates(
+        "see /home/prodrifterdk/projects/CMPC", candidates
+    )
+    assert scores[0].score > 0
+    assert "/home/prodrifterdk/projects/CMPC" in scores[0].matched_tokens
+
+
+def test_p2_does_match_path_with_uri_form():
+    """A path token extracted from a URI form must match an indexed source
+    URI that shares the same component structure. The query typed as
+    ``https://tpa-mcp.up.railway.app/mcp`` produces the same slash-path
+    token (``/tpa-mcp.up.railway.app/mcp``) as the bare path and must
+    match the candidate's ``source_uri`` field.
+    """
+    candidates = [
+        {
+            "id": "mcp-server",
+            "payload": {
+                "text": "tpa-mcp server notes",
+                "source_uri": "https://tpa-mcp.up.railway.app/mcp",
+            },
+        },
+        {
+            "id": "decoy",
+            "payload": {
+                "text": "different host notes",
+                "source_uri": "https://other-host.example.com/mcp",
+            },
+        },
+    ]
+    # Typed with full URL form.
+    scores_full = score_candidates(
+        "see https://tpa-mcp.up.railway.app/mcp", candidates
+    )
+    by_id_full = {score.point_id: score for score in scores_full}
+    assert by_id_full["mcp-server"].score > 0
+    # Typed as bare path token.
+    scores_bare = score_candidates(
+        "see /tpa-mcp.up.railway.app/mcp", candidates
+    )
+    by_id_bare = {score.point_id: score for score in scores_bare}
+    assert by_id_bare["mcp-server"].score > 0
+    # Different host with same path must NOT match (host component differs).
+    assert by_id_full["decoy"].score == 0.0
+    assert by_id_bare["decoy"].score == 0.0
+
+
+def test_p2_strips_trailing_extension_on_query_too():
+    """A query typed WITH the extension (``/api/v1/projects.md``) must
+    still match a candidate indexed WITHOUT the extension and vice versa:
+    the trailing-extension strip is applied symmetrically to query and
+    candidate.
+    """
+    candidates_with_ext = [
+        {
+            "id": "with-ext",
+            "payload": {"text": "docs", "file_path": "/repo/api/v1/projects.md"},
+        },
+    ]
+    candidates_without_ext = [
+        {
+            "id": "no-ext",
+            "payload": {"text": "docs", "file_path": "/repo/api/v1/projects"},
+        },
+    ]
+    # Query without extension → matches candidate WITH extension.
+    scores = score_candidates("see /api/v1/projects", candidates_with_ext)
+    assert scores[0].score > 0
+    # Query with extension → matches candidate WITHOUT extension.
+    scores_rev = score_candidates("see /api/v1/projects.md", candidates_without_ext)
+    assert scores_rev[0].score > 0
+
+
+def test_p2_strips_only_last_component_extension():
+    """Only the LAST path component has its extension stripped; earlier
+    components must remain unchanged so ``/repo/api/v1/projects`` does
+    NOT match ``/repo/api/v1x/projects.md`` (a mid-path prefix
+    false-positive).
+    """
+    candidates = [
+        {
+            "id": "v1x-decoy",
+            "payload": {
+                "text": "v1x docs",
+                "file_path": "/repo/api/v1x/projects.md",
+            },
+        },
+    ]
+    scores = score_candidates("see /api/v1/projects", candidates)
+    # Query: [api, v1, projects]; candidate: [repo, api, v1x, projects].
+    # Slice [api, v1, projects] does not appear contiguously in
+    # [repo, api, v1x, projects] because the middle component ``v1`` ≠
+    # ``v1x``. Must NOT match.
+    assert scores[0].score == 0.0
+    assert scores[0].matched_tokens == []
+
+
+def test_p2_does_not_promote_single_component_path_query():
+    """Single-component structural queries (no delimiter) cannot anchor a
+    substring match: bare ``CMPC`` or ``projects`` has too little
+    structural signal to promote unrelated files.
+    """
+    candidates = [
+        {
+            "id": "cmpr-readme",
+            "payload": {
+                "text": "general notes",
+                "file_path": "/repo/CMPC/README.md",
+            },
+        },
+    ]
+    scores = score_candidates("see CMPC", candidates)
+    # CMPC alone has no structural delimiter, so the substring lane cannot
+    # promote it. The candidate scores 0 because CMPC is also not a strong
+    # exact-match token (no underscore, no digit, no camelCase).
+    assert scores[0].score == 0.0
+    assert scores[0].matched_tokens == []
+
+
+def test_p2_helper_substring_token_aligned_unit():
+    """Unit-level smoke test on ``_substring_token_aligned`` covering
+    both the kept-good-behavior and prevented-false-positive cases.
+    """
+    from qdrant_memory.sparse_search import _substring_token_aligned
+
+    # Kept good behavior.
+    assert _substring_token_aligned(
+        "/api/v1/projects", "/repo/docs/api/v1/projects.md"
+    )
+    assert _substring_token_aligned("pkg.mod", "see pkg.mod.Class here")
+    assert _substring_token_aligned(
+        "/tpa-mcp.up.railway.app/mcp",
+        "https://tpa-mcp.up.railway.app/mcp",
+    )
+    # Prevented false positives.
+    assert not _substring_token_aligned(
+        "/api/v1/project", "/repo/docs/api/v1/projects.md"
+    )
+    assert not _substring_token_aligned("pkg.mod", "see pkg.module.Class here")
+    assert not _substring_token_aligned(
+        "/home/prodrifterdk/projects/CMPC/Nucleogenesis",
+        "/home/prodrifterdk/projects/CMPC/Nucleogenesis-extra/README.md",
+    )
+    # Single-component tokens never anchor substring matches.
+    assert not _substring_token_aligned("CMPC", "/home/prodrifterdk/projects/CMPC/README.md")
+    # Case-insensitive: the candidate might be mixed-case while the query
+    # is lower. The matcher operates on the raw candidate text, but the
+    # exact-equality branch is what handles case-insensitive UUIDs/issues;
+    # for path tokens, the scorer's call site already lowercases the
+    # query side via the helper signature.
+    assert _substring_token_aligned(
+        "/api/v1/projects", "/repo/docs/API/V1/PROJECTS.md"
+    )
