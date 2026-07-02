@@ -19,6 +19,11 @@ import pytest
 
 from qdrant_memory.hybrid import HybridRouter, HybridRouteResult
 from qdrant_memory.hybrid.fusion import rrf_fuse, deduplicate_by_point_id
+from qdrant_memory.hybrid.router import (
+    _GRAPH_UNSAFE_FACT_STATUSES,
+    _graph_payload_unsafe_for_active_context,
+    _graph_to_relations,
+)
 
 
 class FakeEmbedding:
@@ -774,6 +779,156 @@ class TestGraphLane:
         kwargs = graph.calls[0]["kwargs"]
         assert kwargs.get("allow_sparse_scroll") is False
         assert kwargs.get("allow_graph_scroll") is False
+
+    # ------------------------------------------------------------------ #
+    # Phase 6E P3 follow-up: full coverage of every unsafe-status marker
+    # that the graph lane projects, plus the explicit opt-in via
+    # ``include_fact_history=True`` (same contract as the dense lane).
+    # The earlier ``test_graph_relation_unsafe_status_demoted`` only
+    # exercised ``stale`` and ``requires_review``; the reviewer/security
+    # pass asked for every marker to be covered explicitly.
+    # ------------------------------------------------------------------ #
+
+    def test_graph_payload_unsafe_for_each_marker(self):
+        # Read the canonical unsafe ``fact_status`` vocabulary straight
+        # from the implementation so this test cannot drift if a new
+        # unsafe status is added: the set is parametrized over the
+        # actual ``_GRAPH_UNSAFE_FACT_STATUSES`` frozenset.
+        statuses = sorted(str(s) for s in _GRAPH_UNSAFE_FACT_STATUSES)
+        # Sanity: the implementation must expose a non-empty set so
+        # the test is meaningful. If this ever trips, the gate has
+        # been widened and the marker list below needs review.
+        assert statuses, "_GRAPH_UNSAFE_FACT_STATUSES must be non-empty"
+
+        # Each unsafe-marker axis the graph gate inspects. We use a
+        # payload that carries ONLY the marker under test so a
+        # failure can be attributed to the exact marker that broke.
+        marker_payloads: list[dict[str, Any]] = [
+            {"stale": True},
+            {"requires_review": True},
+            {"consolidation_quarantined": True},
+            {"raptor_excluded": True},
+            {"raptor_forgotten": True},
+        ]
+        for status in statuses:
+            marker_payloads.append({"fact_status": status})
+
+        for marker_payload in marker_payloads:
+            # Sanity probe the helper directly: this gate MUST report
+            # unsafe=True for every marker, unsafe=False when the
+            # ``include_fact_history`` opt-in flips on.
+            unsafe = _graph_payload_unsafe_for_active_context(
+                dict(marker_payload),
+                include_fact_history=False,
+            )
+            assert unsafe is True, (
+                "graph payload safety gate did not flag unsafe marker: "
+                + repr(marker_payload)
+            )
+            assert (
+                _graph_payload_unsafe_for_active_context(
+                    dict(marker_payload),
+                    include_fact_history=True,
+                )
+                is False
+            ), (
+                "include_fact_history=True must bypass the unsafe "
+                "marker gate; failing case=" + repr(marker_payload)
+            )
+
+            # End-to-end through ``_graph_to_relations``: the unsafe
+            # candidate is dropped from the emitted list and replaced
+            # with a sanitized warning that carries the redacted
+            # handle, NEVER the raw point id or text.
+            warnings: list[str] = []
+            candidate = FakeGraphCandidate(
+                "graph-marker-1",
+                graph_distance=1,
+                final_score=0.7,
+                payload={
+                    **dict(marker_payload),
+                    "source_uri": "file://docs/marker.md",
+                    "file_path": "docs/marker.md",
+                    "heading": "marker",
+                    "text": "marker body content",
+                },
+            )
+            graph = FakeGraphResult(final=[candidate])
+            emitted = _graph_to_relations(
+                graph,
+                warnings=warnings,
+                max_source_chars=1200,
+            )
+            assert emitted == [], (
+                f"unsafe marker {marker_payload!r} was emitted to "
+                f"graph_relations instead of being demoted"
+            )
+            demoted = [w for w in warnings if "graph relation demoted" in w]
+            assert demoted, (
+                f"no demotion warning for unsafe marker {marker_payload!r}"
+            )
+            for w in demoted:
+                assert "graph-marker-1" not in w, (
+                    "demotion warning leaked raw point id for marker "
+                    f"{marker_payload!r}: {w}"
+                )
+                assert "marker body content" not in w, (
+                    "demotion warning leaked raw payload text for marker "
+                    f"{marker_payload!r}: {w}"
+                )
+
+    def test_graph_relation_include_fact_history_overrides_each_marker(self):
+        # ``include_fact_history=True`` is the explicit opt-in. For
+        # each unsafe marker the candidate MUST survive into
+        # ``results.graph_relations`` when the opt-in is on, and no
+        # demotion warning is emitted for the surviving candidate.
+        marker_payloads = [
+            {"stale": True},
+            {"requires_review": True},
+            {"consolidation_quarantined": True},
+            {"raptor_excluded": True},
+            {"raptor_forgotten": True},
+            {"fact_status": "deprecated"},
+        ]
+        for marker in marker_payloads:
+            graph = FakeGraphRetriever(final=[
+                FakeGraphCandidate(
+                    "graph-history-" + (
+                        next(iter(marker.keys()))
+                        if "fact_status" not in marker
+                        else "fact_status"
+                    ),
+                    graph_distance=1,
+                    final_score=0.7,
+                    payload={
+                        **marker,
+                        "source_uri": "file://docs/h.md",
+                        "file_path": "docs/h.md",
+                        "text": "history body for " + repr(marker),
+                    },
+                ),
+            ])
+            router = HybridRouter(
+                qdrant=FakeQdrant(),
+                embeddings=FakeEmbedding(),
+                collection_name="memory",
+                base_retriever=FakeBaseRetriever(),
+                graph_retriever=graph,
+            )
+            d = router.retrieve(
+                "hi", top_k=5, include_fact_history=True,
+            ).to_dict()
+            ids = [g["point_id"] for g in d["results"]["graph_relations"]]
+            assert len(ids) == 1, (
+                f"include_fact_history=True dropped the candidate for "
+                f"marker {marker!r}"
+            )
+            assert not any(
+                "graph relation demoted" in w for w in d["warnings"]
+            ), (
+                f"include_fact_history=True still emitted a demotion "
+                f"warning for marker {marker!r}: {d['warnings']!r}"
+            )
 
 
 class TestReadOnlySafety:
@@ -2100,6 +2255,262 @@ class TestHybridGlobalContextBudget:
             "global budget warning fired when total was under the hard cap"
         )
 
+    def test_graph_relations_text_in_global_hard_context_budget(self):
+        # Phase 6E P3 follow-up: graph relation ``text`` bodies MUST
+        # participate in the SINGLE global hard context char budget
+        # (16000 chars) that the ``HybridRouter.retrieve`` path
+        # enforces. The dense lane and RAPTOR lane are clamped to
+        # the budget upstream; the final pass drops overflow graph
+        # relations when the *union* of lanes still exceeds the cap.
+        #
+        # We force the overflow by:
+        #   1. emitting a small dense hit (~200 chars) and a small
+        #      RAPTOR summary (~200 chars) — leaves ~15600 chars
+        #      remaining for graph relations;
+        #   2. sending 20 graph candidates, each with a 1200-char
+        #      ``text`` body that fits the per-relation cap (so the
+        #      per-relation gate is NOT what drops them);
+        #   3. asserting that the live ``HybridRouter.retrieve``
+        #      path drops overflow graph relations and emits a
+        #      warning that mentions graph overflow specifically.
+        from qdrant_memory.raptor.search import RaptorSummaryHit
+
+        dense_text_len = 200
+        raptor_summary_text_len = 200
+        # Per-relation text the graph lane will emit (each relation
+        # is below the 1200-char per-relation cap so the per-relation
+        # gate does not interfere).
+        per_relation_text_len = 1200
+        n_graph_candidates = 20
+        hard_budget = 16000
+
+        chunks = [
+            _Chunk(
+                pid="dense-bg-1",
+                text=("D" * 5000),  # truncated to dense_text_len below
+                payload={"profile_id": "default", "source_type": "manual"},
+                final_score=0.9,
+            ),
+        ]
+        raptor_summary = RaptorSummaryHit(
+            point_id="raptor-summary-bg",
+            raptor_node_id="raptor-node-bg",
+            raptor_root_id="root",
+            raptor_level=2,
+            raptor_tree_id="tree",
+            raptor_build_id="build",
+            raptor_cluster_id="cluster-bg",
+            text="R" * raptor_summary_text_len,
+        )
+        graph_candidates = [
+            FakeGraphCandidate(
+                f"graph-overflow-{i:02d}",
+                graph_distance=1,
+                final_score=0.7,
+                payload={
+                    "source_uri": f"file://docs/g{i}.md",
+                    "file_path": f"docs/g{i}.md",
+                    "heading": f"g{i}",
+                    "text": "G" * per_relation_text_len,
+                },
+            )
+            for i in range(n_graph_candidates)
+        ]
+        retriever = FakeBaseRetriever(dense_seeds=chunks)
+        raptor = FakeRaptorSearcher(summaries=[raptor_summary], leaves=[])
+        graph = FakeGraphRetriever(final=graph_candidates)
+        router = HybridRouter(
+            qdrant=FakeQdrant(),
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+            base_retriever=retriever,
+            raptor_searcher=raptor,
+            graph_retriever=graph,
+        )
+        d = router.retrieve(
+            "anything",
+            max_source_chars=per_relation_text_len,
+            top_k=20,
+        ).to_dict()
+
+        # Sanity: dense + RAPTOR survived (preservation policy).
+        assert any(
+            h.get("point_id") == "dense-bg-1"
+            for h in d["results"]["exact_hits"]
+        ), "dense background hit was dropped — preserves RAPTOR-first"
+        assert any(
+            s.get("point_id") == "raptor-summary-bg"
+            for s in d["results"]["summaries"]
+        ), "RAPTOR summary was dropped — preserves tree evidence first"
+
+        emitted_graph = d["results"]["graph_relations"]
+        emitted_graph_pids = [g.get("point_id") for g in emitted_graph]
+        # The per-relation cap (1200 chars) was honored for every
+        # surviving relation — the drop is at the GLOBAL budget, not
+        # the per-relation cap.
+        for rel in emitted_graph:
+            assert len(rel.get("text") or "") <= per_relation_text_len, (
+                "graph relation text exceeded the per-relation cap; "
+                "this would be a per-relation gate regression, not a "
+                "global-budget regression"
+            )
+
+        # At least one graph relation MUST have been dropped because
+        # the union of lanes would otherwise exceed the hard budget.
+        # Budget accounting at top_k=20 (no further top-k trim):
+        #   dense     = 200
+        #   raptor    = 200
+        #   graph fit = (16000 - 200 - 200) / 1200 = ~13 relations
+        #   overflow  = 20 - 13 = 7 relations dropped
+        n_kept = len(emitted_graph)
+        n_dropped = n_graph_candidates - n_kept
+        assert n_dropped > 0, (
+            "expected at least one graph relation to be dropped at "
+            "the global hard context budget; kept "
+            f"{n_kept}/{n_graph_candidates}"
+        )
+
+        # The total union MUST respect the hard budget (this is the
+        # single global cap the contract guarantees).
+        emitted_total = 0
+        for s in d["results"]["summaries"]:
+            emitted_total += len(s.get("text") or "")
+        for leaf in d["results"]["cited_leaves"]:
+            emitted_total += len(leaf.get("text") or "")
+        for hit in d["results"]["exact_hits"]:
+            emitted_total += len(hit.get("text") or "")
+        for rel in emitted_graph:
+            emitted_total += len(rel.get("text") or "")
+        assert emitted_total <= hard_budget, (
+            f"emitted union {emitted_total} exceeds "
+            f"HARD_CONTEXT_CHAR_BUDGET={hard_budget}; Phase 6E P3 "
+            "requires graph relation text to participate in the "
+            "single global hard budget"
+        )
+
+        # ``context_used_chars`` MUST agree with the actual emitted
+        # total (debug counter cannot disagree with the wire).
+        ctx = int(d.get("debug", {}).get("context_used_chars") or 0)
+        assert ctx == emitted_total, (
+            f"context_used_chars={ctx} disagrees with emitted total="
+            f"{emitted_total}; debug envelope must reflect reality"
+        )
+
+        # A sanitized graph-overflow warning MUST have been emitted
+        # and it MUST mention graph (not just dense) overflow.
+        graph_overflow_warnings = [
+            w for w in d["warnings"]
+            if "global hard context budget" in w and "graph" in w
+        ]
+        assert graph_overflow_warnings, (
+            "expected a 'global hard context budget' warning that "
+            "explicitly mentions graph overflow; got: "
+            f"{[w for w in d['warnings'] if 'global hard context budget' in w]!r}"
+        )
+        # Per-relation redacted drop warnings (one per dropped
+        # graph relation) are also expected on the sanitized channel.
+        per_drop = [
+            w for w in d["warnings"]
+            if "graph relation dropped at global context budget" in w
+        ]
+        assert per_drop, (
+            "expected per-relation 'graph relation dropped at global "
+            "context budget' warnings for each overflowed graph "
+            "relation; none found"
+        )
+        assert len(per_drop) == n_dropped, (
+            f"expected {n_dropped} per-relation drop warnings "
+            f"(one per dropped graph relation), got {len(per_drop)}"
+        )
+        # The per-relation drop warnings MUST NOT leak raw point ids.
+        for w in per_drop:
+            for pid in emitted_graph_pids:
+                assert pid not in w, (
+                    f"per-relation drop warning leaked raw point id "
+                    f"({pid}): {w}"
+                )
+            for candidate in graph_candidates:
+                if candidate.point_id not in emitted_graph_pids:
+                    assert candidate.point_id not in w, (
+                        "drop warning leaked raw point id of dropped "
+                        f"graph relation: {w}"
+                    )
+
+        # First-seen-wins determinism: the lowest-indexed graph
+        # candidate must survive if any survives.
+        assert "graph-overflow-00" in emitted_graph_pids, (
+            "first-seen-wins broken: graph-overflow-00 (lowest index) "
+            "was dropped while a higher-index relation survived"
+        )
+
+    def test_graph_relations_in_global_budget_when_dense_fills_first(self):
+        # Defense-in-depth: even when the dense lane consumes most
+        # of the hard budget on its own (no RAPTOR), the union of
+        # dense + graph must still respect the hard cap. Phase 6E
+        # P3 specifically requires graph text to count.
+        per_relation_text_len = 1200
+        n_graph_candidates = 20
+        # Two 7000-char dense hits → dense_text_len=1200 each after
+        # per-hit clamp → 2400 dense chars. Leaves 16000-2400=13600
+        # for graph, i.e. ~11 graph relations fit at 1200 chars each.
+        chunks = [
+            _Chunk(
+                pid="dense-fill-1",
+                text=("D" * 9000),
+                payload={"profile_id": "default", "source_type": "manual"},
+                final_score=0.9,
+            ),
+            _Chunk(
+                pid="dense-fill-2",
+                text=("D" * 9000),
+                payload={"profile_id": "default", "source_type": "manual"},
+                final_score=0.8,
+            ),
+        ]
+        graph_candidates = [
+            FakeGraphCandidate(
+                f"graph-fill-{i:02d}",
+                graph_distance=1,
+                final_score=0.7,
+                payload={
+                    "source_uri": f"file://docs/f{i}.md",
+                    "file_path": f"docs/f{i}.md",
+                    "heading": f"f{i}",
+                    "text": "F" * per_relation_text_len,
+                },
+            )
+            for i in range(n_graph_candidates)
+        ]
+        retriever = FakeBaseRetriever(dense_seeds=chunks)
+        graph = FakeGraphRetriever(final=graph_candidates)
+        router = HybridRouter(
+            qdrant=FakeQdrant(),
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+            base_retriever=retriever,
+            graph_retriever=graph,
+        )
+        d = router.retrieve(
+            "anything",
+            max_source_chars=per_relation_text_len,
+            top_k=20,
+        ).to_dict()
+
+        emitted_total = 0
+        for s in d["results"]["summaries"]:
+            emitted_total += len(s.get("text") or "")
+        for leaf in d["results"]["cited_leaves"]:
+            emitted_total += len(leaf.get("text") or "")
+        for hit in d["results"]["exact_hits"]:
+            emitted_total += len(hit.get("text") or "")
+        for rel in d["results"]["graph_relations"]:
+            emitted_total += len(rel.get("text") or "")
+        assert emitted_total <= 16000, (
+            f"dense+graph union {emitted_total} exceeds the 16000 "
+            "hard budget; Phase 6E P3 regression"
+        )
+        ctx = int(d.get("debug", {}).get("context_used_chars") or 0)
+        assert ctx == emitted_total
 
 
 # ---------------------------------------------------------------------------

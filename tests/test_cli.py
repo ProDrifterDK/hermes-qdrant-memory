@@ -1504,3 +1504,43 @@ def test_cli_improve_apply_rejects_whitespace_candidate_id():
     ])
     with pytest.raises(CliUsageError, match="whitespace"):
         build_tool_call(ws_args)
+
+
+# ===========================================================================
+# Phase 6F: eval-gate CLI parser and build_tool_call block
+# ===========================================================================
+
+def test_register_cli_adds_eval_gate_subcommand_with_defaults():
+    parser = _parser()
+    args = parser.parse_args(["qdrant", "eval-gate", "--report", "report.json"])
+    assert args.qdrant_subcommand == "eval-gate"
+    assert args.report == "report.json"
+    assert args.candidate_variant == "hybrid"
+    assert args.baseline_variants is None
+    assert args.thresholds_file is None
+    assert getattr(args, "json", False) is False
+
+    json_args = parser.parse_args(
+        ["qdrant", "eval-gate", "--report", "r.json", "--candidate-variant",
+         "hybrid-no-graph", "--baseline-variant", "dense-only",
+         "--max-wrong-memory-rate", "5.0", "--json"],
+    )
+    assert json_args.candidate_variant == "hybrid-no-graph"
+    assert json_args.baseline_variants == ["dense-only"]
+    assert json_args.max_wrong_memory_rate == 5.0
+    assert json_args.json is True
+
+
+def test_eval_gate_blocked_in_provider_dispatch():
+    from qdrant_memory.cli_core import CliUsageError, build_tool_call
+
+    parser = _parser()
+    args = parser.parse_args(["qdrant", "eval-gate", "--report", "report.json"])
+    with pytest.raises(CliUsageError, match="handled by"):
+        build_tool_call(args)
+
+
+def test_eval_gate_missing_required_args_is_usage_error():
+    parser = _parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["qdrant", "eval-gate"])

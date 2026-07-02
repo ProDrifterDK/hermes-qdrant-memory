@@ -1977,6 +1977,88 @@ def _execute_eval_capture_command(args: Namespace, stdout, *, provider_factory: 
     return 0
 
 
+def _execute_eval_gate_command(args: Namespace, stdout) -> int:
+    """Run the Phase 6F shadow gate over an evaluator JSON report.
+
+    Local-only: does not import the provider, does not touch Qdrant.
+    Reads the report from disk, builds explicit thresholds, evaluates
+    the gate, and prints a JSON or human summary.
+
+    Exit code:
+      * ``0`` — all checks passed (gate status = pass)
+      * ``1`` — one or more checks failed (gate status = fail)
+      * ``2`` — usage/input error (missing file, invalid JSON, etc.)
+
+    Tests call :func:`evaluate_gate` directly to avoid exit-code
+    handling; this wrapper is the CLI surface.
+    """
+
+    from qdrant_memory import eval_gate
+
+    report_path = str(getattr(args, "report", "") or "")
+    if not report_path:
+        raise CliUsageError("--report is required")
+
+    candidate_variant = str(
+        getattr(args, "candidate_variant", eval_gate.DEFAULT_CANDIDATE_VARIANT)
+        or eval_gate.DEFAULT_CANDIDATE_VARIANT,
+    )
+
+    baseline_variants_raw = getattr(args, "baseline_variants", None)
+    if baseline_variants_raw:
+        baseline_variants: list[str] = [str(v) for v in baseline_variants_raw if v]
+    else:
+        baseline_variants = list(eval_gate.DEFAULT_BASELINE_VARIANTS)
+
+    # Build thresholds: start from preset or file, then apply CLI overrides.
+    thresholds_file = getattr(args, "thresholds_file", None)
+    if thresholds_file:
+        try:
+            thresholds = eval_gate.load_thresholds_file(str(thresholds_file))
+        except eval_gate.EvalGateError as exc:
+            raise CliUsageError(str(exc)) from exc
+    else:
+        thresholds = eval_gate.GateThresholds.auto_recall_default()
+
+    override_map = {
+        "min_case_count": getattr(args, "min_case_count", None),
+        "min_scored_count": getattr(args, "min_scored_count", None),
+        "max_errored_count": getattr(args, "max_errored_count", None),
+        "min_candidate_hit_at_k": getattr(args, "min_candidate_hit_at_k", None),
+        "min_candidate_source_hit_at_k": getattr(args, "min_candidate_source_hit_at_k", None),
+        "min_hit_at_k_lift": getattr(args, "min_hit_at_k_lift", None),
+        "min_source_hit_at_k_lift": getattr(args, "min_source_hit_at_k_lift", None),
+        "max_exact_id_drop": getattr(args, "max_exact_id_drop", None),
+        "max_wrong_memory_rate": getattr(args, "max_wrong_memory_rate", None),
+        "max_wrong_memory_regression": getattr(args, "max_wrong_memory_regression", None),
+        "max_latency_p95_ms": getattr(args, "max_latency_p95_ms", None),
+        "min_latency_budget_pass_rate": getattr(args, "min_latency_budget_pass_rate", None),
+    }
+    try:
+        thresholds = eval_gate.merge_threshold_overrides(thresholds, override_map)
+    except eval_gate.EvalGateError as exc:
+        raise CliUsageError(str(exc)) from exc
+
+    try:
+        report = eval_gate.load_report(report_path)
+    except eval_gate.EvalGateError as exc:
+        raise CliUsageError(str(exc)) from exc
+
+    result = eval_gate.evaluate_gate(
+        report,
+        thresholds=thresholds,
+        candidate_variant=candidate_variant,
+        baseline_variants=baseline_variants,
+    )
+
+    if _json_flag(args):
+        print(json.dumps(result, sort_keys=True), file=stdout)
+    else:
+        stdout.write(eval_gate.format_human_summary(result))
+
+    return 0 if result.get("status") == "pass" else 1
+
+
 def _print_eval_capture_summary(
     summary: dict[str, Any],
     runs_out_path: str,
@@ -2020,6 +2102,8 @@ def _execute_local_command(args: Namespace, stdout, *, provider_factory: Callabl
         return 0
     if subcommand == "eval":
         return _execute_eval_command(args, stdout)
+    if subcommand == "eval-gate":
+        return _execute_eval_gate_command(args, stdout)
     if subcommand == "eval-capture":
         if provider_factory is None:
             raise CliUsageError("eval-capture requires a provider factory")
@@ -2073,6 +2157,12 @@ def build_tool_call(args: Namespace) -> tuple[str, dict[str, Any]]:
         # tool and must not be routed through provider dispatch. Fail
         # closed just like the Phase 6A ``eval`` guard.
         raise CliUsageError("eval-capture is CLI-only; use the CLI subcommand directly")
+
+    if subcommand == "eval-gate":
+        # The eval-gate subcommand is local-only: it reads a report
+        # from disk and evaluates explicit thresholds. It is NOT a
+        # Hermes tool and must not be routed through provider dispatch.
+        raise CliUsageError("eval-gate is handled by _execute_local_command")
 
     if subcommand == "store":
         _require_live_approval(args)

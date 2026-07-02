@@ -819,17 +819,36 @@ def _graph_to_relations(
     override the gate so the history lane remains accessible — same
     contract as the dense lane.
 
-    Note: this helper does NOT enforce the global hard context char
-    budget across ``summaries`` + ``cited_leaves`` + ``exact_hits`` +
-    ``graph_relations``. The Phase 5 global budget helper
-    :func:`_enforce_global_context_budget` only sees the dense and
-    RAPTOR lanes today; the graph-relation ``text`` budget is
-    enforced only at the per-relation ``max_source_chars`` cap.
-    Operators can therefore still see graph text bytes the global
-    hard budget does not yet subtract. This residual is documented
-    in the Phase 6E report and is bounded because every graph
-    relation text is already ``max_source_chars`` clamped (and the
-    dense+RAPTOR lanes still hard-cap themselves independently).
+    Note: this helper enforces TWO gates on each candidate:
+
+    * the per-relation ``max_source_chars`` cap (clamped to
+      ``_HARD_MAX_SOURCE_CHARS`` so a caller cannot bypass the hard
+      cap), applied to the emitted ``text`` body; and
+    * the unsafe-status projection gate — payloads flagged
+      ``stale``, ``requires_review``, ``consolidation_quarantined``,
+      ``raptor_excluded``, ``raptor_forgotten``, or carrying an
+      unsafe ``fact_status`` value are demoted to a sanitized
+      warning rather than emitted to ``results.graph_relations``.
+
+    The :meth:`HybridRouter.retrieve` path then forwards the
+    projected ``graph_relations_payload`` into
+    :func:`_enforce_global_context_budget` together with the RAPTOR
+    ``summaries`` + ``cited_leaves`` and the dense ``exact_hits``
+    so the graph-relation ``text`` bodies participate in the SINGLE
+    global hard context char budget (16000 chars) that protects the
+    caller's LLM context window. When the union of lanes would
+    exceed that hard cap the final pass drops overflow graph
+    relations and emits a sanitized warning (redacted handle, never
+    raw point id or text). Source-handle fields (``source_uri``,
+    ``file_path``, ``heading``) are short strings and are NOT
+    counted toward the budget — only the relation ``text`` body
+    is, matching the dense and RAPTOR lane accounting.
+
+    If this helper is called standalone outside
+    :meth:`HybridRouter.retrieve` (e.g. a tool that consumes
+    ``_graph_to_relations`` directly), only the per-relation
+    ``max_source_chars`` cap applies; the global hard budget is
+    the caller's responsibility to enforce.
     """
 
     if graph_result is None:

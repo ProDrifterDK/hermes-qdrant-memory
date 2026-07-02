@@ -340,6 +340,75 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
         help="Emit machine-readable JSON output (default: human summary).",
     )
 
+    eval_gate = subcommands.add_parser(
+        "eval-gate",
+        help="Phase 6F shadow gate: evaluate explicit thresholds over an eval report. No Qdrant calls.",
+    )
+    eval_gate.set_defaults(qdrant_subcommand="eval-gate")
+    eval_gate.add_argument(
+        "--report",
+        required=True,
+        help="Path to a JSON report produced by 'hermes qdrant eval --json'.",
+    )
+    eval_gate.add_argument(
+        "--candidate-variant",
+        default="hybrid",
+        help="Candidate variant to evaluate. Default: hybrid.",
+    )
+    eval_gate.add_argument(
+        "--baseline-variant",
+        action="append",
+        default=None,
+        dest="baseline_variants",
+        help="Baseline variant to compare against. Repeatable. Default: dense-only,dense+sparse.",
+    )
+    eval_gate.add_argument(
+        "--thresholds-file",
+        default=None,
+        help="Path to a JSON file of threshold overrides (auto-recall-default preset applies if omitted).",
+    )
+    eval_gate.add_argument(
+        "--min-case-count", type=int, default=None, help="Override: minimum case_count.",
+    )
+    eval_gate.add_argument(
+        "--min-scored-count", type=int, default=None, help="Override: minimum scored_count.",
+    )
+    eval_gate.add_argument(
+        "--max-errored-count", type=int, default=None, help="Override: maximum errored_count.",
+    )
+    eval_gate.add_argument(
+        "--min-candidate-hit-at-k", type=float, default=None, help="Override: minimum candidate hit_at_k_rate.",
+    )
+    eval_gate.add_argument(
+        "--min-candidate-source-hit-at-k", type=float, default=None, help="Override: minimum candidate source_hit_at_k_rate.",
+    )
+    eval_gate.add_argument(
+        "--min-hit-at-k-lift", type=float, default=None, help="Override: minimum hit_at_k lift over best baseline.",
+    )
+    eval_gate.add_argument(
+        "--min-source-hit-at-k-lift", type=float, default=None, help="Override: minimum source_hit_at_k lift over best baseline.",
+    )
+    eval_gate.add_argument(
+        "--max-exact-id-drop", type=float, default=None, help="Override: maximum exact_identifier_hit_rate drop vs best baseline.",
+    )
+    eval_gate.add_argument(
+        "--max-wrong-memory-rate", type=float, default=None, help="Override: maximum wrong_memory_rate (absolute).",
+    )
+    eval_gate.add_argument(
+        "--max-wrong-memory-regression", type=float, default=None, help="Override: maximum wrong_memory_rate regression vs best baseline.",
+    )
+    eval_gate.add_argument(
+        "--max-latency-p95-ms", type=float, default=None, help="Override: maximum latency_ms_p95 (ms).",
+    )
+    eval_gate.add_argument(
+        "--min-latency-budget-pass-rate", type=float, default=None, help="Override: minimum latency_budget_pass_rate.",
+    )
+    eval_gate.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON output (default: human summary).",
+    )
+
     learning = subcommands.add_parser("learning", help="Search or preview procedural learnings.")
     learning_subcommands = learning.add_subparsers(dest="learning_subcommand", required=True)
 

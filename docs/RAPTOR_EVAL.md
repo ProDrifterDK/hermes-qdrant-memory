@@ -519,3 +519,197 @@ the Phase 6A `eval` command — same `case_id`/`variant`/`packet`/
 - `tests/test_eval_capture.py` — focused unit tests for the capture
   core and CLI integration.
 - `docs/RAPTOR_EVAL.md` — Phase 6B section (this section).
+
+---
+
+# Phase 6F — shadow gate / explicit thresholds for auto-recall eligibility
+
+Phase 6F adds a **local, offline shadow gate** that evaluates explicit
+thresholds over a Phase 6A evaluator JSON report before auto-recall
+can be considered. It is the decision surface between "we have eval
+data" and "the eval data is good enough to promote."
+
+**This phase does NOT enable auto-recall.** Auto-recall runtime remains
+legacy/provider prefetch. The gate is advisory: it produces a boolean
+`auto_recall_eligible` that an operator reads. No runtime path is
+changed by this phase.
+
+## What is in scope
+
+- `qdrant_memory/eval_gate.py` — a stdlib-only module that:
+  - reads a JSON report produced by `hermes qdrant eval --json`;
+  - builds explicit `GateThresholds` from a preset, a JSON file, and/or
+    CLI flags;
+  - evaluates named checks (case count, scored count, errored count,
+    candidate hit/source floors, baseline lift, exact-id drop,
+    wrong-memory absolute cap, wrong-memory regression, latency p95,
+    latency-budget pass rate);
+  - returns a compact `qdrant_eval_gate.v1` JSON result.
+- `hermes qdrant eval-gate --report REPORT.json [knobs...] [--json]` —
+  a CLI subcommand wired through `_execute_local_command`. It runs
+  without ever instantiating the provider.
+- `build_tool_call` raises `CliUsageError` for `eval-gate` so provider
+  dispatch fails closed (gate is CLI/local-only, not a Hermes tool).
+- `tests/test_eval_gate.py` — focused unit tests.
+- Additional CLI mapping tests in `tests/test_cli.py`.
+- `docs/RAPTOR_EVAL.md` — Phase 6F section (this section).
+
+## What is deferred (Phase 6G or later)
+
+- Enabling auto-recall at runtime based on gate output.
+- Automatic threshold tuning / sweep loops.
+- Cron / background gate runs.
+- Statistical significance testing beyond deterministic aggregates.
+- Gate-triggered Qdrant configuration changes.
+
+## Workflow: eval-capture → eval → eval-gate
+
+```
+hermes qdrant eval-capture --cases ... --runs-out ...    # Phase 6B: live read-only capture
+hermes qdrant eval --cases ... --runs ... --json         # Phase 6A: offline scoring → report
+hermes qdrant eval-gate --report REPORT.json [--json]     # Phase 6F: threshold gate
+```
+
+The gate reads the Phase 6A report and evaluates whether a candidate
+variant (`hybrid` by default) meets explicit thresholds before it can
+be considered for auto-recall promotion.
+
+## CLI
+
+```
+hermes qdrant eval-gate --report REPORT.json \
+  [--candidate-variant hybrid] \
+  [--baseline-variant dense-only] [--baseline-variant dense+sparse] \
+  [--thresholds-file thresholds.json] \
+  [--min-case-count N] [--min-scored-count N] [--max-errored-count N] \
+  [--min-candidate-hit-at-k F] [--min-candidate-source-hit-at-k F] \
+  [--min-hit-at-k-lift F] [--min-source-hit-at-k-lift F] \
+  [--max-exact-id-drop F] \
+  [--max-wrong-memory-rate F] [--max-wrong-memory-regression F] \
+  [--max-latency-p95-ms F] [--min-latency-budget-pass-rate F] \
+  [--json]
+```
+
+- `--report` is required (a JSON report from `hermes qdrant eval --json`).
+- `--candidate-variant` defaults to `hybrid`.
+- `--baseline-variant` is repeatable; defaults to `dense-only` and
+  `dense+sparse` when omitted.
+- `--thresholds-file` loads a JSON file of threshold overrides. The
+  `auto-recall-default` preset applies if omitted. CLI flags override
+  file values, which override the preset.
+- `--json` emits the full JSON gate result on stdout. Without `--json`,
+  the CLI prints a small human summary.
+
+### Exit codes
+
+| code | meaning |
+|------|---------|
+| `0`  | gate status = pass (all checks passed) |
+| `1`  | gate status = fail (one or more checks failed) |
+| `2`  | usage / input error (missing file, invalid JSON, missing variant) |
+
+Tests call `evaluate_gate()` directly to avoid subprocess exit handling.
+
+## Gate output JSON schema
+
+```json
+{
+  "schema": "qdrant_eval_gate.v1",
+  "status": "pass|fail",
+  "auto_recall_eligible": false,
+  "candidate_variant": "hybrid",
+  "candidate_present": true,
+  "baseline_variants": ["dense-only", "dense+sparse"],
+  "baselines_found": ["dense-only", "dense+sparse"],
+  "thresholds": { ... },
+  "checks": [
+    {"name": "...", "status": "pass|fail", "actual": ..., "threshold": ..., "details": "..."}
+  ],
+  "candidate_metrics": { ... },
+  "baseline_metrics": { "dense-only": { ... }, ... },
+  "summary": {"total_checks": 12, "passed": 11, "failed": 1, "failed_checks": ["wrong_memory_rate"]}
+}
+```
+
+The gate output never includes raw query text, packets, per-row
+payloads, `matched_expected`, or `wrong_reasons`. It only reads
+per-variant aggregate metrics from the report's `summary.variants`.
+
+## Default preset: `auto-recall-default`
+
+The `GateThresholds.auto_recall_default()` preset is conservative:
+
+| threshold | value | meaning |
+|-----------|-------|---------|
+| `min_case_count` | `10` | minimum candidate `case_count` |
+| `min_scored_count` | `10` | minimum candidate `scored_count` |
+| `max_errored_count` | `0` | zero errored rows tolerated |
+| `min_candidate_hit_at_k` | `80.0` | absolute floor on candidate `hit_at_k_rate` |
+| `min_candidate_source_hit_at_k` | `80.0` | absolute floor on candidate `source_hit_at_k_rate` |
+| `min_hit_at_k_lift` | `0.0` | candidate must not regress vs best baseline hit |
+| `min_source_hit_at_k_lift` | `0.0` | candidate must not regress vs best baseline source hit |
+| `max_exact_id_drop` | `5.0` | max drop in `exact_identifier_hit_rate` vs best baseline |
+| `max_wrong_memory_rate` | `3.0` | **strict**: absolute wrong-memory cap |
+| `max_wrong_memory_regression` | `1.0` | max wrong-memory increase vs best baseline |
+| `max_latency_p95_ms` | `500.0` | latency ceiling |
+| `min_latency_budget_pass_rate` | `95.0` | latency budget compliance floor |
+
+### Phase 6E does NOT pass the default gate
+
+Current Phase 6E `hybrid` metrics: `hit_at_k_rate = 88.0`,
+`source_hit_at_k_rate = 92.8571`, `wrong_memory_rate = 4.0`,
+`latency_ms_p95 ≈ 265.7`.
+
+The gate produces **11/12 checks pass, 1 fail** (`wrong_memory_rate`:
+4.0 > 3.0 cap). `auto_recall_eligible = false`. This is a feature,
+not a bug: the honest gate says "not yet." Until `wrong_memory_rate`
+drops to `≤ 3.0` (either by tightening poison detection or expanding
+the eval case set), the hybrid variant is not eligible for auto-recall
+promotion under the default preset.
+
+## Checks
+
+The gate evaluates these named checks in order:
+
+1. `candidate_present` — fail closed if the candidate variant is
+   missing from the report entirely.
+2. `case_count` — candidate `case_count >= min_case_count`.
+3. `scored_count` — candidate `scored_count >= min_scored_count`.
+4. `errored_count` — candidate `errored_count <= max_errored_count`.
+5. `candidate_hit_at_k` — candidate `hit_at_k_rate >= min_candidate_hit_at_k`.
+6. `candidate_source_hit_at_k` — candidate `source_hit_at_k_rate >= min_candidate_source_hit_at_k`.
+7. `hit_at_k_lift` — `(candidate - best_baseline) hit_at_k_rate >= min_hit_at_k_lift`.
+8. `source_hit_at_k_lift` — `(candidate - best_baseline) source_hit_at_k_rate >= min_source_hit_at_k_lift`.
+9. `exact_id_drop` — `max(0, best_baseline - candidate) exact_identifier_hit_rate <= max_exact_id_drop`.
+10. `wrong_memory_rate` — candidate `wrong_memory_rate <= max_wrong_memory_rate`.
+11. `wrong_memory_regression` — `max(0, candidate - best_baseline_min) wrong_memory_rate <= max_wrong_memory_regression`.
+12. `latency_p95` — candidate `latency_ms_p95 <= max_latency_p95_ms`.
+13. `latency_budget_pass_rate` — candidate `latency_budget_pass_rate >= min_latency_budget_pass_rate`.
+
+Every check fails closed when a required metric is `null` or absent
+(e.g. `source_hit_at_k_rate` is `null` when no case carried source
+labels). Missing baseline variants cause lift/drop checks to fail
+closed rather than silently pass.
+
+## Privacy and safety rules
+
+- The gate never echoes raw query text, packets, or per-row payloads.
+  It only reads per-variant aggregate metrics.
+- The gate never calls Qdrant, never imports `qdrant_client`, and
+  never instantiates the provider.
+- The gate never mutates memory.
+- The CLI is local-only. There is no HTTP, no remote URL, no
+  auto-upload.
+- `auto_recall_eligible` is advisory. This phase does NOT change
+  runtime auto-recall behavior.
+
+## Files (Phase 6F additions)
+
+- `qdrant_memory/eval_gate.py` — the gate core (stdlib-only).
+- `qdrant_memory/cli_core.py` — `_execute_eval_gate_command` wired
+  into `_execute_local_command`. `build_tool_call` raises
+  `CliUsageError` for `eval-gate` to block provider dispatch.
+- `cli.py` — `hermes qdrant eval-gate` subcommand registration.
+- `tests/test_eval_gate.py` — focused unit tests for the gate core
+  and CLI integration.
+- `docs/RAPTOR_EVAL.md` — Phase 6F section (this section).
