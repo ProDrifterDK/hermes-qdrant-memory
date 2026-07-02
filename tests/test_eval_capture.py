@@ -71,12 +71,14 @@ class FakeBaseRetriever:
 
 class FakeGraphCandidate:
     def __init__(self, pid: str, graph_distance: int = 1,
-                 final_score: float = 0.7, path=None, relation_path=None):
+                 final_score: float = 0.7, path=None, relation_path=None,
+                 payload=None):
         self.point_id = pid
         self.graph_distance = graph_distance
         self.final_score = final_score
         self.path = path or ["seed-1"]
         self.relation_path = relation_path or ["related_to"]
+        self.payload = payload or {}
 
 
 class FakeGraphResult:
@@ -368,6 +370,77 @@ class TestGraphVariant:
         graph_retriever = provider._graph_retriever
         assert len(graph_retriever.calls) == 1
         assert graph_retriever.calls[0]["allow_sparse_scroll"] is False
+
+    # ------------------------------------------------------------------ #
+    # Phase 6E: eval-capture rows must carry source handles from the
+    # graph candidate payload, and must NOT echo raw query text.
+    # ------------------------------------------------------------------ #
+
+    def test_graph_relation_row_carries_source_handles(self):
+        # Phase 6E: an eval-capture row in the ``graph`` variant must
+        # carry the sanitized source handles (``source_uri``,
+        # ``file_path``, ``heading``) and bounded ``text`` for every
+        # emitted graph relation.
+        from qdrant_memory.eval_capture import capture_eval_runs
+
+        provider = _provider_with_all_components(
+            graph_candidates=[
+                FakeGraphCandidate(
+                    "g-handle",
+                    graph_distance=1,
+                    payload={
+                        "source_uri": "file://docs/eval-cap.md",
+                        "file_path": "docs/eval-cap.md",
+                        "heading": "Eval Capture",
+                        "text": "phase 6e graph relation body",
+                    },
+                ),
+            ],
+        )
+        result = capture_eval_runs(provider, _basic_cases(), variants="graph")
+        row = result["rows"][0]
+        rels = row["packet"]["results"]["graph_relations"]
+        assert len(rels) == 1
+        rel = rels[0]
+        assert rel["point_id"] == "g-handle"
+        assert rel["source_uri"] == "file://docs/eval-cap.md"
+        assert rel["file_path"] == "docs/eval-cap.md"
+        assert rel["heading"] == "Eval Capture"
+        assert rel["text"] == "phase 6e graph relation body"
+
+    def test_graph_relation_row_does_not_leak_raw_query(self):
+        # Phase 6E: the raw eval-case query text must never appear in
+        # any emitted graph-relation field, even though the capture
+        # variant now projects more fields from each candidate's
+        # payload.
+        from qdrant_memory.eval_capture import capture_eval_runs
+
+        provider = _provider_with_all_components(
+            graph_candidates=[
+                FakeGraphCandidate(
+                    "g-handle-clean",
+                    graph_distance=1,
+                    payload={
+                        "source_uri": "file://docs/clean.md",
+                        "file_path": "docs/clean.md",
+                        "heading": "Clean",
+                        "text": "clean body for the eval capture row",
+                    },
+                ),
+            ],
+        )
+        cases = [
+            {
+                "case_id": "case-1",
+                "query": "private query text one",
+                "expected_source_uris": ["file://docs/clean.md"],
+            },
+        ]
+        result = capture_eval_runs(provider, cases, variants="graph")
+        row = result["rows"][0]
+        serialized = json.dumps(row, default=str)
+        # The raw query must never echo anywhere in the row.
+        assert "private query text one" not in serialized
 
 
 # --------------------------------------------------------------------------- #

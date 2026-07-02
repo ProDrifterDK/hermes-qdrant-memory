@@ -413,18 +413,36 @@ def _graph_result_to_relations(graph_result: Any) -> list[dict[str, Any]]:
 # --------------------------------------------------------------------------- #
 
 
-def _graph_projection(graph_result: Any) -> list[dict[str, Any]]:
+def _graph_projection(
+    graph_result: Any,
+    *,
+    max_source_chars: int | None = None,
+    include_fact_history: bool = False,
+) -> list[dict[str, Any]]:
     """Project graph candidates through the router's sanitized helper.
 
     Re-uses :func:`qdrant_memory.hybrid.router._graph_to_relations`
-    so secret-bearing candidates (point id, ``path`` element, or
-    ``relation_path`` element matches ``contains_secret``) are dropped
-    before the packet is emitted. ``warnings`` is intentionally not
-    collected: the capture runs file is the persisted output, and the
-    router's per-hit warnings would add operator-only noise.
+    so secret-bearing candidates (point id, ``path`` element,
+    ``relation_path`` element, OR any payload-derived ``source_uri`` /
+    ``file_path`` / ``heading`` / raw ``text`` matches
+    ``contains_secret``) are dropped before the packet is emitted.
+    ``warnings`` is intentionally not collected: the capture runs
+    file is the persisted output, and the router's per-hit warnings
+    would add operator-only noise.
+
+    Phase 6E: ``max_source_chars`` and ``include_fact_history`` are
+    forwarded so the eval-capture rows carry the same
+    ``source_uri`` / ``file_path`` / ``heading`` / bounded ``text``
+    handle projection (and the same unsafe-status demotion gate)
+    that the live HybridRouter path now provides.
     """
 
-    return _graph_to_relations(graph_result, warnings=None) or []
+    return _graph_to_relations(
+        graph_result,
+        warnings=None,
+        max_source_chars=max_source_chars,
+        include_fact_history=include_fact_history,
+    ) or []
 
 
 # --------------------------------------------------------------------------- #
@@ -585,6 +603,7 @@ def _run_graph(
     candidate_seed_top_k: int,
     max_graph_results: int,
     max_depth: int,
+    max_source_chars: int,
     include_fact_history: bool,
 ) -> dict[str, Any]:
     """Graph-only: use ``GraphMemoryRetriever.search`` read-only.
@@ -609,9 +628,16 @@ def _run_graph(
         allow_graph_scroll=True,
     )
     # Re-use the router's sanitized graph projection so secret-bearing
-    # point ids, path entries, and relation-path entries are dropped
-    # before the run row is serialized.
-    relations = _graph_projection(graph_result)
+    # point ids, path entries, relation-path entries, AND payload-
+    # derived ``source_uri`` / ``file_path`` / ``heading`` / raw
+    # ``text`` are dropped before the run row is serialized.
+    # ``max_source_chars`` is forwarded so the per-relation text
+    # cap is enforced identically to the live HybridRouter path.
+    relations = _graph_projection(
+        graph_result,
+        max_source_chars=max_source_chars,
+        include_fact_history=include_fact_history,
+    )
     return _packet_from_results(graph_relations=relations)
 
 
@@ -749,6 +775,7 @@ def _dispatch_variant(
             candidate_seed_top_k=candidate_seed_top_k,
             max_graph_results=max_graph_results,
             max_depth=max_depth,
+            max_source_chars=max_source_chars,
             include_fact_history=include_fact_history,
         )
     if variant == "raptor-only":

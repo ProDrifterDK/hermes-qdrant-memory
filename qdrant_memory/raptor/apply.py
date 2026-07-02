@@ -69,10 +69,17 @@ from qdrant_memory.write_gate import (
 # Strict canonical report ID: raptor-<12 hex chars>
 REPORT_ID_RE = re.compile(r"^raptor-[a-f0-9]{12}$")
 
-# Canonical build/node id shapes (Phase 3 builder uses longer hex but we
-# just need to validate they are non-empty, hex-ish, and not malformed).
+# Canonical build id shape (metadata value — not a Qdrant point id).
 _BUILD_ID_RE = re.compile(r"^raptor-build-[a-f0-9]+$")
-_NODE_ID_RE = re.compile(r"^raptor-node-[a-f0-9]+$")
+
+# RAPTOR node IDs are used as real Qdrant point IDs (the provider upserts
+# each node with ``{"id": raptor_node_id, ...}``). Qdrant accepts only
+# unsigned integers or UUIDs as point IDs, so the builder emits
+# deterministic UUID-shaped node IDs (see ``compute_node_id``). This regex
+# accepts the canonical UUID shape produced by ``str(uuid.UUID(...))``.
+_NODE_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 
 # Status markers that make a source/leaf unsafe for RAPTOR parent status.
 _UNSAFE_LEAF_STATUSES: frozenset[str] = frozenset(
@@ -236,7 +243,9 @@ def _validate_node_id(node_id: str) -> None:
     if not node_id:
         raise RaptorApplyError("raptor_node_id is required")
     if not _NODE_ID_RE.match(node_id):
-        raise RaptorApplyError(f"raptor_node_id must match canonical format raptor-node-<hex>, got: {node_id[:30]}...")
+        raise RaptorApplyError(
+            f"raptor_node_id must be a valid UUID (Qdrant point-id compatible), got: {node_id[:36]}..."
+        )
 
 
 def verify_manifest_digest(

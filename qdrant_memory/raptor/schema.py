@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable, Mapping
 
@@ -145,7 +146,12 @@ _SCOPE_KEYS: tuple[str, ...] = ("profile_id", "user_id_hash", "chat_id_hash")
 
 
 # ---------------------------------------------------------------------------
-# ID helpers (deterministic, sha256-truncated)
+# ID helpers (deterministic, sha256-based)
+#
+# ``compute_node_id`` returns a UUID-shaped string so it can serve as a real
+# Qdrant point ID (Qdrant accepts unsigned integers or UUIDs only). All other
+# IDs (tree/root/build/cluster) are payload *metadata* and keep their
+# ``raptor-<kind>-<hex>`` shape.
 # ---------------------------------------------------------------------------
 
 
@@ -171,15 +177,30 @@ def compute_node_id(
     cluster_id: str,
     parent_ids: Iterable[str] = (),
 ) -> str:
+    """Deterministic, Qdrant-compatible RAPTOR node point ID.
+
+    Returns a UUID-shaped string (``8-4-4-4-12`` lowercase hex) derived
+    deterministically from the sha256 of the structural inputs. Real
+    Qdrant only accepts point IDs that are either unsigned integers or
+    UUIDs; a ``raptor-node-<hex>`` string is rejected with HTTP 400 at
+    upsert time. Converting the first 32 hex chars of the sha256 digest
+    into a UUID keeps the ID fully deterministic (same inputs → same
+    UUID, every run) while remaining a valid Qdrant point ID.
+
+    Note: ``tree_id``, ``root_id``, ``build_id`` etc. remain
+    ``raptor-<kind>-<hex>`` strings because they are payload *metadata*
+    values, never Qdrant point IDs, so they do not need to be
+    UUID-shaped.
+    """
     sorted_parents = sorted(str(p) for p in parent_ids if p)
-    return _sha256_id(
+    digest = _sha256_id(
         "raptor-node",
         tree_id,
         str(int(level)),
         cluster_id,
         "|".join(sorted_parents),
-        prefix="raptor-node-",
     )
+    return str(uuid.UUID(hex=digest[:32]))
 
 
 def compute_build_id(

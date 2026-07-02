@@ -497,11 +497,13 @@ def _enforce_global_context_budget(
     exact_hits_payload: list[dict[str, Any]],
     warnings: list[str] | None,
     hard_budget: int,
+    graph_relations_payload: list[dict[str, Any]] | None = None,
 ) -> tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
     list[dict[str, Any]],
     int,
+    list[dict[str, Any]],
 ]:
     """Enforce a single global hard context char budget across all lanes.
 
@@ -509,19 +511,23 @@ def _enforce_global_context_budget(
     to ``hard_budget`` independently. This helper is the *final*
     pass at the end of :meth:`HybridRouter.retrieve` and enforces
     ONE hard budget across ``summaries`` + ``cited_leaves`` +
-    ``exact_hits`` (the union the caller will receive as LLM context).
+    ``exact_hits`` + (Phase 6E) ``graph_relations`` text bodies.
 
     Deterministic policy (final8 finding #1): preserve RAPTOR
     summaries + cited_leaves FIRST (tree evidence is more
     provenance-anchored and harder to reconstruct than the dense
     lane's exact_hits), then fit dense exact_hits into the remaining
-    budget. When a dense exact_hit would push the running total
-    past ``hard_budget``, the overflow hit is dropped and a
-    sanitized warning (redacted handle, no raw text/ids) is emitted.
+    budget, and finally fit graph relations. When a candidate would
+    push the running total past ``hard_budget``, the overflow item
+    is dropped and a sanitized warning (redacted handle, no raw
+    text/ids) is emitted.
 
-    Returns the re-packed ``(summaries, leaves, exact_hits)`` plus
-    the actual ``context_used_chars`` total. The total MUST be
+    Returns the re-packed ``(summaries, leaves, exact_hits,
+    context_used_chars, graph_relations)`` tuple. The total MUST be
     ``<= hard_budget`` for callers that rely on the contract.
+    ``graph_relations_payload`` may be ``None`` for callers that
+    don't surface the graph lane; in that case the returned graph
+    list is empty.
     """
 
     safe_budget = _clamp_int(
@@ -566,7 +572,7 @@ def _enforce_global_context_budget(
         running += cost
         kept_leaves.append(item)
 
-    # Dense exact_hits last: first-seen-wins truncation.
+    # Dense exact_hits next: first-seen-wins truncation.
     kept_exact: list[dict[str, Any]] = []
     overflow_count = 0
     for item in exact_hits_payload or []:
@@ -589,17 +595,149 @@ def _enforce_global_context_budget(
             f"({overflow_count} dense dropped)"
         )
 
-    return kept_summaries, kept_leaves, kept_exact, running
+    # Phase 6E: graph relations text must also fit into the
+    # remaining hard budget so a long graph lane cannot bypass the
+    # 16000-char cap that already protects the dense+RAPTOR lanes.
+    # Each relation is already ``max_source_chars`` clamped by
+    # :func:`_graph_to_relations`, so this final pass only needs to
+    # drop overflow relations when the *union* of lanes still
+    # exceeds the hard budget. Source-handle fields (``source_uri``,
+    # ``file_path``, ``heading``) are short strings and are NOT
+    # counted toward the budget — only the relation ``text`` body
+    # is, matching the dense and RAPTOR lane accounting.
+    kept_graph: list[dict[str, Any]] = []
+    graph_overflow_count = 0
+    for item in (graph_relations_payload or []):
+        cost = _text_len(item)
+        if cost <= 0:
+            # Empty text body — never blocks the budget, keep the
+            # handle fields intact so the relation still contributes
+            # provenance (source_uri / file_path / heading).
+            kept_graph.append(item)
+            continue
+        if running + cost > safe_budget:
+            point_id = str(item.get("point_id") or "")
+            graph_overflow_count += 1
+            if warnings is not None:
+                warnings.append(
+                    "hybrid: graph relation dropped at global context budget "
+                    f"(handle={_safe_dense_handle(point_id) or '<unknown>'})"
+                )
+            continue
+        running += cost
+        kept_graph.append(item)
+
+    if graph_overflow_count and warnings is not None:
+        warnings.append(
+            "hybrid: global hard context budget enforced "
+            f"({graph_overflow_count} graph dropped)"
+        )
+
+    return (
+        kept_summaries,
+        kept_leaves,
+        kept_exact,
+        running,
+        kept_graph,
+    )
+
+
+# Unsafe fact-status vocabulary shared with the dense lane — see
+# ``_UNSAFE_DENSE_FACT_STATUSES`` and ``_dense_payload_unsafe_for_active_context``
+# above. We deliberately duplicate the constants here rather than
+# alias them so the graph-lane helper stays self-contained for
+# callers that import only the graph projection.
+_GRAPH_UNSAFE_FACT_STATUSES: frozenset[str] = frozenset({
+    "stale",
+    "review_required",
+    "disputed",
+    "deprecated",
+    "superseded",
+})
+
+
+def _graph_payload_unsafe_for_active_context(
+    payload: Any,
+    *,
+    include_fact_history: bool,
+) -> bool:
+    """Return True iff the graph payload is unsafe to surface as a graph relation.
+
+    Mirrors :func:`_dense_payload_unsafe_for_active_context` so the
+    dense and graph lanes share one unsafe-status vocabulary. Payloads
+    flagged ``stale``, ``requires_review``, ``consolidation_quarantined``,
+    ``raptor_excluded``, ``raptor_forgotten``, or carrying an unsafe
+    ``fact_status`` are demoted from active ``results.graph_relations``
+    to a sanitized warning. ``include_fact_history=True`` is the
+    explicit opt-in to override the gate so the history lane remains
+    accessible — same contract as the dense lane.
+    """
+
+    if include_fact_history:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("stale") is True:
+        return True
+    if payload.get("requires_review") is True:
+        return True
+    if payload.get("consolidation_quarantined") is True:
+        return True
+    if payload.get("raptor_excluded") is True:
+        return True
+    if payload.get("raptor_forgotten") is True:
+        return True
+    fact_status = str(payload.get("fact_status") or "").strip().lower()
+    if fact_status and fact_status in _GRAPH_UNSAFE_FACT_STATUSES:
+        return True
+    return False
+
+
+def _graph_payload_projection(payload: Any) -> dict[str, str]:
+    """Return the canonical sanitized projection of a graph candidate payload.
+
+    Only string-typed values from the candidate's payload are projected;
+    missing or non-string fields become empty strings so the projection
+    shape is stable. ``text`` is intentionally NOT truncated here — it
+    is bound separately by the per-relation budget so a long payload
+    text cannot bypass the ``max_source_chars`` hard cap.
+    """
+
+    if not isinstance(payload, dict):
+        return {
+            "source_uri": "",
+            "file_path": "",
+            "heading": "",
+            "text": "",
+        }
+    return {
+        "source_uri": str(payload.get("source_uri") or ""),
+        "file_path": str(payload.get("file_path") or ""),
+        "heading": str(payload.get("heading") or ""),
+        "text": str(payload.get("text") or ""),
+    }
 
 
 def _graph_relation_secret_bearing(candidate: Any) -> bool:
     """Return True iff a graph relation's emitted fields carry a secret.
 
-    The graph lane writes ``point_id``, ``path`` (list of point ids), and
-    ``relation_path`` (list of relation strings) into
-    ``results.graph_relations``. All three are caller-visible, so we
-    scan each element for secret-shaped values before any of them are
-    allowed to reach the wire.
+    Phase 6E: the graph lane now also emits sanitized ``source_uri``,
+    ``file_path``, ``heading``, and bounded ``text`` drawn from
+    ``candidate.payload``. All four are caller-visible (and may flow
+    into ``results.graph_relations`` and the eval-capture rows), so
+    they MUST be scanned for secret-shaped values BEFORE ``text`` is
+    truncated to the ``max_source_chars`` budget — otherwise a secret
+    past the truncation point would silently slip through the gate.
+
+    The raw text scan is performed against the un-truncated text so
+    the secret detector sees the same content the operator stored;
+    the per-relation cap is applied only after this gate runs.
+
+    The graph lane writes ``point_id``, ``path`` (list of point ids),
+    ``relation_path`` (list of relation strings), and the four new
+    payload-derived fields into ``results.graph_relations``. Every
+    one of them is scanned here so the wire envelope can never echo a
+    raw secret-shaped value.
     """
 
     point_id = str(getattr(candidate, "point_id", "") or "")
@@ -613,26 +751,92 @@ def _graph_relation_secret_bearing(candidate: Any) -> bool:
     for item in relation_path:
         if contains_secret(str(item or "")):
             return True
+    # Scan the raw payload fields that the graph projection is about
+    # to emit. Crucially, we read the RAW text here (before any
+    # truncation) so a secret-shaped substring past the
+    # ``max_source_chars`` point cannot bypass the gate.
+    payload = getattr(candidate, "payload", None)
+    projection = _graph_payload_projection(payload)
+    for field_name in ("source_uri", "file_path", "heading", "text"):
+        if projection.get(field_name) and contains_secret(projection[field_name]):
+            return True
     return False
+
+
+def _truncate_graph_text(text: str, max_chars: int) -> str:
+    """Truncate a graph relation text body to ``max_chars``.
+
+    Mirrors the dense-lane :func:`_truncate_dense_text` contract so the
+    graph lane cannot bypass the ``max_source_chars`` budget that
+    already protects the RAPTOR lane. ``max_chars <= 0`` returns the
+    empty string. A trailing ellipsis is preserved so callers can
+    still tell that the text was truncated.
+    """
+
+    text = str(text or "")
+    try:
+        limit = int(max_chars)
+    except Exception:
+        limit = 0
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
 
 
 def _graph_to_relations(
     graph_result: Any,
     *,
     warnings: list[str] | None = None,
+    max_source_chars: int | None = None,
+    include_fact_history: bool = False,
 ) -> list[dict[str, Any]]:
     """Project graph candidates into ``graph_relations`` output shape.
 
-    Secret-bearing candidates (point id, any element of ``path``, or any
-    element of ``relation_path`` matches ``contains_secret``) are dropped
-    to warning-only and never reach ``results.graph_relations`` or the
-    debug envelope. The warning channel only carries the redacted handle
-    derived from the candidate's point id — never the raw secret-shaped
-    string itself.
+    Secret-bearing candidates (point id, any element of ``path``, any
+    element of ``relation_path``, OR any payload-derived ``source_uri``
+    / ``file_path`` / ``heading`` / raw ``text`` matches
+    ``contains_secret``) are dropped to warning-only and never reach
+    ``results.graph_relations`` or the debug envelope. The warning
+    channel only carries the redacted handle derived from the
+    candidate's point id — never the raw secret-shaped string itself.
+
+    Phase 6E also projects the sanitized payload handles
+    (``source_uri``, ``file_path``, ``heading``, bounded ``text``)
+    when ``candidate.payload`` carries them. ``text`` is bound to
+    ``max_source_chars`` (clamped to ``_HARD_MAX_SOURCE_CHARS`` so a
+    caller cannot bypass the hard cap); the raw text is scanned for
+    secrets BEFORE truncation in
+    :func:`_graph_relation_secret_bearing`.
+
+    Phase 6E additionally mirrors the dense-lane unsafe-status
+    demotion: payloads flagged ``stale``, ``requires_review``,
+    ``consolidation_quarantined``, ``raptor_excluded``,
+    ``raptor_forgotten``, or carrying an unsafe ``fact_status`` are
+    demoted from active ``results.graph_relations`` to a sanitized
+    warning. ``include_fact_history=True`` is the explicit opt-in to
+    override the gate so the history lane remains accessible — same
+    contract as the dense lane.
+
+    Note: this helper does NOT enforce the global hard context char
+    budget across ``summaries`` + ``cited_leaves`` + ``exact_hits`` +
+    ``graph_relations``. The Phase 5 global budget helper
+    :func:`_enforce_global_context_budget` only sees the dense and
+    RAPTOR lanes today; the graph-relation ``text`` budget is
+    enforced only at the per-relation ``max_source_chars`` cap.
+    Operators can therefore still see graph text bytes the global
+    hard budget does not yet subtract. This residual is documented
+    in the Phase 6E report and is bounded because every graph
+    relation text is already ``max_source_chars`` clamped (and the
+    dense+RAPTOR lanes still hard-cap themselves independently).
     """
 
     if graph_result is None:
         return []
+    safe_max_source_chars = _clamp_int(
+        max_source_chars, 1200, 1, _HARD_MAX_SOURCE_CHARS,
+    )
     out: list[dict[str, Any]] = []
     final = getattr(graph_result, "final", None) or []
     for candidate in final:
@@ -645,15 +849,57 @@ def _graph_to_relations(
                     f"(handle={handle or '<unknown>'})"
                 )
             continue
-        out.append(
-            {
-                "point_id": point_id,
-                "graph_distance": int(getattr(candidate, "graph_distance", 0) or 0),
-                "final_score": float(getattr(candidate, "final_score", 0.0) or 0.0),
-                "path": list(getattr(candidate, "path", []) or []),
-                "relation_path": list(getattr(candidate, "relation_path", []) or []),
-            }
+        payload = getattr(candidate, "payload", None)
+        if _graph_payload_unsafe_for_active_context(
+            payload,
+            include_fact_history=include_fact_history,
+        ):
+            handle = _safe_dense_handle(point_id)
+            if warnings is not None:
+                reasons: list[str] = []
+                if isinstance(payload, dict):
+                    if payload.get("stale") is True:
+                        reasons.append("stale")
+                    if payload.get("requires_review") is True:
+                        reasons.append("requires_review")
+                    if payload.get("consolidation_quarantined") is True:
+                        reasons.append("quarantined")
+                    if payload.get("raptor_excluded") is True:
+                        reasons.append("raptor_excluded")
+                    if payload.get("raptor_forgotten") is True:
+                        reasons.append("raptor_forgotten")
+                    fact_status = (
+                        str(payload.get("fact_status") or "").strip().lower()
+                    )
+                    if (
+                        fact_status
+                        and fact_status in _GRAPH_UNSAFE_FACT_STATUSES
+                    ):
+                        reasons.append(f"fact_status:{fact_status}")
+                if not reasons:
+                    reasons.append("unsafe_status")
+                warnings.append(
+                    "graph relation demoted: unsafe status "
+                    f"[{', '.join(reasons)}] "
+                    f"(handle={handle or '<unknown>'})"
+                )
+            continue
+        projection = _graph_payload_projection(payload)
+        truncated_text = _truncate_graph_text(
+            projection["text"], safe_max_source_chars,
         )
+        item: dict[str, Any] = {
+            "point_id": point_id,
+            "graph_distance": int(getattr(candidate, "graph_distance", 0) or 0),
+            "final_score": float(getattr(candidate, "final_score", 0.0) or 0.0),
+            "path": list(getattr(candidate, "path", []) or []),
+            "relation_path": list(getattr(candidate, "relation_path", []) or []),
+            "source_uri": projection["source_uri"],
+            "file_path": projection["file_path"],
+            "heading": projection["heading"],
+            "text": truncated_text,
+        }
+        out.append(item)
     return out
 
 
@@ -811,7 +1057,19 @@ class HybridRouter:
                     allow_sparse_scroll=False,
                     allow_graph_scroll=False,
                 )
-                graph_relations = _graph_to_relations(graph_result, warnings=warnings)
+                graph_relations = _graph_to_relations(
+                    graph_result,
+                    warnings=warnings,
+                    # Phase 6E: pass the per-relation truncation
+                    # budget and the ``include_fact_history`` opt-in
+                    # so the graph lane honors the same
+                    # ``max_source_chars`` / unsafe-status demotion
+                    # contract the dense lane already enforces.
+                    # ``max_source_chars`` is caller-clamped here so
+                    # the graph lane cannot bypass the hard cap.
+                    max_source_chars=safe_max_source_chars,
+                    include_fact_history=include_fact_history,
+                )
                 debug["stages"]["graph"] = {
                     "requested": safe_top_k,
                     "returned": len(graph_relations),
@@ -944,12 +1202,18 @@ class HybridRouter:
             leaves_payload,
             exact_hits_payload,
             context_used,
+            graph_relations_payload,
         ) = _enforce_global_context_budget(
             summaries_payload,
             leaves_payload,
             exact_hits_payload,
             warnings,
             _HARD_CONTEXT_CHAR_BUDGET,
+            # Phase 6E: include graph relation text bodies in the
+            # global hard budget so the graph lane cannot push the
+            # union of lanes past the 16000-char cap. Each relation
+            # is already ``max_source_chars`` clamped upstream.
+            graph_relations_payload=graph_relations,
         )
         debug["context_used_chars"] = context_used
         debug["hard_caps"] = {
@@ -968,7 +1232,7 @@ class HybridRouter:
             summaries=summaries_payload,
             cited_leaves=leaves_payload,
             exact_hits=exact_hits_payload,
-            graph_relations=graph_relations[:safe_top_k],
+            graph_relations=graph_relations_payload[:safe_top_k],
             warnings=warnings,
             debug=debug,
         )

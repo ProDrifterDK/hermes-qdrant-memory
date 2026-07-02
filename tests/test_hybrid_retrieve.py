@@ -65,12 +65,13 @@ class FakeGraphResult:
 
 class FakeGraphCandidate:
     def __init__(self, pid, graph_distance=1, final_score=0.7,
-                 path=None, relation_path=None):
+                 path=None, relation_path=None, payload=None):
         self.point_id = pid
         self.graph_distance = graph_distance
         self.final_score = final_score
         self.path = path or []
         self.relation_path = relation_path or []
+        self.payload = payload or {}
 
 
 class FakeGraphRetriever:
@@ -427,6 +428,352 @@ class TestGraphLane:
         assert "graph-clean-5" in ids
         # No spurious graph redaction warnings for clean candidates.
         assert not any("graph relation redacted" in w for w in d["warnings"])
+
+    # ------------------------------------------------------------------ #
+    # Phase 6E: graph relation payload handles (source_uri / file_path /
+    # heading / bounded text) projected from ``candidate.payload``.
+    # ------------------------------------------------------------------ #
+
+    def test_graph_relation_emits_source_handles_from_payload(self):
+        # Phase 6E: a graph candidate whose payload carries provenance
+        # metadata must surface ``source_uri``, ``file_path``,
+        # ``heading``, and bounded ``text`` in the emitted relation.
+        graph = FakeGraphRetriever(final=[
+            FakeGraphCandidate(
+                "graph-handle-1",
+                graph_distance=1,
+                final_score=0.7,
+                payload={
+                    "source_uri": "file://docs/phase6e.md",
+                    "file_path": "docs/phase6e.md",
+                    "heading": "Phase 6E",
+                    "text": "phase 6e graph relation body",
+                },
+            ),
+        ])
+        router = HybridRouter(
+            qdrant=FakeQdrant(),
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+            base_retriever=FakeBaseRetriever(),
+            graph_retriever=graph,
+        )
+        d = router.retrieve("hi", top_k=3).to_dict()
+        rels = d["results"]["graph_relations"]
+        assert len(rels) == 1
+        rel = rels[0]
+        assert rel["point_id"] == "graph-handle-1"
+        assert rel["source_uri"] == "file://docs/phase6e.md"
+        assert rel["file_path"] == "docs/phase6e.md"
+        assert rel["heading"] == "Phase 6E"
+        assert rel["text"] == "phase 6e graph relation body"
+
+    def test_graph_relation_text_bounded_by_max_source_chars(self):
+        # Phase 6E: a graph relation text body is truncated to the
+        # caller's ``max_source_chars`` budget so the graph lane
+        # cannot bypass the same cap the dense and RAPTOR lanes
+        # already enforce.
+        long_body = "x" * 5000
+        graph = FakeGraphRetriever(final=[
+            FakeGraphCandidate(
+                "graph-truncate-1",
+                graph_distance=1,
+                final_score=0.7,
+                payload={
+                    "text": long_body,
+                    "source_uri": "file://docs/long.md",
+                    "file_path": "docs/long.md",
+                },
+            ),
+        ])
+        router = HybridRouter(
+            qdrant=FakeQdrant(),
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+            base_retriever=FakeBaseRetriever(),
+            graph_retriever=graph,
+        )
+        d = router.retrieve("hi", top_k=3, max_source_chars=1200).to_dict()
+        rel = d["results"]["graph_relations"][0]
+        # Per-relation cap is enforced; trailing ellipsis is preserved.
+        assert len(rel["text"]) <= 1200
+        assert rel["text"].endswith("…")
+        # The truncated text must be a prefix of the long body.
+        assert long_body.startswith(rel["text"].rstrip("…"))
+
+    def test_graph_relation_secret_in_source_uri_dropped(self):
+        # Phase 6E: a secret in any of the newly emitted payload
+        # fields must disqualify the entire relation.
+        bad_token = "".join(["Bearer ", "x" * 24])
+        graph = FakeGraphRetriever(final=[
+            FakeGraphCandidate(
+                "graph-bad-uri",
+                graph_distance=1,
+                final_score=0.7,
+                payload={
+                    "source_uri": "file://" + bad_token,
+                    "file_path": "docs/clean.md",
+                    "heading": "Clean",
+                    "text": "clean body",
+                },
+            ),
+        ])
+        router = HybridRouter(
+            qdrant=FakeQdrant(),
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+            base_retriever=FakeBaseRetriever(),
+            graph_retriever=graph,
+        )
+        d = router.retrieve("hi", top_k=3).to_dict()
+        assert d["results"]["graph_relations"] == []
+        serialized = json.dumps(d, default=str)
+        assert bad_token not in serialized
+        assert any("graph relation redacted" in w for w in d["warnings"])
+
+    def test_graph_relation_secret_in_file_path_dropped(self):
+        bad_token = "".join(["Bearer ", "y" * 24])
+        graph = FakeGraphRetriever(final=[
+            FakeGraphCandidate(
+                "graph-bad-path",
+                graph_distance=1,
+                final_score=0.7,
+                payload={
+                    "file_path": "secrets/" + bad_token,
+                    "source_uri": "file://docs/clean.md",
+                    "heading": "Clean",
+                    "text": "clean body",
+                },
+            ),
+        ])
+        router = HybridRouter(
+            qdrant=FakeQdrant(),
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+            base_retriever=FakeBaseRetriever(),
+            graph_retriever=graph,
+        )
+        d = router.retrieve("hi", top_k=3).to_dict()
+        assert d["results"]["graph_relations"] == []
+        serialized = json.dumps(d, default=str)
+        assert bad_token not in serialized
+
+    def test_graph_relation_secret_in_heading_dropped(self):
+        bad_token = "".join(["Bearer ", "z" * 24])
+        graph = FakeGraphRetriever(final=[
+            FakeGraphCandidate(
+                "graph-bad-heading",
+                graph_distance=1,
+                final_score=0.7,
+                payload={
+                    "heading": "leak " + bad_token,
+                    "source_uri": "file://docs/clean.md",
+                    "file_path": "docs/clean.md",
+                    "text": "clean body",
+                },
+            ),
+        ])
+        router = HybridRouter(
+            qdrant=FakeQdrant(),
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+            base_retriever=FakeBaseRetriever(),
+            graph_retriever=graph,
+        )
+        d = router.retrieve("hi", top_k=3).to_dict()
+        assert d["results"]["graph_relations"] == []
+        serialized = json.dumps(d, default=str)
+        assert bad_token not in serialized
+
+    def test_graph_relation_secret_in_text_dropped(self):
+        bad_token = "".join(["Bearer ", "w" * 24])
+        graph = FakeGraphRetriever(final=[
+            FakeGraphCandidate(
+                "graph-bad-text",
+                graph_distance=1,
+                final_score=0.7,
+                payload={
+                    "text": "lead in " + bad_token + " trailer",
+                    "source_uri": "file://docs/clean.md",
+                    "file_path": "docs/clean.md",
+                    "heading": "Clean",
+                },
+            ),
+        ])
+        router = HybridRouter(
+            qdrant=FakeQdrant(),
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+            base_retriever=FakeBaseRetriever(),
+            graph_retriever=graph,
+        )
+        d = router.retrieve("hi", top_k=3).to_dict()
+        assert d["results"]["graph_relations"] == []
+        serialized = json.dumps(d, default=str)
+        assert bad_token not in serialized
+
+    def test_graph_relation_secret_past_truncation_point_still_dropped(self):
+        # Phase 6E: the secret scanner must see the raw text BEFORE
+        # the per-relation ``max_source_chars`` cap is applied.
+        # Otherwise a secret past the truncation point would silently
+        # slip through the gate.
+        bad_token = "".join(["Bearer ", "u" * 24])
+        # Pad the body so the secret sits well past the 1200-char
+        # cap that the caller's ``max_source_chars`` would otherwise
+        # silently chop off.
+        pad = "a" * 3000
+        long_body = pad + bad_token + pad
+        graph = FakeGraphRetriever(final=[
+            FakeGraphCandidate(
+                "graph-truncated-secret",
+                graph_distance=1,
+                final_score=0.7,
+                payload={
+                    "text": long_body,
+                    "source_uri": "file://docs/long.md",
+                    "file_path": "docs/long.md",
+                },
+            ),
+        ])
+        router = HybridRouter(
+            qdrant=FakeQdrant(),
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+            base_retriever=FakeBaseRetriever(),
+            graph_retriever=graph,
+        )
+        d = router.retrieve("hi", top_k=3, max_source_chars=200).to_dict()
+        # The secret-bearing relation must be DROPPED entirely —
+        # not emitted with truncated text. The scanner must see the
+        # raw body and fail-closed.
+        assert d["results"]["graph_relations"] == []
+        serialized = json.dumps(d, default=str)
+        assert bad_token not in serialized
+        assert any("graph relation redacted" in w for w in d["warnings"])
+
+    def test_graph_relation_unsafe_status_demoted(self):
+        # Phase 6E: graph payloads flagged with unsafe status
+        # markers (``stale``, ``requires_review``, ``quarantined``,
+        # ``raptor_excluded``, ``raptor_forgotten``, or unsafe
+        # ``fact_status``) are demoted from active
+        # ``results.graph_relations`` to a sanitized warning.
+        graph = FakeGraphRetriever(final=[
+            FakeGraphCandidate(
+                "graph-stale",
+                graph_distance=1,
+                final_score=0.7,
+                payload={
+                    "stale": True,
+                    "source_uri": "file://docs/x.md",
+                    "file_path": "docs/x.md",
+                    "text": "stale body",
+                },
+            ),
+            FakeGraphCandidate(
+                "graph-review",
+                graph_distance=1,
+                final_score=0.7,
+                payload={
+                    "requires_review": True,
+                    "source_uri": "file://docs/y.md",
+                    "file_path": "docs/y.md",
+                    "text": "review body",
+                },
+            ),
+            FakeGraphCandidate(
+                "graph-clean",
+                graph_distance=1,
+                final_score=0.7,
+                payload={
+                    "source_uri": "file://docs/z.md",
+                    "file_path": "docs/z.md",
+                    "text": "clean body",
+                },
+            ),
+        ])
+        router = HybridRouter(
+            qdrant=FakeQdrant(),
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+            base_retriever=FakeBaseRetriever(),
+            graph_retriever=graph,
+        )
+        d = router.retrieve("hi", top_k=5).to_dict()
+        ids = [g["point_id"] for g in d["results"]["graph_relations"]]
+        assert "graph-clean" in ids
+        assert "graph-stale" not in ids
+        assert "graph-review" not in ids
+        # Demotion warnings must use redacted handles — never raw ids.
+        demoted = [w for w in d["warnings"] if "graph relation demoted" in w]
+        assert demoted
+        for w in demoted:
+            assert "graph-stale" not in w
+            assert "graph-review" not in w
+
+    def test_graph_relation_include_fact_history_overrides_demotion(self):
+        # ``include_fact_history=True`` is the explicit opt-in to
+        # surface review / stale material; unsafe-status demotion
+        # must be bypassed so the history lane remains accessible.
+        graph = FakeGraphRetriever(final=[
+            FakeGraphCandidate(
+                "graph-history",
+                graph_distance=1,
+                final_score=0.7,
+                payload={
+                    "requires_review": True,
+                    "source_uri": "file://docs/h.md",
+                    "file_path": "docs/h.md",
+                    "text": "history body",
+                },
+            ),
+        ])
+        router = HybridRouter(
+            qdrant=FakeQdrant(),
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+            base_retriever=FakeBaseRetriever(),
+            graph_retriever=graph,
+        )
+        d = router.retrieve(
+            "hi", top_k=5, include_fact_history=True,
+        ).to_dict()
+        rels = d["results"]["graph_relations"]
+        ids = [g["point_id"] for g in rels]
+        assert "graph-history" in ids
+        # With the history opt-in, no demotion warning is emitted for
+        # this relation.
+        assert not any("graph relation demoted" in w for w in d["warnings"])
+
+    def test_graph_no_scroll_contract_preserved_phase6e(self):
+        # Phase 5 fix8 invariant: the hybrid graph lane MUST keep
+        # passing ``allow_sparse_scroll=False`` and
+        # ``allow_graph_scroll=False`` after the Phase 6E payload
+        # handle projection.
+        graph = FakeGraphRetriever(final=[
+            FakeGraphCandidate(
+                "graph-pinned",
+                graph_distance=1,
+                final_score=0.7,
+                payload={
+                    "source_uri": "file://docs/p.md",
+                    "file_path": "docs/p.md",
+                    "text": "pinned body",
+                },
+            ),
+        ])
+        router = HybridRouter(
+            qdrant=FakeQdrant(),
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+            base_retriever=FakeBaseRetriever(),
+            graph_retriever=graph,
+        )
+        router.retrieve("hi", top_k=3).to_dict()
+        # The graph retriever saw both scroll-suppression kwargs.
+        assert len(graph.calls) == 1
+        kwargs = graph.calls[0]["kwargs"]
+        assert kwargs.get("allow_sparse_scroll") is False
+        assert kwargs.get("allow_graph_scroll") is False
 
 
 class TestReadOnlySafety:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+import uuid
 from typing import Any
 
 import pytest
@@ -16,7 +18,20 @@ from qdrant_memory.raptor import (
 from qdrant_memory.raptor.schema import (
     RAPTOR_LEVEL_LEAF,
     compute_manifest_digest,
+    compute_node_id,
 )
+
+
+# UUID shape produced by ``str(uuid.UUID(...))`` — the canonical Qdrant
+# point-id format for RAPTOR node IDs.
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+
+
+def _is_uuid_node_id(value: str) -> bool:
+    """Return True iff *value* is a UUID-shaped RAPTOR node ID."""
+    return isinstance(value, str) and bool(_UUID_RE.match(value))
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +261,46 @@ def test_cluster_summary_node_has_leaves_as_children_and_root_has_clusters():
     for rp in root_payloads:
         # Root's children are cluster node ids, not leaf ids.
         for cid in rp["raptor_child_ids"]:
-            assert cid.startswith("raptor-node-")
+            assert _is_uuid_node_id(cid), f"root child id is not UUID-shaped: {cid!r}"
+
+
+def test_builder_node_ids_are_uuid_shaped_for_qdrant():
+    """Every candidate payload raptor_node_id must be a valid UUID so it can
+    be used directly as a Qdrant point ID (UUID or unsigned int only)."""
+    points = [
+        _point("leaf-1", "alpha note about RAPTOR", source_type="manual"),
+        _point("leaf-2", "beta note about RAPTOR", source_type="manual"),
+        _point("leaf-3", "gamma note about RAPTOR", source_type="manual"),
+    ]
+    manifest = RaptorBuilder().build(points)
+    assert manifest.node_count >= 2
+    for payload in manifest.candidate_node_payloads:
+        node_id = payload["raptor_node_id"]
+        assert _is_uuid_node_id(node_id), f"node id not UUID-shaped: {node_id!r}"
+        # Must not be a legacy raptor-node-* prefixed id.
+        assert not node_id.startswith("raptor-node-")
+
+
+def test_builder_root_child_ids_are_uuid_but_summary_of_are_leaf_ids():
+    """Root raptor_child_ids reference child summary nodes (UUID-shaped),
+    while raptor_summary_of still references the original leaf point IDs."""
+    points = [
+        _point("leaf-1", "alpha note about RAPTOR", source_type="manual"),
+        _point("leaf-2", "beta note about RAPTOR", source_type="manual"),
+    ]
+    manifest = RaptorBuilder().build(points)
+    leaf_ids = {"leaf-1", "leaf-2"}
+    root_payloads = [p for p in manifest.candidate_node_payloads if p["raptor_level"] == RAPTOR_LEVEL_LEAF + 2]
+    assert root_payloads
+    root = root_payloads[0]
+    # Root's children are cluster summary node ids → UUID-shaped.
+    for cid in root["raptor_child_ids"]:
+        assert _is_uuid_node_id(cid), f"root child id not UUID: {cid!r}"
+        assert cid not in leaf_ids
+    # Root's summary_of are leaf point ids, not UUID node ids.
+    for sid in root["raptor_summary_of"]:
+        assert sid in leaf_ids, f"summary_of should be leaf id: {sid!r}"
+        assert not _is_uuid_node_id(sid)
 
 
 # ---------------------------------------------------------------------------

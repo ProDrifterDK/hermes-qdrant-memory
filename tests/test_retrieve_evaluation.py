@@ -1290,3 +1290,84 @@ def test_matched_expected_source_labels_helper_skips_nonmatching_source_uri():
     # source_uri must not appear.
     assert matched == ["docs/RAPTOR.md"]
     assert "file://wrong.md" not in matched
+
+
+# ---------------------------------------------------------------------------
+# Phase 6E: graph relation source_handle fields count toward source_hit_at_k
+# when ``graph_relations`` emit ``source_uri`` / ``file_path`` handles from
+# the candidate payload.
+# ---------------------------------------------------------------------------
+
+
+def test_graph_relation_source_hit_at_k_when_source_uri_matches():
+    """A graph relation whose emitted source_uri matches an expected
+    source URI must contribute to ``source_hit_at_k`` and surface the
+    matched label in ``matched_expected.sources``."""
+
+    case = {
+        "case_id": "c-graph-1",
+        "query": "any",
+        "expected_source_uris": ["file://docs/RAPTOR.md"],
+    }
+    run = {
+        "case_id": "c-graph-1",
+        "variant": "graph",
+        "packet": {
+            "results": {
+                "exact_hits": [],
+                "summaries": [],
+                "cited_leaves": [],
+                "graph_relations": [
+                    {
+                        "point_id": "g1",
+                        "text": "graph body",
+                        "file_path": "docs/RAPTOR.md",
+                        "source_uri": "file://docs/RAPTOR.md",
+                    },
+                ],
+            }
+        },
+    }
+    row = evaluation.score_case_run(case, run)
+    # Graph relation source_uri matches the expected label.
+    assert row["source_hit_at_k"] is True
+    assert "file://docs/RAPTOR.md" in row["matched_expected"]["sources"]
+
+
+def test_graph_relation_source_hit_at_k_when_only_file_path_matches():
+    """A graph relation whose emitted ``file_path`` matches an expected
+    file path (and whose source_uri is unrelated) must still count
+    toward ``source_hit_at_k`` and surface the matched file_path
+    label only."""
+
+    case = {
+        "case_id": "c-graph-2",
+        "query": "any",
+        "expected_file_paths": ["docs/RAPTOR.md"],
+    }
+    run = {
+        "case_id": "c-graph-2",
+        "variant": "graph",
+        "packet": {
+            "results": {
+                "exact_hits": [],
+                "summaries": [],
+                "cited_leaves": [],
+                "graph_relations": [
+                    {
+                        "point_id": "g2",
+                        "text": "graph body",
+                        "file_path": "docs/RAPTOR.md",
+                        "source_uri": "file://wrong.md",
+                    },
+                ],
+            }
+        },
+    }
+    row = evaluation.score_case_run(case, run)
+    assert row["source_hit_at_k"] is True
+    sources = row["matched_expected"]["sources"]
+    # Matched file_path must surface; non-matching emitted source_uri
+    # must not leak into the matched list.
+    assert "docs/RAPTOR.md" in sources
+    assert "file://wrong.md" not in sources

@@ -1157,7 +1157,7 @@ def test_mismatched_node_ids_in_apply_record_rejected(tmp_path):
         report_id=report_id,
         build_id=build_id,
         manifest_digest=digest,
-        applied_node_ids=["raptor-node-totally-different"],
+        applied_node_ids=["ffffffff-ffff-4000-8000-000000000000"],
         hermes_home=provider._hermes_home,
     )
 
@@ -1244,7 +1244,7 @@ def test_status_reports_wrong_applied_node_ids_as_error(tmp_path):
         report_id=report_id,
         build_id=build_id,
         manifest_digest=digest,
-        applied_node_ids=["raptor-node-totally-different"],
+        applied_node_ids=["ffffffff-ffff-4000-8000-000000000000"],
         hermes_home=provider._hermes_home,
     )
 
@@ -2407,3 +2407,126 @@ def test_tool_retrieve_learning_clean_chunk_passes_through(tmp_path):
     assert not any("learning exact hit redacted" in w for w in payload["warnings"])
     # ``dropped_exact_hit_ids`` must be empty.
     assert payload["debug"].get("dropped_exact_hit_ids", []) == []
+
+
+# ---------------------------------------------------------------------------
+# Phase 6E: RAPTOR node IDs must be Qdrant-compatible (UUID-shaped)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_accepts_uuid_shaped_node_ids(tmp_path):
+    """A manifest built by the builder produces UUID-shaped raptor_node_ids
+    and the dry-run apply path must accept them without validation errors."""
+    provider, manifest, report_id, build_id, digest = _provider_with_manifest(tmp_path)
+
+    # Every candidate node id must be UUID-shaped (the builder produces them).
+    for payload in manifest["candidate_node_payloads"]:
+        node_id = str(payload.get("raptor_node_id") or "")
+        assert node_id, "empty node id"
+        # Must be a valid UUID.
+        import uuid as _uuid
+        _uuid.UUID(node_id)  # raises ValueError if invalid
+        assert not node_id.startswith("raptor-node-")
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_raptor_apply",
+            {"report_id": report_id, "build_id": build_id, "manifest_digest": digest},
+        )
+    )
+    assert "error" not in result, result
+    assert result["dry_run"] is True
+    assert len(result["would_upsert_ids"]) > 0
+    # All would-upsert IDs must be UUID-shaped.
+    for uid in result["would_upsert_ids"]:
+        import uuid as _uuid
+        _uuid.UUID(uid)
+
+
+def test_apply_rejects_legacy_raptor_node_prefix(tmp_path):
+    """A candidate payload with a legacy raptor-node-<hex> id must be
+    rejected by apply validation because it is not a valid Qdrant point ID."""
+    manifest = _build_manifest()
+    # Tamper: set a legacy-format node id on the first payload
+    manifest["candidate_node_payloads"][0]["raptor_node_id"] = "raptor-node-deadbeef"
+    manifest["manifest_digest"] = compute_manifest_digest(manifest)
+
+    report_id = f"raptor-{manifest['manifest_digest'][:12]}"
+    build_id = manifest["build_id"]
+    digest = manifest["manifest_digest"]
+
+    provider = _provider_for_raptor(tmp_path)
+    wrapper = _wrap_manifest(manifest, report_id=report_id)
+    persist_manifest_report(wrapper, hermes_home=provider._hermes_home)
+    provider._pending_raptor_manifests[report_id] = wrapper
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_raptor_apply",
+            {"report_id": report_id, "build_id": build_id, "manifest_digest": digest},
+        )
+    )
+    assert "error" in result
+    assert "uuid" in result["error"].lower() or "raptor_node_id" in result["error"].lower()
+
+
+def test_apply_rejects_non_uuid_non_integer_node_id(tmp_path):
+    """A candidate payload with a random string node id that is neither UUID
+    nor unsigned int must be rejected."""
+    manifest = _build_manifest()
+    manifest["candidate_node_payloads"][0]["raptor_node_id"] = "just-a-string-id"
+    manifest["manifest_digest"] = compute_manifest_digest(manifest)
+
+    report_id = f"raptor-{manifest['manifest_digest'][:12]}"
+    build_id = manifest["build_id"]
+    digest = manifest["manifest_digest"]
+
+    provider = _provider_for_raptor(tmp_path)
+    wrapper = _wrap_manifest(manifest, report_id=report_id)
+    persist_manifest_report(wrapper, hermes_home=provider._hermes_home)
+    provider._pending_raptor_manifests[report_id] = wrapper
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_raptor_apply",
+            {"report_id": report_id, "build_id": build_id, "manifest_digest": digest},
+        )
+    )
+    assert "error" in result
+
+
+def test_live_apply_upserts_uuid_node_ids_only(tmp_path):
+    """Provider live apply fake path must retrieve/upsert UUID-shaped node
+    IDs — no raptor-node-* IDs should appear in upsert outputs."""
+    provider, manifest, report_id, build_id, digest = _provider_with_manifest(tmp_path)
+
+    # Dry-run first
+    provider.handle_tool_call(
+        "qdrant_memory_raptor_apply",
+        {"report_id": report_id, "build_id": build_id, "manifest_digest": digest},
+    )
+
+    # Live apply
+    live = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_raptor_apply",
+            {"report_id": report_id, "build_id": build_id, "manifest_digest": digest,
+             "dry_run": False, "approve": True},
+        )
+    )
+    assert live["applied"] is True
+    assert live["already_applied"] is False
+
+    import uuid as _uuid
+
+    # Every upserted point id must be UUID-shaped and match a manifest node id.
+    manifest_node_ids = {
+        str(p.get("raptor_node_id") or "")
+        for p in manifest["candidate_node_payloads"]
+    }
+    for _, points in provider._qdrant.upserts:
+        for point in points:
+            pid = str(point["id"])
+            assert pid in manifest_node_ids
+            _uuid.UUID(pid)  # must be valid UUID
+            assert not pid.startswith("raptor-node-")

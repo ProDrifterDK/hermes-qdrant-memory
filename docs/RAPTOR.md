@@ -242,7 +242,7 @@ Phase 3 acceptance:
 | Field                   | Type           | Notes                                   |
 | ----------------------- | -------------- | --------------------------------------- |
 | `raptor_tree_id`        | str            | Stable per (build, prompt, root).       |
-| `raptor_node_id`        | str            | Stable per (tree, level, cluster).      |
+| `raptor_node_id`        | str            | UUID-shaped, stable per (tree, level, cluster). Used as the Qdrant point ID on live apply. |
 | `raptor_level`          | int            | 0 = leaf ref, 1 = cluster, 2 = root.    |
 | `raptor_parent_ids`     | list[str]      | Empty for level-2 root in Phase 3.      |
 | `raptor_child_ids`      | list[str]      | Sorted, deterministic, leaf or cluster. |

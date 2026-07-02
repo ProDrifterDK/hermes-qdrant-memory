@@ -88,6 +88,38 @@ def test_compute_node_id_is_stable_with_parent_order():
     assert d != a
 
 
+def test_compute_node_id_is_uuid_shaped():
+    """RAPTOR node IDs must be valid UUIDs so they work as Qdrant point IDs."""
+    import uuid as _uuid
+
+    cases: list[tuple[str, int, str, tuple[str, ...]]] = [
+        ("t1", 1, "c1", ()),
+        ("t1", 2, "c1", ("p1", "p2")),
+        ("tree-abc", 3, "cluster-xyz", ("p3",)),
+    ]
+    for tree_id, level, cluster_id, parent_ids in cases:
+        node_id = compute_node_id(
+            tree_id=tree_id, level=level, cluster_id=cluster_id, parent_ids=parent_ids
+        )
+        # Must not raise — validates UUID shape.
+        parsed = _uuid.UUID(node_id)
+        # Canonical str(UUID) form (lowercase, 8-4-4-4-12).
+        assert str(parsed) == node_id
+        # Must NOT be a raptor-node-* prefixed string.
+        assert not node_id.startswith("raptor-node-")
+
+
+def test_compute_node_id_deterministic_uuid():
+    """Same structural inputs produce the exact same UUID every time."""
+    kwargs = dict(tree_id="t1", level=1, cluster_id="c1", parent_ids=("p1", "p2"))
+    a = compute_node_id(**kwargs)
+    b = compute_node_id(**kwargs)
+    assert a == b
+    # Different inputs produce different UUIDs.
+    c = compute_node_id(tree_id="t2", level=1, cluster_id="c1", parent_ids=("p1", "p2"))
+    assert a != c
+
+
 def test_compute_build_id_is_stable_under_leaf_order_and_config_independent():
     leaves_a = [{"id": "x"}, {"id": "y"}, {"id": "z"}]
     leaves_b = [{"id": "z"}, {"id": "x"}, {"id": "y"}]
@@ -133,7 +165,7 @@ def test_scope_empty_matches_anything():
 
 def _make_node(**overrides: Any) -> RaptorNode:
     defaults: dict[str, Any] = dict(
-        node_id="raptor-node-1",
+        node_id="00000000-0000-4000-8000-000000000001",
         tree_id="raptor-tree-1",
         root_id="raptor-root-1",
         build_id="raptor-build-1",
@@ -158,7 +190,7 @@ def test_node_payload_includes_all_required_fields():
     for field_name in RAPTOR_REQUIRED_NODE_FIELDS:
         assert field_name in payload, f"missing required field: {field_name}"
     assert payload["raptor_tree_id"] == "raptor-tree-1"
-    assert payload["raptor_node_id"] == "raptor-node-1"
+    assert payload["raptor_node_id"] == "00000000-0000-4000-8000-000000000001"
     assert payload["raptor_level"] == 1
     assert payload["raptor_child_ids"] == ["leaf-1", "leaf-2"]
     assert payload["raptor_summary_of"] == ["leaf-1", "leaf-2"]
@@ -263,7 +295,7 @@ def test_node_payload_json_serializable():
     payload = node.to_payload()
     encoded = json.dumps(payload, sort_keys=True, default=str)
     decoded = json.loads(encoded)
-    assert decoded["raptor_node_id"] == "raptor-node-1"
+    assert decoded["raptor_node_id"] == "00000000-0000-4000-8000-000000000001"
 
 
 # ---------------------------------------------------------------------------
