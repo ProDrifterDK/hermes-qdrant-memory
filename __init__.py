@@ -96,6 +96,7 @@ from qdrant_memory.hybrid.router import (
     _redact_query_metadata,
     _truncate_dense_text,
 )
+from qdrant_memory.shadow_runtime import ShadowRecorder, _safe_hybrid_counts
 HARD_CONTEXT_CHAR_BUDGET: int = 16000
 HARD_MAX_SOURCE_CHARS: int = 2400
 from qdrant_memory.write_gate import evaluate_raptor_summary_write, evaluate_write_candidate
@@ -488,6 +489,7 @@ class QdrantMemoryProvider(MemoryProvider):
         self._hybrid_router: Optional[HybridRouter] = None
         self._graph_retriever: Any = None
         self._raptor_searcher: Optional[RaptorSearcher] = None
+        self._shadow_recorder: Optional[ShadowRecorder] = None
 
     @property
     def name(self) -> str:
@@ -575,6 +577,17 @@ class QdrantMemoryProvider(MemoryProvider):
             self._qdrant.ensure_collection(self._config["learning_collection_name"], self._config["vector_size"], self._config["distance"])
         except Exception:
             logger.debug("Qdrant collection setup failed", exc_info=True)
+        # Phase 6H: lazily construct the shadow recorder if enabled.
+        if self._config.get("auto_recall_shadow_enabled"):
+            try:
+                self._shadow_recorder = ShadowRecorder(
+                    hermes_home=self._hermes_home,
+                    max_per_session=int(self._config.get("auto_recall_shadow_max_per_session", 20)),
+                    artifact_dir=str(self._config.get("auto_recall_shadow_artifact_dir", "")),
+                )
+            except Exception:
+                logger.debug("Shadow recorder init failed", exc_info=True)
+                self._shadow_recorder = None
 
     def _scope_filter_values(self) -> dict[str, str]:
         mode = str(self._config.get("scope_mode") or "profile")
@@ -600,22 +613,147 @@ class QdrantMemoryProvider(MemoryProvider):
             "for explicit memory operations."
         )
 
+    def _run_shadow_retrieve(self, query: str, sid: str, trigger: str, legacy_result: str) -> None:
+        """Phase 6H: run a read-only hybrid retrieve in the background and
+        record a sanitized aggregate-only shadow event.
+
+        This method MUST NOT alter the prompt context. The
+        ``legacy_result`` is already computed and returned to the caller
+        by the prefetch path. The shadow retrieve runs purely for
+        telemetry comparison.
+
+        Privacy: only aggregate counts and sha256[:16] digests are
+        persisted. No raw query, text, point IDs, paths, or exception
+        strings reach the JSONL artifact.
+        """
+        recorder = self._shadow_recorder
+        if recorder is None:
+            return
+        try:
+            import time as _time
+
+            router = self._ensure_hybrid_router(self._config["collection_name"])
+            if router is None:
+                recorder.record_event(
+                    query=query,
+                    session_id=sid,
+                    trigger=trigger,
+                    latency_ms=0.0,
+                    legacy_chars=len(legacy_result or ""),
+                    legacy_empty=not bool(legacy_result and legacy_result.strip()),
+                    hybrid_summaries_count=0,
+                    hybrid_cited_leaves_count=0,
+                    hybrid_exact_hits_count=0,
+                    hybrid_graph_relations_count=0,
+                    hybrid_warning_count=0,
+                    hybrid_context_used_chars=0,
+                    status="error",
+                    error_code="router_unavailable",
+                )
+                return
+            t0 = _time.monotonic()
+            result = router.retrieve(
+                query,
+                top_k=int(self._config["auto_recall_top_k"]),
+                mode=str(self._config.get("auto_recall_shadow_mode", "hybrid")),
+            )
+            latency_ms = (_time.monotonic() - t0) * 1000.0
+            (
+                summaries,
+                cited_leaves,
+                exact_hits,
+                graph_relations,
+                warning_count,
+                context_used_chars,
+            ) = _safe_hybrid_counts(result)
+            recorder.record_event(
+                query=query,
+                session_id=sid,
+                trigger=trigger,
+                latency_ms=latency_ms,
+                legacy_chars=len(legacy_result or ""),
+                legacy_empty=not bool(legacy_result and legacy_result.strip()),
+                hybrid_summaries_count=summaries,
+                hybrid_cited_leaves_count=cited_leaves,
+                hybrid_exact_hits_count=exact_hits,
+                hybrid_graph_relations_count=graph_relations,
+                hybrid_warning_count=warning_count,
+                hybrid_context_used_chars=context_used_chars,
+                status="ok",
+                error_code="",
+            )
+        except Exception:
+            # Fail-closed: never crash the background shadow path.
+            try:
+                recorder.record_event(
+                    query=query,
+                    session_id=sid,
+                    trigger=trigger,
+                    latency_ms=0.0,
+                    legacy_chars=len(legacy_result or ""),
+                    legacy_empty=not bool(legacy_result and legacy_result.strip()),
+                    hybrid_summaries_count=0,
+                    hybrid_cited_leaves_count=0,
+                    hybrid_exact_hits_count=0,
+                    hybrid_graph_relations_count=0,
+                    hybrid_warning_count=0,
+                    hybrid_context_used_chars=0,
+                    status="error",
+                    error_code="exception",
+                )
+            except Exception:
+                pass
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if not self._active or not self._config.get("auto_recall") or not query.strip() or not self._retriever:
             return ""
         sid = session_id or self._session_id or "default"
+        # Phase 6H: ``prefetch`` is the single shadow emission point — it
+        # is the call site that actually builds the prompt-context string
+        # returned to the caller. We pop the cache (a previous
+        # ``queue_prefetch`` for the same session may have populated it)
+        # and use the cached value as the legacy result **only when it is
+        # non-empty/truthy**. An empty cached value (e.g. ``queue_prefetch``
+        # legitimately produced no hits, or a stale empty entry was left
+        # behind) falls through to the normal legacy dense search + format
+        # path so the prompt-context semantics match the pre-fix2 legacy
+        # behavior. Critically, this preserves the original ``if cached:``
+        # truthiness check — the empty string is treated identically to a
+        # cache miss.
+        result = ""
         with self._prefetch_lock:
             cached = self._prefetch_cache.pop(sid, "")
         if cached:
-            return cached
-        try:
-            chunks = self._retriever.search(query, top_k=int(self._config["auto_recall_top_k"]))
-            return format_for_prompt(chunks, int(self._config["display_tokens"]))
-        except Exception:
-            logger.debug("Qdrant prefetch failed", exc_info=True)
-            return ""
+            # Cache hit (non-empty): use the queued formatted result as-is.
+            result = cached
+        else:
+            # Cache miss (or empty cached value): run the normal legacy
+            # dense search + format path. This is the legacy behavior the
+            # prompt-context contract relies on.
+            try:
+                chunks = self._retriever.search(query, top_k=int(self._config["auto_recall_top_k"]))
+                result = format_for_prompt(chunks, int(self._config["display_tokens"]))
+            except Exception:
+                logger.debug("Qdrant prefetch failed", exc_info=True)
+                result = ""
+        # Phase 6H: schedule the background shadow retrieve. The legacy
+        # result is returned unchanged; shadow never alters the prompt
+        # context. The shadow event is intentionally emitted from this
+        # single point — ``queue_prefetch`` alone is just cache priming
+        # and writes nothing.
+        if self._shadow_recorder and self._executor:
+            try:
+                self._executor.submit(self._run_shadow_retrieve, query, sid, "prefetch", result)
+            except Exception:
+                logger.debug("Shadow submit failed", exc_info=True)
+        return result
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        # Phase 6H: ``queue_prefetch`` is purely a legacy cache-priming
+        # step. It must NEVER record a shadow event of its own, since
+        # the prompt-context build (the real user-visible side effect)
+        # happens later in ``prefetch``. The subsequent ``prefetch``
+        # call will emit exactly one shadow event.
         if not self._active or not self._executor or not self._retriever or not self._config.get("auto_recall") or not query.strip():
             return
         sid = session_id or self._session_id or "default"
@@ -894,6 +1032,19 @@ class QdrantMemoryProvider(MemoryProvider):
             "auto_recall": self._config["auto_recall"],
             "sync_turns": self._config["sync_turns"],
         }
+        # Phase 6H: expose safe aggregate-only shadow fields.
+        shadow_enabled = bool(self._config.get("auto_recall_shadow_enabled", False))
+        payload["shadow_enabled"] = shadow_enabled
+        payload["shadow_max_per_session"] = int(self._config.get("auto_recall_shadow_max_per_session", 20))
+        if self._shadow_recorder is not None:
+            summary = self._shadow_recorder.get_status_summary()
+            payload["shadow_recorded_count"] = summary.get("shadow_recorded_count", 0)
+            payload["shadow_session_count"] = summary.get("shadow_session_count", 0)
+            payload["shadow_last_event"] = summary.get("shadow_last_event")
+        else:
+            payload["shadow_recorded_count"] = 0
+            payload["shadow_session_count"] = 0
+            payload["shadow_last_event"] = None
         return json.dumps(payload)
 
     def _tool_store(self, args: dict) -> str:

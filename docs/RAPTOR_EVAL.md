@@ -713,3 +713,212 @@ closed rather than silently pass.
 - `tests/test_eval_gate.py` — focused unit tests for the gate core
   and CLI integration.
 - `docs/RAPTOR_EVAL.md` — Phase 6F section (this section).
+
+---
+
+# Phase 6H — controlled runtime shadow mode for hybrid auto-recall
+
+Phase 6H adds a **real but controlled runtime shadow mode** that runs
+the hybrid/RAPTOR retrieve path alongside the legacy dense auto-recall
+path, captures aggregate-only telemetry, and **never alters prompt
+context**.
+
+**This phase does NOT enable hybrid auto-recall by default.** The
+legacy dense prefetch/queue_prefetch path remains the sole source of
+prompt-injected recall. Shadow mode is disabled by default and only
+runs when an operator explicitly enables it.
+
+## What is in scope
+
+- `qdrant_memory/shadow_runtime.py` — a stdlib-only
+  `ShadowRecorder` that persists append-only JSONL events and a
+  compact state JSON.
+- Config flags (safe defaults):
+  - `auto_recall_shadow_enabled` (bool, default `False`)
+  - `auto_recall_shadow_max_per_session` (int, default `20`)
+  - `auto_recall_shadow_artifact_dir` (str, default `""` →
+    `$HERMES_HOME/qdrant_memory/auto_recall_shadow`)
+  - `auto_recall_shadow_mode` (str, default `"hybrid"`)
+- `QdrantMemoryProvider.prefetch()` augmented to schedule a background
+  shadow retrieve when shadow is enabled. `queue_prefetch()` is legacy
+  cache priming only and is observed only when consumed by `prefetch`.
+- `qdrant_memory_status` augmented with safe aggregate shadow fields.
+- `tests/test_shadow_runtime.py` — focused unit tests.
+- `docs/RAPTOR_EVAL.md` — Phase 6H section (this section).
+
+## What is NOT changed
+
+- Legacy auto-recall prompt injection is unchanged. The formatted
+  result returned by `prefetch()` / `queue_prefetch()` is exactly the
+  legacy dense `MemoryRetriever.search` + `format_for_prompt` output.
+- No eval thresholds or `eval_gate.py` changes.
+- No auto-promotion, no cron, no config mutation at runtime.
+- No new model-visible tool for shadow events (operator visibility is
+  through `qdrant_memory_status` only).
+
+## How it works
+
+When `auto_recall_shadow_enabled` is `True`:
+
+1. `prefetch(query)` computes the legacy dense result and returns it
+   to the caller unchanged. It then submits a background task
+   (`_run_shadow_retrieve`) to the existing `ThreadPoolExecutor` that:
+   - Builds the `HybridRouter` via `_ensure_hybrid_router(collection_name)`.
+   - Calls `router.retrieve(query, top_k=auto_recall_top_k, mode="hybrid")`.
+   - Extracts aggregate counts from the result via
+     `_safe_hybrid_counts` (counts only — never accesses text, point
+     IDs, paths, or warnings text).
+   - Records a single sanitized event to the JSONL artifact.
+
+2. `queue_prefetch(query)` runs the legacy queued search in the
+   background as before. It is purely a cache-priming step and does
+   NOT call `_run_shadow_retrieve`. Shadow telemetry is emitted only
+   when the caller later invokes `prefetch()`.
+
+3. The shadow path never calls any Qdrant mutation methods. The
+   `HybridRouter.retrieve` always passes `update_access=False`.
+
+## Privacy contract
+
+The shadow event schema is **aggregate-only**. The following fields are
+persisted per event:
+
+| field                         | type   | source |
+|-------------------------------|--------|--------|
+| `schema`                      | str    | constant `"qdrant_shadow_event.v1"` |
+| `timestamp`                   | str    | UTC ISO-8601 |
+| `trigger`                     | str    | `"prefetch"` |
+| `session_hash`                | str    | sha256[:16] of session_id |
+| `query_length`                | int    | len(query) |
+| `query_digest`                | str    | sha256[:16] of query |
+| `latency_ms`                  | float  | hybrid retrieve wall-clock |
+| `legacy_chars`                | int    | len of legacy formatted result |
+| `legacy_empty`                | bool   | whether legacy result was empty |
+| `hybrid_summaries_count`      | int    | len(result.summaries) |
+| `hybrid_cited_leaves_count`   | int    | len(result.cited_leaves) |
+| `hybrid_exact_hits_count`     | int    | len(result.exact_hits) |
+| `hybrid_graph_relations_count`| int    | len(result.graph_relations) |
+| `hybrid_warning_count`        | int    | len(result.warnings) |
+| `hybrid_context_used_chars`   | int    | result.debug["context_used_chars"] |
+| `status`                      | str    | `"ok"` or `"error"` |
+| `error_code`                  | str    | sanitized code or `""` |
+
+**Field allowlists.** `status`, `trigger`, and `error_code` are
+sanitized through **per-field allowlists** before reaching JSONL.
+Callers that supply any other value — including safe-alphabet
+strings such as `abcdef0123456789_xyz` that would have been silently
+accepted by an older generic `[a-z0-9_-]` token filter — never see
+their raw input persisted verbatim:
+
+| field         | allowed values                                    | collapse for unknown / non-string |
+|---------------|---------------------------------------------------|------------------------------------|
+| `status`      | `"ok"`, `"error"`, `"skipped"`                     | `"error"` |
+| `trigger`     | `"prefetch"` (Phase 6H only emits from `prefetch`) | `"invalid"` |
+| `error_code`  | `""`, `"router_unavailable"`, `"exception"`        | `"exception"` |
+
+The empty string `""` for `error_code` is the caller's explicit
+"no error code" sentinel and is preserved as-is so OK-path
+statistics remain meaningful. `None` and non-string values always
+collapse to the generic fallback.
+
+**Never persisted**: raw query, raw packet, result text, point IDs,
+source_uri, file_path, headings, warnings text, exception strings,
+matched tokens, or payload excerpts.
+
+## Prefetch shadow emission invariant
+
+The fix2 invariant — `prefetch` is the single shadow emission point;
+`queue_prefetch` is cache priming only and writes zero shadow events
+itself — is preserved. Furthermore, `prefetch` honors a **truthiness**
+check on the queued cache value:
+
+- If `_prefetch_cache[sid]` is **non-empty** (the normal cache-hit
+  case), `prefetch` returns the cached formatted string without
+  re-running `MemoryRetriever.search + format_for_prompt`. The shadow
+  event is still emitted exactly once from this path.
+- If `_prefetch_cache[sid]` is **empty** or **missing** (the normal
+  cache-miss case, including a `queue_prefetch` that legitimately
+  produced no hits), `prefetch` runs the legacy dense search and
+  `format_for_prompt` itself and returns the freshly formatted
+  result. The shadow event is still emitted exactly once from this
+  path.
+
+This matches the pre-fix2 legacy prompt-context contract: the empty
+string is treated identically to a cache miss, never as a cache hit.
+
+## Per-session cap
+
+`auto_recall_shadow_max_per_session` bounds the number of shadow
+events per session (identified by sha256[:16] of the session id). Once
+the cap is reached, subsequent `record_event` calls return `False`
+without writing. The cap is persisted in the compact state JSON so a
+fresh process respects counts from a prior process.
+
+## Operator visibility
+
+`qdrant_memory_status` now includes:
+
+```json
+{
+  "shadow_enabled": false,
+  "shadow_max_per_session": 20,
+  "shadow_recorded_count": 0,
+  "shadow_session_count": 0,
+  "shadow_last_event": null
+}
+```
+
+When events have been recorded, `shadow_last_event` is an object with
+the same aggregate fields as the event schema (counts, latency,
+status, timestamp) — **never** raw query or payload data.
+
+## Enabling shadow mode
+
+Shadow mode is opt-in. There are two equivalent ways to enable it.
+
+### A) `$HERMES_HOME/qdrant_memory.json` (flat keys)
+
+`load_config` reads this file as a **flat mapping of `auto_recall_shadow_*`
+keys at the top level** — it does NOT nest under `qdrant_memory`:
+
+```json
+{
+  "auto_recall_shadow_enabled": true,
+  "auto_recall_shadow_max_per_session": 20,
+  "auto_recall_shadow_artifact_dir": "",
+  "auto_recall_shadow_mode": "hybrid"
+}
+```
+
+### B) `config.yaml` under the `qdrant_memory` section (nested)
+
+When configured via the global Hermes config file, the keys live
+nested under the `qdrant_memory` section because the YAML root maps
+the plugin's namespace:
+
+```yaml
+qdrant_memory:
+  auto_recall_shadow_enabled: true
+  auto_recall_shadow_max_per_session: 20
+  auto_recall_shadow_artifact_dir: ""
+  auto_recall_shadow_mode: "hybrid"
+```
+
+### Environment variable
+
+Both forms can be overridden via environment variables:
+
+```bash
+HERMES_QDRANT_MEMORY_AUTO_RECALL_SHADOW_ENABLED=1
+```
+
+## Files (Phase 6H additions)
+
+- `qdrant_memory/shadow_runtime.py` — the `ShadowRecorder` and
+  `_safe_hybrid_counts` helper (stdlib-only).
+- `qdrant_memory/config.py` — four new config keys with safe defaults.
+- `__init__.py` — `_run_shadow_retrieve` helper invoked from `prefetch()`
+  only, `queue_prefetch()` is legacy cache priming, and shadow fields in
+  `_tool_status`.
+- `tests/test_shadow_runtime.py` — 48 focused unit tests (41 from Phase 6H + 7 regression tests for fix3 P2 #1 cache-miss semantics and P2 #2 per-field allowlist sanitization).
+- `docs/RAPTOR_EVAL.md` — Phase 6H section (this section).

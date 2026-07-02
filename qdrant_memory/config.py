@@ -88,6 +88,12 @@ DEFAULTS: dict[str, Any] = {
     "index_dry_run_default": True,
     "manual_store_duplicate_threshold": 0.92,
     "manual_store_duplicate_top_k": 3,
+    # Phase 6H: runtime shadow mode for hybrid auto-recall path.
+    # Disabled by default; never alters prompt context.
+    "auto_recall_shadow_enabled": False,
+    "auto_recall_shadow_max_per_session": 20,
+    "auto_recall_shadow_artifact_dir": "",
+    "auto_recall_shadow_mode": "hybrid",
 }
 
 _BOOL_KEYS = {
@@ -110,6 +116,7 @@ _BOOL_KEYS = {
     "reconsolidation_include_by_default",
     "index_dry_run_default",
     "provenance_ranking_enabled",
+    "auto_recall_shadow_enabled",
 }
 _INT_KEYS = {
     "vector_size",
@@ -132,6 +139,7 @@ _INT_KEYS = {
     "guarded_auto_quarantine_days",
     "reconsolidation_max_candidates",
     "manual_store_duplicate_top_k",
+    "auto_recall_shadow_max_per_session",
 }
 _FLOAT_KEYS = {"decay_rate", "min_raw_score", "min_final_score", "learning_auto_extract_min_confidence", "learning_auto_extract_semantic_dedupe_threshold", "source_extraction_min_confidence", "consolidation_duplicate_threshold", "guarded_auto_duplicate_min_confidence", "guarded_auto_learning_min_confidence", "reconsolidation_min_confidence", "manual_store_duplicate_threshold"}
 _LIST_KEYS = {"index_dirs", "index_extensions", "index_exclude_dirs"}
