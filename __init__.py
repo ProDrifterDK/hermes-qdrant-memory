@@ -53,7 +53,7 @@ from qdrant_memory.learning import LearningStore, build_learning_payload, classi
 from qdrant_memory.lesson_extractor import LearningCandidate, candidate_to_learning_args, contains_secret, extract_learning_candidates_from_messages
 from qdrant_memory.recipes import get_recipe
 from qdrant_memory.ranking import RankingPolicy
-from qdrant_memory.retriever import MemoryRetriever, format_for_prompt
+from qdrant_memory.retriever import MemoryRetriever, format_for_prompt, format_hybrid_for_prompt
 from qdrant_memory.sources import expand_point, inspect_point, source_status_for_point, trace_point
 from qdrant_memory.proposals import proposal_draft_metadata, write_proposal_draft
 from qdrant_memory.source_extraction import (
@@ -613,6 +613,39 @@ class QdrantMemoryProvider(MemoryProvider):
             "for explicit memory operations."
         )
 
+    def _run_hybrid_prefetch(self, query: str) -> str:
+        """Phase 6I: run a hybrid retrieve and format it for prompt context.
+
+        Returns a prompt-safe string from ``format_hybrid_for_prompt``.
+        On any failure or empty result, returns ``""`` so the caller
+        (``prefetch``) falls back to the legacy dense formatted result.
+
+        Privacy contract: the returned string contains only text bodies
+        from result items — no query, debug, warnings, point IDs, paths,
+        URIs, metadata, or unsafe status fields. See
+        :func:`format_hybrid_for_prompt` for the full privacy contract.
+
+        Read-only invariant: the hybrid router always uses
+        ``update_access=False`` and never mutates Qdrant.
+        """
+        try:
+            router = self._ensure_hybrid_router(self._config["collection_name"])
+            if router is None:
+                return ""
+            result = router.retrieve(
+                query,
+                top_k=int(self._config["auto_recall_top_k"]),
+                mode="hybrid",
+            )
+            formatted = format_hybrid_for_prompt(
+                result,
+                int(self._config["display_tokens"]),
+            )
+            return formatted or ""
+        except Exception:
+            logger.debug("Hybrid prefetch failed, falling back to legacy", exc_info=True)
+            return ""
+
     def _run_shadow_retrieve(self, query: str, sid: str, trigger: str, legacy_result: str) -> None:
         """Phase 6H: run a read-only hybrid retrieve in the background and
         record a sanitized aggregate-only shadow event.
@@ -708,6 +741,10 @@ class QdrantMemoryProvider(MemoryProvider):
         if not self._active or not self._config.get("auto_recall") or not query.strip() or not self._retriever:
             return ""
         sid = session_id or self._session_id or "default"
+        # Phase 6I: determine the active auto-recall mode.
+        active_mode = str(self._config.get("auto_recall_mode") or "legacy").strip().lower()
+        if active_mode not in ("legacy", "hybrid"):
+            active_mode = "legacy"
         # Phase 6H: ``prefetch`` is the single shadow emission point — it
         # is the call site that actually builds the prompt-context string
         # returned to the caller. We pop the cache (a previous
@@ -715,23 +752,35 @@ class QdrantMemoryProvider(MemoryProvider):
         # and use the cached value as the legacy result **only when it is
         # non-empty/truthy**. An empty cached value (e.g. ``queue_prefetch``
         # legitimately produced no hits, or a stale empty entry was left
-        # behind) falls through to the normal legacy dense search + format
-        # path so the prompt-context semantics match the pre-fix2 legacy
-        # behavior. Critically, this preserves the original ``if cached:``
-        # truthiness check — the empty string is treated identically to a
-        # cache miss.
+        # behind) falls through to the normal search + format path so the
+        # prompt-context semantics match the pre-fix2 legacy behavior.
+        # Critically, this preserves the original ``if cached:`` truthiness
+        # check — the empty string is treated identically to a cache miss.
         result = ""
         with self._prefetch_lock:
             cached = self._prefetch_cache.pop(sid, "")
         if cached:
             # Cache hit (non-empty): use the queued formatted result as-is.
             result = cached
+        elif active_mode == "hybrid":
+            # Phase 6I: hybrid auto-recall path. Try the hybrid retrieve
+            # + prompt-safe formatter. If it fails or returns empty,
+            # fall back to the legacy dense search + format path.
+            result = self._run_hybrid_prefetch(query)
+            if not result:
+                # Hybrid fallback to legacy dense formatted result.
+                try:
+                    chunks = self._retriever.search(query, top_k=int(self._config["auto_recall_top_k"]), update_access=False)
+                    result = format_for_prompt(chunks, int(self._config["display_tokens"]))
+                except Exception:
+                    logger.debug("Qdrant prefetch legacy fallback failed", exc_info=True)
+                    result = ""
         else:
             # Cache miss (or empty cached value): run the normal legacy
             # dense search + format path. This is the legacy behavior the
             # prompt-context contract relies on.
             try:
-                chunks = self._retriever.search(query, top_k=int(self._config["auto_recall_top_k"]))
+                chunks = self._retriever.search(query, top_k=int(self._config["auto_recall_top_k"]), update_access=False)
                 result = format_for_prompt(chunks, int(self._config["display_tokens"]))
             except Exception:
                 logger.debug("Qdrant prefetch failed", exc_info=True)
@@ -741,7 +790,21 @@ class QdrantMemoryProvider(MemoryProvider):
         # context. The shadow event is intentionally emitted from this
         # single point — ``queue_prefetch`` alone is just cache priming
         # and writes nothing.
-        if self._shadow_recorder and self._executor:
+        #
+        # Phase 6I: when the active mode is already ``hybrid`` and the
+        # shadow mode is also ``hybrid``, the shadow retrieve would
+        # duplicate the exact same hybrid work we just did for the
+        # prompt context. Skip the shadow emission in that case to
+        # avoid wasted compute. Shadow still fires when the active
+        # mode is ``legacy`` (the original Phase 6H behavior: compare
+        # legacy-vs-hybrid) or when the shadow mode differs from the
+        # active mode.
+        shadow_mode = str(self._config.get("auto_recall_shadow_mode") or "hybrid").strip().lower()
+        skip_shadow = (
+            active_mode == "hybrid"
+            and shadow_mode == "hybrid"
+        )
+        if self._shadow_recorder and self._executor and not skip_shadow:
             try:
                 self._executor.submit(self._run_shadow_retrieve, query, sid, "prefetch", result)
             except Exception:
@@ -749,19 +812,34 @@ class QdrantMemoryProvider(MemoryProvider):
         return result
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        # Phase 6H: ``queue_prefetch`` is purely a legacy cache-priming
-        # step. It must NEVER record a shadow event of its own, since
-        # the prompt-context build (the real user-visible side effect)
+        # Phase 6H: ``queue_prefetch`` is purely a cache-priming step.
+        # It must NEVER record a shadow event of its own, since the
+        # prompt-context build (the real user-visible side effect)
         # happens later in ``prefetch``. The subsequent ``prefetch``
-        # call will emit exactly one shadow event.
+        # call will emit exactly one shadow event (or skip shadow if
+        # Phase 6I active-hybrid dedup applies).
+        #
+        # Phase 6I: when ``auto_recall_mode=hybrid``, queue_prefetch
+        # primes the cache with the hybrid formatted result. If the
+        # hybrid path fails or returns empty, it falls back to the
+        # legacy dense format so the cache is still primed. This
+        # matches the prefetch fallback semantics.
         if not self._active or not self._executor or not self._retriever or not self._config.get("auto_recall") or not query.strip():
             return
         sid = session_id or self._session_id or "default"
+        active_mode = str(self._config.get("auto_recall_mode") or "legacy").strip().lower()
+        if active_mode not in ("legacy", "hybrid"):
+            active_mode = "legacy"
 
         def _run() -> None:
             try:
-                chunks = self._retriever.search(query, top_k=int(self._config["auto_recall_top_k"]))
-                formatted = format_for_prompt(chunks, int(self._config["display_tokens"]))
+                formatted = ""
+                if active_mode == "hybrid":
+                    formatted = self._run_hybrid_prefetch(query)
+                if not formatted:
+                    # Legacy dense path (always the fallback).
+                    chunks = self._retriever.search(query, top_k=int(self._config["auto_recall_top_k"]), update_access=False)
+                    formatted = format_for_prompt(chunks, int(self._config["display_tokens"]))
                 with self._prefetch_lock:
                     self._prefetch_cache[sid] = formatted
             except Exception:
@@ -1032,6 +1110,19 @@ class QdrantMemoryProvider(MemoryProvider):
             "auto_recall": self._config["auto_recall"],
             "sync_turns": self._config["sync_turns"],
         }
+        # Phase 6I: expose auto_recall_mode and effective mode.
+        # ``auto_recall_mode`` is the configured value (allowlisted).
+        # ``auto_recall_effective_mode`` accounts for the hard kill
+        # switch: if ``auto_recall=False`` the effective mode is always
+        # ``legacy`` regardless of the configured mode.
+        configured_mode = str(self._config.get("auto_recall_mode") or "legacy").strip().lower()
+        if configured_mode not in ("legacy", "hybrid"):
+            configured_mode = "legacy"
+        payload["auto_recall_mode"] = configured_mode
+        if self._config.get("auto_recall"):
+            payload["auto_recall_effective_mode"] = configured_mode
+        else:
+            payload["auto_recall_effective_mode"] = "legacy"
         # Phase 6H: expose safe aggregate-only shadow fields.
         shadow_enabled = bool(self._config.get("auto_recall_shadow_enabled", False))
         payload["shadow_enabled"] = shadow_enabled

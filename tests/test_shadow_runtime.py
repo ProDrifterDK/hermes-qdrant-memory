@@ -837,6 +837,7 @@ def _build_provider(
                 "auto_recall_shadow_max_per_session": shadow_max,
                 "auto_recall_shadow_artifact_dir": shadow_dir,
                 "auto_recall_shadow_mode": "hybrid",
+                "auto_recall_mode": "legacy",  # Phase 6I default
                 # Keys read by _tool_status:
                 "qdrant_url": "http://127.0.0.1:6333",
                 "embedding_url": "http://127.0.0.1:8080/v1",
@@ -1106,9 +1107,9 @@ class TestProviderCacheMissRegression:
             search_calls = {"n": 0}
             original_search = provider._retriever.search
 
-            def counting_search(q, top_k):
+            def counting_search(q, top_k, **kwargs):
                 search_calls["n"] += 1
-                return original_search(q, top_k=top_k)
+                return original_search(q, top_k=top_k, **kwargs)
 
             provider._retriever.search = MagicMock(side_effect=counting_search)
             result = provider.prefetch("some query", session_id=sid)
@@ -1188,9 +1189,9 @@ class TestProviderCacheMissRegression:
             search_calls = {"n": 0}
             original_search = provider._retriever.search
 
-            def counting_search(q, top_k):
+            def counting_search(q, top_k, **kwargs):
                 search_calls["n"] += 1
-                return original_search(q, top_k=top_k)
+                return original_search(q, top_k=top_k, **kwargs)
 
             provider._retriever.search = MagicMock(side_effect=counting_search)
             result = provider.prefetch("shadow off query", session_id=sid)
@@ -1223,9 +1224,9 @@ class TestProviderCacheMissRegression:
             search_calls = {"n": 0}
             original_search = provider._retriever.search
 
-            def counting_search(q, top_k):
+            def counting_search(q, top_k, **kwargs):
                 search_calls["n"] += 1
-                return original_search(q, top_k=top_k)
+                return original_search(q, top_k=top_k, **kwargs)
 
             provider._retriever.search = MagicMock(side_effect=counting_search)
             result = provider.prefetch("nonempty cache query", session_id=sid)
@@ -1530,10 +1531,10 @@ class TestShadowRaceOrder:
         search_started = _threading.Event()
         original_search = provider._retriever.search
 
-        def slow_search(q, top_k):
+        def slow_search(q, top_k, **kwargs):
             search_started.set()
             gate.wait(timeout=5.0)  # block until released or timeout
-            return original_search(q, top_k=top_k)
+            return original_search(q, top_k=top_k, **kwargs)
 
         provider._retriever.search = MagicMock(side_effect=slow_search)
 

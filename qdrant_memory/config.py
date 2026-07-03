@@ -94,6 +94,11 @@ DEFAULTS: dict[str, Any] = {
     "auto_recall_shadow_max_per_session": 20,
     "auto_recall_shadow_artifact_dir": "",
     "auto_recall_shadow_mode": "hybrid",
+    # Phase 6I: opt-in hybrid auto-recall prompt injection.
+    # ``legacy`` (default) keeps dense-only auto-recall.
+    # ``hybrid`` routes the prefetch prompt through a dedicated prompt-safe
+    # hybrid formatter. Invalid values fail closed to ``legacy``.
+    "auto_recall_mode": "legacy",
 }
 
 _BOOL_KEYS = {
@@ -145,6 +150,25 @@ _FLOAT_KEYS = {"decay_rate", "min_raw_score", "min_final_score", "learning_auto_
 _LIST_KEYS = {"index_dirs", "index_extensions", "index_exclude_dirs"}
 
 
+# Phase 6I: allowed values for ``auto_recall_mode``.
+# Invalid values fail closed to ``legacy``.
+_AUTO_RECALL_MODES: frozenset[str] = frozenset({"legacy", "hybrid"})
+
+
+def _as_auto_recall_mode(value: Any) -> str:
+    """Coerce ``auto_recall_mode`` to ``legacy`` or ``hybrid``.
+
+    Non-string values and unrecognized strings collapse to ``legacy``
+    (fail-closed default) so a typo or a malicious value cannot activate
+    the hybrid auto-recall path.
+    """
+    if isinstance(value, str):
+        candidate = value.strip().lower()
+        if candidate in _AUTO_RECALL_MODES:
+            return candidate
+    return "legacy"
+
+
 def _as_bool(value: Any, default: bool) -> bool:
     if isinstance(value, bool):
         return value
@@ -190,6 +214,8 @@ def _coerce(key: str, value: Any) -> Any:
                 pass
             return [item.strip() for item in stripped.split(",") if item.strip()]
         return list(default)
+    if key == "auto_recall_mode":
+        return _as_auto_recall_mode(value)
     if isinstance(default, str):
         return str(value)
     return value
