@@ -564,3 +564,59 @@ def test_watcher_guarded_auto_skips_manual_review_and_reconsolidation(monkeypatc
     payload = json.loads(capsys.readouterr().out)
     assert payload["guarded_auto"]["applied"] == []
     assert len(payload["guarded_auto"]["skipped"]) == 2
+
+
+def test_watcher_run_zero_proposal_clears_stale_counts_and_artifact(monkeypatch, tmp_path):
+    """Zero-proposal clean run must overwrite stale last_counts, last_artifact, last_signature."""
+    from qdrant_memory.cli_core import execute_command
+
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    state_dir = hermes_home / "qdrant_memory" / "consolidation"
+    state_dir.mkdir(parents=True)
+
+    # Pre-write stale state with legacy fields
+    stale_state = {
+        "last_run_at": "2025-01-01T00:00:00",
+        "last_counts": {"quality_warning": 9},
+        "last_total_proposals": 3,
+        "last_artifact": {"path": "/old/path/report-old.json", "proposal_count": 3},
+        "last_signature": "deadbeef",
+        "last_proposal_signature": "deadbeef",
+        "last_report_id": "old-report",
+    }
+    (state_dir / "watcher_state.json").write_text(
+        json.dumps(stale_state), encoding="utf-8"
+    )
+
+    # Clean report — no proposals, empty summary
+    report = {
+        "dry_run": True,
+        "report_only": True,
+        "report_id": "clean-r1",
+        "scope": "both",
+        "summary": {},
+        "artifact": {"path": str(state_dir / "report-clean-r1.json"), "proposal_count": 0},
+        "proposals": [],
+    }
+    provider = StaticJsonProvider({"qdrant_memory_consolidate": report})
+    parser = _parser()
+    args = parser.parse_args(["qdrant", "watcher", "run", "--json"])
+
+    assert execute_command(args, provider_factory=lambda: provider) == 0
+
+    state = json.loads(
+        (state_dir / "watcher_state.json").read_text(encoding="utf-8")
+    )
+    # last_counts must reflect current summary (empty)
+    assert state["last_counts"] == {}, f"expected empty dict, got {state['last_counts']}"
+    # last_total_proposals must reflect current proposal count (0)
+    assert state["last_total_proposals"] == 0
+    # last_artifact must reflect current artifact
+    assert state["last_artifact"] == report["artifact"]
+    # last_signature must be a 16-char short signature
+    assert isinstance(state["last_signature"], str) and len(state["last_signature"]) == 16
+    # Existing fields preserved
+    assert state["last_report_id"] == "clean-r1"
+    assert state["last_proposal_count"] == 0
+    assert state["last_signature_changed"] is True

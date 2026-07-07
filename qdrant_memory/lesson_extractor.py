@@ -15,13 +15,80 @@ _SECRET_PATTERNS = [
     re.compile(r"(?i)authorization\s*:\s*bearer\s+\S+"),
     re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]{16,}"),
     re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}"),
-    re.compile(r"(?i)(api[_-]?key|password|secret)\s*[:=]\s*\S+"),
-    re.compile(r"(?i)token\s*[:=]\s*\S+"),
+    # Inline credential assignment: keyword, then ':' or '=' separator, then a
+    # captured RHS that `contains_secret` validates against
+    # `_looks_like_secret_value`. Without that post-filter we flagged ordinary
+    # prose like "password: see error message above" or
+    # "password: <REDACTED>".
+    re.compile(r"(?i)(api[_-]?key|password|secret)\s*[:=]\s*([^\s,;][^\s,;]*)"),
+    # Bare `token = <value>` assignment — also requires secret-shaped RHS.
+    re.compile(r"(?i)\btoken\s*[:=]\s*([^\s,;][^\s,;]*)"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     re.compile(r"https?://[^\s:@]+:[^\s:@]+@"),
 ]
-_TOKEN_CONTEXT_PATTERN = re.compile(r"(?i)\b(?:access\s+)?token\s+(?!budget\b|cache\b|count(?:ing)?\b|counter\b|estimate\b|estimates\b|estimation\b|hard\b|limit\b|overhead\b|window\b|context\b|izer\b)(\S{6,})")
-_CREDENTIAL_CONTEXT_PATTERN = re.compile(r"(?i)\b(api[_-]?key|password|secret)\s+(?!detection\b|patterns?\b|redaction\b|bearing\b|review\b|heuristic\b)(\S{6,})")
+# Word-followed-by-apparent-value patterns. Each captures the RHS so
+# `contains_secret` can apply `_looks_like_secret_value` to it; without that
+# post-filter we flagged ordinary prose like "context token discussion",
+# "Token Bucket algorithm", or "prompts for password before continuing".
+_TOKEN_CONTEXT_PATTERN = re.compile(
+    r"(?i)\b(?:access\s+)?token\s+"
+    r"(?!budget\b|cache\b|count(?:ing)?\b|counter\b|estimate\b|estimates\b|estimation\b|"
+    r"hard\b|limit\b|overhead\b|window\b|context\b|izer\b|management\b|usage\b|rate\b|"
+    r"rotation\b|expiry\b|ttl\b|lifetime\b|session\b|storage\b|size\b|bucket\b|ring\b|"
+    r"network\b|cost\b|discussion\b|metric\b|metrics\b|counts?\b|number\b|amount\b|"
+    r"table\b|tables\b|chart\b|charts\b|report\b|reports\b|comparisons?\b|comparison\b|"
+    r"analys[ei]s\b|taxonomy\b|classification\b|category\b|categories\b|family\b|"
+    r"throughput\b|latency\b|efficiency\b|economics\b|pricing\b|price\b|policy\b|"
+    r"bucket\b)"
+    r"([^\s,;\"'`][^\s,;\"']{5,40})"
+)
+_CREDENTIAL_CONTEXT_PATTERN = re.compile(
+    r"(?i)\b(api[_-]?key|password|secret)\s+"
+    r"(?!detection\b|patterns?\b|redaction\b|bearing\b|review\b|heuristic\b|"
+    r"management\b|rotation\b|field\b|input\b|value\b|prompt\b|policy\b|"
+    r"before\b|after\b|during\b|strength\b|complexity\b|expiry\b|reset\b|change\b|"
+    r"update\b|changeover\b|hashing\b|hash\b|encryption\b|salting\b|salt\b|"
+    r"storage\b|stores?\b|store\b|leak(?:s|ed|age)?\b|safety\b|safekeeping\b|"
+    r"validation\b|checking\b|checks?\b|mistakes?\b|tips?\b|advice\b|guide\b|"
+    r"explanation\b|context\b|discussion\b|comparison\b|comparisons?\b|"
+    r"length\b|size\b|format\b|scheme\b|re(?:use|using)\b|generator\b|"
+    r"vault\b|manager\b|generator\b|requirements?\b|requirement\b|"
+    r"best\b|practices?\b|practice\b|recommendations?\b|recommendation\b)"
+    r"([^\s,;\"'`][^\s,;\"']{5,40})"
+)
+
+# Reserved sentinels for placeholder / redaction values.
+_SECRET_VALUE_REJECT_PREFIXES = ("<", "(", "[", "`", ":")
+_SECRET_VALUE_REJECT_SUBSTRINGS = ("redacted", "placeholder", "***")
+
+
+def _looks_like_secret_value(value: str) -> bool:
+    """Return True iff ``value`` looks like a real credential rather than
+    ordinary prose, a placeholder, or a code-fence marker.
+
+    Heuristic, deliberately conservative:
+
+    * Rejects empty / placeholder / redaction markers.
+    * Rejects anything starting with ``<``, ``(``, ``[``, backtick, or ``:``.
+    * Rejects anything shorter than 8 characters.
+    * Accepts anything that contains a digit, contains a non-alphanumeric
+      punctuation character, or is at least 16 characters of pure
+      alphanumeric text (e.g. long API keys).
+    """
+    if not value:
+        return False
+    if value[0] in _SECRET_VALUE_REJECT_PREFIXES:
+        return False
+    if len(value) < 8:
+        return False
+    lowered = value.lower()
+    if any(marker in lowered for marker in _SECRET_VALUE_REJECT_SUBSTRINGS):
+        return False
+    has_digit = any(ch.isdigit() for ch in value)
+    has_special = any(not ch.isalnum() for ch in value)
+    if has_digit or has_special or len(value) >= 16:
+        return True
+    return False
 
 _EXPLICIT_CORRECTION_PATTERNS = [
     re.compile(r"(?i)\bactually[, ]+(?P<body>.+)"),
@@ -37,8 +104,40 @@ _RESOLUTION_PATTERN = re.compile(r"(?i)(correction|fix|solution|resolved|use|ins
 
 
 def contains_secret(text: str) -> bool:
+    """Return True if ``text`` contains a value that looks like a real secret.
+
+    High-confidence patterns (provider prefixes, JWT shape, private key marker,
+    URL basic auth) match without further validation. Loose patterns (inline
+    credential assignments, "token <x>" / "password <x>" prose) require the
+    captured right-hand side to satisfy ``_looks_like_secret_value`` so we do
+    not flag ordinary English text.
+    """
     text = text or ""
-    return any(pattern.search(text) for pattern in _SECRET_PATTERNS) or bool(_TOKEN_CONTEXT_PATTERN.search(text)) or bool(_CREDENTIAL_CONTEXT_PATTERN.search(text))
+    # Strong patterns (indices 0..5 and 8..9): no post-filter.
+    strong_indices = (0, 1, 2, 3, 4, 5, 8, 9)
+    for idx, pattern in enumerate(_SECRET_PATTERNS):
+        if idx in strong_indices:
+            if pattern.search(text):
+                return True
+            continue
+        # Loose patterns (6, 7): require the captured RHS to look secret-shaped.
+        # Pattern 6 has the keyword in group(1) and the value in group(2).
+        # Pattern 7 has the value in group(1).
+        match = pattern.search(text)
+        rhs_group = 2 if idx == 6 else 1
+        if match and _looks_like_secret_value(match.group(rhs_group)):
+            return True
+    # Word-followed-by-apparent-value patterns also need RHS validation.
+    # ``_TOKEN_CONTEXT_PATTERN`` has the value in group(1) (the keyword is in a
+    # non-capturing group). ``_CREDENTIAL_CONTEXT_PATTERN`` has the keyword in
+    # group(1) and the value in group(2). Validate the value group.
+    token_match = _TOKEN_CONTEXT_PATTERN.search(text)
+    if token_match and _looks_like_secret_value(token_match.group(1)):
+        return True
+    cred_match = _CREDENTIAL_CONTEXT_PATTERN.search(text)
+    if cred_match and _looks_like_secret_value(cred_match.group(2)):
+        return True
+    return False
 
 
 def _stable_id(parts: Iterable[str]) -> str:

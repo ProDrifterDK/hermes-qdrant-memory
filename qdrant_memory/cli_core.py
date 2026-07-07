@@ -493,6 +493,10 @@ def _record_watcher_run(args: Namespace, report: dict[str, Any]) -> None:
             "last_guarded_auto_mode": guarded_auto.get("mode") if guarded_auto else getattr(args, "autonomy_mode", "report-only"),
             "last_guarded_auto_applied_count": guarded_auto_applied,
             "last_guarded_auto_error_count": guarded_auto_errors,
+            "last_counts": report.get("summary", {}),
+            "last_total_proposals": len(proposal_list),
+            "last_artifact": report.get("artifact"),
+            "last_signature": signature[:16],
             "updated_at": timestamp,
         }
     )

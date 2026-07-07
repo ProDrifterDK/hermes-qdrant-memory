@@ -348,7 +348,8 @@ class TestEntityPayload:
         assert "description" not in payload
 
     def test_entity_payload_rejects_secret_in_aliases(self):
-        secret_alias = "".join(["password=", "supersecret"])
+        # Plausible secret-shaped value: 11 chars with a digit and special char.
+        secret_alias = "".join(["password=", "supersec", "ret1!23"])
         payload = build_entity_payload(
             entity_type="concept",
             label="Test",
@@ -419,13 +420,15 @@ class TestEntityPayload:
 
     def test_entity_payload_sanitizes_extra_metadata(self):
         secret_uri = "https://" + "user" + ":" + "pass" + "@evil.test/x"
+        # Plausible secret-shaped value: long enough, has digit + special char.
+        bad_value = "".join(["api", "_key=", "supersec", "ret1!23"])
         payload = build_entity_payload(
             entity_type="concept",
             label="Test",
             extra={
                 "safe_field": "ok",
                 "secret_field": secret_uri,
-                "nested": {"deep": "value", "bad": "".join(["api", "_key=", "secret"])},
+                "nested": {"deep": "value", "bad": bad_value},
             },
             content_hash="sha256:aabbccdd",
         )
