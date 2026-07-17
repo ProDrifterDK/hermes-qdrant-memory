@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -319,9 +320,19 @@ def _validate_cron_schedule(schedule: str) -> str:
     return " ".join(parts)
 
 
+def _resolve_hermes_cli() -> str:
+    resolved = shutil.which("hermes")
+    if not resolved:
+        raise CliUsageError("Hermes CLI executable was not found on PATH; watcher install was not changed")
+    absolute = os.path.abspath(resolved)
+    if not os.path.isfile(absolute) or not os.access(absolute, os.X_OK):
+        raise CliUsageError(f"resolved Hermes CLI is not an existing executable: {absolute}")
+    return absolute
+
+
 def _watcher_run_command(args: Namespace) -> str:
     parts = [
-        "hermes",
+        _resolve_hermes_cli(),
         "qdrant",
         "watcher",
         "run",
@@ -344,10 +355,10 @@ def _watcher_run_command(args: Namespace) -> str:
     return " ".join(shlex.quote(str(part)) for part in parts)
 
 
-def _managed_cron_block(args: Namespace) -> str:
+def _managed_cron_block(args: Namespace, *, command: str | None = None) -> str:
     schedule = _validate_cron_schedule(args.schedule)
     log_path = _watcher_log_path()
-    command = _watcher_run_command(args)
+    command = command if command is not None else _watcher_run_command(args)
     return "\n".join(
         [
             _WATCHER_CRON_BEGIN,
@@ -359,7 +370,8 @@ def _managed_cron_block(args: Namespace) -> str:
 
 
 def _install_watcher(args: Namespace) -> dict[str, Any]:
-    new_block = _managed_cron_block(args)
+    command = _watcher_run_command(args)
+    new_block = _managed_cron_block(args, command=command)
     crontab_text = _read_user_crontab()
     existing_block, remaining = _extract_managed_cron_block(crontab_text)
     changed = existing_block != new_block
@@ -377,7 +389,7 @@ def _install_watcher(args: Namespace) -> dict[str, Any]:
         {
             "installed": True,
             "schedule": _validate_cron_schedule(args.schedule),
-            "command": _watcher_run_command(args),
+            "command": command,
             "installed_at": timestamp,
             "updated_at": timestamp,
         }

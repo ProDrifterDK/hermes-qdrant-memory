@@ -1,6 +1,9 @@
 import argparse
 import importlib.util
 import json
+import os
+import shlex
+import shutil
 from pathlib import Path
 
 import pytest
@@ -66,6 +69,16 @@ def fake_crontab(monkeypatch):
     monkeypatch.setattr(cli_core, "_read_user_crontab", read_crontab)
     monkeypatch.setattr(cli_core, "_write_user_crontab", write_crontab)
     return state
+
+
+@pytest.fixture
+def fake_hermes_cli(monkeypatch, tmp_path):
+    cli_path = tmp_path / "Hermes CLI" / "hermes"
+    cli_path.parent.mkdir(parents=True)
+    cli_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    cli_path.chmod(0o755)
+    monkeypatch.setattr(shutil, "which", lambda executable: str(cli_path) if executable == "hermes" else None)
+    return cli_path
 
 
 def test_watcher_state_signature_is_shared_and_order_independent():
@@ -169,7 +182,7 @@ def test_watcher_run_force_alert_still_maps_to_report_only_consolidation():
     )
 
 
-def test_watcher_local_lifecycle_commands_do_not_construct_provider(monkeypatch, tmp_path, fake_crontab):
+def test_watcher_local_lifecycle_commands_do_not_construct_provider(monkeypatch, tmp_path, fake_crontab, fake_hermes_cli):
     from qdrant_memory.cli_core import execute_command
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
@@ -305,7 +318,63 @@ def test_watcher_reset_signature_requires_approve_and_preserves_other_state(monk
     assert "last_alert_at" not in state
 
 
-def test_watcher_install_writes_managed_cron_block_and_state_without_provider(monkeypatch, tmp_path, fake_crontab, capsys):
+def test_watcher_run_command_resolves_absolute_executable_and_shell_quotes_spaces(monkeypatch, tmp_path):
+    from qdrant_memory.cli_core import _watcher_run_command
+
+    cli_path = tmp_path / "relative Hermes CLI" / "hermes"
+    cli_path.parent.mkdir(parents=True)
+    cli_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    cli_path.chmod(0o755)
+    relative_cli_path = os.path.relpath(cli_path, Path.cwd())
+    monkeypatch.setattr(shutil, "which", lambda executable: relative_cli_path if executable == "hermes" else None)
+    args = _parser().parse_args(["qdrant", "watcher", "install"])
+
+    command = _watcher_run_command(args)
+
+    assert shlex.split(command)[0] == str(cli_path)
+    assert command.startswith(shlex.quote(str(cli_path)) + " qdrant watcher run ")
+
+
+def test_watcher_install_refuses_missing_hermes_executable_without_mutation(monkeypatch, tmp_path, fake_crontab, capsys):
+    from qdrant_memory.cli_core import execute_command
+
+    before = fake_crontab["text"]
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(shutil, "which", lambda executable: None)
+    args = _parser().parse_args(["qdrant", "watcher", "install", "--json"])
+
+    assert execute_command(args, provider_factory=lambda: pytest.fail("provider should not be constructed")) == 2
+    assert fake_crontab["text"] == before
+    assert not (hermes_home / "qdrant_memory" / "consolidation" / "watcher_state.json").exists()
+    error = capsys.readouterr().err
+    assert "Hermes CLI executable" in error
+    assert "PATH" in error
+
+
+def test_watcher_install_refuses_non_executable_resolved_path_without_mutation(
+    monkeypatch, tmp_path, fake_crontab, capsys
+):
+    from qdrant_memory.cli_core import execute_command
+
+    cli_path = tmp_path / "hermes"
+    cli_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    cli_path.chmod(0o644)
+    before = fake_crontab["text"]
+    hermes_home = tmp_path / "hermes-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(shutil, "which", lambda executable: str(cli_path) if executable == "hermes" else None)
+    args = _parser().parse_args(["qdrant", "watcher", "install", "--json"])
+
+    assert execute_command(args, provider_factory=lambda: pytest.fail("provider should not be constructed")) == 2
+    assert fake_crontab["text"] == before
+    assert not (hermes_home / "qdrant_memory" / "consolidation" / "watcher_state.json").exists()
+    assert "not an existing executable" in capsys.readouterr().err
+
+
+def test_watcher_install_writes_exact_absolute_command_to_cron_status_and_state(
+    monkeypatch, tmp_path, fake_crontab, fake_hermes_cli, capsys
+):
     from qdrant_memory.cli_core import execute_command
 
     hermes_home = tmp_path / "hermes"
@@ -319,14 +388,26 @@ def test_watcher_install_writes_managed_cron_block_and_state_without_provider(mo
     assert payload["changed"] is True
     assert "15 2 * * * /usr/bin/true" in fake_crontab["text"]
     assert "BEGIN HERMES_QDRANT_WATCHER" in fake_crontab["text"]
-    assert "hermes qdrant watcher run" in fake_crontab["text"]
     assert "--max-points 42" in fake_crontab["text"]
+    expected_command = payload["command"]
+    assert shlex.split(expected_command)[0] == str(fake_hermes_cli)
+    assert expected_command.startswith(shlex.quote(str(fake_hermes_cli)) + " qdrant watcher run ")
+    assert f"0 3 * * * {expected_command} >> " in fake_crontab["text"]
     state = json.loads((hermes_home / "qdrant_memory" / "consolidation" / "watcher_state.json").read_text(encoding="utf-8"))
     assert state["installed"] is True
     assert state["schedule"] == "0 3 * * *"
+    assert state["command"] == expected_command
+
+    status_args = parser.parse_args(["qdrant", "watcher", "status", "--verbose", "--json"])
+    assert execute_command(status_args, provider_factory=lambda: pytest.fail("provider should not be constructed")) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["state"]["command"] == expected_command
+    assert f"0 3 * * * {expected_command} >> " in status["schedule"]["block"]
 
 
-def test_watcher_install_refuses_to_replace_different_managed_block_without_approve(monkeypatch, tmp_path, fake_crontab, capsys):
+def test_watcher_install_refuses_to_replace_different_managed_block_without_approve(
+    monkeypatch, tmp_path, fake_crontab, fake_hermes_cli, capsys
+):
     from qdrant_memory.cli_core import execute_command
 
     fake_crontab["text"] += "# BEGIN HERMES_QDRANT_WATCHER\n0 1 * * * old-command\n# END HERMES_QDRANT_WATCHER\n"
@@ -379,7 +460,9 @@ def test_watcher_uninstall_preserves_surrounding_crontab_lines(monkeypatch, tmp_
     assert fake_crontab["text"] == "MAILTO=\"\"\n15 2 * * * /usr/bin/true\n"
 
 
-def test_watcher_install_approve_replaces_middle_block_without_merging_neighbors(monkeypatch, tmp_path, fake_crontab):
+def test_watcher_install_approve_replaces_middle_block_without_merging_neighbors(
+    monkeypatch, tmp_path, fake_crontab, fake_hermes_cli
+):
     from qdrant_memory.cli_core import execute_command
 
     fake_crontab["text"] = (
@@ -397,6 +480,7 @@ def test_watcher_install_approve_replaces_middle_block_without_merging_neighbors
     assert "MAILTO=\"\"\n15 2 * * * /usr/bin/true\n" in fake_crontab["text"]
     assert "MAILTO=\"\"15" not in fake_crontab["text"]
     assert "BEGIN HERMES_QDRANT_WATCHER" in fake_crontab["text"]
+    assert shlex.quote(str(fake_hermes_cli)) in fake_crontab["text"]
     assert "old-command" not in fake_crontab["text"]
 
 

@@ -339,6 +339,7 @@ hermes qdrant watcher run --scope both --autonomy-mode guarded-auto --max-auto-a
 
 Expected behavior:
 
+- `install` resolves `hermes` from the install-time `PATH`, requires an existing executable, and stores its shell-quoted absolute path in both the managed cron command and watcher state;
 - `install` writes or updates only the `BEGIN/END HERMES_QDRANT_WATCHER` crontab block and records local state; replacing an existing different managed block requires `--approve`;
 - `uninstall --approve` removes only that managed block and preserves unrelated crontab lines;
 - `status --verbose`, `logs`, and `inspect-state` read local artifacts only and do not construct the provider;
