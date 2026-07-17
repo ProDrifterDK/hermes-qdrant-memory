@@ -99,6 +99,10 @@ def _persist_promotion_report(provider):
     return result, proposal
 
 
+def _report_artifact(tmp_path, report_id):
+    return tmp_path / "qdrant_memory" / "consolidation" / f"report-{report_id}.json"
+
+
 def test_consolidation_apply_schema_is_exposed():
     schemas = {schema["name"]: schema for schema in TOOL_SCHEMAS}
 
@@ -562,3 +566,254 @@ def test_apply_backup_first_creates_backup_before_live_mutation(tmp_path):
     assert provider._qdrant.deleted_ids == [("memory", ["m1"])]
     assert provider._qdrant.deleted_filters == []
     assert provider._qdrant.ensure_calls == []
+
+
+def test_guarded_auto_duplicate_rejects_point_changed_after_report(tmp_path):
+    provider = _provider(tmp_path)
+    provider._qdrant = FakeQdrant(
+        {
+            "memory": [
+                _point("m1", "Always dry-run before live vault indexing", source_type="manual", importance=5, confidence=0.8),
+                _point("m2", "Always dry-run before live vault indexing", source_type="conversation", importance=9, confidence=0.7),
+            ],
+            "learnings": [],
+        }
+    )
+    report, proposal = _persist_duplicate_report(provider)
+    assert proposal["guarded_auto_snapshot"]["point_digests"]
+    provider._qdrant.by_collection["memory"][1]["payload"]["text"] = "Changed after report generation"
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_consolidation_apply",
+            {"report_id": report["report_id"], "proposal_id": proposal["proposal_id"], "action": "merge", "dry_run": False, "approve": True},
+        )
+    )
+
+    assert "error" in result
+    assert "fresh report" in result["error"]
+    assert provider._qdrant.payload_updates == []
+    assert provider._qdrant.deleted_ids == []
+
+
+def test_consolidation_apply_redacts_unexpected_exception_text(tmp_path):
+    provider = _provider(tmp_path)
+    provider._qdrant = FakeQdrant(
+        {
+            "memory": [
+                _point("m1", "Always dry-run before live vault indexing", source_type="manual"),
+                _point("m2", "Always dry-run before live vault indexing", source_type="conversation"),
+            ],
+            "learnings": [],
+        }
+    )
+    report, proposal = _persist_duplicate_report(provider)
+    sentinel = "credential-" + "must-not-escape"
+
+    class RaisingRetrieveQdrant(FakeQdrant):
+        def retrieve(self, _name, _ids, *, with_payload=True, with_vector=False):
+            raise RuntimeError(f"provider path /private/location leaked {sentinel}")
+
+    provider._qdrant = RaisingRetrieveQdrant(provider._qdrant.by_collection)
+    result_text = provider.handle_tool_call(
+        "qdrant_memory_consolidation_apply",
+        {"report_id": report["report_id"], "proposal_id": proposal["proposal_id"], "action": "merge", "dry_run": False, "approve": True},
+    )
+
+    assert sentinel not in result_text
+    assert "/private/location" not in result_text
+    assert json.loads(result_text) == {"error": "consolidation_apply_failed"}
+
+
+def test_guarded_auto_rechecks_points_immediately_before_mutation(tmp_path):
+    class RacingFakeQdrant(FakeQdrant):
+        def __init__(self, by_collection=None):
+            super().__init__(by_collection)
+            self.retrieve_count = 0
+
+        def retrieve(self, name, ids, *, with_payload=True, with_vector=False):
+            self.retrieve_count += 1
+            if self.retrieve_count == 2:
+                self.by_collection["memory"][1]["payload"]["text"] = "Changed inside the apply window"
+            return super().retrieve(name, ids, with_payload=with_payload, with_vector=with_vector)
+
+    provider = _provider(tmp_path)
+    provider._qdrant = RacingFakeQdrant(
+        {
+            "memory": [
+                _point("m1", "Always dry-run before live vault indexing", source_type="manual"),
+                _point("m2", "Always dry-run before live vault indexing", source_type="conversation"),
+            ],
+            "learnings": [],
+        }
+    )
+    report, proposal = _persist_duplicate_report(provider)
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_consolidation_apply",
+            {"report_id": report["report_id"], "proposal_id": proposal["proposal_id"], "action": "merge", "dry_run": False, "approve": True},
+        )
+    )
+
+    assert "error" in result
+    assert "fresh report" in result["error"]
+    assert provider._qdrant.retrieve_count == 2
+    assert provider._qdrant.payload_updates == []
+    assert provider._qdrant.deleted_ids == []
+
+
+def test_guarded_auto_heading_rejects_changed_fingerprint_after_report(tmp_path):
+    provider = _provider(tmp_path)
+    provider._qdrant = FakeQdrant({"memory": [_point("h1", "# Tareas", source_type="conversation")], "learnings": []})
+    report = json.loads(provider.handle_tool_call("qdrant_memory_consolidate", {"scope": "memory", "persist": True}))
+    proposal = next(p for p in report["proposals"] if p["proposal_type"] == "heading_noise")
+    assert proposal["guarded_auto_eligible"] is True
+    provider._qdrant.by_collection["memory"][0]["payload"]["text"] = "# Project Phoenix"
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_consolidation_apply",
+            {"report_id": report["report_id"], "proposal_id": proposal["proposal_id"], "action": "delete", "dry_run": False, "approve": True},
+        )
+    )
+
+    assert "error" in result
+    assert "fresh report" in result["error"]
+    assert provider._qdrant.deleted_ids == []
+
+
+def test_guarded_auto_stale_rejects_current_point_that_is_now_accessed(tmp_path):
+    provider = _provider(tmp_path)
+    old = (datetime.now(timezone.utc) - timedelta(days=200)).isoformat()
+    provider._qdrant = FakeQdrant(
+        {"memory": [_point("m1", "old weak memory", source_type="conversation", importance=1, confidence=0.3, access_count=0, created_at=old)], "learnings": []}
+    )
+    report, proposal = _persist_stale_report(provider)
+    provider._qdrant.by_collection["memory"][0]["payload"]["access_count"] = 1
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_consolidation_apply",
+            {"report_id": report["report_id"], "proposal_id": proposal["proposal_id"], "action": "quarantine", "dry_run": False, "approve": True},
+        )
+    )
+
+    assert "error" in result
+    assert "fresh report" in result["error"]
+    assert provider._qdrant.payload_updates == []
+    assert provider._qdrant.deleted_ids == []
+
+
+def test_guarded_auto_rejects_tampered_proposal_metadata(tmp_path):
+    provider = _provider(tmp_path)
+    provider._qdrant = FakeQdrant(
+        {
+            "memory": [
+                _point("m1", "Always dry-run before live vault indexing", source_type="manual"),
+                _point("m2", "Always dry-run before live vault indexing", source_type="conversation"),
+            ],
+            "learnings": [],
+        }
+    )
+    report, proposal = _persist_duplicate_report(provider)
+    artifact = _report_artifact(tmp_path, report["report_id"])
+    persisted = json.loads(artifact.read_text())
+    persisted_proposal = next(p for p in persisted["proposals"] if p["proposal_id"] == proposal["proposal_id"])
+    persisted_proposal["risk"] = "medium"
+    artifact.write_text(json.dumps(persisted))
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_consolidation_apply",
+            {"report_id": report["report_id"], "proposal_id": proposal["proposal_id"], "action": "merge", "dry_run": False, "approve": True},
+        )
+    )
+
+    assert "error" in result
+    assert "report metadata changed" in result["error"]
+    assert provider._qdrant.payload_updates == []
+    assert provider._qdrant.deleted_ids == []
+
+
+def test_guarded_auto_caller_rejects_removed_preauthorization_metadata(tmp_path):
+    from qdrant_memory.guarded_auto import GuardedAutoPolicy, apply_guarded_auto
+
+    provider = _provider(tmp_path)
+    provider._qdrant = FakeQdrant(
+        {
+            "memory": [
+                _point("m1", "Always dry-run before live vault indexing", source_type="manual"),
+                _point("m2", "Always dry-run before live vault indexing", source_type="conversation"),
+            ],
+            "learnings": [],
+        }
+    )
+    report, proposal = _persist_duplicate_report(provider)
+    artifact = _report_artifact(tmp_path, report["report_id"])
+    persisted = json.loads(artifact.read_text())
+    persisted_proposal = next(p for p in persisted["proposals"] if p["proposal_id"] == proposal["proposal_id"])
+    persisted_proposal.pop("preauthorized_policy")
+    artifact.write_text(json.dumps(persisted))
+
+    summary = apply_guarded_auto(provider, report, GuardedAutoPolicy(mode="guarded-auto"))
+
+    assert summary["applied"] == []
+    assert summary["errors"][0]["code"] == "provider_rejected"
+    assert provider._qdrant.payload_updates == []
+    assert provider._qdrant.deleted_ids == []
+
+
+def test_guarded_auto_rejects_tampered_report_identity(tmp_path):
+    provider = _provider(tmp_path)
+    provider._qdrant = FakeQdrant(
+        {
+            "memory": [
+                _point("m1", "Always dry-run before live vault indexing", source_type="manual"),
+                _point("m2", "Always dry-run before live vault indexing", source_type="conversation"),
+            ],
+            "learnings": [],
+        }
+    )
+    report, proposal = _persist_duplicate_report(provider)
+    artifact = _report_artifact(tmp_path, report["report_id"])
+    persisted = json.loads(artifact.read_text())
+    persisted["report_id"] = "different-report"
+    artifact.write_text(json.dumps(persisted))
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_consolidation_apply",
+            {"report_id": report["report_id"], "proposal_id": proposal["proposal_id"], "action": "merge", "dry_run": False, "approve": True},
+        )
+    )
+
+    assert "error" in result
+    assert "report metadata changed" in result["error"]
+    assert provider._qdrant.payload_updates == []
+    assert provider._qdrant.deleted_ids == []
+
+
+def test_guarded_auto_quarantine_is_idempotent_against_same_report(tmp_path):
+    class StatefulFakeQdrant(FakeQdrant):
+        def update_payload(self, name, point_id, payload):
+            super().update_payload(name, point_id, payload)
+            for point in self.by_collection.get(name, []):
+                if str(point.get("id")) == str(point_id):
+                    point["payload"].update(payload)
+
+    provider = _provider(tmp_path)
+    old = (datetime.now(timezone.utc) - timedelta(days=200)).isoformat()
+    provider._qdrant = StatefulFakeQdrant(
+        {"memory": [_point("m1", "old weak memory", source_type="conversation", importance=1, confidence=0.3, access_count=0, created_at=old)], "learnings": []}
+    )
+    report, proposal = _persist_stale_report(provider)
+    args = {"report_id": report["report_id"], "proposal_id": proposal["proposal_id"], "action": "quarantine", "dry_run": False, "approve": True}
+
+    first = json.loads(provider.handle_tool_call("qdrant_memory_consolidation_apply", args))
+    second = json.loads(provider.handle_tool_call("qdrant_memory_consolidation_apply", args))
+
+    assert first["applied"] is True
+    assert "error" in second
+    assert "fresh report" in second["error"]
+    assert len(provider._qdrant.payload_updates) == 1

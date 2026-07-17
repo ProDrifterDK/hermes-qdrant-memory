@@ -31,6 +31,11 @@ except Exception:  # pragma: no cover - used only for standalone tests without H
         pass
 
 from qdrant_memory.graph_retriever import GraphExpansionPolicy, GraphMemoryRetriever
+from qdrant_memory.guarded_auto import (
+    guarded_auto_report_metadata_matches,
+    seal_guarded_auto_proposals,
+    validate_guarded_auto_current_points,
+)
 from qdrant_memory.client import QdrantClient
 from qdrant_memory.backup import create_backup
 from qdrant_memory.config import load_config
@@ -1504,6 +1509,15 @@ class QdrantMemoryProvider(MemoryProvider):
                 reconsolidation_max_candidates=reconsolidation_max_candidates,
                 reconsolidation_min_confidence=float(self._config.get("reconsolidation_min_confidence", 0.6)),
             )
+            seal_guarded_auto_proposals(
+                report,
+                [*memory_points, *learning_points],
+                stale_days=int(self._config.get("consolidation_stale_days", 90)),
+                min_importance_for_keep=int(self._config.get("consolidation_min_importance_for_keep", 4)),
+                duplicate_min_confidence=float(self._config.get("guarded_auto_duplicate_min_confidence", 0.98)),
+                duplicate_max_cluster_size=int(self._config.get("guarded_auto_duplicate_max_cluster_size", 20)),
+                learning_min_confidence=float(self._config.get("guarded_auto_learning_min_confidence", 0.90)),
+            )
             report.update(
                 {
                     "profile_id": self._profile_id,
@@ -1638,6 +1652,13 @@ class QdrantMemoryProvider(MemoryProvider):
                 return _json_error("proposal belongs to a different profile scope")
             proposal = find_proposal(report, proposal_id)
             proposal_type = str(proposal.get("proposal_type") or "")
+            guarded_auto_requested = parse_bool_arg(args.get("_guarded_auto"), default=False)
+            proposal_is_preauthorized = str(proposal.get("preauthorized_policy") or "").startswith("guarded-auto:")
+            if guarded_auto_requested and not proposal_is_preauthorized:
+                return _json_error("guarded-auto proposal metadata changed; generate a fresh report")
+            guarded_auto_apply = guarded_auto_requested or proposal_is_preauthorized
+            if guarded_auto_apply and not guarded_auto_report_metadata_matches(report, report_id):
+                return _json_error("guarded-auto report metadata changed; generate a fresh report")
             expected_action = expected_action_for_proposal(proposal_type)
             if not expected_action:
                 return _json_error("proposal requires manual review and cannot be applied automatically")
@@ -1654,11 +1675,22 @@ class QdrantMemoryProvider(MemoryProvider):
             points = self._retrieve_consolidation_points(collection_name, affected_ids)
             if len(points) != len(set(affected_ids)):
                 return _json_error("affected point missing; rerun consolidation")
-            if str(proposal.get("preauthorized_policy") or "").startswith("guarded-auto:") and action in {"merge", "delete", "quarantine"}:
+            if guarded_auto_apply and action in {"merge", "delete", "quarantine", "promote_to_skill"}:
                 if any(contains_secret(p.text) or contains_secret(json.dumps(p.payload or {}, sort_keys=True, default=str)) for p in points):
                     return _json_error("secret-bearing point requires manual review")
                 if any(_point_requires_manual_review(p) for p in points):
                     return _json_error("profile or fact-like memory requires manual review")
+                eligible, validation_reason = validate_guarded_auto_current_points(
+                    proposal,
+                    points,
+                    stale_days=int(self._config.get("consolidation_stale_days", 90)),
+                    min_importance_for_keep=int(self._config.get("consolidation_min_importance_for_keep", 4)),
+                    duplicate_min_confidence=float(self._config.get("guarded_auto_duplicate_min_confidence", 0.98)),
+                    duplicate_max_cluster_size=int(self._config.get("guarded_auto_duplicate_max_cluster_size", 20)),
+                    learning_min_confidence=float(self._config.get("guarded_auto_learning_min_confidence", 0.90)),
+                )
+                if not eligible:
+                    return _json_error(validation_reason)
             plan = self._proposal_apply_plan(report, proposal, action, points)
             if dry_run:
                 return json.dumps({"dry_run": True, "would_apply": True, **plan})
@@ -1666,6 +1698,21 @@ class QdrantMemoryProvider(MemoryProvider):
             if parse_bool_arg(args.get("backup_first"), default=False):
                 backup = create_backup(self._qdrant, self._config, hermes_home=self._hermes_home, scope="both")
                 pre_apply["pre_apply_backup_id"] = backup.get("backup_id")
+            if guarded_auto_apply and action in {"merge", "delete", "quarantine", "promote_to_skill"}:
+                points = self._retrieve_consolidation_points(collection_name, affected_ids)
+                if len(points) != len(set(affected_ids)):
+                    return _json_error("affected point missing; generate a fresh report")
+                eligible, validation_reason = validate_guarded_auto_current_points(
+                    proposal,
+                    points,
+                    stale_days=int(self._config.get("consolidation_stale_days", 90)),
+                    min_importance_for_keep=int(self._config.get("consolidation_min_importance_for_keep", 4)),
+                    duplicate_min_confidence=float(self._config.get("guarded_auto_duplicate_min_confidence", 0.98)),
+                    duplicate_max_cluster_size=int(self._config.get("guarded_auto_duplicate_max_cluster_size", 20)),
+                    learning_min_confidence=float(self._config.get("guarded_auto_learning_min_confidence", 0.90)),
+                )
+                if not eligible:
+                    return _json_error(validation_reason)
             if action == "draft_review":
                 write_decision = evaluate_write_candidate(
                     text="\n".join(point.text for point in points),
@@ -1765,8 +1812,8 @@ class QdrantMemoryProvider(MemoryProvider):
                 record = persist_application_record({"applied": True, **plan, **pre_apply, "proposal_draft_path": draft_path, "skill_draft_path": draft_path, "write_decision": write_decision.to_dict()}, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))
                 return json.dumps({"dry_run": False, "applied": True, **plan, **pre_apply, "proposal_draft_path": draft_path, "skill_draft_path": draft_path, "write_decision": write_decision.to_dict(), "application_id": record.get("application_id"), "application_artifact": record.get("artifact_path")})
             return _json_error("unsupported consolidation action")
-        except Exception as exc:
-            return _json_error(f"Consolidation apply failed: {exc}")
+        except Exception:
+            return _json_error("consolidation_apply_failed")
 
     def _ensure_learning_store(self) -> Optional[LearningStore]:
         if self._learning_store:
