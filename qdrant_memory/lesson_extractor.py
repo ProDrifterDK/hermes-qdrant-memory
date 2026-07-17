@@ -19,14 +19,16 @@ _SECRET_PATTERNS = [
     re.compile(r"https?://[^\s:@]+:[^\s:@]+@"),
 ]
 
-# Explicit credential-key assignments are a fail-closed boundary. The value
-# capture keeps quoted or bracketed values together so exact placeholders with
-# spaces can be recognized without weakening real credential assignments.
+# Explicit credential-key assignments are a fail-closed boundary. Separator
+# whitespace is horizontal-only so an apparent assignment cannot borrow its
+# value from a later line or code fence. The value capture keeps quoted or
+# bracketed same-line values together so exact placeholders with spaces can be
+# recognized without weakening real credential assignments.
 _CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
     r"(?i)(?<![A-Za-z0-9])"
     r"(?:api[_-]?key|password|passwd|secret|token|authorization|bearer|"
     r"credential(?:s)?|private[_-]?key)"
-    r"\s*[:=]\s*"
+    r"[ \t]*[:=][ \t]*"
     r"(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|<[^>\r\n]*>|"
     r"\[[^\]\r\n]*\]|\([^\)\r\n]*\)|`[^`\r\n]*`|[^\s,;]+)"
 )

@@ -197,6 +197,29 @@ def test_contains_secret_fails_closed_for_explicit_credential_assignments():
     assert contains_secret(_credential_assignment("api-key", quote + "two words" + quote))
 
 
+def test_contains_secret_assignment_value_must_start_on_same_line():
+    separator = chr(58)
+    fence = chr(96) * 3
+    prose_without_value = "La salida termina sin " + "password" + separator
+    fenced_output = "\n".join([prose_without_value, fence + "text", "$ command --status", "ok", fence])
+
+    assert not contains_secret(fenced_output)
+
+    quote = chr(34)
+    short_value = "".join(["p", "i", "n"])
+    for horizontal_whitespace in ("", " ", "\t", " \t"):
+        same_line = (
+            "password"
+            + horizontal_whitespace
+            + separator
+            + horizontal_whitespace
+            + quote
+            + short_value
+            + quote
+        )
+        assert contains_secret(same_line), repr(same_line)
+
+
 def test_contains_secret_allows_only_exact_placeholder_assignment_values():
     placeholders = [
         "<REDACTED>",
