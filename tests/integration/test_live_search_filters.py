@@ -649,13 +649,20 @@ def test_live_provider_store_tools_persist_to_disposable_collections(live_contex
                 "confidence": 0.95,
                 "tags": ["live-provider-store", "learning-write"],
                 "promote_to_skill_candidate": True,
-                "dry_run": False,
-                "approve": True,
             },
         )
     )
     assert "error" not in learning_response
     assert learning_response["saved"] is True
+    assert "dry_run" not in learning_response
+    assert learning_response["collection_name"] == ctx.learning_collection
+    assert learning_response["write_decision"] == {
+        "decision": "skill_candidate",
+        "reasons": ["skill_candidate"],
+        "confidence": 0.95,
+        "requires_review": True,
+        "metadata": {"importance": 9},
+    }
     learning_id = learning_response["id"]
 
     learning_point = _retrieve_one(ctx, ctx.learning_collection, learning_id)
@@ -923,7 +930,7 @@ def test_live_guarded_auto_canary_applies_one_exact_duplicate_and_leaves_control
     provider._hermes_home = str(tmp_path / "hermes-home")
     provider._config["consolidation_artifact_dir"] = str(tmp_path / "artifacts")
 
-    exact_text = "Guarded auto exact duplicate canary marker retains one implementation fact."
+    exact_text = "Guarded auto primary exact duplicate canary marker retains one implementation fact."
     exact_a = _memory_point(
         ctx,
         "guarded-auto-exact-a",
@@ -941,6 +948,27 @@ def test_live_guarded_auto_canary_applies_one_exact_duplicate_and_leaves_control
         source=f"{ctx.memory_collection}:guarded-auto:exact-b",
         tags=["live-guarded-auto", "exact-duplicate"],
         file_path=f"{PROJECT_A}/guarded-auto/exact-b.md",
+        importance=8,
+        confidence=0.99,
+    )
+    second_exact_text = "Guarded auto secondary exact duplicate canary marker retains one independent implementation fact."
+    second_exact_a = _memory_point(
+        ctx,
+        "guarded-auto-second-exact-a",
+        second_exact_text,
+        source=f"{ctx.memory_collection}:guarded-auto:second-exact-a",
+        tags=["live-guarded-auto", "second-exact-duplicate"],
+        file_path=f"{PROJECT_A}/guarded-auto/second-exact-a.md",
+        importance=9,
+        confidence=0.99,
+    )
+    second_exact_b = _memory_point(
+        ctx,
+        "guarded-auto-second-exact-b",
+        f"  {second_exact_text.upper()}  ",
+        source=f"{ctx.memory_collection}:guarded-auto:second-exact-b",
+        tags=["live-guarded-auto", "second-exact-duplicate"],
+        file_path=f"{PROJECT_A}/guarded-auto/second-exact-b.md",
         importance=8,
         confidence=0.99,
     )
@@ -973,17 +1001,27 @@ def test_live_guarded_auto_canary_applies_one_exact_duplicate_and_leaves_control
         point["payload"]["fact_key"] = "guarded-auto-medium-risk-control"
 
     secret_sentinel = "canary-" + "secret" + "-sentinel-" + uuid.uuid4().hex
-    secret_control = _memory_point(
+    secret_a = _memory_point(
         ctx,
-        "guarded-auto-secret-control",
-        "This isolated canary control carries " + "".join(("se", "cret", "=", secret_sentinel)),
-        source=f"{ctx.memory_collection}:guarded-auto:secret-control",
-        tags=["live-guarded-auto", "secret-control"],
-        file_path=f"{PROJECT_A}/guarded-auto/secret-control.md",
+        "guarded-auto-secret-a",
+        "This isolated canary duplicate carries " + "".join(("se", "cret", "=", secret_sentinel)),
+        source=f"{ctx.memory_collection}:guarded-auto:secret-a",
+        tags=["live-guarded-auto", "secret-duplicate-control"],
+        file_path=f"{PROJECT_A}/guarded-auto/secret-a.md",
         importance=8,
         confidence=0.99,
     )
-    seeded_points = [exact_a, exact_b, near_a, near_b, secret_control]
+    secret_b = _memory_point(
+        ctx,
+        "guarded-auto-secret-b",
+        "This isolated canary duplicate carries " + "".join(("se", "cret", "=", secret_sentinel)),
+        source=f"{ctx.memory_collection}:guarded-auto:secret-b",
+        tags=["live-guarded-auto", "secret-duplicate-control"],
+        file_path=f"{PROJECT_A}/guarded-auto/secret-b.md",
+        importance=8,
+        confidence=0.99,
+    )
+    seeded_points = [exact_a, exact_b, second_exact_a, second_exact_b, near_a, near_b, secret_a, secret_b]
     ctx.qdrant.upsert(ctx.memory_collection, seeded_points)
     seeded_payloads = {
         str(point["id"]): _retrieve_one(ctx, ctx.memory_collection, str(point["id"]))["payload"]
@@ -995,20 +1033,26 @@ def test_live_guarded_auto_canary_applies_one_exact_duplicate_and_leaves_control
     report = json.loads(
         provider.handle_tool_call(
             "qdrant_memory_consolidate",
-            {"scope": "memory", "persist": True, "include_examples": False, "max_groups": 10},
+            {"scope": "memory", "persist": True, "include_examples": True, "max_groups": 10},
         )
     )
     assert "error" not in report
     report_path = _assert_path_under(report["artifact"]["path"], tmp_path)
     assert report_path.exists()
-    exact_proposal = next(
-        proposal
-        for proposal in report["proposals"]
-        if proposal["proposal_type"] == "duplicate_cluster"
-        and set(proposal["affected_ids"]) == {str(exact_a["id"]), str(exact_b["id"])}
-    )
-    assert exact_proposal["match_kind"] == "exact_normalized"
-    assert exact_proposal["guarded_auto_eligible"] is True
+    primary_exact_ids = frozenset((str(exact_a["id"]), str(exact_b["id"])))
+    second_exact_ids = frozenset((str(second_exact_a["id"]), str(second_exact_b["id"])))
+    secret_ids = frozenset((str(secret_a["id"]), str(secret_b["id"])))
+    duplicate_proposals = [proposal for proposal in report["proposals"] if proposal["proposal_type"] == "duplicate_cluster"]
+    proposals_by_affected_ids = {frozenset(proposal["affected_ids"]): proposal for proposal in duplicate_proposals}
+    eligible_exact_proposals = [proposal for proposal in duplicate_proposals if proposal["guarded_auto_eligible"] is True]
+    assert {frozenset(proposal["affected_ids"]) for proposal in eligible_exact_proposals} == {
+        primary_exact_ids,
+        second_exact_ids,
+    }
+    assert len(eligible_exact_proposals) == 2
+    assert all(proposal["match_kind"] == "exact_normalized" for proposal in eligible_exact_proposals)
+    assert all(proposal["guarded_auto_eligible"] is True for proposal in eligible_exact_proposals)
+    assert all(proposal["preauthorized_policy"] == "guarded-auto:exact-duplicate-merge" for proposal in eligible_exact_proposals)
     near_proposal = next(
         proposal
         for proposal in report["proposals"]
@@ -1018,6 +1062,11 @@ def test_live_guarded_auto_canary_applies_one_exact_duplicate_and_leaves_control
     assert near_proposal["match_kind"] == "near_duplicate"
     assert near_proposal["risk"] == "medium"
     assert near_proposal["guarded_auto_eligible"] is False
+    secret_proposal = proposals_by_affected_ids[secret_ids]
+    assert secret_proposal["match_kind"] == "exact_normalized"
+    assert secret_proposal["contains_secret_text"] is True
+    assert secret_proposal["guarded_auto_eligible"] is False
+    assert "preauthorized_policy" not in secret_proposal
 
     policy = GuardedAutoPolicy(mode="guarded-auto", max_actions=1)
     guarded_auto = apply_guarded_auto(provider, report, policy)
@@ -1025,11 +1074,23 @@ def test_live_guarded_auto_canary_applies_one_exact_duplicate_and_leaves_control
     assert guarded_auto["errors"] == []
     assert len(guarded_auto["applied"]) == 1
     applied = guarded_auto["applied"][0]
-    assert applied["proposal_id"] == exact_proposal["proposal_id"]
+    eligible_proposal_ids = {proposal["proposal_id"] for proposal in eligible_exact_proposals}
+    assert applied["proposal_id"] in eligible_proposal_ids
     assert applied["action"] == "merge"
+    skipped_eligible_proposal = next(
+        proposal for proposal in eligible_exact_proposals if proposal["proposal_id"] != applied["proposal_id"]
+    )
+    assert any(
+        skipped["proposal_id"] == skipped_eligible_proposal["proposal_id"]
+        and skipped["proposal_type"] == "duplicate_cluster"
+        and skipped["reason"] == "guarded-auto max_actions reached"
+        for skipped in guarded_auto["skipped"]
+    )
     result = applied["result"]
     assert result["applied"] is True
-    assert {result["canonical_id"], *result["deleted_ids"]} == {str(exact_a["id"]), str(exact_b["id"])}
+    assert {result["canonical_id"], *result["deleted_ids"]} == set(
+        next(proposal["affected_ids"] for proposal in eligible_exact_proposals if proposal["proposal_id"] == applied["proposal_id"])
+    )
     assert "application_artifact" not in result
     application_id = result["application_id"]
     application_artifacts = list((tmp_path / "artifacts" / "applications").glob("application-*.json"))
@@ -1041,9 +1102,12 @@ def test_live_guarded_auto_canary_applies_one_exact_duplicate_and_leaves_control
 
     assert _retrieve_one(ctx, ctx.memory_collection, result["canonical_id"])
     assert ctx.qdrant.retrieve(ctx.memory_collection, result["deleted_ids"], with_payload=True, with_vector=False) == []
-    for point in (near_a, near_b, secret_control):
+    for point in (near_a, near_b, secret_a, secret_b):
         actual_payload = _retrieve_one(ctx, ctx.memory_collection, str(point["id"]))["payload"]
         assert actual_payload == seeded_payloads[str(point["id"])]
+    for point_id in skipped_eligible_proposal["affected_ids"]:
+        preserved_point = _retrieve_one(ctx, ctx.memory_collection, point_id)
+        assert preserved_point["payload"] == seeded_payloads[point_id]
     assert ctx.qdrant.count(ctx.memory_collection) == memory_count_before - 1
     assert ctx.qdrant.count(ctx.learning_collection) == learning_count_before
 
@@ -1058,7 +1122,7 @@ def test_live_guarded_auto_canary_applies_one_exact_duplicate_and_leaves_control
     assert replay["errors"] == [
         {
             "code": "provider_rejected",
-            "proposal_handle": exact_proposal["proposal_id"],
+            "proposal_handle": applied["proposal_id"],
             "action": "merge",
         }
     ]
