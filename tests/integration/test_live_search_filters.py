@@ -1030,8 +1030,14 @@ def test_live_guarded_auto_canary_applies_one_exact_duplicate_and_leaves_control
     result = applied["result"]
     assert result["applied"] is True
     assert {result["canonical_id"], *result["deleted_ids"]} == {str(exact_a["id"]), str(exact_b["id"])}
-    application_path = _assert_path_under(result["application_artifact"], tmp_path)
-    assert application_path.exists()
+    assert "application_artifact" not in result
+    application_id = result["application_id"]
+    application_artifacts = list((tmp_path / "artifacts" / "applications").glob("application-*.json"))
+    assert len(application_artifacts) == 1
+    application_path = application_artifacts[0]
+    assert application_path.name == f"application-{application_id}.json"
+    application_record = json.loads(application_path.read_text(encoding="utf-8"))
+    assert application_record["application_id"] == application_id
 
     assert _retrieve_one(ctx, ctx.memory_collection, result["canonical_id"])
     assert ctx.qdrant.retrieve(ctx.memory_collection, result["deleted_ids"], with_payload=True, with_vector=False) == []
@@ -1051,9 +1057,8 @@ def test_live_guarded_auto_canary_applies_one_exact_duplicate_and_leaves_control
     assert replay["applied"] == []
     assert replay["errors"] == [
         {
-            "proposal_id": exact_proposal["proposal_id"],
+            "code": "provider_rejected",
+            "proposal_handle": exact_proposal["proposal_id"],
             "action": "merge",
-            "reason": "exact normalized duplicate cluster is preauthorized for merge",
-            "error": "affected point missing; rerun consolidation",
         }
     ]
