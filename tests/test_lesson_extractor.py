@@ -9,6 +9,11 @@ from qdrant_memory.lesson_extractor import (
 )
 
 
+def _credential_assignment(key: str, value: str, *, separator: str = "=") -> str:
+    """Build scanner-shaped fixtures without literal credentials in source."""
+    return key + " " + separator + " " + value
+
+
 def test_extract_user_correction_candidate_requires_explicit_correction():
     candidates = extract_learning_candidates_from_turn(
         "Actually, my surname is Gárate, not Garate.",
@@ -160,8 +165,6 @@ def test_contains_secret_preserves_credential_detection_while_ignoring_token_con
         "password: <REDACTED>",
         "password: <input required>",
         "password: (empty)",
-        "password: see error message above",
-        "password:\n```\nstack trace\n```",
         "when using sudo, prompts for password before continuing",
         "requires a password to login",
         "context token discussion",
@@ -171,6 +174,74 @@ def test_contains_secret_preserves_credential_detection_while_ignoring_token_con
         assert contains_secret(text), text
     for text in negative_inputs:
         assert not contains_secret(text), text
+
+
+def test_contains_secret_fails_closed_for_explicit_credential_assignments():
+    quote = chr(34)
+    short_value = "".join(["p", "i", "n"])
+    alpha_passphrase = "".join(["correct", "horse", "battery"])
+    assignment_keys = [
+        "password",
+        "api_key",
+        "secret",
+        "token",
+        "passwd",
+        "credential",
+        "private_key",
+    ]
+
+    for key in assignment_keys:
+        assert contains_secret(_credential_assignment(key, short_value)), key
+    assert contains_secret(_credential_assignment("password", quote + short_value + quote))
+    assert contains_secret(_credential_assignment("password", alpha_passphrase, separator=":"))
+    assert contains_secret(_credential_assignment("api-key", quote + "two words" + quote))
+
+
+def test_contains_secret_allows_only_exact_placeholder_assignment_values():
+    placeholders = [
+        "<REDACTED>",
+        "[REDACTED]",
+        "<input required>",
+        "(empty)",
+        "***",
+        "[redacted: possible secret-bearing value]",
+    ]
+
+    for placeholder in placeholders:
+        assert not contains_secret(_credential_assignment("password", placeholder)), placeholder
+
+    quoted_with_sentence_punctuation = chr(34) + "<REDACTED>" + chr(34) + "."
+    assert not contains_secret(_credential_assignment("token", quoted_with_sentence_punctuation))
+    assert not contains_secret(_credential_assignment("token", "***."))
+    assert contains_secret(_credential_assignment("password", "redacted-value"))
+
+
+def test_contains_secret_checks_every_loose_pattern_match():
+    later_short_value = "".join(["n", "e", "w", "p", "i", "n"])
+    assignments = " then ".join(
+        [
+            _credential_assignment("password", "<REDACTED>"),
+            _credential_assignment("password", later_short_value),
+        ]
+    )
+    token_contexts = "token planet then token alpha123"
+    credential_contexts = "password planet then password alpha123"
+
+    assert contains_secret(assignments)
+    assert contains_secret(token_contexts)
+    assert contains_secret(credential_contexts)
+
+
+def test_write_gate_rejects_short_explicit_credential_assignment():
+    from qdrant_memory.write_gate import evaluate_write_candidate
+
+    text = "store this " + _credential_assignment("password", "".join(["p", "i", "n"]))
+
+    decision = evaluate_write_candidate(text=text, source_type="manual")
+
+    assert decision.decision == "reject"
+    assert decision.requires_review is True
+    assert "possible_secret" in decision.reasons
 
 
 def test_contains_secret_looks_like_secret_value_helper():
@@ -193,6 +264,8 @@ def test_contains_secret_looks_like_secret_value_helper():
 
     # Short or pure-alphabetic single English words — must be rejected.
     assert not _looks_like_secret_value("discussion")
+    assert not _looks_like_secret_value("discussion!")
+    assert not _looks_like_secret_value("short-pass")
     assert not _looks_like_secret_value("Bucket")
     assert not _looks_like_secret_value("before")
     assert not _looks_like_secret_value("hunter2")  # 7 chars

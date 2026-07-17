@@ -15,17 +15,22 @@ _SECRET_PATTERNS = [
     re.compile(r"(?i)authorization\s*:\s*bearer\s+\S+"),
     re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]{16,}"),
     re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}"),
-    # Inline credential assignment: keyword, then ':' or '=' separator, then a
-    # captured RHS that `contains_secret` validates against
-    # `_looks_like_secret_value`. Without that post-filter we flagged ordinary
-    # prose like "password: see error message above" or
-    # "password: <REDACTED>".
-    re.compile(r"(?i)(api[_-]?key|password|secret)\s*[:=]\s*([^\s,;][^\s,;]*)"),
-    # Bare `token = <value>` assignment — also requires secret-shaped RHS.
-    re.compile(r"(?i)\btoken\s*[:=]\s*([^\s,;][^\s,;]*)"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     re.compile(r"https?://[^\s:@]+:[^\s:@]+@"),
 ]
+
+# Explicit credential-key assignments are a fail-closed boundary. The value
+# capture keeps quoted or bracketed values together so exact placeholders with
+# spaces can be recognized without weakening real credential assignments.
+_CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)(?<![A-Za-z0-9])"
+    r"(?:api[_-]?key|password|passwd|secret|token|authorization|bearer|"
+    r"credential(?:s)?|private[_-]?key)"
+    r"\s*[:=]\s*"
+    r"(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|<[^>\r\n]*>|"
+    r"\[[^\]\r\n]*\]|\([^\)\r\n]*\)|`[^`\r\n]*`|[^\s,;]+)"
+)
+
 # Word-followed-by-apparent-value patterns. Each captures the RHS so
 # `contains_secret` can apply `_looks_like_secret_value` to it; without that
 # post-filter we flagged ordinary prose like "context token discussion",
@@ -57,38 +62,55 @@ _CREDENTIAL_CONTEXT_PATTERN = re.compile(
     r"([^\s,;\"'`][^\s,;\"']{5,40})"
 )
 
-# Reserved sentinels for placeholder / redaction values.
-_SECRET_VALUE_REJECT_PREFIXES = ("<", "(", "[", "`", ":")
-_SECRET_VALUE_REJECT_SUBSTRINGS = ("redacted", "placeholder", "***")
+# Narrow exact sentinels for placeholder / redaction values. Matching is
+# case-insensitive after quote and trailing sentence-punctuation normalization.
+_SECRET_PLACEHOLDER_VALUES = frozenset(
+    {
+        "***",
+        "****",
+        "<redacted>",
+        "[redacted]",
+        "<placeholder>",
+        "[placeholder]",
+        "<input required>",
+        "(empty)",
+        "<empty>",
+        "[empty]",
+        "[redacted: possible secret-bearing value]",
+        "[redacted: possible secret-bearing memory]",
+    }
+)
+_PLACEHOLDER_TRAILING_PUNCTUATION = ".,;:!?"
+_PLACEHOLDER_QUOTES = {'"', "'", "`"}
+
+
+def _normalize_placeholder_value(value: str) -> str:
+    """Normalize only what is needed for exact placeholder recognition."""
+    normalized = str(value or "").strip().rstrip(_PLACEHOLDER_TRAILING_PUNCTUATION).strip()
+    if len(normalized) >= 2 and normalized[0] in _PLACEHOLDER_QUOTES and normalized[-1] == normalized[0]:
+        normalized = normalized[1:-1].strip().rstrip(_PLACEHOLDER_TRAILING_PUNCTUATION).strip()
+    return normalized.casefold()
+
+
+def _is_secret_placeholder(value: str) -> bool:
+    return _normalize_placeholder_value(value) in _SECRET_PLACEHOLDER_VALUES
 
 
 def _looks_like_secret_value(value: str) -> bool:
-    """Return True iff ``value`` looks like a real credential rather than
-    ordinary prose, a placeholder, or a code-fence marker.
+    """Return True iff a loose context value looks credential-like.
 
-    Heuristic, deliberately conservative:
-
-    * Rejects empty / placeholder / redaction markers.
-    * Rejects anything starting with ``<``, ``(``, ``[``, backtick, or ``:``.
-    * Rejects anything shorter than 8 characters.
-    * Accepts anything that contains a digit, contains a non-alphanumeric
-      punctuation character, or is at least 16 characters of pure
-      alphanumeric text (e.g. long API keys).
+    Explicit key assignments do not use this heuristic: they fail closed unless
+    ``value`` is an exact placeholder. Loose prose contexts retain a conservative
+    length/shape filter so token-budget and password-detection discussion stays
+    usable. Punctuation alone is never evidence of a secret.
     """
-    if not value:
-        return False
-    if value[0] in _SECRET_VALUE_REJECT_PREFIXES:
+    if not value or _is_secret_placeholder(value):
         return False
     if len(value) < 8:
         return False
-    lowered = value.lower()
-    if any(marker in lowered for marker in _SECRET_VALUE_REJECT_SUBSTRINGS):
-        return False
     has_digit = any(ch.isdigit() for ch in value)
-    has_special = any(not ch.isalnum() for ch in value)
-    if has_digit or has_special or len(value) >= 16:
-        return True
-    return False
+    alphanumeric_count = sum(ch.isalnum() for ch in value)
+    return has_digit or alphanumeric_count >= 16
 
 _EXPLICIT_CORRECTION_PATTERNS = [
     re.compile(r"(?i)\bactually[, ]+(?P<body>.+)"),
@@ -104,39 +126,30 @@ _RESOLUTION_PATTERN = re.compile(r"(?i)(correction|fix|solution|resolved|use|ins
 
 
 def contains_secret(text: str) -> bool:
-    """Return True if ``text`` contains a value that looks like a real secret.
+    """Return True when ``text`` contains a secret-shaped value.
 
-    High-confidence patterns (provider prefixes, JWT shape, private key marker,
-    URL basic auth) match without further validation. Loose patterns (inline
-    credential assignments, "token <x>" / "password <x>" prose) require the
-    captured right-hand side to satisfy ``_looks_like_secret_value`` so we do
-    not flag ordinary English text.
+    Provider-specific patterns remain high-confidence defense in depth. Explicit
+    credential-key assignments fail closed unless their complete RHS is an exact
+    placeholder. Loose word-followed-by-value contexts retain shape filtering,
+    and every match is checked so an earlier benign value cannot hide a later
+    credential.
     """
     text = text or ""
-    # Strong patterns (indices 0..5 and 8..9): no post-filter.
-    strong_indices = (0, 1, 2, 3, 4, 5, 8, 9)
-    for idx, pattern in enumerate(_SECRET_PATTERNS):
-        if idx in strong_indices:
-            if pattern.search(text):
-                return True
-            continue
-        # Loose patterns (6, 7): require the captured RHS to look secret-shaped.
-        # Pattern 6 has the keyword in group(1) and the value in group(2).
-        # Pattern 7 has the value in group(1).
-        match = pattern.search(text)
-        rhs_group = 2 if idx == 6 else 1
-        if match and _looks_like_secret_value(match.group(rhs_group)):
+    if any(pattern.search(text) for pattern in _SECRET_PATTERNS):
+        return True
+
+    for match in _CREDENTIAL_ASSIGNMENT_PATTERN.finditer(text):
+        if not _is_secret_placeholder(match.group("value")):
             return True
-    # Word-followed-by-apparent-value patterns also need RHS validation.
-    # ``_TOKEN_CONTEXT_PATTERN`` has the value in group(1) (the keyword is in a
-    # non-capturing group). ``_CREDENTIAL_CONTEXT_PATTERN`` has the keyword in
-    # group(1) and the value in group(2). Validate the value group.
-    token_match = _TOKEN_CONTEXT_PATTERN.search(text)
-    if token_match and _looks_like_secret_value(token_match.group(1)):
-        return True
-    cred_match = _CREDENTIAL_CONTEXT_PATTERN.search(text)
-    if cred_match and _looks_like_secret_value(cred_match.group(2)):
-        return True
+
+    for match in _TOKEN_CONTEXT_PATTERN.finditer(text):
+        if _looks_like_secret_value(match.group(1)):
+            return True
+
+    for match in _CREDENTIAL_CONTEXT_PATTERN.finditer(text):
+        if _looks_like_secret_value(match.group(2)):
+            return True
+
     return False
 
 
