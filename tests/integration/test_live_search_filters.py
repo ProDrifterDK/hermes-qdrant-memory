@@ -616,10 +616,13 @@ def test_live_provider_store_tools_persist_to_disposable_collections(live_contex
                 "source_type": "manual",
                 "importance": 7,
                 "tags": ["live-provider-store", "memory-write"],
+                "dry_run": False,
+                "approve": True,
             },
         )
     )
     assert "error" not in memory_response
+    assert memory_response["dry_run"] is False
     assert memory_response["saved"] is True
     memory_id = memory_response["id"]
 
@@ -646,6 +649,8 @@ def test_live_provider_store_tools_persist_to_disposable_collections(live_contex
                 "confidence": 0.95,
                 "tags": ["live-provider-store", "learning-write"],
                 "promote_to_skill_candidate": True,
+                "dry_run": False,
+                "approve": True,
             },
         )
     )
@@ -897,6 +902,158 @@ def test_live_provider_consolidation_report_and_gated_apply_paths(live_context: 
     assert draft_path.exists()
     assert _assert_path_under(draft_applied["application_artifact"], tmp_path).exists()
     draft_text = draft_path.read_text(encoding="utf-8")
-    assert "manual review artifact only" in draft_text
-    assert _retrieve_one(ctx, ctx.memory_collection, str(recon_a["id"]))
-    assert _retrieve_one(ctx, ctx.memory_collection, str(recon_b["id"]))
+    assert "# Reconsolidation review draft" in draft_text
+    assert "review artifact" in draft_text.lower()
+    assert "does not mutate qdrant memory" in draft_text.lower()
+    assert draft_proposal["proposal_id"] in draft_text
+    recon_a_after = _retrieve_one(ctx, ctx.memory_collection, str(recon_a["id"]))
+    recon_b_after = _retrieve_one(ctx, ctx.memory_collection, str(recon_b["id"]))
+    assert recon_a_after["payload"] == recon_a["payload"]
+    assert recon_b_after["payload"] == recon_b["payload"]
+
+
+def test_live_guarded_auto_canary_applies_one_exact_duplicate_and_leaves_controls_untouched(
+    live_context: LiveContext, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from qdrant_memory.guarded_auto import GuardedAutoPolicy, apply_guarded_auto
+
+    ctx = live_context
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    provider = _provider_for_live_context(ctx, tmp_path)
+    provider._hermes_home = str(tmp_path / "hermes-home")
+    provider._config["consolidation_artifact_dir"] = str(tmp_path / "artifacts")
+
+    exact_text = "Guarded auto exact duplicate canary marker retains one implementation fact."
+    exact_a = _memory_point(
+        ctx,
+        "guarded-auto-exact-a",
+        exact_text,
+        source=f"{ctx.memory_collection}:guarded-auto:exact-a",
+        tags=["live-guarded-auto", "exact-duplicate"],
+        file_path=f"{PROJECT_A}/guarded-auto/exact-a.md",
+        importance=9,
+        confidence=0.99,
+    )
+    exact_b = _memory_point(
+        ctx,
+        "guarded-auto-exact-b",
+        f"  {exact_text.upper()}  ",
+        source=f"{ctx.memory_collection}:guarded-auto:exact-b",
+        tags=["live-guarded-auto", "exact-duplicate"],
+        file_path=f"{PROJECT_A}/guarded-auto/exact-b.md",
+        importance=8,
+        confidence=0.99,
+    )
+    near_text = (
+        "This controlled medium risk canary record requires an operator review before mutation of isolated memory data."
+    )
+    near_a = _memory_point(
+        ctx,
+        "guarded-auto-near-a",
+        near_text,
+        source=f"{ctx.memory_collection}:guarded-auto:near-a",
+        tags=["live-guarded-auto", "near-duplicate-control"],
+        file_path=f"{PROJECT_A}/guarded-auto/near-a.md",
+        source_type="manual",
+        importance=8,
+        confidence=0.99,
+    )
+    near_b = _memory_point(
+        ctx,
+        "guarded-auto-near-b",
+        f"{near_text[:-1]} carefully.",
+        source=f"{ctx.memory_collection}:guarded-auto:near-b",
+        tags=["live-guarded-auto", "near-duplicate-control"],
+        file_path=f"{PROJECT_A}/guarded-auto/near-b.md",
+        source_type="manual",
+        importance=8,
+        confidence=0.99,
+    )
+    for point in (near_a, near_b):
+        point["payload"]["fact_key"] = "guarded-auto-medium-risk-control"
+
+    secret_sentinel = "canary-" + "secret" + "-sentinel-" + uuid.uuid4().hex
+    secret_control = _memory_point(
+        ctx,
+        "guarded-auto-secret-control",
+        "This isolated canary control carries " + "".join(("se", "cret", "=", secret_sentinel)),
+        source=f"{ctx.memory_collection}:guarded-auto:secret-control",
+        tags=["live-guarded-auto", "secret-control"],
+        file_path=f"{PROJECT_A}/guarded-auto/secret-control.md",
+        importance=8,
+        confidence=0.99,
+    )
+    seeded_points = [exact_a, exact_b, near_a, near_b, secret_control]
+    ctx.qdrant.upsert(ctx.memory_collection, seeded_points)
+    seeded_payloads = {
+        str(point["id"]): _retrieve_one(ctx, ctx.memory_collection, str(point["id"]))["payload"]
+        for point in seeded_points
+    }
+    memory_count_before = ctx.qdrant.count(ctx.memory_collection)
+    learning_count_before = ctx.qdrant.count(ctx.learning_collection)
+
+    report = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_consolidate",
+            {"scope": "memory", "persist": True, "include_examples": False, "max_groups": 10},
+        )
+    )
+    assert "error" not in report
+    report_path = _assert_path_under(report["artifact"]["path"], tmp_path)
+    assert report_path.exists()
+    exact_proposal = next(
+        proposal
+        for proposal in report["proposals"]
+        if proposal["proposal_type"] == "duplicate_cluster"
+        and set(proposal["affected_ids"]) == {str(exact_a["id"]), str(exact_b["id"])}
+    )
+    assert exact_proposal["match_kind"] == "exact_normalized"
+    assert exact_proposal["guarded_auto_eligible"] is True
+    near_proposal = next(
+        proposal
+        for proposal in report["proposals"]
+        if proposal["proposal_type"] == "duplicate_cluster"
+        and set(proposal["affected_ids"]) == {str(near_a["id"]), str(near_b["id"])}
+    )
+    assert near_proposal["match_kind"] == "near_duplicate"
+    assert near_proposal["risk"] == "medium"
+    assert near_proposal["guarded_auto_eligible"] is False
+
+    policy = GuardedAutoPolicy(mode="guarded-auto", max_actions=1)
+    guarded_auto = apply_guarded_auto(provider, report, policy)
+    assert guarded_auto["attempted"] == 1
+    assert guarded_auto["errors"] == []
+    assert len(guarded_auto["applied"]) == 1
+    applied = guarded_auto["applied"][0]
+    assert applied["proposal_id"] == exact_proposal["proposal_id"]
+    assert applied["action"] == "merge"
+    result = applied["result"]
+    assert result["applied"] is True
+    assert {result["canonical_id"], *result["deleted_ids"]} == {str(exact_a["id"]), str(exact_b["id"])}
+    application_path = _assert_path_under(result["application_artifact"], tmp_path)
+    assert application_path.exists()
+
+    assert _retrieve_one(ctx, ctx.memory_collection, result["canonical_id"])
+    assert ctx.qdrant.retrieve(ctx.memory_collection, result["deleted_ids"], with_payload=True, with_vector=False) == []
+    for point in (near_a, near_b, secret_control):
+        actual_payload = _retrieve_one(ctx, ctx.memory_collection, str(point["id"]))["payload"]
+        assert actual_payload == seeded_payloads[str(point["id"])]
+    assert ctx.qdrant.count(ctx.memory_collection) == memory_count_before - 1
+    assert ctx.qdrant.count(ctx.learning_collection) == learning_count_before
+
+    public_output = json.dumps({"report": report, "guarded_auto": guarded_auto}, sort_keys=True)
+    assert secret_sentinel not in public_output
+    assert secret_sentinel not in report_path.read_text(encoding="utf-8")
+    assert secret_sentinel not in application_path.read_text(encoding="utf-8")
+
+    replay = apply_guarded_auto(provider, report, policy)
+    assert replay["attempted"] == 1
+    assert replay["applied"] == []
+    assert replay["errors"] == [
+        {
+            "proposal_id": exact_proposal["proposal_id"],
+            "action": "merge",
+            "reason": "exact normalized duplicate cluster is preauthorized for merge",
+            "error": "affected point missing; rerun consolidation",
+        }
+    ]
