@@ -320,11 +320,18 @@ def _validate_cron_schedule(schedule: str) -> str:
     return " ".join(parts)
 
 
+def _validate_cron_component(value: Any, *, label: str) -> str:
+    text = str(value)
+    if any(delimiter in text for delimiter in ("\r", "\n", "%")):
+        raise CliUsageError(f"{label} contains a character that is unsafe in cron")
+    return text
+
+
 def _resolve_hermes_cli() -> str:
     resolved = shutil.which("hermes")
     if not resolved:
         raise CliUsageError("Hermes CLI executable was not found on PATH; watcher install was not changed")
-    absolute = os.path.abspath(resolved)
+    absolute = _validate_cron_component(os.path.abspath(resolved), label="resolved Hermes CLI path")
     if not os.path.isfile(absolute) or not os.access(absolute, os.X_OK):
         raise CliUsageError(f"resolved Hermes CLI is not an existing executable: {absolute}")
     return absolute
@@ -357,7 +364,7 @@ def _watcher_run_command(args: Namespace) -> str:
 
 def _managed_cron_block(args: Namespace, *, command: str | None = None) -> str:
     schedule = _validate_cron_schedule(args.schedule)
-    log_path = _watcher_log_path()
+    log_path = _validate_cron_component(_watcher_log_path(), label="watcher log path")
     command = command if command is not None else _watcher_run_command(args)
     return "\n".join(
         [

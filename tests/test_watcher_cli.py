@@ -58,12 +58,14 @@ class ApplyingProvider:
 def fake_crontab(monkeypatch):
     from qdrant_memory import cli_core
 
-    state = {"text": "MAILTO=\"\"\n15 2 * * * /usr/bin/true\n"}
+    state = {"text": "MAILTO=\"\"\n15 2 * * * /usr/bin/true\n", "reads": 0, "writes": 0}
 
     def read_crontab():
+        state["reads"] += 1
         return state["text"]
 
     def write_crontab(text):
+        state["writes"] += 1
         state["text"] = text
 
     monkeypatch.setattr(cli_core, "_read_user_crontab", read_crontab)
@@ -79,6 +81,14 @@ def fake_hermes_cli(monkeypatch, tmp_path):
     cli_path.chmod(0o755)
     monkeypatch.setattr(shutil, "which", lambda executable: str(cli_path) if executable == "hermes" else None)
     return cli_path
+
+
+def _seed_watcher_state(hermes_home: Path) -> tuple[Path, bytes]:
+    state_path = hermes_home / "qdrant_memory" / "consolidation" / "watcher_state.json"
+    state_path.parent.mkdir(parents=True)
+    original = b"\x00pre-existing watcher state\r\n"
+    state_path.write_bytes(original)
+    return state_path, original
 
 
 def test_watcher_state_signature_is_shared_and_order_independent():
@@ -370,6 +380,55 @@ def test_watcher_install_refuses_non_executable_resolved_path_without_mutation(
     assert fake_crontab["text"] == before
     assert not (hermes_home / "qdrant_memory" / "consolidation" / "watcher_state.json").exists()
     assert "not an existing executable" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("cron_delimiter", ["\n", "%", "\r"], ids=["lf", "percent", "cr"])
+def test_watcher_install_rejects_cron_delimiters_in_executable_path_without_mutation(
+    monkeypatch, tmp_path, fake_crontab, capsys, cron_delimiter
+):
+    from qdrant_memory import cli_core
+    from qdrant_memory.cli_core import execute_command
+
+    cli_path = tmp_path / f"Hermes{cron_delimiter}CLI" / "hermes"
+    cli_path.parent.mkdir(parents=True)
+    cli_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    cli_path.chmod(0o755)
+    hermes_home = tmp_path / "hermes-home"
+    state_path, original_state = _seed_watcher_state(hermes_home)
+    original_crontab = fake_crontab["text"].encode()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(shutil, "which", lambda executable: str(cli_path) if executable == "hermes" else None)
+    monkeypatch.setattr(cli_core, "_read_watcher_state", lambda: pytest.fail("watcher state must not be read"))
+    args = _parser().parse_args(["qdrant", "watcher", "install", "--json"])
+
+    assert execute_command(args, provider_factory=lambda: pytest.fail("provider should not be constructed")) == 2
+    assert fake_crontab["text"].encode() == original_crontab
+    assert fake_crontab["reads"] == 0
+    assert fake_crontab["writes"] == 0
+    assert state_path.read_bytes() == original_state
+    assert "cron" in capsys.readouterr().err.lower()
+
+
+@pytest.mark.parametrize("cron_delimiter", ["\n", "%", "\r"], ids=["lf", "percent", "cr"])
+def test_watcher_install_rejects_cron_delimiters_in_log_path_without_mutation(
+    monkeypatch, tmp_path, fake_crontab, fake_hermes_cli, capsys, cron_delimiter
+):
+    from qdrant_memory import cli_core
+    from qdrant_memory.cli_core import execute_command
+
+    hermes_home = tmp_path / f"Hermes{cron_delimiter}Home"
+    state_path, original_state = _seed_watcher_state(hermes_home)
+    original_crontab = fake_crontab["text"].encode()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(cli_core, "_read_watcher_state", lambda: pytest.fail("watcher state must not be read"))
+    args = _parser().parse_args(["qdrant", "watcher", "install", "--json"])
+
+    assert execute_command(args, provider_factory=lambda: pytest.fail("provider should not be constructed")) == 2
+    assert fake_crontab["text"].encode() == original_crontab
+    assert fake_crontab["reads"] == 0
+    assert fake_crontab["writes"] == 0
+    assert state_path.read_bytes() == original_state
+    assert "cron" in capsys.readouterr().err.lower()
 
 
 def test_watcher_install_writes_exact_absolute_command_to_cron_status_and_state(
