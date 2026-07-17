@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import importlib.util
 import json
 import os
@@ -17,6 +16,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from qdrant_memory.guarded_auto import GuardedAutoPolicy, apply_guarded_auto
+from qdrant_memory.watcher_state import proposal_signature, watcher_state_fields
 from qdrant_memory import evaluation as _evaluation
 
 
@@ -195,6 +195,7 @@ _WATCHER_CRON_BEGIN = "# BEGIN HERMES_QDRANT_WATCHER"
 _WATCHER_CRON_END = "# END HERMES_QDRANT_WATCHER"
 _WATCHER_SIGNATURE_KEYS = {
     "last_proposal_signature",
+    "last_signature",
     "last_alert_signature",
     "last_alert_at",
     "last_signature_changed",
@@ -432,25 +433,8 @@ def _reset_watcher_signature(args: Namespace) -> dict[str, Any]:
 
 
 def _proposal_signature(report: dict[str, Any]) -> str:
-    proposals = report.get("proposals")
-    proposal_list = proposals if isinstance(proposals, list) else []
-    normalized: list[dict[str, Any]] = []
-    for proposal in proposal_list:
-        if not isinstance(proposal, dict):
-            continue
-        affected = proposal.get("affected_ids")
-        affected_list = affected if isinstance(affected, list) else []
-        normalized.append(
-            {
-                "proposal_id": proposal.get("proposal_id"),
-                "proposal_type": proposal.get("proposal_type"),
-                "suggested_action": proposal.get("suggested_action"),
-                "affected_ids": sorted(str(item) for item in affected_list),
-            }
-        )
-    normalized.sort(key=lambda item: json.dumps(item, sort_keys=True))
-    encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    """Compatibility wrapper for the shared watcher signature helper."""
+    return proposal_signature(report.get("proposals"))
 
 
 def _guarded_auto_policy_from_args(args: Namespace) -> GuardedAutoPolicy:
@@ -467,13 +451,18 @@ def _record_watcher_run(args: Namespace, report: dict[str, Any]) -> None:
     state, _, _ = _read_watcher_state()
     if state.get("error"):
         state = {}
-    signature = _proposal_signature(report)
+    proposals = report.get("proposals")
+    proposal_list = proposals if isinstance(proposals, list) else []
+    shared_state = watcher_state_fields(
+        proposals=proposal_list,
+        counts=report.get("summary"),
+        artifact=report.get("artifact"),
+    )
+    signature = shared_state["last_proposal_signature"]
     previous_signature = state.get("last_proposal_signature")
     signature_changed = previous_signature != signature
     force_alert = bool(getattr(args, "force_alert", False))
     alerted = bool(signature_changed or force_alert)
-    proposals = report.get("proposals")
-    proposal_list = proposals if isinstance(proposals, list) else []
     timestamp = _now_iso()
     guarded_auto = report.get("guarded_auto") if isinstance(report.get("guarded_auto"), dict) else {}
     guarded_auto_applied = len(guarded_auto.get("applied", []) or []) if guarded_auto else 0
@@ -486,17 +475,13 @@ def _record_watcher_run(args: Namespace, report: dict[str, Any]) -> None:
             "last_report_id": report.get("report_id"),
             "last_scope": report.get("scope") or getattr(args, "scope", None),
             "last_proposal_count": len(proposal_list),
-            "last_proposal_signature": signature,
             "last_signature_changed": signature_changed,
             "last_alerted": alerted,
             "last_force_alert": force_alert,
             "last_guarded_auto_mode": guarded_auto.get("mode") if guarded_auto else getattr(args, "autonomy_mode", "report-only"),
             "last_guarded_auto_applied_count": guarded_auto_applied,
             "last_guarded_auto_error_count": guarded_auto_errors,
-            "last_counts": report.get("summary", {}),
-            "last_total_proposals": len(proposal_list),
-            "last_artifact": report.get("artifact"),
-            "last_signature": signature[:16],
+            **shared_state,
             "updated_at": timestamp,
         }
     )

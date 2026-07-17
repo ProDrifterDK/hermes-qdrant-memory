@@ -68,6 +68,33 @@ def fake_crontab(monkeypatch):
     return state
 
 
+def test_watcher_state_signature_is_shared_and_order_independent():
+    """CLI and the external watcher can calculate the same canonical signature."""
+    from qdrant_memory.watcher_state import proposal_signature, proposal_signature_short
+
+    proposals = [
+        {"proposal_id": "p2", "proposal_type": "stale", "suggested_action": "delete", "affected_ids": ["b", "a"]},
+        {"proposal_id": "p1", "proposal_type": "duplicate", "suggested_action": "merge", "affected_ids": ["c"]},
+    ]
+    external_watcher_order = list(reversed(proposals))
+
+    assert proposal_signature(proposals) == proposal_signature(external_watcher_order)
+    assert proposal_signature_short(proposals) == proposal_signature(proposals)[:16]
+
+
+def test_watcher_state_fields_keep_cross_writer_artifact_as_path_string():
+    from qdrant_memory.watcher_state import watcher_state_fields
+
+    proposals = [{"proposal_id": "p1", "proposal_type": "duplicate", "suggested_action": "merge", "affected_ids": ["a"]}]
+    artifact_path = "/tmp/consolidation/report-p1.json"
+    cli_fields = watcher_state_fields(proposals=proposals, counts={"duplicate": 1}, artifact={"path": artifact_path})
+    external_fields = watcher_state_fields(proposals=proposals, counts={"duplicate": 1}, artifact=artifact_path)
+
+    assert cli_fields == external_fields
+    assert cli_fields["last_artifact"] == artifact_path
+    assert isinstance(cli_fields["last_artifact"], str)
+
+
 def test_register_cli_adds_watcher_lifecycle_subcommands():
     parser = _parser()
 
@@ -250,6 +277,7 @@ def test_watcher_reset_signature_requires_approve_and_preserves_other_state(monk
                 "installed": True,
                 "last_report_id": "r1",
                 "last_proposal_signature": "sig1",
+                "last_signature": "sig1-short",
                 "last_alert_signature": "sig1",
                 "last_alert_at": "2026-01-01T00:00:00+00:00",
             }
@@ -272,6 +300,7 @@ def test_watcher_reset_signature_requires_approve_and_preserves_other_state(monk
     assert state["installed"] is True
     assert state["last_report_id"] == "r1"
     assert "last_proposal_signature" not in state
+    assert "last_signature" not in state
     assert "last_alert_signature" not in state
     assert "last_alert_at" not in state
 
@@ -566,9 +595,14 @@ def test_watcher_guarded_auto_skips_manual_review_and_reconsolidation(monkeypatc
     assert len(payload["guarded_auto"]["skipped"]) == 2
 
 
-def test_watcher_run_zero_proposal_clears_stale_counts_and_artifact(monkeypatch, tmp_path):
-    """Zero-proposal clean run must overwrite stale last_counts, last_artifact, last_signature."""
+def test_watcher_run_zero_proposal_replaces_stale_shared_state_fields(monkeypatch, tmp_path):
+    """A clean CLI run must replace shared state with canonical empty values."""
     from qdrant_memory.cli_core import execute_command
+    from qdrant_memory.watcher_state import (
+        PROPOSAL_SIGNATURE_SCHEMA,
+        WATCHER_STATE_SCHEMA,
+        proposal_signature,
+    )
 
     hermes_home = tmp_path / "hermes"
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -608,15 +642,16 @@ def test_watcher_run_zero_proposal_clears_stale_counts_and_artifact(monkeypatch,
     state = json.loads(
         (state_dir / "watcher_state.json").read_text(encoding="utf-8")
     )
-    # last_counts must reflect current summary (empty)
-    assert state["last_counts"] == {}, f"expected empty dict, got {state['last_counts']}"
-    # last_total_proposals must reflect current proposal count (0)
+    # Shared fields must replace stale values with the current clean report.
+    assert state["last_counts"] == {}
     assert state["last_total_proposals"] == 0
-    # last_artifact must reflect current artifact
-    assert state["last_artifact"] == report["artifact"]
-    # last_signature must be a 16-char short signature
-    assert isinstance(state["last_signature"], str) and len(state["last_signature"]) == 16
-    # Existing fields preserved
+    assert state["last_artifact"] == report["artifact"]["path"]
+    assert isinstance(state["last_artifact"], str)
+    assert state["watcher_state_schema"] == WATCHER_STATE_SCHEMA
+    assert state["proposal_signature_schema"] == PROPOSAL_SIGNATURE_SCHEMA
+    assert state["last_proposal_signature"] == proposal_signature([])
+    assert state["last_signature"] == state["last_proposal_signature"][:16]
+    # Existing run fields remain current.
     assert state["last_report_id"] == "clean-r1"
     assert state["last_proposal_count"] == 0
     assert state["last_signature_changed"] is True
