@@ -231,11 +231,14 @@ Allowed local artifacts include:
 - application audit records;
 - skill draft artifacts;
 - reconsolidation markdown review drafts;
+- Memory PR JSON and self-contained HTML review artifacts written only to an explicit caller-selected directory;
 - watcher state used to suppress duplicate alerts.
 
 Local artifact persistence is not the same as a Qdrant memory mutation. Export and backup artifacts are an explicit exception to the usual redacted-report rule: they are recovery artifacts and therefore contain raw memory text and vectors. They must be written with private filesystem permissions and their CLI stdout summaries must not print raw payloads, vectors, or credentials.
 
 Qdrant mutations remain gated by dry-run-first, explicit IDs/proposal handles, and approval requirements.
+
+Memory PR is an additional read-only boundary, not an apply mechanism. It accepts exact report/proposal IDs, retrieves only exact affected point IDs, fails closed on any ID-set mismatch, recursively redacts secret-shaped values, and suppresses snippets and proposal narrative for identity-bearing points. Its dry-run next step is descriptive data only and is never executed by packet generation. Omitting `output_dir` performs no file write.
 
 ---
 

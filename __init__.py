@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -56,6 +57,13 @@ from qdrant_memory.embeddings import EmbeddingClient
 from qdrant_memory.indexer import FileIndexer
 from qdrant_memory.learning import LearningStore, build_learning_payload, classify_learning_type
 from qdrant_memory.lesson_extractor import LearningCandidate, candidate_to_learning_args, contains_secret, extract_learning_candidates_from_messages
+from qdrant_memory.memory_pr import (
+    MemoryPRValidationError,
+    attach_review_point_snapshots,
+    build_memory_pr,
+    validate_exact_id,
+    write_memory_pr_artifacts,
+)
 from qdrant_memory.recipes import get_recipe
 from qdrant_memory.ranking import RankingPolicy
 from qdrant_memory.retriever import MemoryRetriever, format_for_prompt, format_hybrid_for_prompt
@@ -467,7 +475,8 @@ def _merge_context_results(groups: list[list[Any]], top_k: int) -> list[Any]:
 
 class QdrantMemoryProvider(MemoryProvider):
     def __init__(self):
-        self._config = load_config()
+        environment_hermes_home = str(os.environ.get("HERMES_HOME") or "")
+        self._config = load_config(hermes_home=environment_hermes_home or None)
         self._qdrant: Optional[QdrantClient] = None
         self._embeddings: Optional[EmbeddingClient] = None
         self._retriever: Optional[MemoryRetriever] = None
@@ -477,7 +486,7 @@ class QdrantMemoryProvider(MemoryProvider):
         self._prefetch_cache: dict[str, str] = {}
         self._prefetch_lock = threading.Lock()
         self._session_id = ""
-        self._hermes_home = ""
+        self._hermes_home = environment_hermes_home
         self._profile_id = "default"
         self._platform = "cli"
         self._user_id_hash = ""
@@ -1509,6 +1518,7 @@ class QdrantMemoryProvider(MemoryProvider):
                 reconsolidation_max_candidates=reconsolidation_max_candidates,
                 reconsolidation_min_confidence=float(self._config.get("reconsolidation_min_confidence", 0.6)),
             )
+            attach_review_point_snapshots(report, [*memory_points, *learning_points])
             seal_guarded_auto_proposals(
                 report,
                 [*memory_points, *learning_points],
@@ -1552,6 +1562,53 @@ class QdrantMemoryProvider(MemoryProvider):
             return []
         raw = self._qdrant.retrieve(collection_name, ids, with_payload=True, with_vector=False)
         return points_from_qdrant(raw, collection_name=collection_name)
+
+    def _tool_memory_pr(self, args: dict[str, Any]) -> str:
+        """Build one exact, current-state Memory PR without any Qdrant mutation."""
+        try:
+            report_id = validate_exact_id(args.get("report_id"), "report_id")
+            proposal_id = validate_exact_id(args.get("proposal_id"), "proposal_id")
+            if not self._qdrant:
+                return _json_error("Qdrant memory provider is not initialized")
+            report = load_consolidation_report(
+                report_id,
+                hermes_home=self._hermes_home,
+                configured_dir=str(self._config.get("consolidation_artifact_dir") or ""),
+            )
+            if str(report.get("profile_id") or self._profile_id) != self._profile_id:
+                return _json_error("proposal belongs to a different profile scope")
+            proposal = find_proposal(report, proposal_id)
+            raw_affected_ids = proposal.get("affected_ids")
+            if not isinstance(raw_affected_ids, list) or not raw_affected_ids:
+                raise MemoryPRValidationError("proposal has no explicit affected_ids")
+            affected_ids = [validate_exact_id(item, "affected point ID") for item in raw_affected_ids]
+            if len(affected_ids) != len(set(affected_ids)):
+                raise MemoryPRValidationError("proposal contains duplicate affected point IDs")
+            affected_ids = sorted(affected_ids)
+            collection_name = validate_exact_id(self._collection_for_proposal(proposal), "collection_name")
+            points = self._retrieve_consolidation_points(collection_name, affected_ids)
+            packet = build_memory_pr(
+                report=report,
+                report_id=report_id,
+                proposal_id=proposal_id,
+                current_points=points,
+                generation_mode="live",
+                resolved_collection_name=collection_name,
+            )
+            result: dict[str, Any] = {"read_only": True, "persisted": False, "packet": packet}
+            if "output_dir" in args:
+                output_dir = args.get("output_dir")
+                if not isinstance(output_dir, str) or not output_dir:
+                    raise MemoryPRValidationError("output_dir must be a non-empty explicit path")
+                artifact = write_memory_pr_artifacts(
+                    packet,
+                    output_dir,
+                    overwrite=parse_bool_arg(args.get("overwrite"), default=False),
+                )
+                result.update({"persisted": True, "artifact": artifact})
+            return json.dumps(result)
+        except (MemoryPRValidationError, FileNotFoundError, KeyError, OSError, ValueError) as exc:
+            return _json_error(f"Memory PR failed: {exc}")
 
     def _proposal_write_decision(self, proposal: dict[str, Any], action: str, points: list[Any]) -> Any:
         proposal_type = str(proposal.get("proposal_type") or "")
@@ -3558,6 +3615,8 @@ class QdrantMemoryProvider(MemoryProvider):
             return self._tool_source_status(args)
         if tool_name == "qdrant_memory_consolidate":
             return self._tool_consolidate(args)
+        if tool_name == "qdrant_memory_memory_pr":
+            return self._tool_memory_pr(args)
         if tool_name == "qdrant_memory_consolidation_apply":
             return self._tool_consolidation_apply(args)
         if tool_name == "qdrant_learning_store":

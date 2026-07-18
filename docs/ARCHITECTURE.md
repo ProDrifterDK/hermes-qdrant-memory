@@ -26,6 +26,7 @@ It is intentionally not a context engine. Context engines such as LCM recover de
 - `qdrant_memory/writer.py` — completed-turn storage.
 - `qdrant_memory/indexer.py` — Markdown/text file indexing.
 - `qdrant_memory/tools.py` — Hermes tool schemas.
+- `qdrant_memory/memory_pr.py` — pure Memory PR packet builder, static HTML renderer, private artifact writer, and offline fixture CLI.
 - `qdrant_memory/scoring.py` — retrieval scoring helpers.
 
 ## Collections
@@ -116,6 +117,14 @@ Safety gates:
 - secret-bearing quality warnings and secret-bearing merge/promotion inputs require manual review;
 - skill promotion creates a draft artifact only and never installs a skill automatically;
 - reconsolidation candidates can only create local review drafts and must not mutate Qdrant facts.
+
+## Memory PR review packets
+
+The Build Week 2026 Memory PR extension sits strictly on the read side of the report/apply boundary. `qdrant_memory_memory_pr` loads one persisted report, selects one exact proposal, resolves its configured collection, retrieves only its explicit affected point IDs with payloads and without vectors, and requires the retrieved ID set to match exactly. It never delegates to `qdrant_memory_consolidation_apply`.
+
+New consolidation proposals carry `review_point_snapshots`: sorted point ID plus SHA-256 digest records computed from stable sanitized point content. The Memory PR builder recomputes those digests from the current exact points and labels each comparison `unchanged`, `changed`, or `unknown`. `Unknown` is conservative: it covers legacy reports without snapshots and identity- or secret-bearing content whose private text is replaced before hashing.
+
+The packet identity hashes canonical sorted JSON containing stable sanitized review content. It excludes generation time and artifact paths. HTML rendering is a pure escaped transformation over the packet. Artifact persistence occurs only when the caller supplies an output directory; the module fixture CLI is independent of the Hermes provider and all external services.
 
 ## File manifest sync
 
