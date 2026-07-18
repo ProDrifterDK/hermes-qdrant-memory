@@ -37,7 +37,7 @@ Memory PR adds:
 - current exact-point reload with strict affected-ID equality;
 - per-point and overall `unchanged`, `changed`, or conservative `unknown` drift labels;
 - bounded sanitized current evidence, provenance, and visible canonical/stale/review/fact status;
-- one bounded fail-closed identity classifier shared by current payloads, snapshots/digests, snippets, proposal narratives, status reasons, and recursively nested persisted evidence;
+- one bounded schema-first sensitivity classifier shared by current payloads, snapshots/digests, snippets, proposal narratives, status reasons, and persisted evidence;
 - a self-contained escaped HTML review artifact with restrictive CSP, no JavaScript, and no external resources;
 - private explicit artifact persistence (`0700` directory, `0600` files where supported);
 - the public read-only `qdrant_memory_memory_pr` provider tool;
@@ -65,7 +65,7 @@ The reusable module is `qdrant_memory/memory_pr.py`:
 1. Validate canonical exact report/proposal IDs.
 2. Select exactly one proposal and validate its unique affected IDs.
 3. Accept only currently reloaded exact points whose ID set equals the proposal set.
-4. Classify nested mappings/lists once through the shared bounded identity policy, including existing profile/fact markers and normalized identity-sensitive keys; suppress complete sensitive records before hashing or output.
+4. Require current payloads, persisted evidence, summaries, and status changes to match strict bounded review schemas. Unknown fields, unmodeled containers, unsupported types, and bound breaches suppress complete records before hashing or output; normalized PII aliases are defense in depth rather than the primary boundary.
 5. Require every persisted evidence item to name an exact affected point; reject unattributed/unknown IDs and replace identity-bearing records recursively as a whole.
 6. Recursively redact and bound proposal/current evidence.
 7. Recompute the versioned review-relevant point projection and compare it with compatible persisted report snapshots. Version 1 includes text/provenance/review state and excludes access/ranking bookkeeping; its version must be an integer, never a JSON boolean.
@@ -95,6 +95,7 @@ The human/product decisions remained human: the Memory PR pitch and track, the f
 - Legacy reports without Memory PR point snapshots produce `unknown` drift, never a false `unchanged` claim.
 - Reports with unversioned or unsupported review snapshot projections also produce `unknown` drift rather than comparing incompatible digests.
 - Projection version 1 intentionally ignores operational access/ranking fields. Changes to those fields alone are not review drift and do not create a new Memory PR identity.
+- Strict review schemas intentionally trade coverage for privacy: imported or future payload extensions remain review-only but are represented as sensitive, whole-record-suppressed evidence until their shape is explicitly modeled.
 - Identity- or secret-bearing content is replaced before hashing; those sensitive points report `unknown` content drift while still exposing safe state/provenance changes. This avoids publishing a stable digest that could aid guessing private text.
 - Memory PR detects persisted-point drift; it does not establish real-world truth or choose a winning fact.
 - Secret detection is conservative pattern-based defense in depth, not a universal data-loss-prevention system.

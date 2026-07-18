@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import html
 import json
+import math
 import os
 import re
 import stat
@@ -20,6 +21,7 @@ from qdrant_memory.consolidation import (
     redact_secrets,
 )
 from qdrant_memory.lesson_extractor import contains_secret
+from qdrant_memory.schema import FACT_STATUSES, MEMORY_KINDS, RELATION_TYPES
 
 SCHEMA_NAME = "hermes-qdrant-memory.memory-pr"
 SCHEMA_VERSION = 1
@@ -53,11 +55,16 @@ _PROVENANCE_KEYS = (
     "derivation_type",
     "derived_from",
 )
-_IDENTITY_PROVENANCE_VALUE_KEYS = {"source_uri", "locator", "content_hash", "derived_from"}
 _IDENTITY_SENSITIVE_KEYS = {
     "address",
+    "birth_date",
+    "birthdate",
+    "date_of_birth",
     "display_name",
+    "dob",
     "driver_license",
+    "driver_license_id",
+    "driver_license_number",
     "email",
     "email_address",
     "family_name",
@@ -72,15 +79,25 @@ _IDENTITY_SENSITIVE_KEYS = {
     "name",
     "national_id",
     "passport",
+    "passport_id",
+    "passport_identifier",
+    "passport_no",
     "passport_number",
     "phone",
     "phone_number",
     "preferred_name",
     "screen_name",
     "social_security",
+    "social_security_id",
+    "social_security_number",
     "ssn",
     "street_address",
     "tax_id",
+    "tax_identifier",
+    "tax_number",
+    "taxpayer_id",
+    "taxpayer_identifier",
+    "taxpayer_number",
     "user_name",
     "username",
 }
@@ -115,6 +132,135 @@ _REVIEW_SNAPSHOT_PAYLOAD_KEYS = (
     "deprecated_at",
     "consolidation_quarantined",
 )
+_SAFE_DERIVATION_TYPES = {
+    "completed_turn",
+    "generated_summary",
+    "indexed_chunk",
+    "ontology_suggestion",
+    "raptor_summary",
+    "recalled_point",
+    "reconsolidation",
+    "source_extraction",
+    "source_text",
+    "summarization",
+    "summary",
+}
+_SAFE_TIMESTAMP_KEYS = (
+    "source_modified_at",
+    "created_at",
+    "updated_at",
+    "observed_at",
+    "valid_from",
+    "valid_until",
+    "deprecated_at",
+)
+_REVIEW_SAFE_SCHEMAS: dict[str, dict[str, str]] = {
+    "point_payload": {
+        "text": "snapshot_text",
+        "lesson": "snapshot_text",
+        "source": "text",
+        "source_type": "token",
+        "source_uri": "uri",
+        "file_path": "text",
+        "project_path": "text",
+        "locator": "locator",
+        "content_hash": "text",
+        "source_modified_at": "timestamp",
+        "created_at": "timestamp",
+        "updated_at": "timestamp",
+        "observed_at": "timestamp",
+        "valid_from": "timestamp",
+        "valid_until": "timestamp",
+        "last_accessed": "timestamp",
+        "derivation_type": "derivation_type",
+        "derived_from": "derived_from",
+        "memory_kind": "memory_kind",
+        "fact_key": "text",
+        "reconsolidation_key": "text",
+        "subject": "text",
+        "topic": "text",
+        "entity": "text",
+        "canonical": "bool",
+        "stale": "bool",
+        "requires_review": "bool",
+        "fact_status": "fact_status",
+        "superseded_by": "id_list",
+        "supersedes": "id_list",
+        "invalidated_by": "id_list",
+        "deprecated_at": "timestamp",
+        "consolidation_quarantined": "bool",
+        "chunk_type": "token",
+        "importance": "importance",
+        "confidence": "confidence",
+        "access_count": "nonnegative_int",
+        "decay_score": "number",
+        "final_score": "number",
+        "vector_score": "number",
+        "rank": "nonnegative_int",
+        "ranking_debug": "ranking_debug",
+        "tags": "string_list",
+        "profile_id": "token",
+        "platform": "token",
+        "user_id_hash": "token",
+        "chat_id_hash": "token",
+        "session_id": "token",
+        "model": "text",
+        "provider": "token",
+        "target": "token",
+        "memory_target": "token",
+    },
+    "evidence": {
+        "id": "exact_id",
+        "snippet": "snippet_text",
+        "text": "snippet_text",
+        "lesson": "snippet_text",
+        "source_type": "token",
+        "source_uri": "uri",
+        "locator": "locator",
+        "content_hash": "text",
+        "source_modified_at": "timestamp",
+        "created_at": "timestamp",
+        "observed_at": "timestamp",
+        "valid_from": "timestamp",
+        "valid_until": "timestamp",
+        "derivation_type": "derivation_type",
+        "derived_from": "derived_from",
+        "fact_status": "fact_status",
+    },
+    "status_change": {
+        "id": "exact_id",
+        "from": "fact_status",
+        "to": "fact_status",
+        "reason": "text",
+        "superseded_by": "id_list",
+    },
+    "locator": {
+        "line_start": "nonnegative_int",
+        "line_end": "nonnegative_int",
+        "heading": "text",
+    },
+    "derivation_edge": {
+        "source_uri": "uri",
+        "source_type": "token",
+        "locator": "locator",
+        "content_hash": "text",
+        "source_modified_at": "timestamp",
+        "derivation_type": "derivation_type",
+        "relation_type": "relation_type",
+        "child_node_id": "exact_id",
+        "point_id": "exact_id",
+        "source_point_id": "exact_id",
+        "derived_from": "derived_from",
+    },
+    "ranking_debug": {
+        "final_score": "number",
+        "vector_score": "number",
+        "rank": "nonnegative_int",
+        "dense_score": "number",
+        "sparse_score": "number",
+        "graph_score": "number",
+    },
+}
 
 
 class MemoryPRValidationError(ValueError):
@@ -198,28 +344,160 @@ def _is_identity_sensitive_key(value: Any) -> bool:
         return True
     if "name" in tokens and tokens & {"display", "family", "first", "full", "given", "last", "legal", "middle", "preferred"}:
         return True
-    return bool(tokens & {"national", "passport", "tax"} and tokens & {"id", "identifier", "number"})
+    if tokens & {"national", "passport", "tax", "taxpayer"} and tokens & {"id", "identifier", "no", "number"}:
+        return True
+    if {"social", "security"} <= tokens and tokens & {"id", "number"}:
+        return True
+    if {"driver", "license"} <= tokens and tokens & {"id", "number"}:
+        return True
+    return bool(normalized in {"birth_date", "birthdate", "date_of_birth", "dob"})
 
 
-def is_identity_bearing_review_value(value: Any, *, _depth: int = 0) -> bool:
-    """Classify nested review data with bounded, fail-closed traversal."""
-    if isinstance(value, Mapping):
-        if _depth >= MAX_NESTING_DEPTH or len(value) > MAX_CONTAINER_ITEMS:
-            return True
-        materialized = dict(value)
-        if identity_bearing_payload(materialized):
-            return True
-        for key, item in materialized.items():
-            if _is_identity_sensitive_key(key):
-                return True
-            if is_identity_bearing_review_value(item, _depth=_depth + 1):
-                return True
+def _is_review_safe_timestamp(value: Any) -> bool:
+    if type(value) is not str or not value or len(value) > 80 or value != value.strip():
         return False
-    if isinstance(value, (list, tuple)):
-        if _depth >= MAX_NESTING_DEPTH or len(value) > MAX_CONTAINER_ITEMS:
+    candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
+def _is_review_safe_uri(value: Any) -> bool:
+    return (
+        type(value) is str
+        and 0 < len(value) <= MAX_FIELD_CHARS
+        and value == value.strip()
+        and re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*://\S+", value) is not None
+    )
+
+
+def _is_review_safe_text(value: Any, *, max_chars: int = MAX_FIELD_CHARS) -> bool:
+    return type(value) is str and len(value) <= max_chars
+
+
+def _is_review_safe_token(value: Any) -> bool:
+    return (
+        type(value) is str
+        and len(value) <= 256
+        and (not value or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}", value) is not None)
+    )
+
+
+def _is_review_safe_id(value: Any) -> bool:
+    return type(value) is str and _ID_RE.fullmatch(value) is not None
+
+
+def _is_review_safe_field(value: Any, field_type: str, *, depth: int) -> bool:
+    if field_type == "bool":
+        return type(value) is bool
+    if field_type == "nonnegative_int":
+        return type(value) is int and value >= 0
+    if field_type == "importance":
+        return type(value) is int and 1 <= value <= 10
+    if field_type == "number":
+        return type(value) in {int, float} and math.isfinite(value)
+    if field_type == "confidence":
+        return type(value) in {int, float} and math.isfinite(value) and 0 <= value <= 1
+    if field_type == "text":
+        return _is_review_safe_text(value)
+    if field_type == "snippet_text":
+        return _is_review_safe_text(value, max_chars=MAX_SNIPPET_CHARS)
+    if field_type == "snapshot_text":
+        return _is_review_safe_text(value, max_chars=MAX_SNAPSHOT_STRING_CHARS)
+    if field_type == "token":
+        return _is_review_safe_token(value)
+    if field_type == "uri":
+        return _is_review_safe_uri(value)
+    if field_type == "timestamp":
+        return _is_review_safe_timestamp(value)
+    if field_type == "exact_id":
+        return _is_review_safe_id(value)
+    if field_type == "fact_status":
+        return type(value) is str and value in FACT_STATUSES
+    if field_type == "memory_kind":
+        return type(value) is str and value in MEMORY_KINDS
+    if field_type == "derivation_type":
+        return type(value) is str and value in _SAFE_DERIVATION_TYPES
+    if field_type == "relation_type":
+        return type(value) is str and value in RELATION_TYPES
+    if field_type == "string_list":
+        return (
+            isinstance(value, list)
+            and len(value) <= MAX_CONTAINER_ITEMS
+            and all(_is_review_safe_text(item, max_chars=160) for item in value)
+        )
+    if field_type == "id_list":
+        return (
+            isinstance(value, list)
+            and len(value) <= MAX_CONTAINER_ITEMS
+            and all(_is_review_safe_id(item) for item in value)
+        )
+    if field_type == "derived_from":
+        if not isinstance(value, list) or depth >= MAX_NESTING_DEPTH or len(value) > MAX_CONTAINER_ITEMS:
+            return False
+        for item in value:
+            if isinstance(item, Mapping):
+                if is_identity_bearing_review_value(item, record_kind="derivation_edge", _depth=depth + 1):
+                    return False
+            elif not (_is_review_safe_uri(item) or _is_review_safe_id(item)):
+                return False
+        return True
+    nested_kind = {"locator": "locator", "ranking_debug": "ranking_debug"}.get(field_type)
+    return bool(
+        nested_kind
+        and isinstance(value, Mapping)
+        and not is_identity_bearing_review_value(value, record_kind=nested_kind, _depth=depth + 1)
+    )
+
+
+def is_identity_bearing_review_value(
+    value: Any,
+    *,
+    record_kind: str = "point_payload",
+    _depth: int = 0,
+) -> bool:
+    """Classify any value outside a bounded review-safe schema as sensitive."""
+    if record_kind == "summary":
+        return not _is_review_safe_text(value, max_chars=MAX_SUMMARY_CHARS)
+    schema = _REVIEW_SAFE_SCHEMAS.get(record_kind)
+    if schema is None or not isinstance(value, Mapping) or _depth >= MAX_NESTING_DEPTH or len(value) > MAX_CONTAINER_ITEMS:
+        return True
+    materialized = dict(value)
+    if identity_bearing_payload(materialized):
+        return True
+    for key, item in materialized.items():
+        if type(key) is not str or _is_identity_sensitive_key(key):
             return True
-        return any(is_identity_bearing_review_value(item, _depth=_depth + 1) for item in value)
+        field_type = schema.get(key)
+        if field_type is None or not _is_review_safe_field(item, field_type, depth=_depth):
+            return True
     return False
+
+
+def _validated_sensitive_state(payload: Mapping[str, Any]) -> dict[str, Any]:
+    state: dict[str, Any] = {"requires_review": True}
+    for key in ("canonical", "stale", "consolidation_quarantined"):
+        value = payload.get(key)
+        if type(value) is bool:
+            state[key] = value
+    fact_status = payload.get("fact_status")
+    if type(fact_status) is str and fact_status in FACT_STATUSES:
+        state["fact_status"] = fact_status
+    return state
+
+
+def _validated_sensitive_provenance(payload: Mapping[str, Any]) -> dict[str, Any]:
+    provenance: dict[str, Any] = {}
+    for key in _SAFE_TIMESTAMP_KEYS:
+        value = payload.get(key)
+        if _is_review_safe_timestamp(value):
+            provenance[key] = value
+    derivation_type = payload.get("derivation_type")
+    if type(derivation_type) is str and derivation_type in _SAFE_DERIVATION_TYPES:
+        provenance["derivation_type"] = derivation_type
+    return provenance
 
 
 def _point_id(point: Any) -> str:
@@ -257,13 +535,8 @@ def _snapshot_projection(point: Any) -> dict[str, Any]:
     payload = _point_payload(point)
     if is_identity_bearing_review_value(payload):
         safe_text: Any = IDENTITY_REDACTED_SNIPPET
-        safe_payload: Any = {
-            "identity_bearing": True,
-            "canonical": bool(payload.get("canonical", False)),
-            "stale": bool(payload.get("stale", False)),
-            "requires_review": True,
-            "fact_status": sanitize_for_review(payload.get("fact_status") or "active", max_string_chars=80),
-        }
+        safe_payload: Any = {"identity_bearing": True, **_validated_sensitive_state(payload)}
+        safe_provenance: Any = _validated_sensitive_provenance(payload)
     else:
         safe_text = sanitize_for_review(_point_text(point), max_string_chars=MAX_SNAPSHOT_STRING_CHARS)
         review_payload = {
@@ -272,11 +545,15 @@ def _snapshot_projection(point: Any) -> dict[str, Any]:
             if key in payload and payload[key] not in (None, "", [], {})
         }
         safe_payload = sanitize_for_review(review_payload, max_string_chars=MAX_SNAPSHOT_STRING_CHARS)
-    return {
+        safe_provenance = None
+    projection = {
         "projection": _snapshot_projection_descriptor(),
         "text": safe_text,
         "payload": safe_payload,
     }
+    if safe_provenance:
+        projection["provenance"] = safe_provenance
+    return projection
 
 
 def stable_point_snapshot_digest(point: Any) -> str:
@@ -431,15 +708,14 @@ def _fact_status(payload: Mapping[str, Any]) -> str:
 
 
 def _point_provenance(payload: Mapping[str, Any], *, identity_bearing: bool) -> dict[str, Any]:
+    if identity_bearing:
+        return _validated_sensitive_provenance(payload)
     result: dict[str, Any] = {}
     for key in _PROVENANCE_KEYS:
         value = payload.get(key)
         if value in (None, "", [], {}):
             continue
-        if identity_bearing and key in _IDENTITY_PROVENANCE_VALUE_KEYS:
-            result[key] = IDENTITY_REDACTED_SNIPPET
-        else:
-            result[key] = sanitize_for_review(value, max_string_chars=MAX_FIELD_CHARS)
+        result[key] = sanitize_for_review(value, max_string_chars=MAX_FIELD_CHARS)
     if "source_type" not in result:
         result["source_type"] = "unknown"
     return result
@@ -479,12 +755,16 @@ def _evidence_for_point(point: Any, report_snapshot: Mapping[str, Any] | None) -
         "snapshot_scope": "redacted_sensitive_state" if identity_bearing or secret_bearing else "sanitized_point",
         "snapshot_projection": _snapshot_projection_descriptor(),
         "provenance": _point_provenance(payload, identity_bearing=identity_bearing),
-        "state": {
-            "canonical": bool(payload.get("canonical", False)),
-            "stale": bool(payload.get("stale", False)),
-            "requires_review": bool(payload.get("requires_review", False) or identity_bearing),
-            "fact_status": _fact_status(payload),
-        },
+        "state": (
+            _validated_sensitive_state(payload)
+            if identity_bearing
+            else {
+                "canonical": bool(payload.get("canonical", False)),
+                "stale": bool(payload.get("stale", False)),
+                "requires_review": bool(payload.get("requires_review", False)),
+                "fact_status": _fact_status(payload),
+            }
+        ),
         "snapshot_digest": current_digest,
         "report_snapshot_digest": report_digest,
         "report_snapshot_projection": report_projection,
@@ -518,7 +798,7 @@ def _identity_safe_status_changes(changes: Any, identity_ids: set[str], affected
         return safe
     result: list[Any] = []
     for raw_item, item in zip(raw_changes, safe):
-        item_identity_bearing = is_identity_bearing_review_value(raw_item)
+        item_identity_bearing = is_identity_bearing_review_value(raw_item, record_kind="status_change")
         if not isinstance(item, Mapping) or not isinstance(raw_item, Mapping):
             if identity_ids or item_identity_bearing:
                 raise MemoryPRValidationError("invalid proposed status change for identity-bearing proposal")
@@ -539,7 +819,14 @@ def _identity_safe_status_changes(changes: Any, identity_ids: set[str], affected
         if point_id not in identity_ids and not item_identity_bearing:
             result.append(item)
             continue
-        preserved = {key: value for key, value in item.items() if key in {"id", "from", "to", "superseded_by"}}
+        preserved: dict[str, Any] = {"id": point_id}
+        for key in ("from", "to"):
+            value = item.get(key)
+            if type(value) is str and value in FACT_STATUSES:
+                preserved[key] = value
+        superseded_by = item.get("superseded_by")
+        if _is_review_safe_field(superseded_by, "id_list", depth=0):
+            preserved["superseded_by"] = superseded_by
         preserved["reason"] = IDENTITY_REDACTED_SNIPPET
         result.append(preserved)
     return result
@@ -565,7 +852,9 @@ def _identity_safe_persisted_evidence(
             raise MemoryPRValidationError("persisted evidence entry requires an exact affected point ID") from exc
         if point_id not in affected_ids:
             raise MemoryPRValidationError("persisted evidence point ID is not affected by this proposal")
-        identity_bearing = point_id in identity_ids or is_identity_bearing_review_value(raw_item)
+        identity_bearing = point_id in identity_ids or is_identity_bearing_review_value(
+            raw_item, record_kind="evidence"
+        )
         if identity_bearing:
             evidence_identity_ids.add(point_id)
             result.append(
@@ -662,7 +951,7 @@ def build_memory_pr(
         set(affected_ids),
     )
     all_identity_ids = identity_ids | evidence_identity_ids
-    summary_identity_bearing = is_identity_bearing_review_value(_summary_value(proposal))
+    summary_identity_bearing = is_identity_bearing_review_value(_summary_value(proposal), record_kind="summary")
     drift_values = {item["drift_status"] for item in evidence}
     drift_status = "changed" if "changed" in drift_values else ("unknown" if "unknown" in drift_values else "unchanged")
     proposal_type = _bounded_text(proposal.get("proposal_type") or "unknown", max_chars=120)

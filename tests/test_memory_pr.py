@@ -11,6 +11,7 @@ import pytest
 from qdrant_memory.memory_pr import (
     IDENTITY_REDACTED_SNIPPET,
     MemoryPRValidationError,
+    _is_identity_sensitive_key,
     _snapshot_projection,
     build_memory_pr,
     generate_fixture_artifacts,
@@ -276,7 +277,7 @@ def test_nested_secrets_and_bearer_like_values_are_redacted_everywhere():
     assert bearer not in rendered
     assert bearer not in html
     assert "redacted" in rendered.lower()
-    assert "secret-bearing key" in rendered.lower()
+    assert secret_evidence["identity_bearing"] is True
     assert secret_evidence["secret_bearing"] is True
     assert secret_evidence["drift_status"] == "unknown"
 
@@ -441,6 +442,24 @@ def test_identity_classifier_bounds_fail_closed_before_persisted_evidence_output
             "evidence": IDENTITY_REDACTED_SNIPPET,
         }
     ]
+
+
+@pytest.mark.parametrize(
+    "identity_key",
+    [
+        "socialSecurityNumber",
+        "social_security_id",
+        "dateOfBirth",
+        "birthDate",
+        "birthdate",
+        "dob",
+        "driverLicenseNumber",
+        "passportNo",
+        "taxpayerId",
+    ],
+)
+def test_normalized_identity_alias_vocabulary_covers_reported_legacy_families(identity_key):
+    assert _is_identity_sensitive_key(identity_key) is True
 
 
 def test_html_escapes_hostile_values_and_has_no_external_resources():
@@ -741,6 +760,210 @@ def test_live_provider_suppresses_nested_current_and_persisted_identity_before_h
     assert provider._qdrant.payload_update_calls == []
     assert provider._qdrant.delete_ids_calls == []
     assert provider._qdrant.delete_filter_calls == []
+
+
+@pytest.mark.parametrize(
+    ("case_name", "current_extension", "evidence_extension", "identity_values"),
+    [
+        (
+            "ssn-dob-aliases",
+            {
+                "metadata": {
+                    "records": [
+                        {"socialSecurityNumber": "SSN-IDENTITY-SENTINEL-9042"},
+                        {"dateOfBirth": "DOB-IDENTITY-SENTINEL-1970"},
+                    ]
+                }
+            },
+            {
+                "metadata": {
+                    "records": [
+                        {"birthDate": "DOB-IDENTITY-SENTINEL-1970"},
+                        {"taxpayerId": "SSN-IDENTITY-SENTINEL-9042"},
+                    ]
+                }
+            },
+            ["SSN-IDENTITY-SENTINEL-9042", "DOB-IDENTITY-SENTINEL-1970"],
+        ),
+        (
+            "unknown-nested-shape",
+            {
+                "reviewExtension": {
+                    "records": [{"opaqueBiographicalClaim": "UNKNOWN-IDENTITY-SENTINEL-731"}]
+                }
+            },
+            {
+                "legacyEnvelope": {
+                    "claims": [{"unlistedPersonalAttribute": "UNKNOWN-IDENTITY-SENTINEL-731"}]
+                }
+            },
+            ["UNKNOWN-IDENTITY-SENTINEL-731"],
+        ),
+    ],
+)
+def test_live_provider_structurally_suppresses_alias_and_unknown_nested_shapes(
+    tmp_path, case_name, current_extension, evidence_extension, identity_values
+):
+    report, proposal, points = _report_and_points()
+    points[0]["payload"].update(current_extension)
+    points[0]["payload"]["text"] = f"{case_name}: {' '.join(identity_values)}"
+    proposal["candidate_statement"] = f"Review {' '.join(identity_values)}"
+    proposal["proposed_status_changes"][0]["reason"] = f"Reason {' '.join(identity_values)}"
+    proposal["source_snippets"] = [{"id": "runtime-old", **evidence_extension}]
+    for snapshot in proposal["review_point_snapshots"]:
+        point = next(item for item in points if item["id"] == snapshot["id"])
+        snapshot["snapshot_digest"] = stable_point_snapshot_digest(point)
+    report["profile_id"] = "architect"
+    persisted_report = persist_consolidation_report(report, hermes_home=str(tmp_path))
+    provider = _provider(tmp_path, points)
+    output_dir = tmp_path / f"structural-{case_name}"
+
+    projection = _snapshot_projection(points[0])
+    response_text = provider.handle_tool_call(
+        "qdrant_memory_memory_pr",
+        {
+            "report_id": persisted_report["report_id"],
+            "proposal_id": proposal["proposal_id"],
+            "output_dir": str(output_dir),
+        },
+    )
+    result = json.loads(response_text)
+    packet = result["packet"]
+    evidence = next(item for item in packet["current_evidence"] if item["id"] == "runtime-old")
+    written_json = Path(result["artifact"]["json_path"]).read_text(encoding="utf-8")
+    written_html = Path(result["artifact"]["html_path"]).read_text(encoding="utf-8")
+    outputs = [response_text, written_json, written_html, json.dumps(projection, sort_keys=True)]
+
+    assert evidence["identity_bearing"] is True
+    assert evidence["snippet"] == IDENTITY_REDACTED_SNIPPET
+    assert evidence["snapshot_scope"] == "redacted_sensitive_state"
+    assert evidence["drift_status"] == "unknown"
+    assert packet["drift_status"] == "unknown"
+    assert projection["text"] == IDENTITY_REDACTED_SNIPPET
+    assert packet["persisted_evidence"] == [
+        {
+            "id": "runtime-old",
+            "identity_bearing": True,
+            "evidence": IDENTITY_REDACTED_SNIPPET,
+        }
+    ]
+    assert "Identity-bearing proposal summary suppressed" in packet["proposal_summary"]
+    assert packet["proposed_status_changes"][0]["reason"] == IDENTITY_REDACTED_SNIPPET
+    for identity_value in identity_values:
+        assert all(identity_value not in output for output in outputs)
+    assert provider._qdrant.retrieve_calls == [("memory", ["runtime-new", "runtime-old"], True, False)]
+    assert provider._qdrant.upsert_calls == []
+    assert provider._qdrant.payload_update_calls == []
+    assert provider._qdrant.delete_ids_calls == []
+    assert provider._qdrant.delete_filter_calls == []
+
+
+def test_live_provider_sensitive_state_and_provenance_preserve_only_validated_values(tmp_path):
+    report, proposal, points = _report_and_points()
+    invalid_values = [
+        "FREEFORM-STATE-SENTINEL",
+        "FREEFORM-TIMESTAMP-SENTINEL",
+        "FREEFORM-DERIVATION-SENTINEL",
+    ]
+    points[0]["payload"].update(
+        {
+            "metadata": {"records": [{"dob": "DOB-STATE-SENTINEL"}]},
+            "canonical": "false",
+            "stale": 1,
+            "requires_review": "yes",
+            "fact_status": invalid_values[0],
+            "observed_at": invalid_values[1],
+            "derivation_type": invalid_values[2],
+            "created_at": "2026-01-10T00:00:00Z",
+        }
+    )
+    for snapshot in proposal["review_point_snapshots"]:
+        point = next(item for item in points if item["id"] == snapshot["id"])
+        snapshot["snapshot_digest"] = stable_point_snapshot_digest(point)
+    report["profile_id"] = "architect"
+    persisted_report = persist_consolidation_report(report, hermes_home=str(tmp_path))
+    provider = _provider(tmp_path, points)
+
+    projection = _snapshot_projection(points[0])
+    response_text = provider.handle_tool_call(
+        "qdrant_memory_memory_pr",
+        {"report_id": persisted_report["report_id"], "proposal_id": proposal["proposal_id"]},
+    )
+    packet = json.loads(response_text)["packet"]
+    evidence = next(item for item in packet["current_evidence"] if item["id"] == "runtime-old")
+    rendered = json.dumps({"packet": packet, "projection": projection}, sort_keys=True)
+
+    assert projection["payload"] == {"identity_bearing": True, "requires_review": True}
+    assert projection["provenance"] == {"created_at": "2026-01-10T00:00:00Z"}
+    assert evidence["state"] == {"requires_review": True}
+    assert evidence["provenance"] == {"created_at": "2026-01-10T00:00:00Z"}
+    assert evidence["drift_status"] == "unknown"
+    assert "DOB-STATE-SENTINEL" not in rendered
+    for invalid_value in invalid_values:
+        assert invalid_value not in rendered
+
+
+def test_live_provider_safe_control_schema_remains_informative_and_comparable(tmp_path):
+    report, proposal, points = _report_and_points()
+    points[0]["payload"].update(
+        {
+            "source": "fixture-release-notes",
+            "chunk_type": "fact",
+            "importance": 7,
+            "confidence": 0.91,
+            "access_count": 4,
+            "last_accessed": "2026-07-18T00:00:00Z",
+            "decay_score": 0.8,
+            "tags": ["atlas", "runtime"],
+            "locator": {"line_start": 4, "line_end": 8, "heading": "Runtime support"},
+            "derived_from": [
+                {
+                    "source_uri": "fixture://atlas/releases/2026-01",
+                    "source_type": "release_note",
+                    "content_hash": "fixture-atlas-source",
+                    "source_modified_at": "2026-01-10T00:00:00Z",
+                    "derivation_type": "indexed_chunk",
+                    "relation_type": "DERIVED_FROM",
+                    "locator": {"line_start": 4},
+                }
+            ],
+        }
+    )
+    proposal["source_snippets"] = [
+        {
+            "id": "runtime-old",
+            "snippet": "The Atlas worker uses runtime v1.",
+            "source_type": "release_note",
+            "fact_status": "active",
+            "observed_at": "2026-01-10T00:00:00Z",
+        }
+    ]
+    for snapshot in proposal["review_point_snapshots"]:
+        point = next(item for item in points if item["id"] == snapshot["id"])
+        snapshot["snapshot_digest"] = stable_point_snapshot_digest(point)
+    report["profile_id"] = "architect"
+    persisted_report = persist_consolidation_report(report, hermes_home=str(tmp_path))
+    provider = _provider(tmp_path, points)
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_memory_pr",
+            {"report_id": persisted_report["report_id"], "proposal_id": proposal["proposal_id"]},
+        )
+    )
+    packet = result["packet"]
+    evidence = next(item for item in packet["current_evidence"] if item["id"] == "runtime-old")
+    projection = _snapshot_projection(points[0])
+
+    assert evidence["identity_bearing"] is False
+    assert evidence["snippet"] == "The Atlas worker uses runtime v1."
+    assert evidence["drift_status"] == "unchanged"
+    assert packet["drift_status"] == "unchanged"
+    assert evidence["provenance"]["observed_at"] == "2026-01-10T00:00:00Z"
+    assert evidence["provenance"]["derived_from"][0]["relation_type"] == "DERIVED_FROM"
+    assert projection["text"] == "The Atlas worker uses runtime v1."
+    assert projection["payload"]["locator"]["heading"] == "Runtime support"
+    assert packet["persisted_evidence"][0]["snippet"] == "The Atlas worker uses runtime v1."
 
 
 def test_live_provider_rejects_proposal_collection_outside_configured_allowlist(tmp_path):
