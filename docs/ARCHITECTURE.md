@@ -26,6 +26,7 @@ It is intentionally not a context engine. Context engines such as LCM recover de
 - `qdrant_memory/writer.py` — completed-turn storage.
 - `qdrant_memory/indexer.py` — Markdown/text file indexing.
 - `qdrant_memory/tools.py` — Hermes tool schemas.
+- `qdrant_memory/memory_pr.py` — pure Memory PR packet builder, static HTML renderer, private artifact writer, and offline fixture CLI.
 - `qdrant_memory/scoring.py` — retrieval scoring helpers.
 
 ## Collections
@@ -116,6 +117,18 @@ Safety gates:
 - secret-bearing quality warnings and secret-bearing merge/promotion inputs require manual review;
 - skill promotion creates a draft artifact only and never installs a skill automatically;
 - reconsolidation candidates can only create local review drafts and must not mutate Qdrant facts.
+
+## Memory PR review packets
+
+The Build Week 2026 Memory PR extension sits strictly on the read side of the report/apply boundary. `qdrant_memory_memory_pr` loads one persisted report, selects one exact proposal, requires its collection name to exactly equal the provider's configured memory or learning collection, retrieves only its explicit affected point IDs with payloads and without vectors, and requires the retrieved ID set to match exactly. It never delegates to `qdrant_memory_consolidation_apply`.
+
+New consolidation proposals carry `review_point_snapshots`: sorted point ID, projection descriptor, and SHA-256 digest records computed from stable sanitized point content. Projection `memory-pr-review-point` version 1 is a whitelist of memory text, provenance, fact identity, canonical/stale/review state, validity, and supersession fields. It intentionally excludes operational access/ranking bookkeeping such as `access_count`, `last_accessed`, `decay_score`, and ranking debug data. The builder recomputes those digests from the current exact points and labels each comparison `unchanged`, `changed`, or `unknown`. `Unknown` is conservative: it covers missing/unversioned snapshots, unsupported projection versions, and identity- or secret-bearing content whose private text is replaced before hashing.
+
+Persisted proposal evidence uses its own versioned schema. Every evidence record must carry an exact affected point ID. Missing, malformed, or unknown IDs fail closed. One bounded recursive classifier handles current payloads, persisted evidence, summaries, and status changes against strict record-specific allowlists. Standard scalar memory/provenance/review fields and explicitly modeled locator, derivation-edge, exact-ID link, tag, and ranking-bookkeeping shapes remain review-safe. Any unknown key, unsupported type, unmodeled mapping/list, or depth/item-bound breach classifies the whole record as sensitive; privacy does not depend on enumerating every possible PII alias. A narrow normalized alias vocabulary for profile/fact markers, contact/name fields, SSN/DOB/driver-license, and passport/tax identifiers remains defense in depth. Sensitive point snapshots and evidence records are replaced before hashing or rendering, and drift is conservatively `unknown`.
+
+For a sensitive point, the only retained state is exact boolean review state plus an exact fact-status enum; invalid/free-form state is omitted. Provenance is limited to timezone-bearing ISO timestamps and an explicit derivation-type vocabulary. Source URIs, locators, hashes, source types, derived edges, and invalid provenance values are not rendered or hashed for sensitive records.
+
+The packet identity hashes canonical sorted JSON containing stable sanitized review content. It excludes generation time and artifact paths. HTML rendering is a pure escaped transformation over the packet. Report reads resolve paths without creating or chmodding directories. Artifact persistence occurs only when the caller supplies an output directory; new output directories are created private, while pre-existing directories must already be current-user-owned mode `0700`. The module fixture CLI is independent of the Hermes provider and all external services.
 
 ## File manifest sync
 

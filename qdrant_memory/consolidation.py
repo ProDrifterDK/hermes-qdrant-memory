@@ -300,8 +300,18 @@ def redact_secrets(value: Any) -> Any:
     return value
 
 
+def artifact_root_path(hermes_home: str, configured_dir: str = "") -> Path:
+    """Resolve the consolidation artifact root without touching the filesystem."""
+    return (
+        Path(configured_dir).expanduser()
+        if configured_dir
+        else Path(hermes_home or str(Path.home() / ".hermes")) / "qdrant_memory" / "consolidation"
+    )
+
+
 def artifact_root(hermes_home: str, configured_dir: str = "") -> Path:
-    root = Path(configured_dir).expanduser() if configured_dir else Path(hermes_home or str(Path.home() / ".hermes")) / "qdrant_memory" / "consolidation"
+    """Create and privatize the consolidation artifact root for write paths."""
+    root = artifact_root_path(hermes_home, configured_dir)
     root.mkdir(parents=True, exist_ok=True)
     try:
         root.chmod(0o700)
@@ -343,7 +353,7 @@ def load_consolidation_report(report_id: str, *, hermes_home: str, configured_di
     safe_id = "".join(ch for ch in str(report_id) if ch.isalnum() or ch in {"-", "_"})
     if not safe_id or safe_id != str(report_id):
         raise ValueError("invalid report_id")
-    path = artifact_root(hermes_home, configured_dir) / f"report-{safe_id}.json"
+    path = artifact_root_path(hermes_home, configured_dir) / f"report-{safe_id}.json"
     if not path.exists():
         raise FileNotFoundError(f"consolidation report not found: {safe_id}")
     data = json.loads(path.read_text(encoding="utf-8"))

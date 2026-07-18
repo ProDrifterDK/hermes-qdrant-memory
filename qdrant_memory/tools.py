@@ -285,6 +285,29 @@ CONSOLIDATE_SCHEMA = {
     },
 }
 
+MEMORY_PR_SCHEMA = {
+    "name": "qdrant_memory_memory_pr",
+    "description": (
+        "Generate one read-only Memory PR packet from an exact persisted report_id and proposal_id. "
+        "Reloads only the proposal's exact current point IDs and never mutates Qdrant, memory payloads, or sources. "
+        "Artifacts are written only when output_dir is explicitly supplied."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "report_id": {"type": "string", "description": "Exact persisted consolidation report ID."},
+            "proposal_id": {"type": "string", "description": "Exact proposal ID inside the persisted report."},
+            "output_dir": {
+                "type": "string",
+                "description": "Optional explicit local directory for private JSON and HTML artifacts.",
+            },
+            "overwrite": {"type": "boolean", "description": "Explicitly replace existing Memory PR artifacts. Defaults false."},
+        },
+        "required": ["report_id", "proposal_id"],
+        "additionalProperties": False,
+    },
+}
+
 CONSOLIDATION_APPLY_SCHEMA = {
     "name": "qdrant_memory_consolidation_apply",
     "description": "Preview or apply one persisted consolidation proposal by report_id and proposal_id. Dry-run defaults to true; live actions require approve=true.",
@@ -589,6 +612,7 @@ TOOL_SCHEMAS = [
     SOURCE_EXTRACTION_PREVIEW_SCHEMA,
     SOURCE_EXTRACTION_APPROVE_SCHEMA,
     CONSOLIDATE_SCHEMA,
+    MEMORY_PR_SCHEMA,
     CONSOLIDATION_APPLY_SCHEMA,
     GRAPH_SEARCH_SCHEMA,
     IMPROVE_PREVIEW_SCHEMA,

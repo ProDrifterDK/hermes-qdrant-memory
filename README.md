@@ -60,6 +60,7 @@ Public beta / experimental. Current published release: `v0.9.0 Public Beta`. The
 | Ontology suggestions | Implemented as review/draft artifacts only; no self-modifying ontology |
 | Sleep consolidation | M11 guarded-auto watcher policy implemented: report persistence plus preauthorized low-risk apply for heading noise, exact duplicate merges, stale quarantine, and learning-to-skill drafts |
 | Reconsolidation | M10 + fact-conflict proposals create local review drafts; no automatic fact rewrites |
+| Memory PR | Build Week 2026 extension: deterministic read-only JSON + self-contained HTML review packets from exact persisted report/proposal IDs, with current-point reload and drift detection |
 | Native Hermes CLI beta | Implemented for active memory provider (`hermes qdrant ...`) with human-readable defaults, stable `--json`, CLI parity, recovery commands, read-only inspection helpers, filtered search ergonomics, and watcher lifecycle management |
 | Backup/export/restore recovery | Implemented with private local artifacts, dry-run restore default, live approval gate, and automatic pre-restore backup |
 | CLI inspection/ergonomics | Implemented for exact point lookup, persisted report listing/showing, proposal inspection, and read-only search filters without widening mutation authority |
@@ -607,6 +608,23 @@ Behavior:
 - `--preview-duplicates` runs a semantic search scoped to the configured memory collection/profile/source type. If a candidate meets `manual_store_duplicate_threshold`, the live path returns the duplicate details and skips the upsert.
 - Duplicate preview is an explicit operator aid; it does not delete, merge, or rewrite existing memories.
 
+## Memory PR (OpenAI Build Week 2026)
+
+Memory PR makes one persistent-memory proposal reviewable before any separate apply decision. Given an exact persisted `report_id` and `proposal_id`, it reloads only the proposal's current exact points from the configured memory or learning collection, validates the affected-ID set, labels review-relevant drift, recursively redacts secret and identity-bearing content, and produces a versioned deterministic JSON packet plus a self-contained HTML review artifact. Classification is schema-first: only bounded, explicitly modeled point/evidence fields and nested provenance shapes are review-safe; any unknown key, unsupported type, unmodeled mapping/list, or traversal-bound breach suppresses the whole record before snippets, summaries, status reasons, rendering, or hashing. A narrow normalized identity-alias vocabulary remains defense in depth. Its versioned point projection excludes operational access/ranking bookkeeping such as `access_count`, `last_accessed`, and `decay_score`, so ordinary retrieval does not create false drift or a new Memory PR identity.
+
+The offline judge path needs only Python and this checkout—no Hermes, Qdrant, embeddings, network, Obsidian, or third-party package:
+
+```bash
+python3 -m qdrant_memory.memory_pr fixture --output-dir /tmp/hermes-memory-pr-demo --overwrite
+python3 -m qdrant_memory.memory_pr verify-fixture
+```
+
+Open the generated `memory-pr-*.html` file in `/tmp/hermes-memory-pr-demo` to inspect the review experience. The fixture uses only synthetic Atlas build-worker facts and contains no private user memory or paths.
+
+Live Hermes integrations use the explicitly read-only `qdrant_memory_memory_pr` tool documented below. It writes no artifact unless `output_dir` is supplied and never calls the consolidation apply path. Native `hermes qdrant` integration is intentionally not included.
+
+See [docs/BUILD_WEEK_2026_MEMORY_PR.md](docs/BUILD_WEEK_2026_MEMORY_PR.md) for the frozen baseline, before/after boundary, architecture, judge walkthrough, Codex GPT-5.6 contribution statement, and known limitations.
+
 ## Tools exposed to Hermes
 
 ### `qdrant_memory_status`
@@ -730,6 +748,19 @@ Useful arguments:
 Proposal types include duplicate clusters, stale low-value memory candidates, learning promotion candidates, quality warnings such as possible secret-bearing memories, and optional reconsolidation candidates.
 
 For operational report review and watcher usage, see [docs/OPERATIONS.md](docs/OPERATIONS.md).
+
+### `qdrant_memory_memory_pr`
+
+Generates one read-only Memory PR from an exact persisted `report_id` and `proposal_id`. The tool reloads only the proposal's explicit affected point IDs with payloads and without vectors, rejects missing/additional/mismatched IDs, and returns a sanitized packet. It never searches by query, applies a proposal, or mutates Qdrant, memory payloads, sources, or user files.
+
+Useful arguments:
+
+- `report_id`: required exact persisted consolidation report ID.
+- `proposal_id`: required exact proposal ID inside that report.
+- `output_dir`: optional explicit local directory for private JSON and HTML artifacts. Omit it for a no-file preview.
+- `overwrite`: optional explicit replacement of the same deterministic artifact filenames. Defaults to false.
+
+The response always includes `read_only: true`. When `output_dir` is omitted it includes `persisted: false` and the packet only; even a missing report does not create or chmod the consolidation artifact tree. When supplied, a newly created output directory is private (`0700`) and the JSON/HTML files are private (`0600`) where supported. A pre-existing output directory is accepted only when it is already owned by the current user with mode `0700`; Memory PR never chmods an arbitrary shared directory.
 
 ### `qdrant_memory_consolidation_apply`
 
@@ -919,6 +950,7 @@ No third-party Python package is required by the plugin runtime; it uses the Pyt
 - [CHANGELOG.md](CHANGELOG.md) — release history.
 - [RELEASE_NOTES.md](RELEASE_NOTES.md) — latest public beta notes, upgrade command, smoke checks, and remaining future work.
 - [docs/SAFETY.md](docs/SAFETY.md) — canonical safety contract for indexing, deletion, consolidation, reconsolidation, cron/reporting, and scanner-safe docs/tests.
+- [docs/BUILD_WEEK_2026_MEMORY_PR.md](docs/BUILD_WEEK_2026_MEMORY_PR.md) — Memory PR baseline delta, judge quickstart, architecture, safety boundary, and explicit cuts.
 - [docs/OPERATIONS.md](docs/OPERATIONS.md) — operator runbook for status checks, smoke tests, watcher lifecycle/log/state handling, approved apply flow, post-apply verification, gateway/process restarts, and troubleshooting.
 - [docs/LCM_BOUNDARY.md](docs/LCM_BOUNDARY.md) — boundary between active-session LCM recovery and cross-session Qdrant semantic memory.
 - [docs/CLI_OUTPUT_CONTRACT.md](docs/CLI_OUTPUT_CONTRACT.md) — human/default and `--json` machine-output contract for `hermes qdrant ...`.

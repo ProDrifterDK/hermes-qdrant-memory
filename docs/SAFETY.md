@@ -231,11 +231,14 @@ Allowed local artifacts include:
 - application audit records;
 - skill draft artifacts;
 - reconsolidation markdown review drafts;
+- Memory PR JSON and self-contained HTML review artifacts written only to an explicit caller-selected directory;
 - watcher state used to suppress duplicate alerts.
 
 Local artifact persistence is not the same as a Qdrant memory mutation. Export and backup artifacts are an explicit exception to the usual redacted-report rule: they are recovery artifacts and therefore contain raw memory text and vectors. They must be written with private filesystem permissions and their CLI stdout summaries must not print raw payloads, vectors, or credentials.
 
 Qdrant mutations remain gated by dry-run-first, explicit IDs/proposal handles, and approval requirements.
+
+Memory PR is an additional read-only boundary, not an apply mechanism. It accepts exact report/proposal IDs, permits only the configured memory or learning collection, retrieves only exact affected point IDs, and fails closed on any ID-set mismatch. A strict bounded schema—not an open-ended alias list—defines review-safe point, evidence, summary, status, locator, derivation, exact-ID link, and ranking shapes. Any unknown key, unsupported type, unmodeled mapping/list, or traversal-bound breach suppresses the entire record before snippets, provenance, status, rendering, or digest construction and forces `unknown` drift. Normalized identity aliases, including SSN, DOB, driver-license, passport, and taxpayer families, are additional defense in depth. Sensitive records retain only exact booleans/fact-status enums and validated timezone-bearing timestamps/derivation types; invalid or free-form state/provenance is omitted. Persisted evidence must be attributable to exact affected IDs, and missing/unknown evidence IDs are rejected. Secret-shaped values remain recursively redacted. Its versioned drift projection excludes access/ranking bookkeeping that ordinary retrieval mutates and requires an actual integer version—JSON booleans are invalid. Its dry-run next step is descriptive data only and is never executed by packet generation. Omitting `output_dir` performs no file write or directory creation/permission change. A pre-existing output directory is never chmodded and must already be current-user-owned mode `0700`.
 
 ---
 
