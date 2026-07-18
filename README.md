@@ -610,7 +610,7 @@ Behavior:
 
 ## Memory PR (OpenAI Build Week 2026)
 
-Memory PR makes one persistent-memory proposal reviewable before any separate apply decision. Given an exact persisted `report_id` and `proposal_id`, it reloads only the proposal's current exact points, validates the affected-ID set, labels drift, recursively redacts secret and identity-bearing content, and produces a versioned deterministic JSON packet plus a self-contained HTML review artifact.
+Memory PR makes one persistent-memory proposal reviewable before any separate apply decision. Given an exact persisted `report_id` and `proposal_id`, it reloads only the proposal's current exact points, validates the affected-ID set, labels review-relevant drift, recursively redacts secret and identity-bearing content, and produces a versioned deterministic JSON packet plus a self-contained HTML review artifact. Its versioned point projection excludes operational access/ranking bookkeeping such as `access_count`, `last_accessed`, and `decay_score`, so ordinary retrieval does not create false drift or a new Memory PR identity.
 
 The offline judge path needs only Python and this checkout—no Hermes, Qdrant, embeddings, network, Obsidian, or third-party package:
 
@@ -760,7 +760,7 @@ Useful arguments:
 - `output_dir`: optional explicit local directory for private JSON and HTML artifacts. Omit it for a no-file preview.
 - `overwrite`: optional explicit replacement of the same deterministic artifact filenames. Defaults to false.
 
-The response always includes `read_only: true`. When `output_dir` is omitted it includes `persisted: false` and the packet only. When supplied, the output directory is private (`0700`) and the JSON/HTML files are private (`0600`) where supported.
+The response always includes `read_only: true`. When `output_dir` is omitted it includes `persisted: false` and the packet only; even a missing report does not create or chmod the consolidation artifact tree. When supplied, a newly created output directory is private (`0700`) and the JSON/HTML files are private (`0600`) where supported. A pre-existing output directory is accepted only when it is already owned by the current user with mode `0700`; Memory PR never chmods an arbitrary shared directory.
 
 ### `qdrant_memory_consolidation_apply`
 

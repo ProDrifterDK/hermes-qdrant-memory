@@ -238,7 +238,7 @@ Local artifact persistence is not the same as a Qdrant memory mutation. Export a
 
 Qdrant mutations remain gated by dry-run-first, explicit IDs/proposal handles, and approval requirements.
 
-Memory PR is an additional read-only boundary, not an apply mechanism. It accepts exact report/proposal IDs, retrieves only exact affected point IDs, fails closed on any ID-set mismatch, recursively redacts secret-shaped values, and suppresses snippets and proposal narrative for identity-bearing points. Its dry-run next step is descriptive data only and is never executed by packet generation. Omitting `output_dir` performs no file write.
+Memory PR is an additional read-only boundary, not an apply mechanism. It accepts exact report/proposal IDs, retrieves only exact affected point IDs, fails closed on any ID-set mismatch, recursively redacts secret-shaped values, and suppresses snippets and proposal narrative for identity-bearing points. Persisted evidence must be attributable to exact affected IDs; identity-bearing evidence is replaced recursively as a whole, and missing/unknown evidence IDs are rejected. Its versioned drift projection excludes access/ranking bookkeeping that ordinary retrieval mutates. Its dry-run next step is descriptive data only and is never executed by packet generation. Omitting `output_dir` performs no file write or directory creation/permission change. A pre-existing output directory is never chmodded and must already be current-user-owned mode `0700`.
 
 ---
 

@@ -33,11 +33,11 @@ The baseline did not provide a deterministic portable packet, report-versus-curr
 Memory PR adds:
 
 - a versioned JSON packet with deterministic `memory_pr_id` and `content_digest`;
-- digest-only point snapshots on newly generated consolidation proposals;
+- digest-only point snapshots on newly generated consolidation proposals, bound to the versioned review projection used to compute them;
 - current exact-point reload with strict affected-ID equality;
 - per-point and overall `unchanged`, `changed`, or conservative `unknown` drift labels;
 - bounded sanitized current evidence, provenance, and visible canonical/stale/review/fact status;
-- identity-safe suppression of snippets, proposal narratives, and identity-bearing status reasons;
+- identity-safe suppression of snippets, proposal narratives, status reasons, and recursively nested persisted evidence;
 - a self-contained escaped HTML review artifact with restrictive CSP, no JavaScript, and no external resources;
 - private explicit artifact persistence (`0700` directory, `0600` files where supported);
 - the public read-only `qdrant_memory_memory_pr` provider tool;
@@ -65,16 +65,17 @@ The reusable module is `qdrant_memory/memory_pr.py`:
 1. Validate canonical exact report/proposal IDs.
 2. Select exactly one proposal and validate its unique affected IDs.
 3. Accept only currently reloaded exact points whose ID set equals the proposal set.
-4. Recursively redact and bound proposal/current evidence.
-5. Recompute stable sanitized point snapshots and compare them with the persisted report snapshots.
-6. Hash canonical stable review content, excluding timestamps and paths.
-7. Return the JSON packet and optionally render/write private JSON and HTML artifacts.
+4. Require every persisted evidence item to name an exact affected point; reject unattributed/unknown IDs and replace identity-bearing records recursively as a whole.
+5. Recursively redact and bound proposal/current evidence.
+6. Recompute the versioned review-relevant point projection and compare it with compatible persisted report snapshots. Version 1 includes text/provenance/review state and excludes access/ranking bookkeeping.
+7. Hash canonical stable review content, excluding timestamps and paths.
+8. Return the JSON packet and optionally render/write private JSON and HTML artifacts.
 
-The provider handler performs only `load_consolidation_report`, exact proposal selection, and `QdrantClient.retrieve(..., with_payload=True, with_vector=False)`. The pure builder and fixture path have no Qdrant client dependency.
+The provider handler performs only a non-creating report path resolution/read, exact proposal selection, and `QdrantClient.retrieve(..., with_payload=True, with_vector=False)`. The pure builder and fixture path have no Qdrant client dependency.
 
 ## Non-mutation boundary
 
-Packet generation never calls upsert, payload update, delete, filter delete, learning approval, embedding, search, or consolidation apply. It never alters report artifacts, current memory points, sources, or user files. The only allowed write is the explicitly requested artifact pair in `output_dir`; no path is persisted inside the packet or HTML.
+Packet generation never calls upsert, payload update, delete, filter delete, learning approval, embedding, search, or consolidation apply. It never alters report artifacts, current memory points, sources, or user files. A missing report read creates no directory and changes no permissions. The only allowed write is the explicitly requested artifact pair in `output_dir`; no path is persisted inside the packet or HTML. A new output directory is mode `0700`; a pre-existing directory must already be current-user-owned mode `0700` and is never chmodded.
 
 The packet includes a reviewer checklist and serialized arguments for the existing exact-proposal dry-run gate. Those arguments are evidence for a possible next review step and are not executed.
 
@@ -91,6 +92,8 @@ The human/product decisions remained human: the Memory PR pitch and track, the f
 ## Known limitations and explicit cuts
 
 - Legacy reports without Memory PR point snapshots produce `unknown` drift, never a false `unchanged` claim.
+- Reports with unversioned or unsupported review snapshot projections also produce `unknown` drift rather than comparing incompatible digests.
+- Projection version 1 intentionally ignores operational access/ranking fields. Changes to those fields alone are not review drift and do not create a new Memory PR identity.
 - Identity- or secret-bearing content is replaced before hashing; those sensitive points report `unknown` content drift while still exposing safe state/provenance changes. This avoids publishing a stable digest that could aid guessing private text.
 - Memory PR detects persisted-point drift; it does not establish real-world truth or choose a winning fact.
 - Secret detection is conservative pattern-based defense in depth, not a universal data-loss-prevention system.

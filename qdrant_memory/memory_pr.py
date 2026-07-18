@@ -6,6 +6,7 @@ import html
 import json
 import os
 import re
+import stat
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +23,10 @@ from qdrant_memory.lesson_extractor import contains_secret
 
 SCHEMA_NAME = "hermes-qdrant-memory.memory-pr"
 SCHEMA_VERSION = 1
+REVIEW_SNAPSHOT_PROJECTION_NAME = "memory-pr-review-point"
+REVIEW_SNAPSHOT_PROJECTION_VERSION = 1
+PERSISTED_EVIDENCE_SCHEMA_NAME = "memory-pr-persisted-evidence"
+PERSISTED_EVIDENCE_SCHEMA_VERSION = 1
 MAX_ID_CHARS = 128
 MAX_AFFECTED_POINTS = 100
 MAX_SNIPPET_CHARS = 360
@@ -49,6 +54,37 @@ _PROVENANCE_KEYS = (
     "derived_from",
 )
 _IDENTITY_PROVENANCE_VALUE_KEYS = {"source_uri", "locator", "content_hash", "derived_from"}
+_REVIEW_SNAPSHOT_PAYLOAD_KEYS = (
+    "source",
+    "source_type",
+    "source_uri",
+    "file_path",
+    "project_path",
+    "locator",
+    "content_hash",
+    "source_modified_at",
+    "created_at",
+    "updated_at",
+    "observed_at",
+    "valid_from",
+    "valid_until",
+    "derivation_type",
+    "derived_from",
+    "memory_kind",
+    "fact_key",
+    "reconsolidation_key",
+    "subject",
+    "topic",
+    "entity",
+    "canonical",
+    "stale",
+    "requires_review",
+    "fact_status",
+    "superseded_by",
+    "supersedes",
+    "deprecated_at",
+    "consolidation_quarantined",
+)
 
 
 class MemoryPRValidationError(ValueError):
@@ -142,6 +178,13 @@ def _point_collection(point: Any) -> str:
     return str(getattr(point, "collection_name", "") or "")
 
 
+def _snapshot_projection_descriptor() -> dict[str, Any]:
+    return {
+        "name": REVIEW_SNAPSHOT_PROJECTION_NAME,
+        "version": REVIEW_SNAPSHOT_PROJECTION_VERSION,
+    }
+
+
 def _snapshot_projection(point: Any) -> dict[str, Any]:
     payload = _point_payload(point)
     if identity_bearing_payload(payload):
@@ -156,8 +199,17 @@ def _snapshot_projection(point: Any) -> dict[str, Any]:
         }
     else:
         safe_text = sanitize_for_review(_point_text(point), max_string_chars=MAX_SNAPSHOT_STRING_CHARS)
-        safe_payload = sanitize_for_review(payload, max_string_chars=MAX_SNAPSHOT_STRING_CHARS)
-    return {"text": safe_text, "payload": safe_payload}
+        review_payload = {
+            key: payload[key]
+            for key in _REVIEW_SNAPSHOT_PAYLOAD_KEYS
+            if key in payload and payload[key] not in (None, "", [], {})
+        }
+        safe_payload = sanitize_for_review(review_payload, max_string_chars=MAX_SNAPSHOT_STRING_CHARS)
+    return {
+        "projection": _snapshot_projection_descriptor(),
+        "text": safe_text,
+        "payload": safe_payload,
+    }
 
 
 def stable_point_snapshot_digest(point: Any) -> str:
@@ -196,16 +248,22 @@ def _point_secret_bearing(point: Any) -> bool:
     )
 
 
-def review_point_snapshots(points: Sequence[Any]) -> list[dict[str, str]]:
+def review_point_snapshots(points: Sequence[Any]) -> list[dict[str, Any]]:
     """Build the digest-only report snapshot records used for drift checks."""
-    records: list[dict[str, str]] = []
+    records: list[dict[str, Any]] = []
     seen: set[str] = set()
     for point in points:
         point_id = validate_exact_id(_point_id(point), "point_id")
         if point_id in seen:
             raise MemoryPRValidationError("duplicate current affected point ID")
         seen.add(point_id)
-        records.append({"id": point_id, "snapshot_digest": stable_point_snapshot_digest(point)})
+        records.append(
+            {
+                "id": point_id,
+                "projection": _snapshot_projection_descriptor(),
+                "snapshot_digest": stable_point_snapshot_digest(point),
+            }
+        )
     return sorted(records, key=lambda item: item["id"])
 
 
@@ -261,13 +319,14 @@ def _affected_ids(proposal: Mapping[str, Any]) -> list[str]:
     return sorted(ids)
 
 
-def _report_snapshot_map(proposal: Mapping[str, Any], affected_ids: Sequence[str]) -> dict[str, str]:
+def _report_snapshot_map(proposal: Mapping[str, Any], affected_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
     raw = proposal.get("review_point_snapshots")
     if raw in (None, []):
         return {}
     if not isinstance(raw, list):
         raise MemoryPRValidationError("invalid report review point snapshots")
-    result: dict[str, str] = {}
+    result: dict[str, dict[str, Any]] = {}
+    projection_presence: set[bool] = set()
     for item in raw:
         if not isinstance(item, Mapping):
             raise MemoryPRValidationError("invalid report review point snapshot")
@@ -277,7 +336,21 @@ def _report_snapshot_map(proposal: Mapping[str, Any], affected_ids: Sequence[str
             raise MemoryPRValidationError("invalid report review point snapshot digest")
         if point_id in result:
             raise MemoryPRValidationError("duplicate report review point snapshot ID")
-        result[point_id] = digest
+        projection = item.get("projection")
+        projection_presence.add(projection is not None)
+        if projection is None:
+            safe_projection = None
+        else:
+            if not isinstance(projection, Mapping):
+                raise MemoryPRValidationError("invalid report review point snapshot projection")
+            name = projection.get("name")
+            version = projection.get("version")
+            if name != REVIEW_SNAPSHOT_PROJECTION_NAME or not isinstance(version, int) or version < 1:
+                raise MemoryPRValidationError("invalid report review point snapshot projection")
+            safe_projection = {"name": name, "version": version}
+        result[point_id] = {"snapshot_digest": digest, "projection": safe_projection}
+    if len(projection_presence) > 1:
+        raise MemoryPRValidationError("mixed legacy and versioned report review point snapshots")
     if set(result) != set(affected_ids):
         raise MemoryPRValidationError("report snapshot affected point IDs do not match proposal affected point IDs")
     return result
@@ -305,15 +378,22 @@ def _point_provenance(payload: Mapping[str, Any], *, identity_bearing: bool) -> 
     return result
 
 
-def _evidence_for_point(point: Any, report_digest: str | None) -> dict[str, Any]:
+def _evidence_for_point(point: Any, report_snapshot: Mapping[str, Any] | None) -> dict[str, Any]:
     point_id = validate_exact_id(_point_id(point), "point_id")
     payload = _point_payload(point)
     identity_bearing = identity_bearing_payload(payload)
     secret_bearing = _point_secret_bearing(point)
     current_digest = stable_point_snapshot_digest(point)
+    report_digest = str(report_snapshot.get("snapshot_digest") or "") if report_snapshot else None
+    report_projection = report_snapshot.get("projection") if report_snapshot else None
+    comparable_projection = (
+        isinstance(report_projection, Mapping)
+        and report_projection.get("name") == REVIEW_SNAPSHOT_PROJECTION_NAME
+        and report_projection.get("version") == REVIEW_SNAPSHOT_PROJECTION_VERSION
+    )
     drift_status = (
         "unknown"
-        if report_digest is None or identity_bearing or secret_bearing
+        if report_digest is None or not comparable_projection or identity_bearing or secret_bearing
         else ("unchanged" if report_digest == current_digest else "changed")
     )
     snippet = (
@@ -329,6 +409,7 @@ def _evidence_for_point(point: Any, report_digest: str | None) -> dict[str, Any]
         "identity_bearing": identity_bearing,
         "secret_bearing": secret_bearing,
         "snapshot_scope": "redacted_sensitive_state" if identity_bearing or secret_bearing else "sanitized_point",
+        "snapshot_projection": _snapshot_projection_descriptor(),
         "provenance": _point_provenance(payload, identity_bearing=identity_bearing),
         "state": {
             "canonical": bool(payload.get("canonical", False)),
@@ -338,6 +419,7 @@ def _evidence_for_point(point: Any, report_digest: str | None) -> dict[str, Any]
         },
         "snapshot_digest": current_digest,
         "report_snapshot_digest": report_digest,
+        "report_snapshot_projection": report_projection,
         "drift_status": drift_status,
     }
 
@@ -354,13 +436,21 @@ def _summary_text(proposal: Mapping[str, Any]) -> str:
     return "Review the current exact point evidence against the persisted proposal."
 
 
-def _identity_safe_status_changes(changes: Any, identity_ids: set[str]) -> Any:
+def _identity_safe_status_changes(changes: Any, identity_ids: set[str], affected_ids: set[str]) -> Any:
     safe = sanitize_for_review(changes or [], max_string_chars=MAX_FIELD_CHARS)
     if not identity_ids or not isinstance(safe, list):
         return safe
     result: list[Any] = []
     for item in safe:
-        if not isinstance(item, Mapping) or str(item.get("id") or "") not in identity_ids:
+        if not isinstance(item, Mapping):
+            raise MemoryPRValidationError("invalid proposed status change for identity-bearing proposal")
+        try:
+            point_id = validate_exact_id(item.get("id"), "proposed status change point ID")
+        except MemoryPRValidationError as exc:
+            raise MemoryPRValidationError("identity-bearing proposed status change requires an exact point ID") from exc
+        if point_id not in affected_ids:
+            raise MemoryPRValidationError("proposed status change point ID is not affected by this proposal")
+        if point_id not in identity_ids:
             result.append(item)
             continue
         preserved = {key: value for key, value in item.items() if key in {"id", "from", "to", "superseded_by"}}
@@ -369,21 +459,54 @@ def _identity_safe_status_changes(changes: Any, identity_ids: set[str]) -> Any:
     return result
 
 
-def _identity_safe_persisted_evidence(value: Any, identity_ids: set[str]) -> Any:
-    safe = sanitize_for_review(value or [], max_string_chars=MAX_SNIPPET_CHARS)
-    if not identity_ids or not isinstance(safe, list):
-        return safe
+def _contains_identity_metadata(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        if identity_bearing_payload(dict(value)):
+            return True
+        return any(_contains_identity_metadata(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_identity_metadata(item) for item in value)
+    return False
+
+
+def _identity_safe_persisted_evidence(
+    value: Any,
+    identity_ids: set[str],
+    affected_ids: set[str],
+) -> tuple[list[Any], set[str]]:
+    if value in (None, []):
+        return [], set()
+    if not isinstance(value, list):
+        raise MemoryPRValidationError("persisted evidence must be a bounded list of exact-ID records")
     result: list[Any] = []
-    for item in safe:
-        if not isinstance(item, Mapping) or str(item.get("id") or "") not in identity_ids:
-            result.append(item)
+    evidence_identity_ids: set[str] = set()
+    for raw_item in value[:MAX_CONTAINER_ITEMS]:
+        if not isinstance(raw_item, Mapping):
+            raise MemoryPRValidationError("persisted evidence entries must be objects with exact affected point IDs")
+        try:
+            point_id = validate_exact_id(raw_item.get("id"), "persisted evidence point ID")
+        except MemoryPRValidationError as exc:
+            raise MemoryPRValidationError("persisted evidence entry requires an exact affected point ID") from exc
+        if point_id not in affected_ids:
+            raise MemoryPRValidationError("persisted evidence point ID is not affected by this proposal")
+        identity_bearing = point_id in identity_ids or _contains_identity_metadata(raw_item)
+        if identity_bearing:
+            evidence_identity_ids.add(point_id)
+            result.append(
+                {
+                    "id": point_id,
+                    "identity_bearing": True,
+                    "evidence": IDENTITY_REDACTED_SNIPPET,
+                }
+            )
             continue
-        redacted = dict(item)
-        for key in ("text", "snippet", "lesson", "source_uri", "locator", "derived_from"):
-            if key in redacted:
-                redacted[key] = IDENTITY_REDACTED_SNIPPET
-        result.append(redacted)
-    return result
+        safe_item = sanitize_for_review(raw_item, max_string_chars=MAX_SNIPPET_CHARS)
+        if not isinstance(safe_item, Mapping) or safe_item.get("id") != point_id:
+            raise MemoryPRValidationError("persisted evidence entry changed during sanitization")
+        result.append(dict(safe_item))
+    if len(value) > MAX_CONTAINER_ITEMS:
+        raise MemoryPRValidationError("persisted evidence exceeds the review item limit")
+    return result, evidence_identity_ids
 
 
 def _dry_run_next_step(report_id: str, proposal_id: str, expected_action: str | None) -> dict[str, Any]:
@@ -454,6 +577,15 @@ def build_memory_pr(
         _evidence_for_point(points_by_id[point_id], report_snapshots.get(point_id)) for point_id in affected_ids
     ]
     identity_ids = {item["id"] for item in evidence if item.get("identity_bearing")}
+    persisted_evidence_raw = (
+        proposal.get("source_snippets") if "source_snippets" in proposal else proposal.get("examples")
+    )
+    persisted_evidence, evidence_identity_ids = _identity_safe_persisted_evidence(
+        persisted_evidence_raw,
+        identity_ids,
+        set(affected_ids),
+    )
+    all_identity_ids = identity_ids | evidence_identity_ids
     drift_values = {item["drift_status"] for item in evidence}
     drift_status = "changed" if "changed" in drift_values else ("unknown" if "unknown" in drift_values else "unchanged")
     proposal_type = _bounded_text(proposal.get("proposal_type") or "unknown", max_chars=120)
@@ -476,13 +608,17 @@ def build_memory_pr(
         "affected_point_ids": affected_ids,
         "proposal_summary": (
             "Identity-bearing proposal summary suppressed; review exact status and provenance fields only."
-            if identity_ids
+            if all_identity_ids
             else _summary_text(proposal)
         ),
-        "proposed_status_changes": _identity_safe_status_changes(proposal.get("proposed_status_changes"), identity_ids),
-        "persisted_evidence": _identity_safe_persisted_evidence(
-            proposal.get("source_snippets") or proposal.get("examples"), identity_ids
+        "proposed_status_changes": _identity_safe_status_changes(
+            proposal.get("proposed_status_changes"), all_identity_ids, set(affected_ids)
         ),
+        "persisted_evidence_schema": {
+            "name": PERSISTED_EVIDENCE_SCHEMA_NAME,
+            "version": PERSISTED_EVIDENCE_SCHEMA_VERSION,
+        },
+        "persisted_evidence": persisted_evidence,
         "current_evidence": evidence,
         "drift_status": drift_status,
         "write_boundary": {
@@ -709,6 +845,23 @@ def _write_private_file(path: Path, content: bytes, *, overwrite: bool) -> None:
             temporary_path.unlink()
 
 
+def _prepare_private_output_directory(root: Path) -> None:
+    try:
+        root.mkdir(parents=True, mode=0o700, exist_ok=False)
+    except FileExistsError:
+        if root.is_symlink() or not root.is_dir():
+            raise MemoryPRValidationError("pre-existing output path must be a private directory")
+        details = root.stat()
+        mode = stat.S_IMODE(details.st_mode)
+        owned_by_current_user = not hasattr(os, "geteuid") or details.st_uid == os.geteuid()
+        if mode != 0o700 or not owned_by_current_user:
+            raise MemoryPRValidationError(
+                "pre-existing output directory must already be private (owned by the current user with mode 0700)"
+            )
+        return
+    root.chmod(0o700)
+
+
 def write_memory_pr_artifacts(
     packet: Mapping[str, Any], output_dir: str | os.PathLike[str], *, overwrite: bool = False
 ) -> dict[str, Any]:
@@ -717,10 +870,7 @@ def write_memory_pr_artifacts(
     root = Path(output_dir)
     if not str(output_dir):
         raise MemoryPRValidationError("an explicit output directory is required")
-    if root.exists() and not root.is_dir():
-        raise MemoryPRValidationError("output path must be a directory")
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    root.chmod(0o700)
+    _prepare_private_output_directory(root)
     json_path = root / f"memory-pr-{memory_pr_id}.json"
     html_path = root / f"memory-pr-{memory_pr_id}.html"
     if not overwrite and (json_path.exists() or html_path.exists()):

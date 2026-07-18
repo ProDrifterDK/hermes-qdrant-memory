@@ -80,7 +80,12 @@ def _report_and_points():
             },
         ],
         "review_point_snapshots": [
-            {"id": point["id"], "snapshot_digest": stable_point_snapshot_digest(point)} for point in points
+            {
+                "id": point["id"],
+                "projection": {"name": "memory-pr-review-point", "version": 1},
+                "snapshot_digest": stable_point_snapshot_digest(point),
+            }
+            for point in points
         ],
     }
     report = {
@@ -136,6 +141,54 @@ def test_memory_pr_reports_no_drift_and_detects_changed_current_content():
     assert {item["id"] for item in changed["current_evidence"] if item["drift_status"] == "changed"} == {"runtime-old"}
 
 
+def test_review_snapshot_projection_is_versioned_and_ignores_access_bookkeeping():
+    report, proposal, points = _report_and_points()
+    before = _build(report=report, points=points)
+    accessed_points = json.loads(json.dumps(points))
+    for index, point in enumerate(accessed_points, start=1):
+        point["payload"].update(
+            {
+                "access_count": 40 + index,
+                "last_accessed": f"2026-07-18T00:00:0{index}Z",
+                "decay_score": 0.01 * index,
+                "ranking_debug": {"final_score": 0.99 - (index * 0.01)},
+            }
+        )
+
+    after = _build(report=report, points=accessed_points)
+
+    assert proposal["review_point_snapshots"][0]["projection"] == {
+        "name": "memory-pr-review-point",
+        "version": 1,
+    }
+    assert after["drift_status"] == "unchanged"
+    assert {item["drift_status"] for item in after["current_evidence"]} == {"unchanged"}
+    assert [item["snapshot_digest"] for item in before["current_evidence"]] == [
+        item["snapshot_digest"] for item in after["current_evidence"]
+    ]
+    assert before["memory_pr_id"] == after["memory_pr_id"]
+    assert before["content_digest"] == after["content_digest"]
+
+
+@pytest.mark.parametrize(
+    ("payload_change", "value"),
+    [
+        ("source_uri", "memory://fixture/revised-source"),
+        ("stale", True),
+        ("fact_status", "superseded"),
+    ],
+)
+def test_review_snapshot_projection_preserves_provenance_and_review_state(payload_change, value):
+    report, _, points = _report_and_points()
+    changed_points = json.loads(json.dumps(points))
+    changed_points[0]["payload"][payload_change] = value
+
+    packet = _build(report=report, points=changed_points)
+
+    changed = next(item for item in packet["current_evidence"] if item["id"] == "runtime-old")
+    assert changed["drift_status"] == "changed"
+
+
 def test_legacy_report_without_snapshots_labels_drift_unknown():
     report, proposal, points = _report_and_points()
     proposal.pop("review_point_snapshots")
@@ -144,6 +197,17 @@ def test_legacy_report_without_snapshots_labels_drift_unknown():
 
     assert packet["drift_status"] == "unknown"
     assert {item["drift_status"] for item in packet["current_evidence"]} == {"unknown"}
+
+
+def test_unversioned_legacy_snapshots_are_not_compared_as_current_projection():
+    report, _, points = _report_and_points()
+    for snapshot in report["proposals"][0]["review_point_snapshots"]:
+        snapshot.pop("projection")
+
+    packet = _build(report=report, points=points)
+
+    assert packet["drift_status"] == "unknown"
+    assert {item["report_snapshot_projection"] for item in packet["current_evidence"]} == {None}
 
 
 @pytest.mark.parametrize("value", ["", " report-1", "report-1 ", "../report", "a/b", "a.b", "a\\b"])
@@ -227,6 +291,66 @@ def test_identity_bearing_point_never_exposes_its_snippet():
     assert identity_text not in html
 
 
+def test_identity_persisted_evidence_is_recursively_suppressed():
+    report, proposal, points = _report_and_points()
+    identity_text = "Casey Example uses the private recovery contact."
+    points[0]["payload"].update({"source_type": "user_profile", "fact_key": "user.contact"})
+    proposal["source_snippets"] = [
+        {
+            "id": "runtime-old",
+            "source_type": "manual",
+            "metadata": {"contact": {"note": identity_text, "labels": [identity_text]}},
+        }
+    ]
+
+    packet = _build(report=report, points=points)
+    rendered = json.dumps(packet, sort_keys=True)
+
+    assert identity_text not in rendered
+    assert packet["persisted_evidence"] == [
+        {
+            "id": "runtime-old",
+            "identity_bearing": True,
+            "evidence": IDENTITY_REDACTED_SNIPPET,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "source_snippets",
+    [
+        [{"metadata": {"note": "Casey Example private contact"}}],
+        [{"id": "unknown-point", "snippet": "Casey Example private contact"}],
+    ],
+)
+def test_identity_persisted_evidence_without_exact_affected_id_fails_closed(source_snippets):
+    report, proposal, points = _report_and_points()
+    points[0]["payload"].update({"source_type": "user_profile", "fact_key": "user.contact"})
+    proposal["source_snippets"] = source_snippets
+
+    with pytest.raises(MemoryPRValidationError, match="persisted evidence"):
+        _build(report=report, points=points)
+
+
+def test_persisted_identity_metadata_is_suppressed_when_current_point_is_not_identity_bearing():
+    report, proposal, points = _report_and_points()
+    identity_text = "Casey Example private recovery contact."
+    proposal["source_snippets"] = [
+        {
+            "id": "runtime-old",
+            "metadata": {
+                "source_type": "user_profile",
+                "contact_note": identity_text,
+            },
+        }
+    ]
+
+    packet = _build(report=report, points=points)
+
+    assert identity_text not in json.dumps(packet, sort_keys=True)
+    assert packet["persisted_evidence"][0]["identity_bearing"] is True
+
+
 def test_html_escapes_hostile_values_and_has_no_external_resources():
     report, proposal, points = _report_and_points()
     hostile = "<script>alert('memory-pr')</script><img src=x onerror=alert(2)>"
@@ -272,6 +396,34 @@ def test_artifact_directory_and_files_use_restrictive_permissions(tmp_path):
     assert stat.S_IMODE(output_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE(Path(result["json_path"]).stat().st_mode) == 0o600
     assert stat.S_IMODE(Path(result["html_path"]).stat().st_mode) == 0o600
+
+
+def test_existing_shared_output_directory_is_rejected_without_chmod_or_artifacts(tmp_path):
+    packet = _build()
+    shared_dir = tmp_path / "shared-output"
+    shared_dir.mkdir(mode=0o770)
+    shared_dir.chmod(0o770)
+    before = shared_dir.stat()
+
+    with pytest.raises(MemoryPRValidationError, match="private"):
+        write_memory_pr_artifacts(packet, shared_dir)
+
+    after = shared_dir.stat()
+    assert stat.S_IMODE(after.st_mode) == 0o770
+    assert after.st_ctime_ns == before.st_ctime_ns
+    assert list(shared_dir.iterdir()) == []
+
+
+def test_existing_private_output_directory_is_accepted_without_permission_change(tmp_path):
+    packet = _build()
+    private_dir = tmp_path / "private-output"
+    private_dir.mkdir(mode=0o700)
+    private_dir.chmod(0o700)
+
+    result = write_memory_pr_artifacts(packet, private_dir)
+
+    assert stat.S_IMODE(private_dir.stat().st_mode) == 0o700
+    assert Path(result["json_path"]).is_file()
 
 
 def test_documented_fixture_module_commands_run_without_services(tmp_path):
@@ -408,6 +560,29 @@ def test_provider_memory_pr_persists_only_with_explicit_output_directory(tmp_pat
     assert provider._qdrant.delete_filter_calls == []
 
 
+def test_provider_missing_report_without_output_does_not_create_or_chmod_paths(tmp_path):
+    fresh_home = tmp_path / "fresh-hermes-home"
+    fresh_home.mkdir(mode=0o755)
+    fresh_home.chmod(0o755)
+    before = fresh_home.stat()
+    provider = _provider(fresh_home, [])
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_memory_pr",
+            {"report_id": "missing-report", "proposal_id": "missing-proposal"},
+        )
+    )
+
+    after = fresh_home.stat()
+    assert "error" in result
+    assert "not found" in result["error"]
+    assert not (fresh_home / "qdrant_memory").exists()
+    assert stat.S_IMODE(after.st_mode) == stat.S_IMODE(before.st_mode) == 0o755
+    assert after.st_mtime_ns == before.st_mtime_ns
+    assert after.st_ctime_ns == before.st_ctime_ns
+
+
 def test_consolidation_report_snapshots_cover_every_proposal_affected_id(tmp_path):
     _, _, points = _report_and_points()
     provider = _provider(tmp_path, points)
@@ -422,3 +597,4 @@ def test_consolidation_report_snapshots_cover_every_proposal_affected_id(tmp_pat
 
     assert {item["id"] for item in proposal["review_point_snapshots"]} == set(proposal["affected_ids"])
     assert all(len(item["snapshot_digest"]) == 64 for item in proposal["review_point_snapshots"])
+    assert {item["projection"]["version"] for item in proposal["review_point_snapshots"]} == {1}
