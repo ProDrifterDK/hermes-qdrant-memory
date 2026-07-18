@@ -55,7 +55,7 @@ Missing, additional, duplicate, or mismatched points cause an error; the builder
 
 For ordinary points, the same versioned stable sanitized snapshot projection is hashed during report persistence and Memory PR generation. Equal digests produce `unchanged`; unequal digests produce `changed`; absent, unversioned, or unsupported projections produce `unknown`. Identity- or secret-bearing point content is replaced before hashing and receives conservative `unknown` content drift so the artifact does not publish a guessable digest of private text. The packet also carries an overall drift status.
 
-Persisted proposal evidence has a separate versioned schema. Each item must be an object with an exact ID in the proposal's affected set. Missing or unknown IDs fail closed. Records attributed to current identity-bearing points, or containing identity-bearing metadata at any nesting level, are replaced entirely with the identity-redaction sentinel.
+Persisted proposal evidence has a separate versioned schema. Each item must be an object with an exact ID in the proposal's affected set. Missing or unknown IDs fail closed. A single bounded recursive classifier is shared by current point payloads, persisted evidence, snapshot/digest construction, snippets, summaries, and status changes. It recognizes existing nested profile/fact markers plus normalized identity-sensitive keys for email, phone, address, usernames/handles, identity names, and national/passport/tax identifiers. Records with any sensitive nested part—or structures exceeding the classifier's review bounds—are replaced entirely with the identity-redaction sentinel before hashing or output, with drift forced to `unknown`.
 
 ## HTML artifact
 
@@ -65,7 +65,7 @@ The document uses semantic landmarks, a skip link, ordered heading levels, lists
 
 ## Artifact and provider behavior
 
-Without an output directory, the provider tool resolves and reads the report without creating or chmodding any directory, returns the packet as a read-only preview, and reports that no artifact was persisted. With an explicit output directory, it writes deterministic filenames based on `memory_pr_id`. New directories use mode `0700` and files mode `0600` where the platform supports them. A pre-existing directory is accepted only if it is already owned by the current user with mode `0700`; it is never chmodded. Existing files are not replaced unless the caller explicitly opts into overwrite.
+Without an output directory, the provider tool resolves and reads the report without creating or chmodding any directory, requires the proposal collection to exactly match the configured memory or learning collection, returns the packet as a read-only preview, and reports that no artifact was persisted. With an explicit output directory, it writes deterministic filenames based on `memory_pr_id`. New directories use mode `0700` and files mode `0600` where the platform supports them. A pre-existing directory is accepted only if it is already owned by the current user with mode `0700`; it is never chmodded. Existing files are not replaced unless the caller explicitly opts into overwrite.
 
 The offline CLI command is:
 
@@ -81,7 +81,7 @@ Pure functions raise a dedicated validation error with safe, bounded messages. T
 
 ## Testing
 
-Focused tests cover deterministic identity and digest, access-bookkeeping stability, versioned snapshot projection, exact/malformed IDs, changed and unchanged drift, legacy unknown drift, affected-ID mismatch, nested secret redaction, bearer-like values, recursive identity evidence suppression, missing/unknown evidence IDs, identity metadata drift, HTML injection, absence of external resources, private permissions, shared-directory rejection without chmod, non-creating missing-report reads, fixture generation and verification, and zero mutation calls on provider and fixture paths.
+Focused tests cover deterministic identity and digest, access-bookkeeping stability, exact integer snapshot versions, exact/malformed IDs, changed and unchanged drift, legacy unknown drift, affected-ID mismatch, nested secret redaction, bearer-like values, bounded recursive identity suppression across current payloads/evidence/summaries/status changes, missing/unknown evidence IDs, live-provider JSON/HTML/pre-hash projection privacy, configured-collection rejection, HTML injection, absence of external resources, private permissions, shared-directory rejection without chmod, non-creating missing-report reads, fixture generation and verification, and zero mutation calls on provider and fixture paths.
 
 Existing consolidation, reconsolidation, proposal, provider tool, and CLI tests provide regression evidence that report/apply and guarded-auto contracts remain intact. Verification also includes the full repository suite under a disposable `HERMES_HOME`, compilation, fake-secret scanning, whitespace checks, fixture generation from a clean output directory, and explicit inspection for private paths, secrets, and external assets.
 

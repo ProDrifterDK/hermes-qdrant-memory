@@ -37,7 +37,7 @@ Memory PR adds:
 - current exact-point reload with strict affected-ID equality;
 - per-point and overall `unchanged`, `changed`, or conservative `unknown` drift labels;
 - bounded sanitized current evidence, provenance, and visible canonical/stale/review/fact status;
-- identity-safe suppression of snippets, proposal narratives, status reasons, and recursively nested persisted evidence;
+- one bounded fail-closed identity classifier shared by current payloads, snapshots/digests, snippets, proposal narratives, status reasons, and recursively nested persisted evidence;
 - a self-contained escaped HTML review artifact with restrictive CSP, no JavaScript, and no external resources;
 - private explicit artifact persistence (`0700` directory, `0600` files where supported);
 - the public read-only `qdrant_memory_memory_pr` provider tool;
@@ -65,13 +65,14 @@ The reusable module is `qdrant_memory/memory_pr.py`:
 1. Validate canonical exact report/proposal IDs.
 2. Select exactly one proposal and validate its unique affected IDs.
 3. Accept only currently reloaded exact points whose ID set equals the proposal set.
-4. Require every persisted evidence item to name an exact affected point; reject unattributed/unknown IDs and replace identity-bearing records recursively as a whole.
-5. Recursively redact and bound proposal/current evidence.
-6. Recompute the versioned review-relevant point projection and compare it with compatible persisted report snapshots. Version 1 includes text/provenance/review state and excludes access/ranking bookkeeping.
-7. Hash canonical stable review content, excluding timestamps and paths.
-8. Return the JSON packet and optionally render/write private JSON and HTML artifacts.
+4. Classify nested mappings/lists once through the shared bounded identity policy, including existing profile/fact markers and normalized identity-sensitive keys; suppress complete sensitive records before hashing or output.
+5. Require every persisted evidence item to name an exact affected point; reject unattributed/unknown IDs and replace identity-bearing records recursively as a whole.
+6. Recursively redact and bound proposal/current evidence.
+7. Recompute the versioned review-relevant point projection and compare it with compatible persisted report snapshots. Version 1 includes text/provenance/review state and excludes access/ranking bookkeeping; its version must be an integer, never a JSON boolean.
+8. Hash canonical stable review content, excluding timestamps and paths.
+9. Return the JSON packet and optionally render/write private JSON and HTML artifacts.
 
-The provider handler performs only a non-creating report path resolution/read, exact proposal selection, and `QdrantClient.retrieve(..., with_payload=True, with_vector=False)`. The pure builder and fixture path have no Qdrant client dependency.
+The provider handler performs only a non-creating report path resolution/read, exact proposal selection, strict configured memory/learning collection validation, and `QdrantClient.retrieve(..., with_payload=True, with_vector=False)`. The pure builder and fixture path have no Qdrant client dependency.
 
 ## Non-mutation boundary
 

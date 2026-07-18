@@ -1563,6 +1563,18 @@ class QdrantMemoryProvider(MemoryProvider):
         raw = self._qdrant.retrieve(collection_name, ids, with_payload=True, with_vector=False)
         return points_from_qdrant(raw, collection_name=collection_name)
 
+    def _memory_pr_collection_for_proposal(self, proposal: dict[str, Any]) -> str:
+        collection_name = validate_exact_id(proposal.get("collection_name"), "collection_name")
+        allowed = {
+            str(self._config.get("collection_name") or ""),
+            str(self._config.get("learning_collection_name") or ""),
+        }
+        if collection_name not in allowed:
+            raise MemoryPRValidationError(
+                "proposal collection must exactly match the configured memory or learning collection"
+            )
+        return collection_name
+
     def _tool_memory_pr(self, args: dict[str, Any]) -> str:
         """Build one exact, current-state Memory PR without any Qdrant mutation."""
         try:
@@ -1585,7 +1597,7 @@ class QdrantMemoryProvider(MemoryProvider):
             if len(affected_ids) != len(set(affected_ids)):
                 raise MemoryPRValidationError("proposal contains duplicate affected point IDs")
             affected_ids = sorted(affected_ids)
-            collection_name = validate_exact_id(self._collection_for_proposal(proposal), "collection_name")
+            collection_name = self._memory_pr_collection_for_proposal(proposal)
             points = self._retrieve_consolidation_points(collection_name, affected_ids)
             packet = build_memory_pr(
                 report=report,

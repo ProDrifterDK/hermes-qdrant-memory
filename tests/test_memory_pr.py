@@ -11,6 +11,7 @@ import pytest
 from qdrant_memory.memory_pr import (
     IDENTITY_REDACTED_SNIPPET,
     MemoryPRValidationError,
+    _snapshot_projection,
     build_memory_pr,
     generate_fixture_artifacts,
     render_memory_pr_html,
@@ -210,6 +211,15 @@ def test_unversioned_legacy_snapshots_are_not_compared_as_current_projection():
     assert {item["report_snapshot_projection"] for item in packet["current_evidence"]} == {None}
 
 
+def test_boolean_snapshot_projection_version_is_rejected_not_compared_as_v1():
+    report, _, points = _report_and_points()
+    for snapshot in report["proposals"][0]["review_point_snapshots"]:
+        snapshot["projection"]["version"] = True
+
+    with pytest.raises(MemoryPRValidationError, match="projection"):
+        _build(report=report, points=points)
+
+
 @pytest.mark.parametrize("value", ["", " report-1", "report-1 ", "../report", "a/b", "a.b", "a\\b"])
 def test_exact_id_validation_rejects_malformed_or_path_like_values(value):
     with pytest.raises(MemoryPRValidationError):
@@ -349,6 +359,88 @@ def test_persisted_identity_metadata_is_suppressed_when_current_point_is_not_ide
 
     assert identity_text not in json.dumps(packet, sort_keys=True)
     assert packet["persisted_evidence"][0]["identity_bearing"] is True
+
+
+@pytest.mark.parametrize(
+    "identity_metadata",
+    [
+        {"email": "casey@example.invalid"},
+        {"phone": "+1 555 010 0199"},
+        {"address": "19 Synthetic Avenue"},
+        {"username": "casey-fixture"},
+        {"handle": "casey-fixture"},
+        {"legalName": "Casey Fixture"},
+        {"preferred_name": "Casey Fixture"},
+        {"full-name": "Casey Fixture"},
+        {"nationalId": "fixture-national-id"},
+        {"passport_number": "fixture-passport-id"},
+        {"tax-id": "fixture-tax-id"},
+        {"contactEmail": "casey@example.invalid"},
+        {"mobile_phone": "+1 555 010 0199"},
+        {"homeAddress": "19 Synthetic Avenue"},
+        {"passportId": "fixture-passport-id"},
+    ],
+)
+def test_nested_identity_sensitive_evidence_keys_suppress_the_entire_record(identity_metadata):
+    report, proposal, points = _report_and_points()
+    proposal["source_snippets"] = [
+        {
+            "id": "runtime-old",
+            "metadata": {"records": [identity_metadata]},
+        }
+    ]
+
+    packet = _build(report=report, points=points)
+
+    assert packet["persisted_evidence"] == [
+        {
+            "id": "runtime-old",
+            "identity_bearing": True,
+            "evidence": IDENTITY_REDACTED_SNIPPET,
+        }
+    ]
+
+
+def test_nested_identity_in_summary_and_status_change_is_suppressed_with_safe_current_points():
+    report, proposal, points = _report_and_points()
+    summary_identity = "casey@example.invalid"
+    status_identity = "+1 555 010 0199"
+    proposal["candidate_statement"] = {"metadata": {"contactEmail": summary_identity}}
+    proposal["proposed_status_changes"][0].update(
+        {
+            "reason": "review requested",
+            "metadata": {"contacts": [{"mobilePhone": status_identity}]},
+        }
+    )
+
+    packet = _build(report=report, points=points)
+    rendered = json.dumps(packet, sort_keys=True)
+
+    assert "Identity-bearing proposal summary suppressed" in packet["proposal_summary"]
+    assert packet["proposed_status_changes"][0]["reason"] == IDENTITY_REDACTED_SNIPPET
+    assert summary_identity not in rendered
+    assert status_identity not in rendered
+
+
+def test_identity_classifier_bounds_fail_closed_before_persisted_evidence_output():
+    report, proposal, points = _report_and_points()
+    over_limit = [{"note": f"bounded-{index}"} for index in range(101)]
+    proposal["source_snippets"] = [
+        {
+            "id": "runtime-old",
+            "metadata": {"records": over_limit},
+        }
+    ]
+
+    packet = _build(report=report, points=points)
+
+    assert packet["persisted_evidence"] == [
+        {
+            "id": "runtime-old",
+            "identity_bearing": True,
+            "evidence": IDENTITY_REDACTED_SNIPPET,
+        }
+    ]
 
 
 def test_html_escapes_hostile_values_and_has_no_external_resources():
@@ -558,6 +650,116 @@ def test_provider_memory_pr_persists_only_with_explicit_output_directory(tmp_pat
     assert provider._qdrant.payload_update_calls == []
     assert provider._qdrant.delete_ids_calls == []
     assert provider._qdrant.delete_filter_calls == []
+
+
+def test_live_provider_suppresses_nested_current_and_persisted_identity_before_hash_and_output(tmp_path):
+    report, proposal, points = _report_and_points()
+    identity_values = [
+        "casey@example.invalid",
+        "+1 555 010 0199",
+        "19 Synthetic Avenue",
+        "Casey Fixture",
+    ]
+    points[0]["payload"].update(
+        {
+            "text": f"Contact {identity_values[0]} for the private runtime account.",
+            "metadata": {
+                "classifiers": [
+                    {"source_type": "user_profile"},
+                    {"fact_key": "user.email"},
+                ]
+            },
+        }
+    )
+    proposal["candidate_statement"] = f"Review the runtime preference for {identity_values[3]}."
+    proposal["proposed_status_changes"][0]["reason"] = f"Requested by {identity_values[0]}."
+    proposal["source_snippets"] = [
+        {
+            "id": "runtime-old",
+            "metadata": {
+                "contacts": [
+                    {"email": identity_values[0]},
+                    {"phone": identity_values[1]},
+                    {"address": identity_values[2]},
+                    {"preferredName": identity_values[3]},
+                ]
+            },
+        }
+    ]
+    for snapshot in proposal["review_point_snapshots"]:
+        point = next(item for item in points if item["id"] == snapshot["id"])
+        snapshot["snapshot_digest"] = stable_point_snapshot_digest(point)
+    report["profile_id"] = "architect"
+    persisted_report = persist_consolidation_report(report, hermes_home=str(tmp_path))
+    provider = _provider(tmp_path, points)
+    output_dir = tmp_path / "nested-identity-output"
+
+    projection = _snapshot_projection(points[0])
+    response_text = provider.handle_tool_call(
+        "qdrant_memory_memory_pr",
+        {
+            "report_id": persisted_report["report_id"],
+            "proposal_id": proposal["proposal_id"],
+            "output_dir": str(output_dir),
+        },
+    )
+    result = json.loads(response_text)
+    packet = result["packet"]
+    evidence = next(item for item in packet["current_evidence"] if item["id"] == "runtime-old")
+    written_json = Path(result["artifact"]["json_path"]).read_text(encoding="utf-8")
+    written_html = Path(result["artifact"]["html_path"]).read_text(encoding="utf-8")
+    all_outputs = [response_text, written_json, written_html, json.dumps(projection, sort_keys=True)]
+
+    assert result["read_only"] is True
+    assert result["persisted"] is True
+    assert evidence["identity_bearing"] is True
+    assert evidence["snippet"] == IDENTITY_REDACTED_SNIPPET
+    assert evidence["snapshot_scope"] == "redacted_sensitive_state"
+    assert evidence["drift_status"] == "unknown"
+    assert packet["drift_status"] == "unknown"
+    assert projection["text"] == IDENTITY_REDACTED_SNIPPET
+    assert projection["payload"] == {
+        "identity_bearing": True,
+        "canonical": False,
+        "stale": False,
+        "requires_review": True,
+        "fact_status": "active",
+    }
+    assert packet["persisted_evidence"] == [
+        {
+            "id": "runtime-old",
+            "identity_bearing": True,
+            "evidence": IDENTITY_REDACTED_SNIPPET,
+        }
+    ]
+    assert "Identity-bearing proposal summary suppressed" in packet["proposal_summary"]
+    assert packet["proposed_status_changes"][0]["reason"] == IDENTITY_REDACTED_SNIPPET
+    for identity_value in identity_values:
+        assert all(identity_value not in output for output in all_outputs)
+    assert provider._qdrant.retrieve_calls == [("memory", ["runtime-new", "runtime-old"], True, False)]
+    assert provider._qdrant.upsert_calls == []
+    assert provider._qdrant.payload_update_calls == []
+    assert provider._qdrant.delete_ids_calls == []
+    assert provider._qdrant.delete_filter_calls == []
+
+
+def test_live_provider_rejects_proposal_collection_outside_configured_allowlist(tmp_path):
+    report, proposal, points = _report_and_points()
+    report["profile_id"] = "architect"
+    proposal["collection_name"] = "restored_archive"
+    persisted_report = persist_consolidation_report(report, hermes_home=str(tmp_path))
+    provider = _provider(tmp_path, points)
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_memory_pr",
+            {"report_id": persisted_report["report_id"], "proposal_id": proposal["proposal_id"]},
+        )
+    )
+
+    assert "error" in result
+    assert "configured memory or learning collection" in result["error"]
+    assert provider._qdrant.retrieve_calls == []
 
 
 def test_provider_missing_report_without_output_does_not_create_or_chmod_paths(tmp_path):

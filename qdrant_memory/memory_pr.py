@@ -54,6 +54,36 @@ _PROVENANCE_KEYS = (
     "derived_from",
 )
 _IDENTITY_PROVENANCE_VALUE_KEYS = {"source_uri", "locator", "content_hash", "derived_from"}
+_IDENTITY_SENSITIVE_KEYS = {
+    "address",
+    "display_name",
+    "driver_license",
+    "email",
+    "email_address",
+    "family_name",
+    "first_name",
+    "full_name",
+    "given_name",
+    "handle",
+    "last_name",
+    "legal_name",
+    "mailing_address",
+    "middle_name",
+    "name",
+    "national_id",
+    "passport",
+    "passport_number",
+    "phone",
+    "phone_number",
+    "preferred_name",
+    "screen_name",
+    "social_security",
+    "ssn",
+    "street_address",
+    "tax_id",
+    "user_name",
+    "username",
+}
 _REVIEW_SNAPSHOT_PAYLOAD_KEYS = (
     "source",
     "source_type",
@@ -154,6 +184,44 @@ def sanitize_for_review(value: Any, *, max_string_chars: int = MAX_FIELD_CHARS) 
     return _bound_sanitized(redact_secrets(value), max_string_chars=max_string_chars)
 
 
+def _normalized_identity_key(value: Any) -> str:
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", str(value))
+    return re.sub(r"[^a-z0-9]+", "_", text.casefold()).strip("_")
+
+
+def _is_identity_sensitive_key(value: Any) -> bool:
+    normalized = _normalized_identity_key(value)
+    if normalized in _IDENTITY_SENSITIVE_KEYS:
+        return True
+    tokens = set(normalized.split("_"))
+    if tokens & {"address", "email", "handle", "phone", "username"}:
+        return True
+    if "name" in tokens and tokens & {"display", "family", "first", "full", "given", "last", "legal", "middle", "preferred"}:
+        return True
+    return bool(tokens & {"national", "passport", "tax"} and tokens & {"id", "identifier", "number"})
+
+
+def is_identity_bearing_review_value(value: Any, *, _depth: int = 0) -> bool:
+    """Classify nested review data with bounded, fail-closed traversal."""
+    if isinstance(value, Mapping):
+        if _depth >= MAX_NESTING_DEPTH or len(value) > MAX_CONTAINER_ITEMS:
+            return True
+        materialized = dict(value)
+        if identity_bearing_payload(materialized):
+            return True
+        for key, item in materialized.items():
+            if _is_identity_sensitive_key(key):
+                return True
+            if is_identity_bearing_review_value(item, _depth=_depth + 1):
+                return True
+        return False
+    if isinstance(value, (list, tuple)):
+        if _depth >= MAX_NESTING_DEPTH or len(value) > MAX_CONTAINER_ITEMS:
+            return True
+        return any(is_identity_bearing_review_value(item, _depth=_depth + 1) for item in value)
+    return False
+
+
 def _point_id(point: Any) -> str:
     if isinstance(point, Mapping):
         return str(point.get("id") or "")
@@ -187,11 +255,10 @@ def _snapshot_projection_descriptor() -> dict[str, Any]:
 
 def _snapshot_projection(point: Any) -> dict[str, Any]:
     payload = _point_payload(point)
-    if identity_bearing_payload(payload):
+    if is_identity_bearing_review_value(payload):
         safe_text: Any = IDENTITY_REDACTED_SNIPPET
         safe_payload: Any = {
             "identity_bearing": True,
-            "source_type": sanitize_for_review(payload.get("source_type", "unknown"), max_string_chars=160),
             "canonical": bool(payload.get("canonical", False)),
             "stale": bool(payload.get("stale", False)),
             "requires_review": True,
@@ -345,7 +412,7 @@ def _report_snapshot_map(proposal: Mapping[str, Any], affected_ids: Sequence[str
                 raise MemoryPRValidationError("invalid report review point snapshot projection")
             name = projection.get("name")
             version = projection.get("version")
-            if name != REVIEW_SNAPSHOT_PROJECTION_NAME or not isinstance(version, int) or version < 1:
+            if name != REVIEW_SNAPSHOT_PROJECTION_NAME or type(version) is not int or version < 1:
                 raise MemoryPRValidationError("invalid report review point snapshot projection")
             safe_projection = {"name": name, "version": version}
         result[point_id] = {"snapshot_digest": digest, "projection": safe_projection}
@@ -381,7 +448,7 @@ def _point_provenance(payload: Mapping[str, Any], *, identity_bearing: bool) -> 
 def _evidence_for_point(point: Any, report_snapshot: Mapping[str, Any] | None) -> dict[str, Any]:
     point_id = validate_exact_id(_point_id(point), "point_id")
     payload = _point_payload(point)
-    identity_bearing = identity_bearing_payload(payload)
+    identity_bearing = is_identity_bearing_review_value(payload)
     secret_bearing = _point_secret_bearing(point)
     current_digest = stable_point_snapshot_digest(point)
     report_digest = str(report_snapshot.get("snapshot_digest") or "") if report_snapshot else None
@@ -389,6 +456,7 @@ def _evidence_for_point(point: Any, report_snapshot: Mapping[str, Any] | None) -
     comparable_projection = (
         isinstance(report_projection, Mapping)
         and report_projection.get("name") == REVIEW_SNAPSHOT_PROJECTION_NAME
+        and type(report_projection.get("version")) is int
         and report_projection.get("version") == REVIEW_SNAPSHOT_PROJECTION_VERSION
     )
     drift_status = (
@@ -424,11 +492,18 @@ def _evidence_for_point(point: Any, report_snapshot: Mapping[str, Any] | None) -
     }
 
 
-def _summary_text(proposal: Mapping[str, Any]) -> str:
+def _summary_value(proposal: Mapping[str, Any]) -> Any:
     for key in ("candidate_statement", "summary", "reason", "supersession_reason", "manual_review_reason"):
         value = proposal.get(key)
         if value in (None, "", [], {}):
             continue
+        return value
+    return None
+
+
+def _summary_text(proposal: Mapping[str, Any]) -> str:
+    value = _summary_value(proposal)
+    if value not in (None, "", [], {}):
         safe = sanitize_for_review(value, max_string_chars=MAX_SUMMARY_CHARS)
         if isinstance(safe, str):
             return _bounded_text(safe, max_chars=MAX_SUMMARY_CHARS)
@@ -437,36 +512,37 @@ def _summary_text(proposal: Mapping[str, Any]) -> str:
 
 
 def _identity_safe_status_changes(changes: Any, identity_ids: set[str], affected_ids: set[str]) -> Any:
-    safe = sanitize_for_review(changes or [], max_string_chars=MAX_FIELD_CHARS)
-    if not identity_ids or not isinstance(safe, list):
+    raw_changes = changes or []
+    safe = sanitize_for_review(raw_changes, max_string_chars=MAX_FIELD_CHARS)
+    if not isinstance(raw_changes, list) or not isinstance(safe, list):
         return safe
     result: list[Any] = []
-    for item in safe:
-        if not isinstance(item, Mapping):
-            raise MemoryPRValidationError("invalid proposed status change for identity-bearing proposal")
+    for raw_item, item in zip(raw_changes, safe):
+        item_identity_bearing = is_identity_bearing_review_value(raw_item)
+        if not isinstance(item, Mapping) or not isinstance(raw_item, Mapping):
+            if identity_ids or item_identity_bearing:
+                raise MemoryPRValidationError("invalid proposed status change for identity-bearing proposal")
+            result.append(item)
+            continue
         try:
             point_id = validate_exact_id(item.get("id"), "proposed status change point ID")
         except MemoryPRValidationError as exc:
-            raise MemoryPRValidationError("identity-bearing proposed status change requires an exact point ID") from exc
+            if identity_ids or item_identity_bearing:
+                raise MemoryPRValidationError("identity-bearing proposed status change requires an exact point ID") from exc
+            result.append(item)
+            continue
         if point_id not in affected_ids:
-            raise MemoryPRValidationError("proposed status change point ID is not affected by this proposal")
-        if point_id not in identity_ids:
+            if identity_ids or item_identity_bearing:
+                raise MemoryPRValidationError("proposed status change point ID is not affected by this proposal")
+            result.append(item)
+            continue
+        if point_id not in identity_ids and not item_identity_bearing:
             result.append(item)
             continue
         preserved = {key: value for key, value in item.items() if key in {"id", "from", "to", "superseded_by"}}
         preserved["reason"] = IDENTITY_REDACTED_SNIPPET
         result.append(preserved)
     return result
-
-
-def _contains_identity_metadata(value: Any) -> bool:
-    if isinstance(value, Mapping):
-        if identity_bearing_payload(dict(value)):
-            return True
-        return any(_contains_identity_metadata(item) for item in value.values())
-    if isinstance(value, (list, tuple)):
-        return any(_contains_identity_metadata(item) for item in value)
-    return False
 
 
 def _identity_safe_persisted_evidence(
@@ -489,7 +565,7 @@ def _identity_safe_persisted_evidence(
             raise MemoryPRValidationError("persisted evidence entry requires an exact affected point ID") from exc
         if point_id not in affected_ids:
             raise MemoryPRValidationError("persisted evidence point ID is not affected by this proposal")
-        identity_bearing = point_id in identity_ids or _contains_identity_metadata(raw_item)
+        identity_bearing = point_id in identity_ids or is_identity_bearing_review_value(raw_item)
         if identity_bearing:
             evidence_identity_ids.add(point_id)
             result.append(
@@ -586,6 +662,7 @@ def build_memory_pr(
         set(affected_ids),
     )
     all_identity_ids = identity_ids | evidence_identity_ids
+    summary_identity_bearing = is_identity_bearing_review_value(_summary_value(proposal))
     drift_values = {item["drift_status"] for item in evidence}
     drift_status = "changed" if "changed" in drift_values else ("unknown" if "unknown" in drift_values else "unchanged")
     proposal_type = _bounded_text(proposal.get("proposal_type") or "unknown", max_chars=120)
@@ -608,7 +685,7 @@ def build_memory_pr(
         "affected_point_ids": affected_ids,
         "proposal_summary": (
             "Identity-bearing proposal summary suppressed; review exact status and provenance fields only."
-            if all_identity_ids
+            if all_identity_ids or summary_identity_bearing
             else _summary_text(proposal)
         ),
         "proposed_status_changes": _identity_safe_status_changes(
