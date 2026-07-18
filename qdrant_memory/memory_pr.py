@@ -791,11 +791,19 @@ def _summary_text(proposal: Mapping[str, Any]) -> str:
     return "Review the current exact point evidence against the persisted proposal."
 
 
-def _identity_safe_status_changes(changes: Any, identity_ids: set[str], affected_ids: set[str]) -> Any:
-    raw_changes = changes or []
+def _identity_safe_status_changes(changes: Any, identity_ids: set[str], affected_ids: set[str]) -> list[Any]:
+    if changes is None:
+        return []
+    if not isinstance(changes, list):
+        raise MemoryPRValidationError("proposed_status_changes must be a bounded list of status-change records")
+    if len(changes) > MAX_CONTAINER_ITEMS:
+        raise MemoryPRValidationError("proposed_status_changes exceeds the review item limit")
+    if not changes:
+        return []
+    raw_changes = changes
     safe = sanitize_for_review(raw_changes, max_string_chars=MAX_FIELD_CHARS)
-    if not isinstance(raw_changes, list) or not isinstance(safe, list):
-        return safe
+    if not isinstance(safe, list):
+        raise MemoryPRValidationError("proposed_status_changes could not be safely sanitized")
     result: list[Any] = []
     for raw_item, item in zip(raw_changes, safe):
         item_identity_bearing = is_identity_bearing_review_value(raw_item, record_kind="status_change")

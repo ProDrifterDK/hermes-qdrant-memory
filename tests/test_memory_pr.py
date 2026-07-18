@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import qdrant_memory.memory_pr as memory_pr_module
 from qdrant_memory.memory_pr import (
     IDENTITY_REDACTED_SNIPPET,
     MemoryPRValidationError,
@@ -669,6 +670,111 @@ def test_provider_memory_pr_persists_only_with_explicit_output_directory(tmp_pat
     assert provider._qdrant.payload_update_calls == []
     assert provider._qdrant.delete_ids_calls == []
     assert provider._qdrant.delete_filter_calls == []
+
+
+@pytest.mark.parametrize(
+    ("case_name", "status_changes", "sentinels"),
+    [
+        (
+            "single-mapping",
+            {
+                "id": "runtime-old",
+                "from": "active",
+                "to": "superseded",
+                "metadata": {
+                    "socialSecurityNumber": "SSN-STATUS-SENTINEL-9042",
+                    "dateOfBirth": "DOB-STATUS-SENTINEL-1970",
+                    "arbitraryUnlistedNestedKey": "UNKNOWN-STATUS-SENTINEL-731",
+                },
+            },
+            [
+                "SSN-STATUS-SENTINEL-9042",
+                "DOB-STATUS-SENTINEL-1970",
+                "UNKNOWN-STATUS-SENTINEL-731",
+            ],
+        ),
+        (
+            "scalar",
+            "UNSUPPORTED-STATUS-TYPE-SENTINEL-612",
+            ["UNSUPPORTED-STATUS-TYPE-SENTINEL-612"],
+        ),
+    ],
+)
+def test_live_provider_rejects_unsupported_status_containers_before_hash_or_output(
+    tmp_path, monkeypatch, case_name, status_changes, sentinels
+):
+    report, proposal, points = _report_and_points()
+    proposal["proposed_status_changes"] = status_changes
+    report["profile_id"] = "architect"
+    persisted_report = persist_consolidation_report(report, hermes_home=str(tmp_path))
+    provider = _provider(tmp_path, points)
+    output_dir = tmp_path / f"rejected-status-{case_name}"
+    hash_inputs = []
+    html_inputs = []
+    original_sha256 = memory_pr_module._sha256
+    original_renderer = memory_pr_module.render_memory_pr_html
+
+    def recording_sha256(value):
+        hash_inputs.append(value)
+        return original_sha256(value)
+
+    def recording_renderer(packet):
+        html_inputs.append(packet)
+        return original_renderer(packet)
+
+    monkeypatch.setattr(memory_pr_module, "_sha256", recording_sha256)
+    monkeypatch.setattr(memory_pr_module, "render_memory_pr_html", recording_renderer)
+
+    response_text = provider.handle_tool_call(
+        "qdrant_memory_memory_pr",
+        {
+            "report_id": persisted_report["report_id"],
+            "proposal_id": proposal["proposal_id"],
+            "output_dir": str(output_dir),
+        },
+    )
+    result = json.loads(response_text)
+    pre_hash_projection = json.dumps(hash_inputs, sort_keys=True)
+
+    assert "error" in result
+    assert "bounded list" in result["error"]
+    assert "packet" not in result
+    assert html_inputs == []
+    assert not output_dir.exists()
+    assert list(tmp_path.rglob("memory-pr-*.json")) == []
+    assert list(tmp_path.rglob("memory-pr-*.html")) == []
+    for sentinel in sentinels:
+        assert sentinel not in response_text
+        assert sentinel not in pre_hash_projection
+    assert provider._qdrant.retrieve_calls == [("memory", ["runtime-new", "runtime-old"], True, False)]
+    assert provider._qdrant.upsert_calls == []
+    assert provider._qdrant.payload_update_calls == []
+    assert provider._qdrant.delete_ids_calls == []
+    assert provider._qdrant.delete_filter_calls == []
+
+
+def test_status_change_outer_limit_fails_before_record_traversal():
+    report, proposal, points = _report_and_points()
+    proposal["proposed_status_changes"] = [
+        {
+            "id": "runtime-old",
+            "from": "active",
+            "to": "superseded",
+            "reason": f"bounded status change {index}",
+        }
+        for index in range(101)
+    ]
+
+    with pytest.raises(MemoryPRValidationError, match="item limit"):
+        _build(report=report, points=points)
+
+
+def test_valid_status_change_list_remains_reviewable():
+    report, proposal, points = _report_and_points()
+
+    packet = _build(report=report, points=points)
+
+    assert packet["proposed_status_changes"] == proposal["proposed_status_changes"]
 
 
 def test_live_provider_suppresses_nested_current_and_persisted_identity_before_hash_and_output(tmp_path):
