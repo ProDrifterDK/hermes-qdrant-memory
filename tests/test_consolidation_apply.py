@@ -365,6 +365,10 @@ def test_apply_promote_live_creates_skill_draft_and_marks_learning(tmp_path):
         }
     )
     report, proposal = _persist_promotion_report(provider)
+    assert proposal["guarded_auto_eligible"] is True
+    assert proposal["preauthorized_policy"] == "guarded-auto:learning-skill-draft"
+    assert proposal["guarded_auto_snapshot"]["point_digests"]
+    assert proposal["guarded_auto_proposal_sha256"]
 
     result = json.loads(provider.handle_tool_call("qdrant_memory_consolidation_apply", {"report_id": report["report_id"], "proposal_id": proposal["proposal_id"], "action": "promote_to_skill", "dry_run": False, "approve": True}))
 
@@ -382,6 +386,54 @@ def test_apply_promote_live_creates_skill_draft_and_marks_learning(tmp_path):
     assert update["proposal_draft_path"] == result["proposal_draft_path"]
     assert update["skill_draft_path"] == result["skill_draft_path"]
     assert provider._qdrant.deleted_ids == []
+
+
+def test_apply_promote_fact_like_learning_is_manual_review_only_but_human_apply_still_drafts(tmp_path):
+    provider = _provider(tmp_path)
+    provider._qdrant = FakeQdrant(
+        {
+            "memory": [],
+            "learnings": [
+                _point(
+                    "l-fact",
+                    "Always run pytest after changing consolidation actions",
+                    source_type="learning",
+                    learning_type="workflow_lesson",
+                    fact_key="workflow.consolidation",
+                    confidence=0.95,
+                    importance=9,
+                    promote_to_skill_candidate=True,
+                )
+            ],
+        }
+    )
+    report, proposal = _persist_promotion_report(provider)
+
+    assert proposal["guarded_auto_eligible"] is False
+    assert proposal["manual_review_required"] is True
+    assert proposal["manual_review_reason"] == "profile or fact-like memory requires manual review"
+    assert "preauthorized_policy" not in proposal
+    assert "guarded_auto_snapshot" not in proposal
+    assert "guarded_auto_proposal_sha256" not in proposal
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_consolidation_apply",
+            {
+                "report_id": report["report_id"],
+                "proposal_id": proposal["proposal_id"],
+                "action": "promote_to_skill",
+                "dry_run": False,
+                "approve": True,
+            },
+        )
+    )
+
+    assert result["applied"] is True
+    assert result["action"] == "promote_to_skill"
+    assert result["skill_draft_path"]
+    assert result["write_decision"]["decision"] == "skill_candidate"
+    assert provider._qdrant.payload_updates[0][0:2] == ("learnings", "l-fact")
 
 
 def test_apply_promote_refuses_secret_bearing_learning_even_with_persisted_proposal(tmp_path):

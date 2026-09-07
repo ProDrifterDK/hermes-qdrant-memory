@@ -677,6 +677,7 @@ def _learning_promotion_proposals(points: list[ConsolidationPoint], *, include_e
             continue
         if _as_float(payload.get("confidence"), 0.0) < 0.85 or _as_int(payload.get("importance"), 0) < 8:
             continue
+        manual_review_required = _point_requires_manual_review(point)
         proposal: dict[str, Any] = {
             "proposal_id": _proposal_id("learning_promotion_candidate", [point.id]),
             "proposal_type": "learning_promotion_candidate",
@@ -694,9 +695,13 @@ def _learning_promotion_proposals(points: list[ConsolidationPoint], *, include_e
                 }
             ],
             "requires_explicit_approval": True,
-            "guarded_auto_eligible": True,
-            "preauthorized_policy": "guarded-auto:learning-skill-draft",
+            "guarded_auto_eligible": not manual_review_required,
         }
+        if manual_review_required:
+            proposal["manual_review_required"] = True
+            proposal["manual_review_reason"] = "profile or fact-like memory requires manual review"
+        else:
+            proposal["preauthorized_policy"] = "guarded-auto:learning-skill-draft"
         if include_examples:
             proposal["examples"] = [{"id": point.id, "text": _point_snippet(point)}]
         proposals.append(proposal)
