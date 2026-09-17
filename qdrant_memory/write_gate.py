@@ -13,7 +13,8 @@ from qdrant_memory.schema import clean_text_for_memory, score_importance
 # (rather than imported from ``qdrant_memory.raptor``) to keep
 # ``write_gate`` free of circular imports and to guarantee the same
 # shape is enforced by both the pre- and post-enrichment gates.
-_SHA256_HEX_RE = re.compile(r"^[a-f0-9]{64}$")
+# Exact-token anchor ('\Z', not '$'): a trailing newline must not pass.
+_SHA256_HEX_RE = re.compile(r"^[a-f0-9]{64}\Z")
 # RAPTOR derivation/relation types for provenance edges. Mirrored from
 # ``qdrant_memory.raptor.schema`` to keep the post-enrichment gate
 # self-contained.
@@ -96,6 +97,34 @@ def _metadata_contains_secret(value: Any) -> bool:
     if isinstance(value, (list, tuple, set)):
         return any(_metadata_contains_secret(item) for item in value)
     return False
+
+
+_MECHANICAL_EDGE_CLASS = "mechanical"
+
+
+def structural_lineage_marker_reasons(payload: Any) -> list[str]:
+    """Value-semantic detection of structural write-class markers.
+
+    Retrieval and consolidation exclude structural records by truthiness, so
+    ANY truthy ``lineage_record`` / ``lineage_pending`` value — not just the
+    literal boolean ``True`` — creates a record those readers would hide.
+    ``edge_class="mechanical"`` is likewise a structural write-class claim a
+    semantic write path must never certify, whatever the relation type.
+    Absent and falsy markers (``False``, ``0``, ``""``) remain allowed shared
+    metadata, and ordinary semantic fields (endpoint types, source paths) are
+    never touched.
+    """
+    if not isinstance(payload, Mapping):
+        return []
+    reasons: list[str] = []
+    if payload.get("lineage_record"):
+        reasons.append("lineage_record")
+    if payload.get("lineage_pending"):
+        reasons.append("lineage_pending")
+    edge_class = payload.get("edge_class")
+    if isinstance(edge_class, str) and edge_class.strip().lower() == _MECHANICAL_EDGE_CLASS:
+        reasons.append("edge_class=mechanical")
+    return reasons
 
 
 def _semantic_text_for_quality(text: str) -> str:
@@ -288,6 +317,25 @@ def evaluate_extraction_candidate_write(
 
     payload = dict(persisted_payload or _candidate_payload(candidate))
     candidate_type = str(getattr(candidate, "candidate_type", "") or "").strip()
+
+    # The mechanical lineage candidate class is internal to the lineage
+    # writer path. It must never be submittable through the ordinary
+    # extraction gate, whatever payload flags it carries. Any truthy
+    # ``lineage_record`` / ``lineage_pending`` marker of ANY type is equally
+    # structural (truthiness is what retrieval and consolidation exclude on,
+    # so ``1`` or ``"true"`` would create a record those readers hide), and a
+    # payload claiming the mechanical edge class is a structural write-class
+    # claim the semantic path must never certify — a claim edge labeled
+    # mechanical is still rejected.
+    structural_reasons = structural_lineage_marker_reasons(payload)
+    if candidate_type == "mechanical_lineage_candidate" or structural_reasons:
+        return _decision(
+            "reject",
+            ["mechanical_lineage_candidate_forbidden", *structural_reasons],
+            confidence=1.0,
+            requires_review=True,
+            metadata={"candidate_type": candidate_type},
+        )
     candidate_risk = str(getattr(candidate, "risk", "unknown") or "unknown").strip().lower()
     candidate_confidence = _clamp_confidence(getattr(candidate, "confidence", None), 0.0)
     metadata = {
@@ -433,6 +481,210 @@ def evaluate_extraction_candidate_write(
     )
 
 
+def evaluate_mechanical_lineage_write(
+    payload: Any,
+    *,
+    operation: str,
+    evidence: Any,
+    collection_name: str,
+) -> WriteDecision:
+    """Gate one structural lineage write using the independent evidence record.
+
+    ``collection_name`` is the exact collection the caller will upsert into;
+    it must match the evidence, and the payload's scope digest is recomputed
+    from this collection plus the evidence ownership tuple, so one evidence
+    object can never authorize writes into a different collection.
+
+    This is a separate function and internal evidence type from the reviewed
+    semantic path — never a user-controlled boolean. It returns ``store`` only
+    for the approved operation/relation matrix and permitted source/version
+    records; everything else (claim edges, forged endpoint types, missing or
+    altered provenance, ownership mismatch, unsupported operations, and any
+    validation error) fails closed with ``reject``. Unlike the semantic path,
+    import or validation errors here propagate — they are never swallowed.
+
+    A ``store`` decision authorizes structural persistence only: stored graph
+    payloads keep ``requires_review=True`` and ``canonical=False``.
+    """
+    gate_metadata: dict[str, Any] = {"candidate_type": "mechanical_lineage_candidate"}
+    from qdrant_memory import lineage as _lineage
+    from qdrant_memory.graph_schema import is_uuid_string as _is_uuid
+
+    # Original tokens are validated before any normalization: an operation or
+    # collection name that only matches after stripping is a different token
+    # and fails closed, per the identity conventions in section 4.
+    op = operation if isinstance(operation, str) else ""
+    if op not in _lineage.LINEAGE_OPERATIONS:
+        return _decision("reject", ["unsupported_lineage_operation"], confidence=1.0, requires_review=True, metadata=gate_metadata)
+    if not isinstance(payload, dict):
+        return _decision("reject", ["lineage_payload_invalid"], confidence=1.0, requires_review=True, metadata=gate_metadata)
+    if not isinstance(evidence, _lineage.LineageEvidence):
+        return _decision("reject", ["lineage_evidence_invalid"], confidence=1.0, requires_review=True, metadata=gate_metadata)
+    if str(evidence.operation or "") != op:
+        return _decision("reject", ["operation_mismatch"], confidence=1.0, requires_review=True, metadata=gate_metadata)
+    if not str(evidence.collection_name or "").strip() or not str(evidence.profile_id or "").strip():
+        return _decision("reject", ["lineage_evidence_invalid"], confidence=1.0, requires_review=True, metadata=gate_metadata)
+
+    def _collection_token_invalid(token: Any) -> bool:
+        # Whitespace-bearing collection tokens are malformed, not equivalent
+        # to their stripped form: writes bind to the exact configured name.
+        return not isinstance(token, str) or not token or any(ch.isspace() for ch in token)
+
+    target_collection = collection_name
+    if _collection_token_invalid(target_collection) or _collection_token_invalid(evidence.collection_name):
+        return _decision("reject", ["lineage_collection_invalid"], confidence=1.0, requires_review=True, metadata=gate_metadata)
+    if target_collection != evidence.collection_name:
+        return _decision("reject", ["lineage_collection_mismatch"], confidence=1.0, requires_review=True, metadata=gate_metadata)
+
+    if contains_secret(json.dumps(payload, sort_keys=True, default=str)) or _metadata_contains_secret(evidence.to_dict()):
+        return _decision("reject", ["possible_secret"], confidence=1.0, requires_review=True, metadata=gate_metadata)
+
+    if not _lineage.ownership_matches(payload, evidence):
+        return _decision("reject", ["lineage_ownership_mismatch"], confidence=1.0, requires_review=True, metadata=gate_metadata)
+
+    internal = _lineage.evidence_internal_mismatches(evidence)
+    if internal:
+        return _decision(
+            "reject",
+            ["lineage_evidence_invalid", *internal[:8]],
+            confidence=1.0,
+            requires_review=True,
+            metadata=gate_metadata,
+        )
+
+    problems = _lineage.validate_lineage_payload(payload)
+    if problems:
+        return _decision(
+            "reject",
+            ["lineage_payload_invalid", *problems[:8]],
+            confidence=1.0,
+            requires_review=True,
+            metadata=gate_metadata,
+        )
+
+    missing = _lineage.evidence_missing_requirements(payload, evidence)
+    if missing:
+        return _decision(
+            "reject",
+            ["lineage_evidence_missing", *missing[:8]],
+            confidence=1.0,
+            requires_review=True,
+            metadata=gate_metadata,
+        )
+
+    # The evidence record itself is held to the same shared W0 shape domains
+    # as the payload: a present evidence value outside its documented domain
+    # (malformed digest, non-UUID token, whitespace-bearing URI, invalid
+    # locator, off-vocabulary token) is refused before any comparison.
+    evidence_shape = _lineage.evidence_shape_problems(evidence)
+    if evidence_shape:
+        return _decision(
+            "reject",
+            ["lineage_evidence_invalid", *evidence_shape[:8]],
+            confidence=1.0,
+            requires_review=True,
+            metadata=gate_metadata,
+        )
+
+    mismatches = _lineage.evidence_payload_mismatches(payload, evidence)
+    if mismatches:
+        return _decision(
+            "reject",
+            ["lineage_evidence_mismatch", *mismatches[:8]],
+            confidence=1.0,
+            requires_review=True,
+            metadata=gate_metadata,
+        )
+
+    identity = _lineage.structural_identity_mismatches(payload, evidence)
+    if identity:
+        return _decision(
+            "reject",
+            ["lineage_identity_mismatch", *identity[:8]],
+            confidence=1.0,
+            requires_review=True,
+            metadata=gate_metadata,
+        )
+
+    if payload.get("memory_kind") == "graph_edge":
+        relation = str(payload.get("relation_type") or "")
+        allowed_relations = _lineage.OPERATION_RELATION_MATRIX.get(op, ())
+        if relation not in allowed_relations:
+            return _decision(
+                "reject",
+                ["lineage_operation_relation_mismatch"],
+                confidence=1.0,
+                requires_review=True,
+                metadata=gate_metadata,
+            )
+        if relation == "SUPERSEDES":
+            if op == "approved_citation":
+                return _decision(
+                    "reject",
+                    ["lineage_operation_relation_mismatch"],
+                    confidence=1.0,
+                    requires_review=True,
+                    metadata=gate_metadata,
+                )
+            # The current event reference must come from the evidence and be
+            # distinct from its predecessor. W0 binds UUID tokens here; it
+            # does not look up event persistence or transition commit state.
+            predecessor = str(evidence.predecessor_event_id or "")
+            event = str(evidence.event_id or "")
+            if not _is_uuid(predecessor):
+                return _decision(
+                    "reject",
+                    ["supersedes_predecessor_required"],
+                    confidence=1.0,
+                    requires_review=True,
+                    metadata=gate_metadata,
+                )
+            if not _is_uuid(event):
+                return _decision(
+                    "reject",
+                    ["supersedes_event_required"],
+                    confidence=1.0,
+                    requires_review=True,
+                    metadata=gate_metadata,
+                )
+            if predecessor == event:
+                return _decision(
+                    "reject",
+                    ["supersedes_event_not_distinct"],
+                    confidence=1.0,
+                    requires_review=True,
+                    metadata=gate_metadata,
+                )
+            if str(payload.get("lineage_event_id") or "") != event:
+                return _decision(
+                    "reject",
+                    ["supersedes_event_mismatch"],
+                    confidence=1.0,
+                    requires_review=True,
+                    metadata=gate_metadata,
+                )
+        # Approval is required for every approved-citation relation: the
+        # operation itself is not approval, and citation-class relations
+        # require a recorded approval reference under any operation.
+        if relation in ("SUMMARIZES", "EXTRACTED_FROM") or op == "approved_citation":
+            if not str(evidence.approval_ref or "").strip():
+                return _decision(
+                    "reject",
+                    ["approved_citation_required"],
+                    confidence=1.0,
+                    requires_review=True,
+                    metadata=gate_metadata,
+                )
+
+    return _decision(
+        "store",
+        ["mechanical_lineage_store"],
+        confidence=1.0,
+        requires_review=True,
+        metadata=gate_metadata,
+    )
+
+
 def decision_to_json(decision: WriteDecision) -> str:
     return json.dumps(decision.to_dict(), sort_keys=True)
 
@@ -503,6 +755,21 @@ def evaluate_raptor_summary_write(
     if contains_secret(cleaned) or _metadata_contains_secret(metadata):
         return _decision("reject", ["possible_secret"], confidence=1.0, requires_review=True,
                          metadata={"raptor": True})
+
+    # Structural lineage markers are forbidden on RAPTOR summary payloads,
+    # whatever their type: a summary marked as structural or pending would be
+    # written into the ordinary pool while every structural reader excludes
+    # it. This is the same shared gate the post-enrichment path runs, so
+    # enrichment-time drift cannot reintroduce the markers either.
+    structural_reasons = structural_lineage_marker_reasons(metadata)
+    if structural_reasons:
+        return _decision(
+            "reject",
+            ["structural_lineage_marker_forbidden", *structural_reasons],
+            confidence=1.0,
+            requires_review=True,
+            metadata={"raptor": True},
+        )
 
     # Canonical must be exactly the boolean False for RAPTOR summaries.
     # Reject every other value (strings, ints, None, True) — type-loose

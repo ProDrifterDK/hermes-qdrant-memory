@@ -159,7 +159,15 @@ def test_memory_search_hides_deprecated_and_superseded_fact_status_by_default():
     default_filter = qdrant.searches[0]["filter"]
     assert {"key": "fact_status", "match": {"value": "deprecated"}} in default_filter["must_not"]
     assert {"key": "fact_status", "match": {"value": "superseded"}} in default_filter["must_not"]
-    assert "must_not" not in qdrant.searches[1]["filter"]
+    # History queries drop fact-status exclusions but must still exclude
+    # structural lineage records and pending chunks (containment is
+    # unconditional; history may not bypass it).
+    history_must_not = qdrant.searches[1]["filter"]["must_not"]
+    assert {"key": "lineage_record", "match": {"value": True}} in history_must_not
+    assert {"key": "lineage_pending", "match": {"value": True}} in history_must_not
+    assert not any(
+        condition.get("key") == "fact_status" for condition in history_must_not
+    )
 
 
 class FakeSparseAwareQdrant(FakeFactStatusQdrant):
@@ -359,3 +367,64 @@ def test_memory_search_default_still_runs_sparse_when_signal_present():
         allow_sparse_scroll=True,
     )
     assert len(qdrant.scroll_calls) == 1
+
+# ===========================================================================
+# W0: structural lineage / pending containment in candidate pools
+# ===========================================================================
+
+def test_default_search_filter_excludes_structural_and_pending_points():
+    qdrant = FakeQdrant()
+    retriever = MemoryRetriever(
+        qdrant=qdrant,
+        embeddings=FakeEmbedding(),
+        collection_name="memory",
+        scope={"profile_id": "coder", "platform": "telegram"},
+        search_candidates=3,
+    )
+
+    retriever.search("api endpoint", top_k=2)
+
+    must_not = qdrant.searches[0]["filter"]["must_not"]
+    assert {"key": "lineage_record", "match": {"value": True}} in must_not
+    assert {"key": "lineage_pending", "match": {"value": True}} in must_not
+
+
+def test_sparse_lane_scroll_filter_excludes_structural_and_pending_points():
+    """The sparse scroll must carry the structural exclusions too."""
+    scroll_results = [{
+        "id": "550e8400-e29b-41d4-a716-446655440000",
+        "payload": {
+            "text": "incident notes",
+            "source_type": "project_doc",
+            "profile_id": "coder",
+            "user_id_hash": "u1",
+            "chat_id_hash": "c1",
+            "importance": 8,
+            "created_at": "2026-01-15T00:00:00+00:00",
+            "fact_status": "active",
+        },
+    }]
+    qdrant = FakeSparseAwareQdrant(search_results=[], scroll_results=scroll_results)
+    retriever = MemoryRetriever(
+        qdrant=qdrant,
+        embeddings=FakeEmbedding(),
+        collection_name="memory",
+        scope={"profile_id": "coder", "user_id_hash": "u1", "chat_id_hash": "c1"},
+        search_candidates=3,
+    )
+
+    retriever.search("recall 550e8400-e29b-41d4-a716-446655440000", top_k=3)
+    must_not = qdrant.scroll_calls[0]["filter"]["must_not"]
+    assert {"key": "lineage_record", "match": {"value": True}} in must_not
+    assert {"key": "lineage_pending", "match": {"value": True}} in must_not
+
+
+def test_payload_allowed_defensively_drops_structural_and_pending():
+    from qdrant_memory.retriever import _payload_allowed
+
+    base = {"text": "x", "importance": 5, "created_at": "2026-01-15T00:00:00+00:00"}
+    assert _payload_allowed(dict(base)) is True
+    for key in ("lineage_record", "lineage_pending"):
+        structural = dict(base)
+        structural[key] = True
+        assert _payload_allowed(structural) is False

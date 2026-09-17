@@ -144,6 +144,16 @@ class GraphSearchResult:
 # retriever can apply identical conditions to every Qdrant scroll.
 _SCOPE_KEYS = ("profile_id", "user_id_hash", "chat_id_hash")
 
+# Structural lineage records are never semantic graph candidates or results.
+_LINEAGE_STRUCTURAL_EXCLUSIONS = (
+    {"key": "lineage_record", "match": {"value": True}},
+    {"key": "lineage_pending", "match": {"value": True}},
+)
+
+
+def _is_structural_lineage_payload(payload: dict[str, Any]) -> bool:
+    return bool(payload.get("lineage_record") or payload.get("lineage_pending"))
+
 
 def _scope_filter_conditions(scope: dict[str, str] | None) -> list[dict[str, Any]]:
     """Return Qdrant ``must`` conditions derived from *scope*.
@@ -552,7 +562,10 @@ class GraphMemoryRetriever:
             for eid, payload in alias_match_entities:
                 if eid not in seed_entities:
                     seed_entities[eid] = GraphExpandedCandidate(
-                        point_id=str(payload.get("entity_id") or eid),
+                        # Surface the exact Qdrant storage ID of the scrolled
+                        # entity point; the logical handle stays in the payload
+                        # and must never be handed back as a point ID.
+                        point_id=str(eid or payload.get("entity_id") or ""),
                         payload=payload,
                         vector_score=0.0,  # query-match, not vector hit
                         graph_distance=0,
@@ -713,9 +726,13 @@ class GraphMemoryRetriever:
                 else:
                     # Even without resolved memory points, include the edge as an
                     # expansion candidate — it may still be useful context.
-                    # Use the validated edge id, never the raw point id.
+                    # Surface the edge point's exact Qdrant storage ID so the
+                    # candidate can be retrieved/inspected; the validated logical
+                    # handle stays in the payload and is only a fallback when the
+                    # scrolled record somehow lacks an ID.
+                    edge_storage_id = str(edge_point.get("id") or "")
                     expansions.append(GraphExpandedCandidate(
-                        point_id=validated_edge_id,
+                        point_id=edge_storage_id or validated_edge_id,
                         payload=edge_payload,
                         vector_score=0.0,
                         graph_distance=next_depth,
@@ -920,7 +937,7 @@ class GraphMemoryRetriever:
         if entity_types:
             must.append({"key": "entity_type", "match": {"any": entity_types}})
 
-        filt: dict[str, Any] = {"must": must}
+        filt: dict[str, Any] = {"must": must, "must_not": list(_LINEAGE_STRUCTURAL_EXCLUSIONS)}
 
         try:
             points = self.qdrant.scroll_by_filter(
@@ -935,6 +952,9 @@ class GraphMemoryRetriever:
         results: list[tuple[str, dict[str, Any]]] = []
         for point in points:
             payload = point.get("payload") or {}
+            # Defensive: never treat structural lineage records as seeds.
+            if _is_structural_lineage_payload(payload):
+                continue
             if _query_alias_matches(query_cf, payload):
                 # Validate entity_id — only accept IDs that pass valid_entity_id().
                 # Do not fall back to arbitrary point IDs unless they also validate.
@@ -970,7 +990,7 @@ class GraphMemoryRetriever:
         if relation_types:
             must.append({"key": "relation_type", "match": {"any": relation_types}})
 
-        filt: dict[str, Any] = {"must": must}
+        filt: dict[str, Any] = {"must": must, "must_not": list(_LINEAGE_STRUCTURAL_EXCLUSIONS)}
 
         # Bound the scroll: allow at most a small overfetch factor above the
         # per-node neighbor cap so dedup/filtering can work without unbounded
@@ -981,7 +1001,7 @@ class GraphMemoryRetriever:
         )
 
         try:
-            return self.qdrant.scroll_by_filter(
+            scrolled = self.qdrant.scroll_by_filter(
                 self.collection_name,
                 filt,
                 limit=min(bounded_max, _HARD_SCROLL_PER_CALL),
@@ -989,6 +1009,12 @@ class GraphMemoryRetriever:
             )
         except Exception:
             return []
+        # Defensive: structural lineage edges never expand the graph.
+        return [
+            point
+            for point in scrolled
+            if not _is_structural_lineage_payload(point.get("payload") or {})
+        ]
 
     def _resolve_entity_memories(
         self,
@@ -1012,7 +1038,7 @@ class GraphMemoryRetriever:
         if entity_types:
             must.append({"key": "entity_type", "match": {"any": entity_types}})
 
-        filt: dict[str, Any] = {"must": must}
+        filt: dict[str, Any] = {"must": must, "must_not": list(_LINEAGE_STRUCTURAL_EXCLUSIONS)}
 
         try:
             entity_points = self.qdrant.scroll_by_filter(
@@ -1050,6 +1076,9 @@ class GraphMemoryRetriever:
                 # the entity scroll matched — Qdrant retrieve() does not accept
                 # a filter, so we verify scope in-memory.
                 if not _payload_in_scope(p_payload, self.scope):
+                    continue
+                # Defensive: structural lineage records are never memories.
+                if _is_structural_lineage_payload(p_payload):
                     continue
                 p_fs = valid_fact_status(p_payload.get("fact_status")) or "active"
                 if (

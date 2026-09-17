@@ -224,3 +224,60 @@ Use a collaborative fanout swarm rather than a single implementer:
 - `reviewer` only after implementation evidence exists; do not run final approval in the same no-barrier wave.
 
 Every lane must coordinate through `agent-swarm`, register artifacts, and write an auditable report/result JSON in the fanout workspace. Main Hermes verifies diffs/tests before merging or reporting completion.
+
+---
+
+## W0 prerequisites (lineage identity, gate split, containment) — implemented
+
+Structural lineage records must be valid Qdrant points. Dense and sparse
+search, semantic-graph entity scroll, and consolidation candidate selection
+exclude structural and pending records before their candidate budgets. The
+semantic graph's direct-ID source-reference path is different: it caps each
+entity's `source_point_ids` at eight before fetching payloads and applies the
+structural exclusion only as a defensive post-filter, so an excluded ID can
+consume one of those eight slots. The budget guarantee is therefore not
+global. Three deferred gaps remain: RAPTOR direct-ID search and builder paths
+still admit pending chunks into their own pools (N1); source extraction and
+improve rebuild candidates from recalled points without preserving pending
+state, with two retained cases still failing (N2); and the ordinary indexer
+still deletes persisted structural source records (N3). This slice is
+prerequisite plumbing only: no indexer persistence, no supersession, no state
+propagation, and `lineage_mode` stays `off` by default.
+
+- `graph_schema.make_graph_point_id(logical_id)`: logical `entity-*`/`edge-*`
+  handles map to deterministic UUID storage IDs (`graph-record-v1` domain).
+  Payloads keep logical handles; improve apply now targets UUIDs and refuses
+  stale reports that still carry raw handles.
+- New `lineage.py`: canonical identity digests (scope/source/version keys),
+  typed `LineageEvidence`, structural payload builders, exact write-ownership
+  checks, and `validate_lineage_payload` (collision refusal included).
+- `write_gate.evaluate_mechanical_lineage_write`: separate mechanical gate
+  bound to independent evidence. Claim-level `SUPPORTS`/`CONTRADICTS` edges
+  stay allowed on the reviewed SEMANTIC path; they are forbidden only on the
+  mechanical path. Conversely, structural-class payloads (truthy
+  `lineage_record`/`lineage_pending` markers or a mechanical `edge_class`)
+  are refused on every semantic path, and the internal mechanical candidate
+  class is rejected through every path but the mechanical gate.
+- Acceptance boundary: the mechanical gate validates the W0 identity,
+  provenance, token, hash, UUID-reference, logical-handle, locator, URI, and
+  controlled-vocabulary domains, plus relation requirements and evidence
+  binding. It does not validate the generic presentation/scoring fields
+  `confidence`, `truth_confidence`, `usefulness_weight`, `description`, or
+  `file_size`. Those remain the domain of the public serializers
+  (`build_entity_payload`, `GraphEntity.to_payload`, `build_edge_payload`, and
+  `GraphEdge.to_payload`). A caller that assembles raw payload dicts
+  and skips those serializers must not rely on the gate for those fields. A
+  `store` decision must not be read as a claim that every payload argument is
+  well formed.
+- Generic-metadata enforcement at the final gate is explicitly deferred, not
+  fixed. The reviewed sites are `qdrant_memory/graph_schema.py:1000-1011`,
+  `:1169-1173`, `:1404-1408`, `qdrant_memory/lineage.py:546-846`, and
+  `qdrant_memory/write_gate.py:555-563`, `:679-685`. Closing that boundary
+  requires a separately authorized wave; this deferral does not authorize a
+  live writer.
+- Containment: dense and sparse search, semantic-graph entity scroll, and
+  consolidation candidate selection exclude `lineage_record=True` and
+  `lineage_pending=True` server-side and defensively post-filter. The
+  semantic-graph direct-ID source-reference path caps references at eight
+  before payload fetch and excludes structural payloads only afterward.
+  Consolidation apply refuses proposals that select structural records.

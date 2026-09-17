@@ -107,3 +107,25 @@ def test_recency_older_is_lower():
 def test_final_score_importance_matters():
     now = datetime.now(timezone.utc).isoformat()
     assert final_memory_score(1.0, 10, now, 0.001) > final_memory_score(1.0, 1, now, 0.001)
+
+def test_lineage_mode_defaults_off_and_fails_closed(tmp_path):
+    cfg = load_config(hermes_home=str(tmp_path), hermes_config={})
+    assert cfg["lineage_mode"] == "off"
+
+    for raw, expected in (
+        ("capture", "capture"),
+        ("reconcile", "reconcile"),
+        ("off", "off"),
+        ("OFF", "off"),
+        (" capture ", "capture"),
+        ("bogus", "off"),
+        ("", "off"),
+        (7, "off"),
+        (True, "off"),
+        (None, "off"),
+    ):
+        cfg = load_config(
+            hermes_home=str(tmp_path),
+            hermes_config={"qdrant_memory": {"lineage_mode": raw}},
+        )
+        assert cfg["lineage_mode"] == expected, (raw, cfg["lineage_mode"])

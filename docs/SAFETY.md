@@ -840,3 +840,130 @@ full public surface.
   `HybridRouter` / `RaptorSearcher` modules, and the `hermes qdrant
   retrieve` CLI subcommand. The existing `qdrant_memory_search` tool
   schema and behavior are unchanged.
+
+---
+
+## 20. Lineage W0 prerequisites — identity, mechanical gate, containment
+
+Structural lineage groundwork is valid-point-safe. Dense and sparse search,
+the semantic-graph entity-scroll path, and consolidation candidate selection
+exclude `lineage_record=True` / `lineage_pending=True` server-side and also
+post-filter defensively. The semantic graph's direct-ID source-reference path
+is narrower: it caps each entity's `source_point_ids` at the first eight
+before fetching payloads, then applies structural exclusion defensively. A
+structural or pending ID within those eight therefore consumes a reference
+slot, and an active ID beyond the cap is not fetched. Three known gaps remain
+open and are NOT covered by the search-path qualification:
+
+- N1: the RAPTOR direct-ID search and builder paths can still admit
+  `lineage_pending` chunks into their own pools.
+- N2: `source_extraction.extract_source_candidates_from_point` and
+  `improve.extract_improve_candidates_from_point` rebuild candidates from a
+  point without preserving pending-state markers. Pending state can therefore
+  be lost before the semantic gate sees the candidate; two retained N2 probes
+  still fail.
+- N3: the ordinary indexer still deletes persisted structural source records
+  it does not recognize.
+
+No lineage writer is enabled (`lineage_mode` defaults to `off`).
+
+- Logical `entity-*` / `edge-*` handles are never used as Qdrant point IDs;
+  storage uses deterministic UUIDs (`make_graph_point_id`). Improve apply
+  refuses stale reports whose stored targets predate the mapping.
+- The mechanical lineage gate (`evaluate_mechanical_lineage_write`) is a
+  separate function fed by an internal evidence type. It fails closed on
+  unsupported operations, claim-level relations, forged endpoint types,
+  missing/altered provenance, ownership mismatch, and any validation error;
+  import errors propagate instead of being swallowed. `edge_class` alone is
+  never authorization. Structural token, hash, UUID-reference, logical-handle,
+  locator, URI, and controlled-vocabulary fields are validated by raw type and
+  domain whenever their payload key is present, before relation requirements
+  and evidence comparison. For those fields, key absence is omission; a
+  present empty, null, false, or container value is rejected unless that value
+  belongs to the field's stated domain. Builder arguments use explicit
+  omission sentinels and omit the corresponding payload key. Trust and state
+  booleans are separate: `lineage_pending=False` is valid, `canonical` must be
+  `False`, and optional ownership hashes may be empty strings. Structural
+  builders preserve the safe raw `profile_id` spelling so they cannot change
+  the owner the gate evaluates; non-lineage profile sanitization is unchanged.
+  The evidence record is held to the same named token, hash, locator, URI, and
+  vocabulary domains, with its documented omission sentinels. All W0 shape
+  domains (raw digest, `sha256:`-prefixed content hash, UUID reference token,
+  logical handle, controlled vocabulary, file-chunk locator, URI) are defined once in the
+  shared validation surface (`graph_schema` `w0_*` functions). The gate and
+  the structural builder paths call those same functions. The builders'
+  contract is classification, not enforcement: at the serialization boundary
+  they classify handles/URIs with the shared domains before any legacy
+  normalizer — unsafe values (non-string, secret-bearing) raise, and
+  malformed-but-serializable raw strings serialize with their exact spelling
+  (never stripped into a storable token), leaving the mechanical gate as the
+  enforcing write boundary that refuses them. A `content_hash` on a
+  `file_source` record is refused
+  outright: the source node designates the exact path, not a content
+  snapshot, so no digest on it can be independently evidenced.
+- Acceptance boundary: the mechanical gate validates the W0 identity,
+  provenance, token, hash, UUID-reference, logical-handle, locator, URI, and
+  controlled-vocabulary domains, plus relation requirements and evidence
+  binding. It does not validate the generic presentation/scoring fields
+  `confidence`, `truth_confidence`, `usefulness_weight`, `description`, or
+  `file_size`. Those remain the domain of the public serializers
+  (`build_entity_payload`, `GraphEntity.to_payload`, `build_edge_payload`, and
+  `GraphEdge.to_payload`). A caller that assembles raw payload dicts
+  and skips those serializers must not rely on the gate for those fields. A
+  `store` decision must not be read as a claim that every payload argument is
+  well formed.
+- Generic-metadata enforcement at the final gate is explicitly deferred, not
+  fixed. The reviewed sites are `qdrant_memory/graph_schema.py:1000-1011`,
+  `:1169-1173`, `:1404-1408`, `qdrant_memory/lineage.py:546-846`, and
+  `qdrant_memory/write_gate.py:555-563`, `:679-685`. Closing that boundary
+  requires a separately authorized wave; this deferral does not authorize a
+  live writer.
+- The gate binds the exact write-target collection: callers pass the
+  collection they will upsert into, and it must equal the evidence's
+  collection. The payload's scope digest is recomputed from that collection
+  plus the evidence ownership tuple (never taken from a claimed digest),
+  and the source key is recomputed from the recomputed scope plus the
+  evidence file path. The final payload's `lineage_operation` must equal the
+  authorized operation.
+- Structural identity is verified by full-digest recomputation from the
+  evidence's own binding material, not by the 16-hex handle truncation
+  alone: a same-prefix/different-suffix full identity is refused.
+  Compare-before-overwrite against an already-stored record's digest stays
+  a persistence-time duty for the W1 writer.
+- `SUPERSEDES` runs only between two distinct content-bearing file versions
+  (endpoint content hashes present, valid, and different). Its predecessor
+  and current `lineage_event_id` are distinct exact UUID reference tokens, and
+  the current token must equal the evidence token. Every `approved_citation`
+  operation requires a non-empty approval reference supplied by the evidence,
+  including `DERIVED_FROM`. W0 does not look up event or approval records and
+  does not observe persistence existence, transition commit state, or approval
+  state; a future caller must do that before invoking the gate.
+- `file_version_id` and `lineage_event_id` are exact UUID reference tokens on
+  mechanical edge records where they are valid fields. `file_version_id` is
+  bound to the deterministic file-version endpoint UUID, while
+  `lineage_event_id` is bound to the evidence token. Neither token is looked
+  up by W0. Logical handles live only in the explicitly named `*entity_id`
+  reference fields. Entity records (file_source / file_version) do not
+  interpret `lineage_event_id` at all and refuse it whenever the key is
+  present, whatever the value.
+- `extra` cannot forge lineage fields or the ownership keys
+  (`user_id_hash` / `chat_id_hash`): the reserved-key wall covers every
+  structural field at the builder boundary. That wall is a reserved-extra-key
+  rule, not a complete write boundary: builders construct payloads but are
+  not writers, final payloads can be constructed directly, and the mechanical
+  gate therefore validates the final payload itself (shared shape domains)
+  instead of trusting where it came from. When `lineage_record` is false,
+  the legacy generic sanitizers keep their historical strip/normalize
+  behavior for non-lineage callers.
+- The extraction gate also refuses semantic candidates carrying a bare
+  `lineage_pending=True` payload flag, so the semantic path cannot create a
+  point that containment would permanently hide.
+- Structural records keep `canonical=False` and `requires_review=True`; a
+  store decision authorizes persistence, not assertion use.
+- Dense and sparse search, semantic-graph entity scroll, and consolidation
+  candidate selection exclude `lineage_record=True` /
+  `lineage_pending=True` before their candidate budgets and defensively after
+  retrieval. The semantic graph's direct-ID source-reference path instead
+  caps `source_point_ids` at eight before payload fetch and only then applies
+  the defensive structural filter, so excluded IDs can consume those eight
+  slots. Consolidation apply refuses proposals selecting structural records.

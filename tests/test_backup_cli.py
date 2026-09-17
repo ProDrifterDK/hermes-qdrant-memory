@@ -750,3 +750,92 @@ def test_restore_live_creates_pre_restore_backup_by_default(monkeypatch, tmp_pat
     assert result["pre_restore_backup_id"] != original_backup_id
     assert (hermes_home / "qdrant_memory" / "backups" / result["pre_restore_backup_id"] / "manifest.json").exists()
     assert fake.upserts == [("memory", [backup_points["memory"][0]])]
+
+# ===========================================================================
+# W0: payload-only points (vector={}) round-trip exactly
+# ===========================================================================
+
+def test_export_and_restore_roundtrip_payload_only_points_exactly(tmp_path, monkeypatch):
+    """Metadata-only structural records export with ``vector={}`` and restore
+    byte-exact: same id, empty vector map, identical payload."""
+    qdrant = FakeQdrant(by_collection={
+        "memory": [
+            {
+                "id": "3ef33041-ae69-62c4-f736-c033ce20c8b7",
+                "vector": {},
+                "payload": {
+                    "memory_kind": "graph_entity",
+                    "entity_id": "entity-0123456789abcdef",
+                    "entity_type": "source",
+                    "lineage_record": True,
+                    "lineage_schema_version": 1,
+                    "lineage_operation": "index_capture",
+                    "lineage_identity_digest": "a" * 64,
+                    "lineage_role": "file_source",
+                    "label": "file-source-abc123",
+                    "text": "file-source-abc123",
+                    "canonical": False,
+                    "requires_review": True,
+                    "profile_id": "p1",
+                    "user_id_hash": "",
+                    "chat_id_hash": "",
+                },
+            },
+            {
+                "id": "ordinary-1",
+                "vector": [0.1, 0.2],
+                "payload": {"text": "ordinary memory"},
+            },
+        ],
+        "learnings": [],
+    })
+    config = {
+        "qdrant_url": "http://local-qdrant.invalid:6333",
+        "collection_name": "memory",
+        "learning_collection_name": "learnings",
+        "vector_size": 2,
+        "distance": "Cosine",
+    }
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    out_file = tmp_path / "export" / "memory.jsonl"
+
+    from qdrant_memory import backup as backup_module
+
+    export_info = backup_module.export_collection(
+        qdrant, config, scope="memory", out_file=str(out_file), overwrite=False
+    )
+    assert export_info.get("count") == 2 or export_info.get("point_count") == 2
+
+    # The exported JSONL must keep the empty vector map verbatim.
+    lines = [json.loads(line) for line in out_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    # First line is the collection header; points carry an explicit "id".
+    records = [record for record in lines if isinstance(record, dict) and "id" in record]
+    by_id = {record["id"]: record for record in records}
+    assert by_id["3ef33041-ae69-62c4-f736-c033ce20c8b7"]["vector"] == {}
+    assert by_id["ordinary-1"]["vector"] == [0.1, 0.2]
+
+    backup = backup_module.create_backup(qdrant, config, hermes_home=str(hermes_home), scope="both")
+    backup_id = backup["backup_id"]
+
+    # Restore into a second, empty fake collection set.
+    target = FakeQdrant(by_collection={"memory": [], "learnings": []})
+    monkeypatch.setattr(backup_module, "create_backup", lambda *a, **k: {"backup_id": "pre-restore-skip"})
+    result = backup_module.restore_backup(target, config, hermes_home=str(hermes_home), backup_id=backup_id, dry_run=False, backup_first=False)
+    assert result["applied"] is True
+    upserted = {point["id"]: point for _name, points in target.upserts for point in points}
+    structural = upserted["3ef33041-ae69-62c4-f736-c033ce20c8b7"]
+    assert structural["vector"] == {}
+    assert structural["payload"]["lineage_record"] is True
+    assert structural["payload"] == by_id["3ef33041-ae69-62c4-f736-c033ce20c8b7"]["payload"]
+    ordinary = upserted["ordinary-1"]
+    assert ordinary["vector"] == [0.1, 0.2]
+
+
+def test_validate_vector_size_accepts_empty_vector_map():
+    from qdrant_memory.backup import BackupError, _validate_vector_size
+
+    record = {"id": "p1", "vector": {}, "payload": {}}
+    _validate_vector_size(record, 1024, scope="memory")  # must not raise
+    with pytest.raises(BackupError):
+        _validate_vector_size({"id": "p2", "vector": [0.1], "payload": {}}, 1024, scope="memory")

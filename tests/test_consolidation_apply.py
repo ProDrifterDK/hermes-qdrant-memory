@@ -869,3 +869,54 @@ def test_guarded_auto_quarantine_is_idempotent_against_same_report(tmp_path):
     assert "error" in second
     assert "fresh report" in second["error"]
     assert len(provider._qdrant.payload_updates) == 1
+
+# ===========================================================================
+# W0: provider apply refuses proposals selecting structural records
+# ===========================================================================
+
+def test_apply_refuses_structural_lineage_points_selected_by_old_proposal(tmp_path):
+    """Structural lineage records retrieved by exact ID must never reach the
+    apply plan or any mutation, even when an old proposal selects them."""
+    provider = _provider(tmp_path)
+    report_payload = {
+        "report_id": "consolidation-aaaaaaaaaaaa",
+        "report_type": "consolidation_report",
+        "profile_id": "architect",
+        "proposals": [
+            {
+                "proposal_id": "proposal-1",
+                "proposal_type": "heading_noise",
+                "collection_name": "memory",
+                "affected_ids": ["structural-1"],
+                "suggested_action": "delete_review_only",
+                "confidence": 0.7,
+                "risk": "medium",
+                "evidence": [{"id": "structural-1", "reason": "heading noise"}],
+                "requires_explicit_approval": True,
+            }
+        ],
+    }
+    artifact = _report_artifact(tmp_path, "consolidation-aaaaaaaaaaaa")
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text(json.dumps(report_payload), encoding="utf-8")
+    structural_point = {
+        "id": "structural-1",
+        "payload": {"text": "file-source-abc123", "lineage_record": True},
+    }
+    provider._qdrant = FakeQdrant(by_collection={"memory": [structural_point]})
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_consolidation_apply",
+            {
+                "report_id": "consolidation-aaaaaaaaaaaa",
+                "proposal_id": "proposal-1",
+                "dry_run": True,
+            },
+        )
+    )
+    assert "error" in result
+    assert "structural lineage" in result["error"]
+    assert provider._qdrant.upserts == []
+    assert provider._qdrant.deleted_ids == []
+    assert provider._qdrant.payload_updates == []

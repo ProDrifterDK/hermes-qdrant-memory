@@ -1112,6 +1112,72 @@ class TestExtraCannotInjectReservedKeys:
         assert payload["memory_kind"] == "graph_entity"
         assert payload.get("safe_custom") == "allowed"
 
+    def test_entity_extra_cannot_inject_ownership_keys(self):
+        """user_id_hash / chat_id_hash are exact write-scope contract fields;
+        ``extra`` must never be able to forge them."""
+        payload = build_entity_payload(
+            entity_type="concept",
+            label="Test",
+            source_uri="file:///docs/x.md",
+            extra={
+                "user_id_hash": "forged-user-hash",
+                "chat_id_hash": "forged-chat-hash",
+                "safe_custom": "allowed",
+            },
+        )
+        assert payload.get("user_id_hash", "") != "forged-user-hash"
+        assert payload.get("chat_id_hash", "") != "forged-chat-hash"
+        assert payload.get("safe_custom") == "allowed"
+
+    def test_edge_extra_cannot_inject_ownership_keys(self):
+        src = make_entity_id("concept", "A")
+        tgt = make_entity_id("concept", "B")
+        payload = build_edge_payload(
+            source_entity_id=src,
+            target_entity_id=tgt,
+            relation_type="SUPPORTS",
+            source_uri="file:///docs/x.md",
+            extra={
+                "user_id_hash": "forged-user-hash",
+                "chat_id_hash": "forged-chat-hash",
+            },
+        )
+        assert payload.get("user_id_hash", "") != "forged-user-hash"
+        assert payload.get("chat_id_hash", "") != "forged-chat-hash"
+
+    def test_version_and_event_reference_fields_require_storage_uuids(self):
+        """file_version_id / lineage_event_id are exact storage point IDs
+        (UUIDs); logical handles are not valid references there."""
+        src = make_entity_id("concept", "A")
+        tgt = make_entity_id("concept", "B")
+        uuid_ref = "12345678-90ab-4cde-8f01-234567890abc"
+        ok = build_edge_payload(
+            source_entity_id=src,
+            target_entity_id=tgt,
+            relation_type="SUPPORTS",
+            source_uri="file:///docs/x.md",
+            file_version_id=uuid_ref,
+            lineage_event_id=uuid_ref,
+        )
+        assert ok["file_version_id"] == uuid_ref
+        assert ok["lineage_event_id"] == uuid_ref
+        with pytest.raises(ValueError):
+            build_edge_payload(
+                source_entity_id=src,
+                target_entity_id=tgt,
+                relation_type="SUPPORTS",
+                source_uri="file:///docs/x.md",
+                file_version_id="entity-0123456789abcdef",
+            )
+        with pytest.raises(ValueError):
+            build_edge_payload(
+                source_entity_id=src,
+                target_entity_id=tgt,
+                relation_type="SUPPORTS",
+                source_uri="file:///docs/x.md",
+                lineage_event_id="entity-0123456789abcdef",
+            )
+
     # -- Edge payload ----------------------------------------------------
 
     def test_edge_extra_cannot_inject_content_hash(self):
@@ -1388,3 +1454,278 @@ class TestTimestampSanitization:
         dumped = json.dumps(payload)
         assert "secret" not in dumped
         assert payload["created_at"] != self._SECRET_TS
+
+# ===========================================================================
+# W0: graph storage identity (logical handle vs UUID point ID)
+# ===========================================================================
+
+class TestGraphStorageIdentity:
+    """entity-*/edge-* stay logical handles; Qdrant IDs are deterministic UUIDs."""
+
+    def test_make_graph_point_id_maps_logical_handle_to_uuid(self):
+        from qdrant_memory.graph_schema import is_uuid_string, make_graph_point_id, make_entity_id
+        from qdrant_memory.schema import make_point_id
+
+        handle = make_entity_id("source", "file-source-abc123")
+        storage_id = make_graph_point_id(handle)
+        assert storage_id != handle
+        assert is_uuid_string(storage_id)
+        assert not is_uuid_string(handle)
+        # Deterministic and equal to the documented domain mapping.
+        assert storage_id == make_graph_point_id(handle)
+        assert storage_id == make_point_id("graph-record-v1", handle)
+
+    def test_graph_point_ids_differ_across_handles_and_domains(self):
+        from qdrant_memory.graph_schema import make_edge_id, make_entity_id, make_graph_point_id
+
+        entity_a = make_entity_id("tool", "kubectl")
+        entity_b = make_entity_id("tool", "helm")
+        edge = make_edge_id(entity_a, entity_b, "DEPENDS_ON")
+        ids = {
+            make_graph_point_id(entity_a),
+            make_graph_point_id(entity_b),
+            make_graph_point_id(edge),
+        }
+        assert len(ids) == 3
+
+    def test_make_graph_point_id_rejects_empty_and_secrets(self):
+        import pytest
+
+        from qdrant_memory.graph_schema import make_graph_point_id
+
+        with pytest.raises(ValueError):
+            make_graph_point_id("")
+        with pytest.raises(ValueError):
+            make_graph_point_id("entity-x " + "api_" + "key=hunter2000")  # scanner-safe runtime construction
+
+    def test_entity_identity_digest_enables_collision_refusal(self):
+        from qdrant_memory.graph_schema import entity_identity_digest, make_entity_id
+        from qdrant_memory.lineage import logical_id_matches_digest
+
+        label = "file-source-deadbeef"
+        handle = make_entity_id("source", label)
+        full_digest = entity_identity_digest("source", label)
+        assert logical_id_matches_digest(handle, full_digest)
+        # A different full identity that shares the truncated handle is a
+        # collision and must never validate.
+        forged_digest = ("0" * 15 + full_digest[15]) if full_digest[15] != "0" else ("1" * 15 + full_digest[15])
+        forged_digest = forged_digest + full_digest[16:]
+        assert not logical_id_matches_digest(handle, forged_digest)
+
+
+class TestLineageIdentityHelpers:
+    """Canonical identity digests: case/punctuation distinctions, determinism."""
+
+    def _lineage(self):
+        from qdrant_memory import lineage
+
+        return lineage
+
+    def test_scope_key_is_exact_tuple_not_wildcard(self):
+        lineage = self._lineage()
+        empty = lineage.make_scope_key(collection_name="memory", profile_id="p1")
+        assert empty == lineage.make_scope_key(collection_name="memory", profile_id="p1", user_id_hash="", chat_id_hash="")
+        assert empty != lineage.make_scope_key(collection_name="memory", profile_id="p1", user_id_hash="u1")
+        assert empty != lineage.make_scope_key(collection_name="memory", profile_id="p1", chat_id_hash="c1")
+        assert empty != lineage.make_scope_key(collection_name="learnings", profile_id="p1")
+
+    def test_source_key_distinguishes_case_and_punctuation(self):
+        lineage = self._lineage()
+        scope = lineage.make_scope_key(collection_name="memory", profile_id="p1")
+        keys = {
+            lineage.make_source_key(scope_key=scope, resolved_file_path=path)
+            for path in (
+                "/repo/Src File.md",
+                "/repo/src file.md",
+                "/repo/Src-File.md",
+                "/repo/SrcFile.md",
+            )
+        }
+        assert len(keys) == 4
+        # Deterministic.
+        again = lineage.make_source_key(scope_key=scope, resolved_file_path="/repo/Src File.md")
+        assert again in keys
+
+    def test_version_identity_digest_depends_on_hash(self):
+        lineage = self._lineage()
+        scope = lineage.make_scope_key(collection_name="memory", profile_id="p1")
+        source = lineage.make_source_key(scope_key=scope, resolved_file_path="/repo/a.md")
+        d1 = lineage.make_version_identity_digest(source_key=source, file_sha256="a" * 64)
+        d2 = lineage.make_version_identity_digest(source_key=source, file_sha256="b" * 64)
+        assert d1 != d2
+        assert d1 == lineage.make_version_identity_digest(source_key=source, file_sha256="a" * 64)
+
+    def test_source_and_version_logical_ids_survive_label_slugification(self):
+        """Identity comes from bare digests, not display labels: paths whose
+        slugified labels would collapse must still produce distinct handles."""
+        lineage = self._lineage()
+        from qdrant_memory.graph_schema import make_entity_id
+
+        scope = lineage.make_scope_key(collection_name="memory", profile_id="p1")
+        key_upper = lineage.make_source_key(scope_key=scope, resolved_file_path="/repo/Src File.md")
+        key_lower = lineage.make_source_key(scope_key=scope, resolved_file_path="/repo/src file.md")
+        id_upper = lineage.source_logical_id(source_key=key_upper, profile_id="p1")
+        id_lower = lineage.source_logical_id(source_key=key_lower, profile_id="p1")
+        assert id_upper != id_lower
+        # Sanity: make_entity_id alone WOULD collapse the slugified labels —
+        # spaces and dots both slugify to "-", and case is lowercased — which
+        # is exactly why paths are hashed before identity generation.
+        assert make_entity_id("source", "Src File.md") == make_entity_id("source", "src file.md")
+        assert key_upper != key_lower
+
+
+class TestStructuralLineagePayloads:
+    """Builders keep trust flags and strict types; validation fails closed."""
+
+    def _fixtures(self):
+        import hashlib
+
+        from qdrant_memory import lineage
+
+        profile = "lin-profile"
+        scope_key = lineage.make_scope_key(collection_name="memory", profile_id=profile)
+        source_key = lineage.make_source_key(scope_key=scope_key, resolved_file_path="/repo/Src File.md")
+        file_sha = hashlib.sha256(b"file bytes").hexdigest()
+        src = lineage.build_source_node_payload(
+            source_key=source_key,
+            scope_key=scope_key,
+            profile_id=profile,
+            file_path="/repo/Src File.md",
+            source_uri="file:///repo/Src%20File.md",
+        )
+        ver = lineage.build_version_node_payload(
+            source_key=source_key,
+            scope_key=scope_key,
+            profile_id=profile,
+            file_path="/repo/Src File.md",
+            file_sha256=file_sha,
+            source_uri="file:///repo/Src%20File.md",
+        )
+        return lineage, profile, scope_key, source_key, file_sha, src, ver
+
+    def test_source_and_version_nodes_are_valid_structural_records(self):
+        lineage, _, _, _, _, src, ver = self._fixtures()
+        for payload in (src, ver):
+            assert payload["canonical"] is False
+            assert payload["requires_review"] is True
+            assert payload["lineage_record"] is True
+            assert isinstance(payload["lineage_schema_version"], int)
+            assert not isinstance(payload["lineage_schema_version"], bool)
+            assert payload["lineage_schema_version"] == 1
+            assert payload["user_id_hash"] == ""
+            assert payload["chat_id_hash"] == ""
+            assert lineage.validate_lineage_payload(payload) == []
+
+    def test_version_node_label_and_identity_are_bare_digests(self):
+        lineage, _, _, source_key, file_sha, _, ver = self._fixtures()
+        version_digest = lineage.make_version_identity_digest(source_key=source_key, file_sha256=file_sha)
+        assert ver["label"] == f"file-version-{version_digest}"
+        assert ver["text"] == ver["label"]
+        assert ver["content_hash"] == f"sha256:{file_sha}"
+        assert ver["file_sha256"] == file_sha
+        assert ver["entity_id"] == lineage.version_logical_id(
+            version_identity_digest=version_digest, profile_id="lin-profile"
+        )
+
+    def test_validation_rejects_bool_schema_version_and_claim_labels(self):
+        lineage, _, _, _, _, src, _ = self._fixtures()
+        bad_bool = dict(src)
+        bad_bool["lineage_schema_version"] = True
+        problems = lineage.validate_lineage_payload(bad_bool)
+        assert any("integer" in problem for problem in problems)
+
+        bad_role = dict(src)
+        bad_role["lineage_role"] = "totally_new_role"
+        assert any("lineage_role" in problem for problem in lineage.validate_lineage_payload(bad_role))
+
+    def test_validation_detects_handle_collision(self):
+        lineage, _, _, _, _, src, _ = self._fixtures()
+        tampered = dict(src)
+        tampered["lineage_identity_digest"] = "0" * 64
+        problems = lineage.validate_lineage_payload(tampered)
+        assert any("collision" in problem for problem in problems)
+
+    def test_validation_rejects_non_canonical_or_review_free_records(self):
+        lineage, _, _, _, _, src, _ = self._fixtures()
+        for key, value in (("canonical", True), ("requires_review", False)):
+            tampered = dict(src)
+            tampered[key] = value
+            problems = lineage.validate_lineage_payload(tampered)
+            assert len(problems) == 1
+
+    def test_reserved_extra_cannot_inject_lineage_fields(self):
+        import pytest
+
+        from qdrant_memory.graph_schema import build_edge_payload, build_entity_payload, make_entity_id
+
+        injection = {
+            "lineage_record": True,
+            "lineage_pending": True,
+            "lineage_schema_version": 1,
+            "lineage_operation": "index_capture",
+            "lineage_identity_digest": "a" * 64,
+            "edge_class": "mechanical",
+            "file_version_id": "entity-0123456789abcdef",
+            "file_sha256": "b" * 64,
+        }
+        entity = build_entity_payload(
+            entity_type="concept",
+            label="safe label",
+            source_uri="session://unit",
+            extra=dict(injection),
+        )
+        edge = build_edge_payload(
+            source_entity_id=make_entity_id("tool", "a"),
+            target_entity_id=make_entity_id("tool", "b"),
+            relation_type="DEPENDS_ON",
+            source_uri="session://unit",
+            extra=dict(injection),
+        )
+        for payload in (entity, edge):
+            for key in injection:
+                assert key not in payload
+
+    def test_explicit_lineage_builder_args_are_strictly_validated(self):
+        import pytest
+
+        from qdrant_memory.graph_schema import build_entity_payload
+
+        def build(**overrides):
+            kwargs = dict(
+                entity_type="source",
+                label="file-source-x",
+                source_uri="file:///x.md",
+                lineage_record=True,
+                lineage_schema_version=1,
+                lineage_operation="index_capture",
+                lineage_identity_digest="a" * 64,
+            )
+            kwargs.update(overrides)
+            return build_entity_payload(**kwargs)
+
+        # Boolean schema version is invalid even though bool subclasses int.
+        with pytest.raises(ValueError):
+            build(lineage_schema_version=True)
+        with pytest.raises(ValueError):
+            build(lineage_schema_version="1")
+        with pytest.raises(ValueError):
+            build(lineage_operation="make_it_up")
+        with pytest.raises(ValueError):
+            build(lineage_identity_digest="XYZ")
+        # Missing operation/digest with record flag fails closed.
+        with pytest.raises(ValueError):
+            build_entity_payload(
+                entity_type="source",
+                label="file-source-x",
+                source_uri="file:///x.md",
+                lineage_record=True,
+                lineage_schema_version=1,
+            )
+        # Lineage metadata without the record flag is refused outright.
+        with pytest.raises(ValueError):
+            build_entity_payload(
+                entity_type="concept",
+                label="safe",
+                source_uri="session://x",
+                lineage_operation="index_capture",
+            )

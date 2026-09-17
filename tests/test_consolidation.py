@@ -426,3 +426,30 @@ def test_status_includes_consolidation_report_flags():
     assert result["consolidation_supported_actions"] == ["merge", "delete", "quarantine", "promote_to_skill", "draft_review"]
     assert result["reconsolidation_report_only"] is True
     assert result["reconsolidation_supported_actions"] == ["draft_review"]
+
+# ===========================================================================
+# W0: structural lineage / pending containment for consolidation
+# ===========================================================================
+
+def test_make_filter_excludes_structural_and_pending_points():
+    from qdrant_memory.consolidation import make_filter
+
+    filt = make_filter({"profile_id": "coder"}, source_type="project_doc")
+    must_not = filt["must_not"]
+    assert {"key": "lineage_record", "match": {"value": True}} in must_not
+    assert {"key": "lineage_pending", "match": {"value": True}} in must_not
+    must = filt["must"]
+    assert {"key": "profile_id", "match": {"value": "coder"}} in must
+    assert {"key": "source_type", "match": {"value": "project_doc"}} in must
+
+
+def test_points_from_qdrant_skips_structural_and_pending_points():
+    from qdrant_memory.consolidation import points_from_qdrant
+
+    raw = [
+        {"id": "normal-1", "payload": {"text": "normal memory"}},
+        {"id": "structural-1", "payload": {"text": "file-source-abc", "lineage_record": True}},
+        {"id": "pending-1", "payload": {"text": "pending chunk", "lineage_pending": True}},
+    ]
+    points = points_from_qdrant(raw, collection_name="memory")
+    assert [point.id for point in points] == ["normal-1"]

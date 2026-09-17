@@ -515,7 +515,13 @@ def make_filter(scope: dict[str, str], *, source_type: str | None = None) -> dic
             must.append({"key": key, "match": {"value": value}})
     if source_type:
         must.append({"key": "source_type", "match": {"value": source_type}})
-    return {"must": must}
+    # Structural lineage records and pending chunks never enter proposal
+    # generation candidate pools.
+    must_not: list[dict[str, Any]] = [
+        {"key": "lineage_record", "match": {"value": True}},
+        {"key": "lineage_pending", "match": {"value": True}},
+    ]
+    return {"must": must, "must_not": must_not}
 
 
 def _similarity(a: str, b: str) -> float:
@@ -994,6 +1000,17 @@ def _quality_warning_proposals(points: list[ConsolidationPoint], *, max_groups: 
     return proposals
 
 
+class StructuralLineageRefusal(ValueError):
+    """Raised when a proposal selection touches structural lineage records."""
+
+
+def is_structural_lineage_payload(payload: Any) -> bool:
+    """True iff a payload marks a structural lineage record or pending chunk."""
+    if not isinstance(payload, dict):
+        return False
+    return bool(payload.get("lineage_record") or payload.get("lineage_pending"))
+
+
 def points_from_qdrant(raw_points: list[dict[str, Any]], *, collection_name: str) -> list[ConsolidationPoint]:
     points: list[ConsolidationPoint] = []
     for raw in raw_points:
@@ -1001,6 +1018,10 @@ def points_from_qdrant(raw_points: list[dict[str, Any]], *, collection_name: str
         payload = _point_payload(raw)
         text = _point_text(raw)
         if not point_id:
+            continue
+        # Defensive post-filter: structural records / pending chunks must
+        # never become consolidation candidates even if a filter was bypassed.
+        if is_structural_lineage_payload(payload):
             continue
         points.append(ConsolidationPoint(id=point_id, collection_name=collection_name, text=text, payload=payload))
     return points

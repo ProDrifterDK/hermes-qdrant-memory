@@ -2530,3 +2530,35 @@ def test_live_apply_upserts_uuid_node_ids_only(tmp_path):
             assert pid in manifest_node_ids
             _uuid.UUID(pid)  # must be valid UUID
             assert not pid.startswith("raptor-node-")
+
+
+# ---------------------------------------------------------------------------
+# W0 correction B2: RAPTOR apply refuses structural/pending markers (any
+# truthy type) and mechanical-class annotations before any embedding/upsert.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("payload_delta", [
+    {"lineage_record": True},
+    {"lineage_pending": True},
+    {"lineage_record": 1},
+    {"lineage_pending": "true"},
+    {"edge_class": "mechanical"},
+])
+def test_raptor_apply_refuses_structural_markers(tmp_path, payload_delta):
+    """A digest-approved manifest proves which payload was approved, not that
+    it obeys W0 write-class rules: structural/pending markers refuse the whole
+    apply before any embedding and any upsert."""
+    manifest = _build_manifest()
+    for payload in manifest["candidate_node_payloads"]:
+        payload.update(payload_delta)
+    manifest["manifest_digest"] = compute_manifest_digest(manifest)
+    provider, wrapper, report_id, build_id, digest = _provider_with_manifest(tmp_path, manifest)
+    args = {"report_id": report_id, "build_id": build_id, "manifest_digest": digest}
+    preview = json.loads(provider.handle_tool_call("qdrant_memory_raptor_apply", args))
+    result = json.loads(provider.handle_tool_call("qdrant_memory_raptor_apply", {**args, "dry_run": False, "approve": True}))
+    assert provider._qdrant.upserts == [], (payload_delta, preview, result)
+    # Refusal happens before any embedding work, at preview and at apply.
+    assert provider._embeddings.documents == [], (payload_delta, preview, result)
+    combined = str(preview.get("error") or "") + str(result.get("error") or "")
+    assert "structural lineage markers" in combined, (payload_delta, preview, result)
