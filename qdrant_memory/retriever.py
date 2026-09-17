@@ -117,6 +117,10 @@ def _payload_allowed(
     requires_review: Any = None,
     canonical: Any = None,
 ) -> bool:
+    # Structural lineage records and pending chunks never surface as
+    # retrieval results, even if a server-side filter was bypassed.
+    if payload.get("lineage_record") or payload.get("lineage_pending"):
+        return False
     if not _payload_value_matches(payload.get("source_type"), source_type):
         return False
     if not _payload_value_matches(payload.get("memory_kind"), memory_kind):
@@ -204,6 +208,11 @@ def _scope_filter(
     _append_bool_filter(must, must_not, "stale", stale)
     _append_bool_filter(must, must_not, "requires_review", requires_review)
     _append_bool_filter(must, must_not, "canonical", canonical)
+    # Structural lineage records and pending chunks are excluded from every
+    # candidate pool (dense search, sparse lane, history queries) before any
+    # budget is consumed.
+    must_not.append({"key": "lineage_record", "match": {"value": True}})
+    must_not.append({"key": "lineage_pending", "match": {"value": True}})
     result: dict[str, Any] = {}
     if must:
         result["must"] = must

@@ -1592,3 +1592,198 @@ def test_graph_edge_candidate_payload_has_endpoint_type_metadata():
     payload_json = json.dumps(payload)
     assert "TestProject" not in payload_json
     assert "TestTool" not in payload_json
+
+# ===========================================================================
+# W0: graph storage-ID mapping for improve targets
+# ===========================================================================
+
+def test_graph_candidate_target_point_id_is_uuid_not_logical_handle():
+    """Graph candidates must target Qdrant UUID storage IDs; payloads keep the
+    logical entity-*/edge-* handles unchanged."""
+    from qdrant_memory.graph_schema import is_uuid_string, make_graph_point_id, make_entity_id
+    from qdrant_memory.improve import candidate_target_point_id, candidate_from_report_item
+
+    logical = make_entity_id("project", "StorageIdProject")
+    candidate = candidate_from_report_item({
+        "candidate_id": "cand-entity",
+        "candidate_type": "graph_entity_candidate",
+        "proposed_payload": {"entity_id": logical, "label": "StorageIdProject"},
+    })
+    target = candidate_target_point_id(candidate)
+    assert target == make_graph_point_id(logical)
+    assert is_uuid_string(target)
+    assert target != logical
+    # Deterministic across repeats.
+    assert candidate_target_point_id(candidate) == target
+
+
+def test_regular_candidate_target_point_id_unchanged():
+    from qdrant_memory.improve import candidate_target_point_id, candidate_from_report_item
+
+    candidate = candidate_from_report_item({
+        "candidate_id": "cand-regular",
+        "candidate_type": "memory_candidate",
+        "proposed_payload": {"text": "regular memory"},
+    })
+    assert candidate_target_point_id(candidate) == "cand-regular"
+
+
+def test_live_apply_refuses_stale_report_with_logical_handle_target(tmp_path):
+    """Reports generated before the UUID mapping carry raw entity-*/edge-*
+    targets; apply must refuse and require regeneration (digest not reinterpreted)."""
+    provider = _provider_for_improve(tmp_path)
+    source = "Graph entity: project: StaleMapping"
+    preview = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_preview",
+            {"source_text": source, "source_uri": "session://test/stale-mapping"},
+        )
+    )
+    report_id = preview["report_id"]
+    store_candidate = next(c for c in preview["candidates"] if c["would_store"])
+    candidate_id = store_candidate["candidate_id"]
+
+    # Simulate an old-generation report item in place: an old report was
+    # generated with the logical handle as target, so its persisted digest
+    # consistently covers that value.
+    from qdrant_memory.improve import make_candidate_digest
+    for item in provider._pending_improve_reports[report_id]["candidates"]:
+        if item["candidate_id"] == candidate_id:
+            item["target_point_id"] = "entity-0123456789abcdef"
+            item["candidate_digest"] = make_candidate_digest(item)
+
+    provider.handle_tool_call(
+        "qdrant_memory_improve_apply",
+        {"report_id": report_id, "candidate_id": candidate_id},
+    )
+    live = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_apply",
+            {"report_id": report_id, "candidate_id": candidate_id, "dry_run": False, "approve": True},
+        )
+    )
+    assert "error" in live
+    assert "regenerate" in live["error"]
+    assert provider._qdrant.upserts == []
+
+
+def test_live_apply_refuses_tampered_storage_target(tmp_path):
+    """A stored target diverging from the current mapping is refused the same
+    way, even if it is not a legacy logical handle."""
+    provider = _provider_for_improve(tmp_path)
+    source = "Graph entity: project: TamperedTarget"
+    preview = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_preview",
+            {"source_text": source, "source_uri": "session://test/tampered-target"},
+        )
+    )
+    report_id = preview["report_id"]
+    store_candidate = next(c for c in preview["candidates"] if c["would_store"])
+    candidate_id = store_candidate["candidate_id"]
+
+    from qdrant_memory.improve import make_candidate_digest
+    for item in provider._pending_improve_reports[report_id]["candidates"]:
+        if item["candidate_id"] == candidate_id:
+            item["target_point_id"] = "99999999-8888-7777-6666-555555555555"
+            item["candidate_digest"] = make_candidate_digest(item)
+
+    provider.handle_tool_call(
+        "qdrant_memory_improve_apply",
+        {"report_id": report_id, "candidate_id": candidate_id},
+    )
+    live = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_apply",
+            {"report_id": report_id, "candidate_id": candidate_id, "dry_run": False, "approve": True},
+        )
+    )
+    assert "error" in live
+    assert "regenerate" in live["error"]
+    assert provider._qdrant.upserts == []
+
+
+def test_live_apply_store_path_uses_uuid_target_for_graph_candidate(tmp_path):
+    """The applied point ID is the mapped UUID, not the logical handle."""
+    from qdrant_memory.graph_schema import is_uuid_string
+
+    provider = _provider_for_improve(tmp_path)
+    source = "Graph entity: project: UuidApply"
+    preview = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_preview",
+            {"source_text": source, "source_uri": "session://test/uuid-apply"},
+        )
+    )
+    store_candidate = next(c for c in preview["candidates"] if c["would_store"])
+    candidate_id = store_candidate["candidate_id"]
+    report_id = preview["report_id"]
+
+    provider.handle_tool_call(
+        "qdrant_memory_improve_apply",
+        {"report_id": report_id, "candidate_id": candidate_id},
+    )
+    live = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_improve_apply",
+            {"report_id": report_id, "candidate_id": candidate_id, "dry_run": False, "approve": True},
+        )
+    )
+    assert live["saved"] is True
+    assert is_uuid_string(live["id"])
+    assert provider._qdrant.upserts[0][1][0]["id"] == live["id"]
+    # Payload still carries the logical handle.
+    payload = provider._qdrant.upserts[0][1][0]["payload"]
+    assert payload["entity_id"].startswith("entity-")
+
+
+# ---------------------------------------------------------------------------
+# W0 correction B1: structural payload metadata is refused at both improve
+# apply seams (proposed and post-enrichment), before any embedding/upsert.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("payload_delta", [
+    {"lineage_pending": 1},
+    {"lineage_record": "true"},
+    {"edge_class": "mechanical"},
+])
+def test_live_apply_refuses_structural_payload_metadata(tmp_path, payload_delta):
+    """A reviewed semantic report must not be able to certify a payload class
+    W0 reserves for mechanical validation: any truthy lineage marker of any
+    type, or the mechanical edge class, refuses the apply with no upsert."""
+    provider = _provider_for_improve(tmp_path)
+    report = json.loads(provider.handle_tool_call("qdrant_memory_improve_preview", {
+        "source_text": "Graph edge: project:DeploymentSafety -[SUPPORTS]-> concept:Validation",
+        "source_uri": "session://review/edge",
+    }))
+    report_id = report["report_id"]
+    item = provider._pending_improve_reports[report_id]["candidates"][0]
+    # The delta is installed BEFORE review and its digest recomputed, so this
+    # exercises the gate's refusal, not a stale-digest bypass.
+    item["proposed_payload"].update(payload_delta)
+    item["candidate_digest"] = make_candidate_digest(item)
+    args = {"report_id": report_id, "candidate_id": item["candidate_id"]}
+    preview = json.loads(provider.handle_tool_call("qdrant_memory_improve_apply", args))
+    assert preview.get("would_store") is False, preview
+    result = json.loads(provider.handle_tool_call("qdrant_memory_improve_apply", {**args, "dry_run": False, "approve": True}))
+    assert provider._qdrant.upserts == [], (payload_delta, result)
+    assert "write gate rejected" in str(result.get("error") or ""), result
+
+
+def test_live_apply_normal_semantic_edge_still_stores(tmp_path):
+    """Positive control for the B1 refusals: the same report without payload
+    tampering applies and upserts exactly one point."""
+    provider = _provider_for_improve(tmp_path)
+    report = json.loads(provider.handle_tool_call("qdrant_memory_improve_preview", {
+        "source_text": "Graph edge: project:DeploymentSafety -[SUPPORTS]-> concept:Validation",
+        "source_uri": "session://review/edge",
+    }))
+    report_id = report["report_id"]
+    item = provider._pending_improve_reports[report_id]["candidates"][0]
+    args = {"report_id": report_id, "candidate_id": item["candidate_id"]}
+    preview = json.loads(provider.handle_tool_call("qdrant_memory_improve_apply", args))
+    assert preview.get("would_store") is True, preview
+    result = json.loads(provider.handle_tool_call("qdrant_memory_improve_apply", {**args, "dry_run": False, "approve": True}))
+    assert result.get("saved") is True, result
+    assert len(provider._qdrant.upserts) == 1, result

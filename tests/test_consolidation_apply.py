@@ -365,6 +365,10 @@ def test_apply_promote_live_creates_skill_draft_and_marks_learning(tmp_path):
         }
     )
     report, proposal = _persist_promotion_report(provider)
+    assert proposal["guarded_auto_eligible"] is True
+    assert proposal["preauthorized_policy"] == "guarded-auto:learning-skill-draft"
+    assert proposal["guarded_auto_snapshot"]["point_digests"]
+    assert proposal["guarded_auto_proposal_sha256"]
 
     result = json.loads(provider.handle_tool_call("qdrant_memory_consolidation_apply", {"report_id": report["report_id"], "proposal_id": proposal["proposal_id"], "action": "promote_to_skill", "dry_run": False, "approve": True}))
 
@@ -382,6 +386,54 @@ def test_apply_promote_live_creates_skill_draft_and_marks_learning(tmp_path):
     assert update["proposal_draft_path"] == result["proposal_draft_path"]
     assert update["skill_draft_path"] == result["skill_draft_path"]
     assert provider._qdrant.deleted_ids == []
+
+
+def test_apply_promote_fact_like_learning_is_manual_review_only_but_human_apply_still_drafts(tmp_path):
+    provider = _provider(tmp_path)
+    provider._qdrant = FakeQdrant(
+        {
+            "memory": [],
+            "learnings": [
+                _point(
+                    "l-fact",
+                    "Always run pytest after changing consolidation actions",
+                    source_type="learning",
+                    learning_type="workflow_lesson",
+                    fact_key="workflow.consolidation",
+                    confidence=0.95,
+                    importance=9,
+                    promote_to_skill_candidate=True,
+                )
+            ],
+        }
+    )
+    report, proposal = _persist_promotion_report(provider)
+
+    assert proposal["guarded_auto_eligible"] is False
+    assert proposal["manual_review_required"] is True
+    assert proposal["manual_review_reason"] == "profile or fact-like memory requires manual review"
+    assert "preauthorized_policy" not in proposal
+    assert "guarded_auto_snapshot" not in proposal
+    assert "guarded_auto_proposal_sha256" not in proposal
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_consolidation_apply",
+            {
+                "report_id": report["report_id"],
+                "proposal_id": proposal["proposal_id"],
+                "action": "promote_to_skill",
+                "dry_run": False,
+                "approve": True,
+            },
+        )
+    )
+
+    assert result["applied"] is True
+    assert result["action"] == "promote_to_skill"
+    assert result["skill_draft_path"]
+    assert result["write_decision"]["decision"] == "skill_candidate"
+    assert provider._qdrant.payload_updates[0][0:2] == ("learnings", "l-fact")
 
 
 def test_apply_promote_refuses_secret_bearing_learning_even_with_persisted_proposal(tmp_path):
@@ -817,3 +869,54 @@ def test_guarded_auto_quarantine_is_idempotent_against_same_report(tmp_path):
     assert "error" in second
     assert "fresh report" in second["error"]
     assert len(provider._qdrant.payload_updates) == 1
+
+# ===========================================================================
+# W0: provider apply refuses proposals selecting structural records
+# ===========================================================================
+
+def test_apply_refuses_structural_lineage_points_selected_by_old_proposal(tmp_path):
+    """Structural lineage records retrieved by exact ID must never reach the
+    apply plan or any mutation, even when an old proposal selects them."""
+    provider = _provider(tmp_path)
+    report_payload = {
+        "report_id": "consolidation-aaaaaaaaaaaa",
+        "report_type": "consolidation_report",
+        "profile_id": "architect",
+        "proposals": [
+            {
+                "proposal_id": "proposal-1",
+                "proposal_type": "heading_noise",
+                "collection_name": "memory",
+                "affected_ids": ["structural-1"],
+                "suggested_action": "delete_review_only",
+                "confidence": 0.7,
+                "risk": "medium",
+                "evidence": [{"id": "structural-1", "reason": "heading noise"}],
+                "requires_explicit_approval": True,
+            }
+        ],
+    }
+    artifact = _report_artifact(tmp_path, "consolidation-aaaaaaaaaaaa")
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text(json.dumps(report_payload), encoding="utf-8")
+    structural_point = {
+        "id": "structural-1",
+        "payload": {"text": "file-source-abc123", "lineage_record": True},
+    }
+    provider._qdrant = FakeQdrant(by_collection={"memory": [structural_point]})
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "qdrant_memory_consolidation_apply",
+            {
+                "report_id": "consolidation-aaaaaaaaaaaa",
+                "proposal_id": "proposal-1",
+                "dry_run": True,
+            },
+        )
+    )
+    assert "error" in result
+    assert "structural lineage" in result["error"]
+    assert provider._qdrant.upserts == []
+    assert provider._qdrant.deleted_ids == []
+    assert provider._qdrant.payload_updates == []

@@ -78,13 +78,20 @@ class FakeGraphQdrant:
             "name": name, "filter": filter, "limit": limit,
             "max_total": max_total,
         })
-        # Match points from store against filter
+        # Match points from store against filter (must + must_not).
+        # ``must`` is a conjunction; ``must_not`` is Qdrant NONE semantics:
+        # a point is excluded when ANY single condition matches on its own
+        # (NOT(AND) here would let single-flag structural records through).
         results = []
         must = filter.get("must", []) if filter else []
+        must_not = filter.get("must_not", []) if filter else []
         for point_id, point in self._store.items():
             payload = point.get("payload") or {}
-            if self._matches_filter(payload, must):
-                results.append(point)
+            if not self._matches_filter(payload, must):
+                continue
+            if any(self._matches_filter(payload, [condition]) for condition in must_not):
+                continue
+            results.append(point)
         if max_total:
             results = results[:max_total]
         else:
@@ -128,6 +135,88 @@ class FakeGraphQdrant:
                 if str(payload.get(key)) not in values:
                     return False
         return True
+
+
+class FilterBypassingGraphQdrant(FakeGraphQdrant):
+    """Backend whose server-side ``must_not`` filter is silently ignored.
+
+    Models a Qdrant deployment (or proxy) that fails to enforce the
+    requested exclusion: ``must`` still reaches the store so scope/kind
+    narrowing works, but ``must_not`` never excludes anything. In these
+    fixtures the retriever's in-process defensive checks are the only
+    remaining line of defense.
+    """
+
+    def scroll_by_filter(self, name, filter, *, limit=256, with_payload=True, with_vector=False, max_total=None):
+        crippled = dict(filter) if isinstance(filter, dict) else filter
+        if isinstance(crippled, dict):
+            crippled.pop("must_not", None)
+        return super().scroll_by_filter(
+            name, crippled,
+            limit=limit, with_payload=with_payload,
+            with_vector=with_vector, max_total=max_total,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test 0: FakeGraphQdrant must_not boolean contract
+# ---------------------------------------------------------------------------
+
+class TestFakeGraphQdrantMustNotContract:
+    """The fake must implement Qdrant ``must_not`` as NONE semantics: a point
+    is excluded when ANY single condition matches on its own, never as
+    NOT(AND) over the whole list. A wrong fake understates structural-lineage
+    leakage in every containment test built on it.
+    """
+
+    @staticmethod
+    def _seeded_qdrant() -> FakeGraphQdrant:
+        qdrant = FakeGraphQdrant()
+        qdrant.add_point("normal", {"memory_kind": "graph_entity", "label": "plain"})
+        qdrant.add_point("record", {
+            "memory_kind": "graph_entity", "label": "rec", "lineage_record": True,
+        })
+        qdrant.add_point("pending", {
+            "memory_kind": "graph_entity", "label": "pend", "lineage_pending": True,
+        })
+        qdrant.add_point("both", {
+            "memory_kind": "graph_entity", "label": "both",
+            "lineage_record": True, "lineage_pending": True,
+        })
+        return qdrant
+
+    def test_must_not_excludes_each_condition_independently(self):
+        qdrant = self._seeded_qdrant()
+
+        def returned_ids(filt):
+            return sorted(p["id"] for p in qdrant.scroll_by_filter("memory", filt))
+
+        # Absent must_not: nothing excluded.
+        assert returned_ids({"must": []}) == ["both", "normal", "pending", "record"], (
+            f"absent must_not must exclude nothing, got {returned_ids({'must': []})}"
+        )
+
+        # Empty must_not: nothing excluded — an empty conjunction must not be
+        # treated as vacuously true (the NOT(AND) bug excluded every point).
+        assert returned_ids({"must": [], "must_not": []}) == ["both", "normal", "pending", "record"], (
+            f"empty must_not must exclude nothing, got {returned_ids({'must': [], 'must_not': []})}"
+        )
+
+        # Single condition: exactly the matching payloads are excluded.
+        single = [{"key": "lineage_record", "match": {"value": True}}]
+        assert returned_ids({"must": [], "must_not": single}) == ["normal", "pending"], (
+            f"single must_not condition excluded the wrong set, got {returned_ids({'must': [], 'must_not': single})}"
+        )
+
+        # Two independent conditions (the exact pair production constructs):
+        # each excludes on its own, leaving only the unmarked point.
+        structural = [
+            {"key": "lineage_record", "match": {"value": True}},
+            {"key": "lineage_pending", "match": {"value": True}},
+        ]
+        assert returned_ids({"must": [], "must_not": structural}) == ["normal"], (
+            f"both must_not conditions must leave only 'normal', got {returned_ids({'must': [], 'must_not': structural})}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1449,6 +1538,60 @@ class TestGraphIDValidation:
             f"valid edge should produce expansion to mem-b: {exp_ids}"
         )
 
+    def test_unresolved_edge_expansion_exposes_storage_point_id(self):
+        """W0 regression: when an edge has no resolvable memory points, the
+        fallback expansion candidate must carry the edge point's exact Qdrant
+        storage ID, never the logical ``edge-*`` handle (which real Qdrant
+        rejects as a point ID)."""
+        eid_a = make_entity_id("concept", "A")
+        eid_b = make_entity_id("concept", "B")
+        seeds = [{
+            "id": "seed-a",
+            "score": 0.9,
+            "payload": {
+                "text": "entity A",
+                "importance": 5,
+                "created_at": "2026-06-20T00:00:00+00:00",
+                "entity_id": eid_a,
+                "fact_status": "active",
+            },
+        }]
+        qdrant = FakeGraphQdrant(search_results=seeds)
+        qdrant.add_point("ent-a", {
+            "memory_kind": "graph_entity",
+            "entity_id": eid_a,
+            "source_point_ids": [],
+            "fact_status": "active",
+        })
+        edge_id = make_edge_id(eid_a, eid_b, "RELATED_TO")
+        edge_storage_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        qdrant.add_point(edge_storage_id, {
+            "memory_kind": "graph_edge",
+            "edge_id": edge_id,
+            "source_entity_id": eid_a,
+            "target_entity_id": eid_b,
+            "relation_type": "RELATED_TO",
+            "confidence": 0.9,
+            "fact_status": "active",
+        })
+        # Counterparty entity exists but resolves to no memory points, so the
+        # edge itself becomes the fallback expansion candidate.
+        qdrant.add_point("ent-b", {
+            "memory_kind": "graph_entity",
+            "entity_id": eid_b,
+            "source_point_ids": [],
+            "fact_status": "active",
+        })
+        retriever = GraphMemoryRetriever(
+            qdrant=qdrant,
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+        )
+        result = retriever.search("entity A", top_k=5, debug=True)
+        exp_ids = [e.point_id for e in result.expansions]
+        assert edge_storage_id in exp_ids, f"fallback expansion must use the storage ID: {exp_ids}"
+        assert edge_id not in exp_ids, f"logical handle must never surface as a point ID: {exp_ids}"
+
 
 class TestProviderGraphSearchDispatch:
     """Blocker 1: Provider must dispatch qdrant_memory_graph_search."""
@@ -1865,3 +2008,265 @@ class TestGraphScopeIsolation:
             f"in-scope control point 'mem-scoped' was incorrectly filtered "
             f"out of expansions/final: {all_ids}"
         )
+
+# ===========================================================================
+# W0: structural lineage containment in semantic graph search
+# ===========================================================================
+
+class TestStructuralLineageContainment:
+    """Structural records never become seeds, edges, or results — even when
+    their labels match the query."""
+
+    def _retriever(self, qdrant):
+        return GraphMemoryRetriever(
+            qdrant=qdrant,
+            embeddings=FakeEmbedding(),
+            collection_name="memory",
+            scope={"profile_id": "coder"},
+        )
+
+    @staticmethod
+    def _add_structural_and_ordinary_entities(qdrant) -> tuple[str, str]:
+        """Seed one ordinary alias-matched entity and one structural lineage
+        entity whose alias also matches the query. Returns their entity IDs."""
+        ordinary_eid = "entity-aaaaaaaaaaaaaaaa"
+        structural_eid = "entity-bbbbbbbbbbbbbbbb"
+        qdrant.add_point("entity-real", {
+            "memory_kind": "graph_entity",
+            "entity_id": ordinary_eid,
+            "entity_type": "tool",
+            "label": "deploy pipeline",
+            "text": "deploy pipeline",
+            "source_point_ids": ["seed-1"],
+            "confidence": 0.9,
+            "canonical": False,
+            "requires_review": True,
+            "fact_status": "active",
+            "profile_id": "coder",
+        })
+        qdrant.add_point("struct-src", {
+            "memory_kind": "graph_entity",
+            "entity_id": structural_eid,
+            "entity_type": "source",
+            "lineage_record": True,
+            "lineage_role": "file_source",
+            "label": "file-source-deploy-pipeline",
+            "text": "file-source-deploy-pipeline",
+            "aliases": ["deploy pipeline"],
+            "source_uri": "file:///repo/deploy.md",
+            "content_hash": "sha256:" + "a" * 64,
+            "canonical": False,
+            "requires_review": True,
+            "fact_status": "active",
+            "profile_id": "coder",
+        })
+        return ordinary_eid, structural_eid
+
+    @staticmethod
+    def _add_ordinary_graph_context(qdrant, ordinary_eid: str) -> str:
+        """Ordinary edge + memory-backed counterparty so the public search
+        reports a real expansion/final candidate through the ordinary entity.
+        Returns the reported memory point id."""
+        counterparty_eid = "entity-cccccccccccccccc"
+        memory_pid = "mem-ordinary-ctl"
+        qdrant.add_point("entity-ctl", {
+            "memory_kind": "graph_entity",
+            "entity_id": counterparty_eid,
+            "entity_type": "workflow",
+            "label": "rollback notes",
+            "source_point_ids": [memory_pid],
+            "confidence": 0.9,
+            "canonical": False,
+            "requires_review": True,
+            "fact_status": "active",
+            "profile_id": "coder",
+        })
+        qdrant.add_point(memory_pid, {
+            "text": "rollback notes for the deploy pipeline runbook",
+            "source_type": "project_doc",
+            "importance": 8,
+            "created_at": "2026-06-20T00:00:00+00:00",
+            "fact_status": "active",
+            "profile_id": "coder",
+        })
+        qdrant.add_point("edge-ctl", {
+            "memory_kind": "graph_edge",
+            "edge_id": "edge-cccccccccccccccc",
+            "source_entity_id": ordinary_eid,
+            "target_entity_id": counterparty_eid,
+            "relation_type": "RELATED_TO",
+            "confidence": 0.9,
+            "usefulness_weight": 0.7,
+            "fact_status": "active",
+            "canonical": False,
+            "requires_review": True,
+            "profile_id": "coder",
+        })
+        return memory_pid
+
+    @staticmethod
+    def _traversed_entity_ids(qdrant) -> set[str]:
+        """Entity IDs the BFS actually traversed, read from the edge-scroll
+        request filters (observable query-alias traversal footprint)."""
+        traversed: set[str] = set()
+        for scroll in qdrant.scrolls:
+            for condition in scroll["filter"].get("must", []):
+                if condition.get("key") in ("source_entity_id", "target_entity_id"):
+                    traversed.add(condition["match"]["value"])
+        return traversed
+
+    @staticmethod
+    def _assert_structural_excluded(result, qdrant, ordinary_eid, structural_eid) -> None:
+        assert isinstance(result, GraphSearchResult), (
+            f"search() must return a GraphSearchResult, got {type(result)!r}"
+        )
+        stage_b = (result.debug.get("stages") or {}).get("B_entity_extraction") or {}
+        assert stage_b.get("matched_from_query_aliases") == 1, (
+            f"alias traversal must match exactly the ordinary entity, got "
+            f"matched_from_query_aliases={stage_b.get('matched_from_query_aliases')!r}"
+        )
+        traversed = TestStructuralLineageContainment._traversed_entity_ids(qdrant)
+        assert ordinary_eid in traversed, (
+            f"ordinary entity never entered BFS traversal: {sorted(traversed)}"
+        )
+        assert structural_eid not in traversed, (
+            f"structural entity entered BFS traversal: {sorted(traversed)}"
+        )
+        # The ordinary entity must also be REPORTED: at least one expansion
+        # and one final candidate travel through its path.
+        through_expansions = [c for c in result.expansions if ordinary_eid in (c.path or [])]
+        assert through_expansions, (
+            f"no expansion candidate reported through the ordinary entity: "
+            f"expansions={[(c.point_id, list(c.path)) for c in result.expansions]}"
+        )
+        through_final = [c for c in result.final if ordinary_eid in (c.path or [])]
+        assert through_final, (
+            f"ordinary entity path never reached a final result: "
+            f"final={[(c.point_id, list(c.path)) for c in result.final]}"
+        )
+        reported_ids = (
+            {s.id for s in result.seeds}
+            | {c.point_id for c in result.expansions}
+            | {c.point_id for c in result.final}
+        )
+        assert structural_eid not in reported_ids, (
+            f"structural entity leaked into reported results: {sorted(reported_ids)}"
+        )
+
+    def test_structural_entity_label_matching_query_is_excluded(self):
+        """With the server-side filter enforced, the structural entity never
+        reaches the traversal, the ordinary entity is reported, and every
+        scroll still carries both structural exclusions."""
+        qdrant = FakeGraphQdrant(search_results=[])
+        ordinary_eid, structural_eid = self._add_structural_and_ordinary_entities(qdrant)
+        self._add_ordinary_graph_context(qdrant, ordinary_eid)
+
+        retriever = self._retriever(qdrant)
+        result = retriever.search("deploy pipeline", top_k=5, candidate_seed_top_k=5)
+
+        self._assert_structural_excluded(result, qdrant, ordinary_eid, structural_eid)
+        # Every scroll carries both structural exclusions server-side.
+        for scroll in qdrant.scrolls:
+            must_not_keys = {condition.get("key") for condition in scroll["filter"].get("must_not", [])}
+            assert "lineage_record" in must_not_keys, (
+                f"scroll missing lineage_record exclusion: {scroll['filter']}"
+            )
+            assert "lineage_pending" in must_not_keys, (
+                f"scroll missing lineage_pending exclusion: {scroll['filter']}"
+            )
+
+    def test_structural_entity_excluded_even_when_server_filter_bypassed(self):
+        """Defensive in-process guard, tested independently of the request
+        filter: when the backend silently drops ``must_not``, the guard must
+        still keep the structural entity out of the query-alias traversal
+        while the ordinary entity is reported."""
+        qdrant = FilterBypassingGraphQdrant(search_results=[])
+        ordinary_eid, structural_eid = self._add_structural_and_ordinary_entities(qdrant)
+        self._add_ordinary_graph_context(qdrant, ordinary_eid)
+
+        retriever = self._retriever(qdrant)
+        result = retriever.search("deploy pipeline", top_k=5, candidate_seed_top_k=5)
+
+        self._assert_structural_excluded(result, qdrant, ordinary_eid, structural_eid)
+
+    def test_entity_scroll_filter_carries_lineage_exclusions(self):
+        qdrant = FakeGraphQdrant(search_results=[])
+        retriever = self._retriever(qdrant)
+        retriever._find_query_matched_entities("deploy", None)
+        assert qdrant.scrolls, "expected an entity scroll"
+        must_not = qdrant.scrolls[0]["filter"]["must_not"]
+        assert {"key": "lineage_record", "match": {"value": True}} in must_not
+        assert {"key": "lineage_pending", "match": {"value": True}} in must_not
+
+    def test_edge_scroll_filter_carries_lineage_exclusions(self):
+        qdrant = FakeGraphQdrant(search_results=[])
+        retriever = self._retriever(qdrant)
+        edges = retriever._scroll_edges_for_entity("entity-aaaaaaaaaaaaaaaa", side="source", relation_types=None)
+        assert edges == []
+        assert qdrant.scrolls, "expected an edge scroll"
+        must_not = qdrant.scrolls[0]["filter"]["must_not"]
+        assert {"key": "lineage_record", "match": {"value": True}} in must_not
+        assert {"key": "lineage_pending", "match": {"value": True}} in must_not
+
+    def test_structural_edge_matching_entity_is_dropped(self):
+        qdrant = FakeGraphQdrant(search_results=[])
+        # A structural mechanical edge stored with the legacy raw-handle id:
+        # even if the filter missed it, the defensive post-filter must drop it.
+        qdrant.add_point("edge-structural", {
+            "memory_kind": "graph_edge",
+            "edge_id": "edge-aaaaaaaaaaaaaaaa",
+            "source_entity_id": "entity-aaaaaaaaaaaaaaaa",
+            "target_entity_id": "entity-bbbbbbbbbbbbbbbb",
+            "relation_type": "PART_OF",
+            "edge_class": "mechanical",
+            "lineage_record": True,
+            "lineage_schema_version": 1,
+            "lineage_operation": "index_capture",
+            "lineage_identity_digest": "c" * 64,
+            "source_point_id": "11111111-2222-3333-4444-555555555555",
+            "target_point_id": "66666666-7777-8888-9999-aaaaaaaaaaaa",
+            "source_entity_type": "source",
+            "target_entity_type": "source",
+            "confidence": 1.0,
+            "canonical": False,
+            "requires_review": True,
+            "fact_status": "active",
+            "profile_id": "coder",
+            "content_hash": "sha256:" + "b" * 64,
+        })
+        retriever = self._retriever(qdrant)
+        edges = retriever._scroll_edges_for_entity("entity-aaaaaaaaaaaaaaaa", side="source", relation_types=None)
+        assert edges == []
+
+    def test_resolve_entity_memories_drops_structural_source_points(self):
+        qdrant = FakeGraphQdrant(search_results=[])
+        qdrant.add_point("entity-1", {
+            "memory_kind": "graph_entity",
+            "entity_id": "entity-aaaaaaaaaaaaaaaa",
+            "entity_type": "tool",
+            "label": "kubectl",
+            "source_point_ids": ["mem-1", "struct-mem"],
+            "confidence": 0.9,
+            "canonical": False,
+            "requires_review": True,
+            "fact_status": "active",
+            "profile_id": "coder",
+        })
+        qdrant.add_point("mem-1", {
+            "text": "kubectl notes",
+            "source_type": "project_doc",
+            "importance": 8,
+            "fact_status": "active",
+            "profile_id": "coder",
+        })
+        qdrant.add_point("struct-mem", {
+            "text": "file-version-" + "d" * 64,
+            "lineage_record": True,
+            "lineage_role": "file_version",
+            "fact_status": "active",
+            "profile_id": "coder",
+        })
+        retriever = self._retriever(qdrant)
+        results = retriever._resolve_entity_memories("entity-aaaaaaaaaaaaaaaa", None, include_fact_history=False)
+        ids = [point_id for point_id, _payload in results]
+        assert ids == ["mem-1"]

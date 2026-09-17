@@ -1073,3 +1073,55 @@ The feature set is successful when:
 - Extraction candidates remain preview/approval gated and cannot bypass write safety.
 - Obsidian-specific behavior is optional and never required for public plugin users.
 - The plugin remains a Hermes MemoryProvider, not a replacement for LCM or a full note-taking system. HDFP is no longer part of the active architecture; LCM is the sole active-session context engine.
+
+---
+
+## W0 lineage prerequisites (recorded, not yet a writer)
+
+Approved plan prerequisites landed, and two of them change existing runtime
+behavior today: the improve target-ID mapping (improve apply now targets
+`graph-record-v1` UUIDs and refuses stale reports) and the retrieval /
+consolidation filters (candidate pools exclude `lineage_record=True` and
+`lineage_pending=True`). What has NOT landed is the lineage writer itself:
+no structural record is persisted and `lineage_mode` stays `off`.
+
+- Identity/storage split: `entity-*`/`edge-*` are logical handles; Qdrant
+  point IDs use the `graph-record-v1` UUID mapping (`make_graph_point_id`).
+  Source/version identity uses canonical-JSON digests
+  (`memory-scope-v1`, `file-source-v1`, `file-version-v1`) over exact
+  case-sensitive paths, with full-digest collision refusal.
+- Mechanical/semantic gate split: `evaluate_mechanical_lineage_write` plus
+  typed `LineageEvidence`; writes require the exact
+  `(profile_id, user_id_hash, chat_id_hash)` ownership tuple plus collection,
+  with missing optional scope meaning empty, never wildcard.
+- Acceptance boundary: the mechanical gate validates the W0 identity,
+  provenance, token, hash, UUID-reference, logical-handle, locator, URI, and
+  controlled-vocabulary domains, plus relation requirements and evidence
+  binding. It does not validate the generic presentation/scoring fields
+  `confidence`, `truth_confidence`, `usefulness_weight`, `description`, or
+  `file_size`. Those remain the domain of the public serializers
+  (`build_entity_payload`, `GraphEntity.to_payload`, `build_edge_payload`, and
+  `GraphEdge.to_payload`). A caller that assembles raw payload dicts
+  and skips those serializers must not rely on the gate for those fields. A
+  `store` decision must not be read as a claim that every payload argument is
+  well formed.
+- Generic-metadata enforcement at the final gate is explicitly deferred, not
+  fixed. The reviewed sites are `qdrant_memory/graph_schema.py:1000-1011`,
+  `:1169-1173`, `:1404-1408`, `qdrant_memory/lineage.py:546-846`, and
+  `qdrant_memory/write_gate.py:555-563`, `:679-685`. Closing that boundary
+  requires a separately authorized wave; this deferral does not authorize a
+  live writer.
+- Dense and sparse search, semantic-graph entity scroll, and consolidation
+  candidate selection exclude structural and pending records before their
+  candidate budgets, with defensive post-filtering. The semantic graph's
+  direct-ID source-reference path caps `source_point_ids` at eight before it
+  fetches payloads and excludes structural payloads only afterward, so an
+  excluded reference can consume a slot.
+- Deferred containment gaps remain explicit: RAPTOR direct-ID search and
+  builder paths can admit pending chunks (N1); source extraction and improve
+  rebuild candidates from recalled points without preserving pending state,
+  with two retained cases still failing (N2); and the ordinary indexer can
+  delete persisted structural source records it does not recognize (N3).
+
+Capture (`lineage_mode=capture`) and reconciliation remain future waves; the
+config value defaults to `off` and no W0 code writes structural records.

@@ -4,7 +4,6 @@ import json
 import os
 import urllib.parse
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -38,91 +37,9 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@dataclass(frozen=True)
-class LiveContext:
-    qdrant: QdrantClient
-    embeddings: EmbeddingClient
-    memory_collection: str
-    learning_collection: str
-    prefix: str
-    vector_size: int
-    distance: str
-    scope: dict[str, str]
-
-
-@pytest.fixture
-def live_context() -> Iterator[LiveContext]:
-    prefix = os.environ.get("QDRANT_TEST_COLLECTION_PREFIX", "hermes_qdrant_itest").strip()
-    if not prefix:
-        pytest.fail("QDRANT_TEST_COLLECTION_PREFIX must not be empty")
-
-    qdrant_url = os.environ.get("QDRANT_TEST_URL", "http://127.0.0.1:6333")
-    qdrant_credential = os.environ.get("QDRANT_TEST_API_KEY", "")
-    embedding_url = os.environ.get("QDRANT_TEST_EMBEDDING_URL", "http://127.0.0.1:8080/v1")
-    embedding_model = os.environ.get("QDRANT_TEST_EMBEDDING_MODEL", "bge-m3")
-    vector_size = int(os.environ.get("QDRANT_TEST_VECTOR_SIZE", "1024"))
-    distance = os.environ.get("QDRANT_TEST_DISTANCE", "Cosine")
-
-    random_suffix = uuid.uuid4().hex[:12]
-    base_name = f"{prefix}_{random_suffix}"
-    memory_collection = f"{base_name}_memory"
-    learning_collection = f"{base_name}_learnings"
-    for collection_name in (memory_collection, learning_collection):
-        if not collection_name.startswith(prefix):
-            pytest.fail(f"Refusing to use non-prefixed test collection: {collection_name!r}")
-
-    qdrant = QdrantClient(qdrant_url, timeout=10.0, **{"api_key": qdrant_credential})
-    embeddings = EmbeddingClient(embedding_url, embedding_model, timeout=30.0)
-
-    try:
-        qdrant._request("GET", "/collections")
-    except Exception as exc:  # pragma: no cover - depends on live service state
-        pytest.fail(f"Qdrant health check failed for {qdrant_url}: {exc}")
-
-    try:
-        probe_vector = embeddings.embed_query("Hermes Qdrant live integration health probe")
-    except Exception as exc:  # pragma: no cover - depends on live service state
-        pytest.fail(f"Embedding health check failed for {embedding_url} model={embedding_model!r}: {exc}")
-    if len(probe_vector) != vector_size:
-        pytest.fail(
-            f"Embedding vector size mismatch for {embedding_url} model={embedding_model!r}: "
-            f"expected QDRANT_TEST_VECTOR_SIZE={vector_size}, got {len(probe_vector)}"
-        )
-
-    created: list[str] = []
-    try:
-        existing_collections = set(qdrant.get_collections())
-        for collection_name in (memory_collection, learning_collection):
-            if collection_name in existing_collections:
-                pytest.fail(f"Refusing to reuse existing test collection: {collection_name!r}")
-        for collection_name in (memory_collection, learning_collection):
-            result = qdrant.ensure_collection(collection_name, vector_size, distance)
-            if result.get("exists"):
-                pytest.fail(f"Refusing to reuse concurrently created test collection: {collection_name!r}")
-            created.append(collection_name)
-        yield LiveContext(
-            qdrant=qdrant,
-            embeddings=embeddings,
-            memory_collection=memory_collection,
-            learning_collection=learning_collection,
-            prefix=prefix,
-            vector_size=vector_size,
-            distance=distance,
-            scope={"profile_id": PROFILE_ID, "platform": PLATFORM},
-        )
-    finally:
-        cleanup_errors: list[str] = []
-        for collection_name in reversed(created):
-            if not collection_name.startswith(prefix):
-                cleanup_errors.append(f"refused to delete non-prefixed collection {collection_name!r}")
-                continue
-            try:
-                quoted = urllib.parse.quote(collection_name, safe="")
-                qdrant._request("DELETE", f"/collections/{quoted}")
-            except Exception as exc:  # pragma: no cover - depends on live service state
-                cleanup_errors.append(f"{collection_name}: {exc}")
-        if cleanup_errors:
-            pytest.fail("Live Qdrant integration cleanup failed: " + "; ".join(cleanup_errors))
+# The `live_context` fixture and LiveContext dataclass live in
+# tests/integration/conftest.py (shared across integration modules).
+from conftest import LiveContext  # noqa: E402,F401
 
 
 def _point_id(collection_name: str, label: str) -> str:

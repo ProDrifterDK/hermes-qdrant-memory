@@ -60,6 +60,7 @@ from qdrant_memory.raptor.schema import (
 from qdrant_memory.write_gate import (
     WriteDecision,
     evaluate_raptor_summary_write,
+    structural_lineage_marker_reasons,
 )
 
 # ---------------------------------------------------------------------------
@@ -312,6 +313,20 @@ def _validate_candidate_payload(payload: Mapping[str, Any]) -> WriteDecision:
         raise RaptorApplyError("candidate_node_payload must be a dict")
 
     node_id = str(payload.get("raptor_node_id") or "")
+
+    # Structural lineage markers are refused before anything else in the
+    # manifest is processed, before any embedding and long before any upsert:
+    # a digest-approved manifest proves which payload was approved, not that
+    # the payload obeys the write-class rules. Any truthy marker value of any
+    # type (and a mechanical edge-class annotation) fails the whole apply.
+    structural_reasons = structural_lineage_marker_reasons(payload)
+    if structural_reasons:
+        raise RaptorApplyError(
+            f"candidate node {node_id} carries forbidden structural lineage "
+            f"markers: {', '.join(structural_reasons)}; RAPTOR summaries must "
+            "never be structurally classified or unpublished"
+        )
+
     _validate_node_id(node_id)
 
     # Check required RAPTOR fields are present by KEY (not truthiness).

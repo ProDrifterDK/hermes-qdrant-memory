@@ -41,6 +41,7 @@ from qdrant_memory.graph_schema import (
     build_entity_payload,
     make_edge_id,
     make_entity_id,
+    make_graph_point_id,
     sanitize_profile_id,
 )
 from qdrant_memory.lesson_extractor import contains_secret
@@ -556,14 +557,43 @@ def extract_improve_candidates_from_point(
 # ---------------------------------------------------------------------------
 
 def _candidate_target_point_id(candidate: ExtractionCandidate) -> str:
-    """Get the Qdrant target point ID for a candidate (entity_id or edge_id)."""
+    """Get the Qdrant storage point ID for a candidate.
+
+    Graph entity/edge candidates target deterministic UUID storage IDs
+    (``make_graph_point_id``): real Qdrant rejects raw logical handles as
+    point IDs. Payloads and edge endpoints keep the logical handles.
+    """
     payload = candidate.proposed_payload or {}
     if candidate.candidate_type == "graph_entity_candidate":
-        return str(payload.get("entity_id") or "")
+        logical = str(payload.get("entity_id") or "")
+        return make_graph_point_id(logical) if logical else ""
     if candidate.candidate_type == "graph_edge_candidate":
-        return str(payload.get("edge_id") or "")
+        logical = str(payload.get("edge_id") or "")
+        return make_graph_point_id(logical) if logical else ""
     # Regular candidates use candidate_id as point ID (matching extraction flow)
     return candidate.candidate_id
+
+
+def candidate_target_point_id(candidate: ExtractionCandidate) -> str:
+    """Public wrapper so apply paths share the exact target-ID mapping."""
+    return _candidate_target_point_id(candidate)
+
+
+def candidate_from_report_item(item: dict[str, Any]) -> ExtractionCandidate:
+    """Rebuild the ExtractionCandidate for one persisted report item."""
+    return ExtractionCandidate(
+        candidate_id=str(item.get("candidate_id") or ""),
+        candidate_type=str(item.get("candidate_type") or ""),
+        source_uri=str(item.get("source_uri") or ""),
+        locator=item.get("locator") or {},
+        derived_from=item.get("derived_from") or [],
+        proposed_payload=item.get("proposed_payload") or {},
+        reason=str(item.get("reason") or ""),
+        confidence=float(item.get("confidence") or 0.0),
+        risk=str(item.get("risk") or "unknown"),
+        requires_review=bool(item.get("requires_review", True)),
+        created_at=str(item.get("created_at") or ""),
+    )
 
 
 def _candidate_target_memory_kind(candidate: ExtractionCandidate) -> str:

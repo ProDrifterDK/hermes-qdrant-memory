@@ -515,7 +515,13 @@ def make_filter(scope: dict[str, str], *, source_type: str | None = None) -> dic
             must.append({"key": key, "match": {"value": value}})
     if source_type:
         must.append({"key": "source_type", "match": {"value": source_type}})
-    return {"must": must}
+    # Structural lineage records and pending chunks never enter proposal
+    # generation candidate pools.
+    must_not: list[dict[str, Any]] = [
+        {"key": "lineage_record", "match": {"value": True}},
+        {"key": "lineage_pending", "match": {"value": True}},
+    ]
+    return {"must": must, "must_not": must_not}
 
 
 def _similarity(a: str, b: str) -> float:
@@ -677,6 +683,7 @@ def _learning_promotion_proposals(points: list[ConsolidationPoint], *, include_e
             continue
         if _as_float(payload.get("confidence"), 0.0) < 0.85 or _as_int(payload.get("importance"), 0) < 8:
             continue
+        manual_review_required = _point_requires_manual_review(point)
         proposal: dict[str, Any] = {
             "proposal_id": _proposal_id("learning_promotion_candidate", [point.id]),
             "proposal_type": "learning_promotion_candidate",
@@ -694,9 +701,13 @@ def _learning_promotion_proposals(points: list[ConsolidationPoint], *, include_e
                 }
             ],
             "requires_explicit_approval": True,
-            "guarded_auto_eligible": True,
-            "preauthorized_policy": "guarded-auto:learning-skill-draft",
+            "guarded_auto_eligible": not manual_review_required,
         }
+        if manual_review_required:
+            proposal["manual_review_required"] = True
+            proposal["manual_review_reason"] = "profile or fact-like memory requires manual review"
+        else:
+            proposal["preauthorized_policy"] = "guarded-auto:learning-skill-draft"
         if include_examples:
             proposal["examples"] = [{"id": point.id, "text": _point_snippet(point)}]
         proposals.append(proposal)
@@ -989,6 +1000,17 @@ def _quality_warning_proposals(points: list[ConsolidationPoint], *, max_groups: 
     return proposals
 
 
+class StructuralLineageRefusal(ValueError):
+    """Raised when a proposal selection touches structural lineage records."""
+
+
+def is_structural_lineage_payload(payload: Any) -> bool:
+    """True iff a payload marks a structural lineage record or pending chunk."""
+    if not isinstance(payload, dict):
+        return False
+    return bool(payload.get("lineage_record") or payload.get("lineage_pending"))
+
+
 def points_from_qdrant(raw_points: list[dict[str, Any]], *, collection_name: str) -> list[ConsolidationPoint]:
     points: list[ConsolidationPoint] = []
     for raw in raw_points:
@@ -996,6 +1018,10 @@ def points_from_qdrant(raw_points: list[dict[str, Any]], *, collection_name: str
         payload = _point_payload(raw)
         text = _point_text(raw)
         if not point_id:
+            continue
+        # Defensive post-filter: structural records / pending chunks must
+        # never become consolidation candidates even if a filter was bypassed.
+        if is_structural_lineage_payload(payload):
             continue
         points.append(ConsolidationPoint(id=point_id, collection_name=collection_name, text=text, payload=payload))
     return points

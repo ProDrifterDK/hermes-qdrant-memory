@@ -42,6 +42,8 @@ from qdrant_memory.backup import create_backup
 from qdrant_memory.config import load_config
 from qdrant_memory.context import ContextTemplateError, build_context_packet, default_context_top_k
 from qdrant_memory.consolidation import (
+    StructuralLineageRefusal,
+    is_structural_lineage_payload,
     _point_requires_manual_review,
     build_consolidation_report,
     expected_action_for_proposal,
@@ -80,6 +82,8 @@ from qdrant_memory.improve import (
     IMPROVE_MAX_CANDIDATES_HARD_CAP,
     REPORT_ID_RE,
     build_improve_report,
+    candidate_from_report_item,
+    candidate_target_point_id,
     extract_improve_candidates_from_point,
     extract_improve_candidates_from_text,
     is_candidate_applied,
@@ -1561,6 +1565,18 @@ class QdrantMemoryProvider(MemoryProvider):
         if not self._qdrant:
             return []
         raw = self._qdrant.retrieve(collection_name, ids, with_payload=True, with_vector=False)
+        # Defensive refusal: an old proposal selecting structural lineage
+        # records must never reach the apply plan or any mutation.
+        structural_ids = sorted(
+            str(point.get("id"))
+            for point in raw
+            if is_structural_lineage_payload(point.get("payload") or {})
+        )
+        if structural_ids:
+            raise StructuralLineageRefusal(
+                "refusing to apply proposal touching structural lineage records: "
+                + ", ".join(structural_ids)
+            )
         return points_from_qdrant(raw, collection_name=collection_name)
 
     def _memory_pr_collection_for_proposal(self, proposal: dict[str, Any]) -> str:
@@ -1881,6 +1897,8 @@ class QdrantMemoryProvider(MemoryProvider):
                 record = persist_application_record({"applied": True, **plan, **pre_apply, "proposal_draft_path": draft_path, "skill_draft_path": draft_path, "write_decision": write_decision.to_dict()}, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))
                 return json.dumps({"dry_run": False, "applied": True, **plan, **pre_apply, "proposal_draft_path": draft_path, "skill_draft_path": draft_path, "write_decision": write_decision.to_dict(), "application_id": record.get("application_id"), "application_artifact": record.get("artifact_path")})
             return _json_error("unsupported consolidation action")
+        except StructuralLineageRefusal as exc:
+            return _json_error(str(exc))
         except Exception:
             return _json_error("consolidation_apply_failed")
 
@@ -2379,20 +2397,7 @@ class QdrantMemoryProvider(MemoryProvider):
         review_key = f"{report_id}:{candidate_id}:{candidate_digest}"
 
         # Reconstruct candidate from report item for write-gate evaluation
-        from qdrant_memory.extraction_candidates import ExtractionCandidate as _EC
-        candidate = _EC(
-            candidate_id=str(match_item.get("candidate_id") or ""),
-            candidate_type=str(match_item.get("candidate_type") or ""),
-            source_uri=str(match_item.get("source_uri") or ""),
-            locator=match_item.get("locator") or {},
-            derived_from=match_item.get("derived_from") or [],
-            proposed_payload=match_item.get("proposed_payload") or {},
-            reason=str(match_item.get("reason") or ""),
-            confidence=float(match_item.get("confidence") or 0.0),
-            risk=str(match_item.get("risk") or "unknown"),
-            requires_review=bool(match_item.get("requires_review", True)),
-            created_at=str(match_item.get("created_at") or ""),
-        )
+        candidate = candidate_from_report_item(match_item)
 
         # Evaluate write gate
         write_decision = evaluate_source_extraction_candidate(candidate)
@@ -2428,6 +2433,19 @@ class QdrantMemoryProvider(MemoryProvider):
         fresh_digest = make_candidate_digest(match_item)
         if fresh_digest != candidate_digest:
             return _json_error("candidate digest mismatch; report may be stale")
+
+        # Storage-ID target validation. Graph candidates now target Qdrant
+        # UUID storage IDs; reports generated before that mapping carry raw
+        # logical handles and must be regenerated (their digests are NOT
+        # reinterpreted). Any stored target diverging from the current
+        # mapping is refused the same way.
+        expected_target_pid = candidate_target_point_id(candidate)
+        stored_target_pid = str(match_item.get("target_point_id") or "")
+        if stored_target_pid != expected_target_pid:
+            return _json_error(
+                "stale improve report: target point ID does not match the "
+                "current storage-ID mapping; regenerate the preview report"
+            )
 
         # Route by write decision
         if write_decision.decision == "reject":

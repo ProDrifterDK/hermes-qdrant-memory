@@ -99,6 +99,10 @@ DEFAULTS: dict[str, Any] = {
     # ``hybrid`` routes the prefetch prompt through a dedicated prompt-safe
     # hybrid formatter. Invalid values fail closed to ``legacy``.
     "auto_recall_mode": "legacy",
+    # Lineage (W0): supported values are exactly off, capture, reconcile.
+    # Default/fail-closed value is off. In W0 no writer is enabled: capture
+    # becomes operational in W1 and reconcile stays closed until W2.
+    "lineage_mode": "off",
 }
 
 _BOOL_KEYS = {
@@ -153,6 +157,23 @@ _LIST_KEYS = {"index_dirs", "index_extensions", "index_exclude_dirs"}
 # Phase 6I: allowed values for ``auto_recall_mode``.
 # Invalid values fail closed to ``legacy``.
 _AUTO_RECALL_MODES: frozenset[str] = frozenset({"legacy", "hybrid"})
+
+# Lineage (W0): allowed values for ``lineage_mode``.
+# Invalid values fail closed to ``off``.
+_LINEAGE_MODES: frozenset[str] = frozenset({"off", "capture", "reconcile"})
+
+
+def _as_lineage_mode(value: Any) -> str:
+    """Coerce ``lineage_mode`` to off, capture, or reconcile.
+
+    Non-string values and unrecognized strings collapse to ``off``
+    (fail-closed default).
+    """
+    if isinstance(value, str):
+        candidate = value.strip().lower()
+        if candidate in _LINEAGE_MODES:
+            return candidate
+    return "off"
 
 
 def _as_auto_recall_mode(value: Any) -> str:
@@ -216,6 +237,8 @@ def _coerce(key: str, value: Any) -> Any:
         return list(default)
     if key == "auto_recall_mode":
         return _as_auto_recall_mode(value)
+    if key == "lineage_mode":
+        return _as_lineage_mode(value)
     if isinstance(default, str):
         return str(value)
     return value
