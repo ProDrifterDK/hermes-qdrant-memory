@@ -392,6 +392,94 @@ def test_execute_command_invokes_provider_and_prints_json(capsys):
     assert output["tool"] == "qdrant_memory_search"
 
 
+def test_index_cli_off_mode_refusal_is_visible_and_nonzero_in_human_and_json(capsys):
+    from qdrant_memory.cli_core import execute_command
+
+    parser = _parser()
+    payload = {
+        "dry_run": False, "files_seen": 1, "files_indexed": 1, "chunks_prepared": 1,
+        "lineage_mode": "off", "refused": True, "partial_failure": True,
+        "refusals": [{"reason": "lineage_managed_requires_capture_or_retirement"}],
+        "lineage_blocked_files": [{"file_path": "/tmp/note.md", "lineage_blocked_reason": "lineage_managed_requires_capture_or_retirement"}],
+        "foreign_scope_chunks": [{"file_path": "/tmp/foreign.md", "count": 2}],
+        "errors": [],
+    }
+    provider = StaticJsonProvider({"qdrant_memory_index": payload})
+
+    human_args = parser.parse_args(["qdrant", "index", "/tmp/note.md", "--no-dry-run", "--approve"])
+    assert execute_command(human_args, provider_factory=lambda: provider) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Index refused" in captured.err
+    assert "refused: true" in captured.err
+    assert "partial_failure: true" in captured.err
+    assert "blocked: /tmp/note.md reason=lineage_managed_requires_capture_or_retirement" in captured.err
+    assert "foreign_scope_chunks: /tmp/foreign.md count=2" in captured.err
+    assert "Index applied" not in captured.err
+
+    json_args = parser.parse_args(["qdrant", "index", "/tmp/note.md", "--json"])
+    assert execute_command(json_args, provider_factory=lambda: provider) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == json.dumps(payload) + "\n"
+
+
+def test_index_cli_successful_off_mode_index_returns_zero_without_failure_labels(capsys):
+    from qdrant_memory.cli_core import execute_command
+
+    parser = _parser()
+    payload = {
+        "dry_run": False, "files_seen": 1, "files_indexed": 1, "chunks_prepared": 1,
+        "chunks_upserted": 1, "lineage_mode": "off", "lineage_blocked_files": [], "errors": [],
+    }
+    provider = StaticJsonProvider({"qdrant_memory_index": payload})
+    args = parser.parse_args(["qdrant", "index", "/tmp/note.md", "--no-dry-run", "--approve"])
+
+    assert execute_command(args, provider_factory=lambda: provider) == 0
+    output = capsys.readouterr().out
+    assert "Index applied" in output
+    assert "chunks_upserted: 1" in output
+    assert "refused" not in output and "partial_failure" not in output
+
+
+def test_index_cli_successful_fresh_force_returns_zero(capsys):
+    from qdrant_memory.cli_core import execute_command
+
+    parser = _parser()
+    payload = {
+        "dry_run": False, "force": True, "files_seen": 1, "files_indexed": 1,
+        "chunks_prepared": 1, "chunks_upserted": 1, "chunks_deleted": 0,
+        "delete_mode": "none", "lineage_mode": "off", "lineage_blocked_files": [], "errors": [],
+    }
+    provider = StaticJsonProvider({"qdrant_memory_index": payload})
+    args = parser.parse_args(["qdrant", "index", "/tmp/note.md", "--force", "--no-dry-run", "--approve"])
+
+    assert execute_command(args, provider_factory=lambda: provider) == 0
+    output = capsys.readouterr().out
+    assert "Index applied" in output
+    assert "errors:" not in output and "refused:" not in output
+
+
+def test_index_cli_genuine_partial_failure_is_visible_and_nonzero(capsys):
+    from qdrant_memory.cli_core import execute_command
+
+    parser = _parser()
+    payload = {
+        "dry_run": False, "files_seen": 1, "files_indexed": 1, "chunks_prepared": 1,
+        "lineage_mode": "off", "partial_failure": True,
+        "errors": [{"file_path": "/tmp/note.md", "error": "upsert failed: boom"}],
+    }
+    provider = StaticJsonProvider({"qdrant_memory_index": payload})
+    args = parser.parse_args(["qdrant", "index", "/tmp/note.md", "--no-dry-run", "--approve"])
+
+    assert execute_command(args, provider_factory=lambda: provider) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Index partial failure" in captured.err
+    assert "partial_failure: true" in captured.err
+    assert "errors: 1" in captured.err
+
+
 def test_status_defaults_to_human_output_and_json_preserves_raw_payload(capsys):
     from qdrant_memory.cli_core import execute_command
 

@@ -25,9 +25,13 @@ Identity conventions (approved plan, section 4):
 from __future__ import annotations
 
 import hashlib
+import os
+import stat
+import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from qdrant_memory.graph_schema import (
     KNOWN_ENTITY_TYPES,
@@ -41,6 +45,7 @@ from qdrant_memory.graph_schema import (
     is_uuid_string,
     make_entity_id,
     make_graph_point_id,
+    make_point_id,
     w0_content_hash_problems,
     w0_file_path_problems,
     w0_is_omitted,
@@ -1345,3 +1350,607 @@ def structural_identity_mismatches(payload: dict[str, Any], evidence: LineageEvi
         if payload_version_id and payload_version_id not in version_storages:
             mismatches.append("file_version_id")
     return mismatches
+
+
+# W1 additive capture helpers. W0 functions above intentionally stay unchanged.
+CHUNKER_VERSION = "text-markdown-v1"
+
+
+def make_versioned_file_chunk_id(
+    *, scope_key: str, resolved_file_path: str, file_sha256: str,
+    chunker_version: str, chunk_index: int, chunk_hash: str,
+) -> str:
+    return make_point_id(
+        "indexed-file-v2",
+        canonical_json([scope_key, resolved_file_path, file_sha256, chunker_version, chunk_index, chunk_hash]),
+    )
+
+
+def _capture_evidence(
+    *, collection_name: str, profile_id: str, user_id_hash: str,
+    chat_id_hash: str, scope_key: str, source_key: str, source_uri: str,
+    file_path: str, file_sha256: str, observation: str,
+    content_hash: str = "", source_content_hash: str = "",
+    target_content_hash: str = "", file_version_id: str = "",
+    locator: dict[str, Any] | None = None, relation_type: str = "",
+    source_point_id: str = "", target_point_id: str = "",
+    source_entity_type: str = "", target_entity_type: str = "",
+) -> LineageEvidence:
+    return LineageEvidence(
+        operation="index_capture", collection_name=collection_name,
+        profile_id=profile_id, user_id_hash=user_id_hash,
+        chat_id_hash=chat_id_hash, scope_key=scope_key, source_key=source_key,
+        source_uri=source_uri, file_path=file_path, file_sha256=file_sha256,
+        content_hash=content_hash, source_content_hash=source_content_hash,
+        target_content_hash=target_content_hash, file_version_id=file_version_id,
+        locator=dict(locator or {}), observation=observation,
+        relation_type=relation_type, source_point_id=source_point_id,
+        target_point_id=target_point_id, source_entity_type=source_entity_type,
+        target_entity_type=target_entity_type,
+    )
+
+
+def build_file_source(
+    *, collection_name: str, profile_id: str, user_id_hash: str,
+    chat_id_hash: str, scope_key: str, source_key: str, file_path: str,
+    source_uri: str, current_version_id: str, created_at: str | None = None,
+) -> tuple[str, dict[str, Any], LineageEvidence]:
+    if not is_uuid_string(current_version_id):
+        raise ValueError("current_version_id must be a UUID")
+    payload = build_source_node_payload(
+        source_key=source_key, scope_key=scope_key, profile_id=profile_id,
+        file_path=file_path, source_uri=source_uri, created_at=created_at,
+    )
+    payload.update(user_id_hash=user_id_hash, chat_id_hash=chat_id_hash,
+                   current_version_id=current_version_id, source_deleted=False)
+    point_id = storage_point_id(str(payload["entity_id"]))
+    evidence = _capture_evidence(
+        collection_name=collection_name, profile_id=profile_id,
+        user_id_hash=user_id_hash, chat_id_hash=chat_id_hash,
+        scope_key=scope_key, source_key=source_key, source_uri=source_uri,
+        file_path=file_path, file_sha256="", observation="read_bytes",
+    )
+    return point_id, payload, evidence
+
+
+def build_file_version(
+    *, collection_name: str, profile_id: str, user_id_hash: str,
+    chat_id_hash: str, scope_key: str, source_key: str, file_path: str,
+    source_uri: str, file_sha256: str, file_size: int, file_mtime: str,
+    file_mtime_ns: int, created_at: str | None = None,
+) -> tuple[str, dict[str, Any], LineageEvidence]:
+    payload = build_version_node_payload(
+        source_key=source_key, scope_key=scope_key, profile_id=profile_id,
+        file_path=file_path, file_sha256=file_sha256, file_size=file_size,
+        file_mtime=file_mtime, source_uri=source_uri, created_at=created_at,
+    )
+    payload.update(user_id_hash=user_id_hash, chat_id_hash=chat_id_hash,
+                   file_mtime_ns=file_mtime_ns, lineage_history_complete=False)
+    point_id = storage_point_id(str(payload["entity_id"]))
+    evidence = _capture_evidence(
+        collection_name=collection_name, profile_id=profile_id,
+        user_id_hash=user_id_hash, chat_id_hash=chat_id_hash,
+        scope_key=scope_key, source_key=source_key, source_uri=source_uri,
+        file_path=file_path, file_sha256=file_sha256,
+        content_hash=f"sha256:{file_sha256}", observation="read_bytes",
+    )
+    return point_id, payload, evidence
+
+
+def build_chunk_derivation(
+    *, collection_name: str, profile_id: str, user_id_hash: str,
+    chat_id_hash: str, scope_key: str, source_key: str, file_path: str,
+    source_uri: str, file_sha256: str, chunk_point_id: str,
+    chunk_entity_id: str, chunk_hash: str, locator: dict[str, Any],
+    version_point_id: str, version_entity_id: str,
+) -> tuple[str, dict[str, Any], LineageEvidence]:
+    source_hash, target_hash = f"sha256:{chunk_hash}", f"sha256:{file_sha256}"
+    payload = build_mechanical_edge_payload(
+        relation_type="DERIVED_FROM", source_entity_id=chunk_entity_id,
+        target_entity_id=version_entity_id, profile_id=profile_id,
+        source_point_id=chunk_point_id, target_point_id=version_point_id,
+        source_entity_type="memory_point", target_entity_type="source",
+        lineage_operation="index_capture", lineage_source_key=source_key,
+        lineage_scope_key=scope_key, observation="indexed_payload",
+        source_content_hash=source_hash, target_content_hash=target_hash,
+        file_version_id=version_point_id, file_path=file_path,
+        file_sha256=file_sha256, locator=locator,
+    )
+    payload.update(user_id_hash=user_id_hash, chat_id_hash=chat_id_hash)
+    point_id = storage_point_id(str(payload["edge_id"]))
+    evidence = _capture_evidence(
+        collection_name=collection_name, profile_id=profile_id,
+        user_id_hash=user_id_hash, chat_id_hash=chat_id_hash,
+        scope_key=scope_key, source_key=source_key, source_uri=source_uri,
+        file_path=file_path, file_sha256=file_sha256,
+        source_content_hash=source_hash, target_content_hash=target_hash,
+        file_version_id=version_point_id, locator=locator,
+        observation="indexed_payload", relation_type="DERIVED_FROM",
+        source_point_id=chunk_point_id, target_point_id=version_point_id,
+        source_entity_type="memory_point", target_entity_type="source",
+    )
+    return point_id, payload, evidence
+
+
+def _capture_fingerprint(point: dict[str, Any]) -> str:
+    payload = point.get("payload") if isinstance(point, dict) else None
+    stable_payload = {
+        key: value for key, value in (payload or {}).items()
+        if key not in {"access_count", "last_accessed"}
+    }
+    return lineage_digest(["lineage-reread-v1", str(point.get("id", "")), stable_payload])
+
+
+def _missing_bindings(payload: dict[str, Any]) -> list[str]:
+    missing = [key for key in ("file_sha256", "source_uri", "chunk_hash", "content_hash") if not payload.get(key)]
+    if not isinstance(payload.get("locator"), dict) or not payload["locator"]:
+        missing.append("locator")
+    return missing
+
+
+def plan_file_lineage(
+    *, collection_name: str, profile_id: str, user_id_hash: str,
+    chat_id_hash: str, manifest: dict[str, Any], chunks: list[Any],
+    existing_points: list[dict[str, Any]],
+    existing_source: dict[str, Any] | None = None,
+    existing_version: dict[str, Any] | None = None,
+    ownership_errors: list[str] | None = None,
+) -> dict[str, Any]:
+    """Purely classify one snapshot and build deterministic W1 records."""
+    file_path, file_sha256 = str(manifest["file_path"]), str(manifest["file_sha256"])
+    source_uri = str(manifest["source_uri"])
+    scope_key = make_scope_key(collection_name=collection_name, profile_id=profile_id,
+                               user_id_hash=user_id_hash, chat_id_hash=chat_id_hash)
+    source_key = make_source_key(scope_key=scope_key, resolved_file_path=file_path)
+    source_entity = source_logical_id(source_key=source_key, profile_id=profile_id)
+    version_digest = make_version_identity_digest(source_key=source_key, file_sha256=file_sha256)
+    version_entity = version_logical_id(version_identity_digest=version_digest, profile_id=profile_id)
+    source_id, version_id = storage_point_id(source_entity), storage_point_id(version_entity)
+    plan: dict[str, Any] = {
+        "file_path": file_path, "lineage_baseline_basis": "new_file",
+        "lineage_missing_fields": [], "lineage_blocked_reason": "",
+        "lineage_history_complete": False, "lineage_entity_ids": [source_entity, version_entity],
+        "lineage_edge_ids": [], "lineage_point_ids": [source_id, version_id],
+        "lineage_existing_ids": [], "lineage_repair_ids": [],
+        "structural_records": [], "chunk_patches": [],
+        "old_ids": [str(p["id"]) for p in existing_points if p.get("id") is not None],
+        "old_fingerprints": {str(p["id"]): _capture_fingerprint(p) for p in existing_points if p.get("id") is not None},
+        "source_point_id": source_id, "version_point_id": version_id,
+        "source_expected": existing_source is not None,
+        "source_fingerprint": _capture_fingerprint(existing_source) if existing_source else "",
+        "capturable": False, "is_new": not existing_points and existing_source is None,
+    }
+
+    if ownership_errors:
+        plan.update(lineage_baseline_basis="incomplete_indexed_provenance",
+                    lineage_missing_fields=sorted(set(ownership_errors)),
+                    lineage_blocked_reason="legacy_baseline_requires_reconcile")
+        return plan
+
+    for point in existing_points:
+        payload = point.get("payload") if isinstance(point, dict) else None
+        if not isinstance(payload, dict) or payload.get("profile_id") != profile_id or any(
+            payload.get(key, "") != expected
+            for key, expected in (("user_id_hash", user_id_hash), ("chat_id_hash", chat_id_hash))
+        ):
+            plan.update(lineage_baseline_basis="incomplete_indexed_provenance",
+                        lineage_missing_fields=["ownership_scope"],
+                        lineage_blocked_reason="legacy_baseline_requires_reconcile")
+            return plan
+
+    hashes: set[str] = set()
+    present = 0
+    for point in existing_points:
+        value = (point.get("payload") or {}).get("file_sha256")
+        if value in (None, ""):
+            continue
+        present += 1
+        if not is_sha256_hex(value):
+            plan.update(lineage_baseline_basis="incomplete_indexed_provenance",
+                        lineage_missing_fields=["malformed_file_sha256"],
+                        lineage_blocked_reason="legacy_baseline_requires_reconcile")
+            return plan
+        hashes.add(value)
+    if existing_points and not present:
+        missing = sorted({field for point in existing_points for field in _missing_bindings(point.get("payload") or {})})
+        plan.update(lineage_baseline_basis="missing_indexed_file_sha256",
+                    lineage_missing_fields=missing or ["file_sha256"],
+                    lineage_blocked_reason="legacy_baseline_requires_reconcile")
+        return plan
+    if existing_points and present != len(existing_points):
+        plan.update(lineage_baseline_basis="incomplete_indexed_provenance",
+                    lineage_missing_fields=["file_sha256"],
+                    lineage_blocked_reason="legacy_baseline_requires_reconcile")
+        return plan
+    if len(hashes) > 1:
+        plan.update(lineage_baseline_basis="incomplete_indexed_provenance",
+                    lineage_missing_fields=["ambiguous_file_sha256"],
+                    lineage_blocked_reason="legacy_baseline_requires_reconcile")
+        return plan
+    if existing_source:
+        source_payload = existing_source.get("payload") or {}
+        if source_payload.get("head_event_id") or source_payload.get("pending_event_id"):
+            plan.update(lineage_baseline_basis="incomplete_indexed_provenance",
+                        lineage_missing_fields=["event_managed_source"],
+                        lineage_blocked_reason="legacy_baseline_requires_reconcile")
+            return plan
+        current_version = source_payload.get("current_version_id")
+        if current_version != version_id:
+            plan.update(lineage_baseline_basis="indexed_file_sha256",
+                        lineage_missing_fields=[] if current_version else ["current_version_id"],
+                        lineage_blocked_reason="retirement_requires_reconcile" if current_version else "legacy_baseline_requires_reconcile")
+            return plan
+        version_payload = (existing_version or {}).get("payload") or {}
+        version_durable = (
+            str((existing_version or {}).get("id") or "") == version_id
+            and version_payload.get("lineage_role") == "file_version"
+            and version_payload.get("lineage_identity_digest") == entity_identity_digest(
+                "source", version_digest, profile_id=profile_id)
+            and version_payload.get("entity_id") == version_entity
+            and version_payload.get("file_sha256") == file_sha256
+            and version_payload.get("lineage_source_key") == source_key
+            and version_payload.get("profile_id") == profile_id
+        )
+        if not version_durable:
+            plan.update(lineage_baseline_basis="incomplete_indexed_provenance",
+                        lineage_missing_fields=["file_version_record"],
+                        lineage_blocked_reason="incomplete_capture")
+            return plan
+        if not existing_points:
+            plan["is_new"] = True  # interrupted new capture or managed empty file
+            plan["lineage_baseline_basis"] = "indexed_file_sha256"
+
+    if existing_points:
+        if next(iter(hashes)) != file_sha256:
+            plan.update(lineage_baseline_basis="indexed_file_sha256",
+                        lineage_blocked_reason="retirement_requires_reconcile")
+            return plan
+        by_index, missing = {}, set()
+        for point in existing_points:
+            payload = point.get("payload") or {}
+            missing.update(_missing_bindings(payload))
+            index = payload.get("chunk_index")
+            if isinstance(index, bool) or not isinstance(index, int) or index < 0 or index in by_index:
+                missing.add("chunk_inventory")
+            else:
+                by_index[index] = point
+        expected_ids = {
+            int(chunk.chunk_index): make_versioned_file_chunk_id(
+                scope_key=scope_key, resolved_file_path=file_path,
+                file_sha256=file_sha256, chunker_version=chunk.chunker_version,
+                chunk_index=int(chunk.chunk_index), chunk_hash=chunk.chunk_hash,
+            )
+            for chunk in chunks
+        }
+        incomplete_managed = bool(existing_source) and (
+            len(by_index) != len(chunks)
+            or set(by_index) != {int(chunk.chunk_index) for chunk in chunks}
+        )
+        if incomplete_managed:
+            surviving_ids = {str(point.get("id")) for point in existing_points}
+            if (missing or not surviving_ids.issubset(set(expected_ids.values()))
+                    or any(
+                        (point.get("payload") or {}).get("file_version_id") != version_id
+                        or str(point.get("id")) != expected_ids.get(int((point.get("payload") or {}).get("chunk_index", -1)))
+                        for point in existing_points
+                    )):
+                plan.update(lineage_baseline_basis="incomplete_indexed_provenance",
+                            lineage_missing_fields=sorted(missing),
+                            lineage_blocked_reason="incomplete_capture")
+                return plan
+            for chunk in chunks:
+                chunk.id = expected_ids[int(chunk.chunk_index)]
+                if chunk.id in surviving_ids:
+                    plan["lineage_existing_ids"].append(chunk.id)
+            plan["is_new"] = True
+            plan["lineage_baseline_basis"] = "indexed_file_sha256"
+        else:
+            if len(by_index) != len(chunks) or set(by_index) != {int(chunk.chunk_index) for chunk in chunks}:
+                plan.update(lineage_baseline_basis="indexed_file_sha256",
+                            lineage_blocked_reason="retirement_requires_reconcile")
+                return plan
+            for chunk in chunks:
+                point, locator = by_index[int(chunk.chunk_index)], chunk.locator()
+                payload = point.get("payload") or {}
+                if payload.get("chunk_count") != len(chunks):
+                    missing.add("chunk_count")
+                if payload.get("chunk_hash") and payload.get("content_hash") and (
+                    payload.get("chunk_hash") != chunk.chunk_hash
+                    or payload.get("content_hash") != f"sha256:{chunk.chunk_hash}"
+                ):
+                    plan.update(lineage_baseline_basis="indexed_file_sha256",
+                                lineage_blocked_reason="retirement_requires_reconcile")
+                    return plan
+                if payload.get("source_uri") != source_uri:
+                    missing.add("source_uri")
+                if payload.get("locator") != locator:
+                    missing.add("locator")
+                chunk.id = str(point["id"])
+                plan["lineage_existing_ids"].append(chunk.id)
+            if missing:
+                plan.update(lineage_baseline_basis="incomplete_indexed_provenance",
+                            lineage_missing_fields=sorted(missing),
+                            lineage_blocked_reason="legacy_baseline_requires_reconcile")
+                return plan
+            plan["lineage_baseline_basis"] = "indexed_file_sha256"
+
+    source_created = ((existing_source or {}).get("payload") or {}).get("created_at")
+    source_id, source_payload, source_ev = build_file_source(
+        collection_name=collection_name, profile_id=profile_id,
+        user_id_hash=user_id_hash, chat_id_hash=chat_id_hash,
+        scope_key=scope_key, source_key=source_key, file_path=file_path,
+        source_uri=source_uri, current_version_id=version_id, created_at=source_created,
+    )
+    version_id, version_payload, version_ev = build_file_version(
+        collection_name=collection_name, profile_id=profile_id,
+        user_id_hash=user_id_hash, chat_id_hash=chat_id_hash,
+        scope_key=scope_key, source_key=source_key, file_path=file_path,
+        source_uri=source_uri, file_sha256=file_sha256,
+        file_size=int(manifest["file_size"]), file_mtime=str(manifest["file_mtime_iso"]),
+        file_mtime_ns=int(manifest["file_mtime_ns"]),
+    )
+    source_hash = f"sha256:{file_sha256}"
+    part_payload = build_mechanical_edge_payload(
+        relation_type="PART_OF", source_entity_id=version_entity,
+        target_entity_id=source_entity, profile_id=profile_id,
+        source_point_id=version_id, target_point_id=source_id,
+        source_entity_type="source", target_entity_type="source",
+        lineage_operation="index_capture", lineage_source_key=source_key,
+        lineage_scope_key=scope_key, observation="read_bytes",
+        source_content_hash=source_hash, file_version_id=version_id,
+        file_path=file_path, file_sha256=file_sha256,
+    )
+    part_payload.update(user_id_hash=user_id_hash, chat_id_hash=chat_id_hash)
+    part_id = storage_point_id(str(part_payload["edge_id"]))
+    part_ev = _capture_evidence(
+        collection_name=collection_name, profile_id=profile_id,
+        user_id_hash=user_id_hash, chat_id_hash=chat_id_hash,
+        scope_key=scope_key, source_key=source_key, source_uri=source_uri,
+        file_path=file_path, file_sha256=file_sha256,
+        source_content_hash=source_hash, file_version_id=version_id,
+        observation="read_bytes", relation_type="PART_OF",
+        source_point_id=version_id, target_point_id=source_id,
+        source_entity_type="source", target_entity_type="source",
+    )
+    records = [
+        {"id": version_id, "payload": version_payload, "evidence": version_ev},
+        {"id": source_id, "payload": source_payload, "evidence": source_ev},
+        {"id": part_id, "payload": part_payload, "evidence": part_ev},
+    ]
+    plan["lineage_edge_ids"].append(str(part_payload["edge_id"]))
+    plan["lineage_point_ids"].append(part_id)
+    for chunk in chunks:
+        if plan["is_new"]:
+            chunk.id = make_versioned_file_chunk_id(
+                scope_key=scope_key, resolved_file_path=file_path,
+                file_sha256=file_sha256, chunker_version=chunk.chunker_version,
+                chunk_index=chunk.chunk_index, chunk_hash=chunk.chunk_hash,
+            )
+        chunk_entity = memory_point_endpoint_logical_id(
+            scope_key=scope_key, point_id=chunk.id, profile_id=profile_id)
+        chunk.lineage_schema_version = LINEAGE_SCHEMA_VERSION
+        chunk.lineage_entity_id, chunk.file_version_id = chunk_entity, version_id
+        chunk.file_version_entity_id, chunk.lineage_pending = version_entity, False
+        if plan["is_new"]:
+            chunk.manifest_version = 2
+        else:
+            prior_manifest = (by_index[int(chunk.chunk_index)].get("payload") or {}).get("manifest_version")
+            chunk.manifest_version = 2 if prior_manifest == 2 else 1
+        derivation = {
+            "point_id": version_id, "source_uri": f"memory://point/{version_id}",
+            "relation_type": "DERIVED_FROM", "derivation_type": "indexed_chunk",
+            "content_hash": source_hash,
+        }
+        prior_derivations: list[dict[str, Any]] = []
+        if not plan["is_new"]:
+            prior = by_index[int(chunk.chunk_index)].get("payload") or {}
+            if isinstance(prior.get("derived_from"), list):
+                prior_derivations = [item for item in prior["derived_from"] if isinstance(item, dict)]
+        chunk.derived_from = [item for item in prior_derivations
+                              if not (item.get("point_id") == version_id and item.get("relation_type") == "DERIVED_FROM")]
+        chunk.derived_from.append(derivation)
+        edge_id, edge_payload, edge_ev = build_chunk_derivation(
+            collection_name=collection_name, profile_id=profile_id,
+            user_id_hash=user_id_hash, chat_id_hash=chat_id_hash,
+            scope_key=scope_key, source_key=source_key, file_path=file_path,
+            source_uri=source_uri, file_sha256=file_sha256,
+            chunk_point_id=chunk.id, chunk_entity_id=chunk_entity,
+            chunk_hash=chunk.chunk_hash, locator=chunk.locator(),
+            version_point_id=version_id, version_entity_id=version_entity,
+        )
+        records.append({"id": edge_id, "payload": edge_payload, "evidence": edge_ev})
+        plan["lineage_entity_ids"].append(chunk_entity)
+        plan["lineage_edge_ids"].append(str(edge_payload["edge_id"]))
+        plan["lineage_point_ids"].append(edge_id)
+        plan["chunk_patches"].append(chunk)
+    plan["structural_records"], plan["capturable"] = records, True
+    return plan
+
+
+def _collection_lock_digest(collection_name: str, user_id: int) -> str:
+    return hashlib.sha256(f"{int(user_id)}\n{collection_name}".encode()).hexdigest()
+
+
+@contextmanager
+def collection_write_lock(
+    *, collection_name: str, timeout: float = 5.0, lock_dir: str = "",
+) -> Iterator[Path]:
+    try:
+        import fcntl
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("lineage locking is unsupported on this platform") from exc
+    uid = os.getuid()
+    directory = Path(lock_dir) if lock_dir else Path(f"/tmp/hermes-qdrant-lineage-{uid}")
+    if directory.is_symlink():
+        raise RuntimeError("lineage lock directory must not be a symlink")
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = directory.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise RuntimeError(f"lineage lock directory unavailable: {exc}") from exc
+    if (info.st_uid != uid or not stat.S_ISDIR(info.st_mode)
+            or stat.S_IMODE(info.st_mode) & 0o077):
+        raise RuntimeError("lineage lock directory has unsafe ownership, type, or permissions")
+    path = directory / f"{_collection_lock_digest(collection_name, uid)}.lock"
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise RuntimeError("lineage locking requires O_NOFOLLOW support")
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    handle = os.fdopen(fd, "a+")
+    try:
+        info = os.fstat(handle.fileno())
+        if info.st_uid != uid or not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
+            raise RuntimeError("lineage lock file has unsafe ownership, type, or permissions")
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("lineage collection lock acquisition timed out")
+                time.sleep(0.05)
+        yield path
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def read_back_exact_records(
+    qdrant: Any, collection_name: str, point_ids: list[str], *,
+    with_vector: bool = False,
+) -> dict[str, dict[str, Any]]:
+    ids = list(dict.fromkeys(str(value) for value in point_ids if value))
+    if not ids:
+        return {}
+    records = qdrant.retrieve(collection_name, ids, with_payload=True, with_vector=with_vector)
+    return {str(record.get("id")): record for record in records or []
+            if isinstance(record, dict) and str(record.get("id")) in ids}
+
+
+def _record_matches(actual: dict[str, Any], expected: dict[str, Any]) -> bool:
+    payload = actual.get("payload") if isinstance(actual, dict) else None
+    keys = ("memory_kind", "entity_id", "edge_id", "lineage_identity_digest",
+            "lineage_scope_key", "lineage_source_key", "lineage_role",
+            "relation_type", "source_point_id", "target_point_id",
+            "file_version_id", "file_sha256", "current_version_id", "source_deleted",
+            "lineage_history_complete", "file_mtime_ns")
+    return isinstance(payload, dict) and all(payload.get(key) == expected.get(key)
+                                             for key in keys if key in expected)
+
+
+def apply_capture_plan(
+    *, qdrant: Any, collection_name: str,
+    plan: dict[str, Any], chunk_points: list[dict[str, Any]],
+    read_owned_chunks: Any, lock_timeout: float = 5.0, lock_dir: str = "",
+) -> dict[str, Any]:
+    """Gate, persist metadata before chunks, and verify exact W1 records."""
+    if not plan.get("capturable"):
+        return {"acknowledged_ids": [], "read_back_ids": [], "repair_ids": []}
+    from qdrant_memory.write_gate import evaluate_mechanical_lineage_write
+    with collection_write_lock(collection_name=collection_name,
+                               timeout=lock_timeout, lock_dir=lock_dir):
+        old_ids = list(plan.get("old_ids") or [])
+        reread = read_back_exact_records(qdrant, collection_name, old_ids)
+        if set(reread) != set(old_ids) or any(
+            _capture_fingerprint(reread.get(point_id, {})) != fingerprint
+            for point_id, fingerprint in (plan.get("old_fingerprints") or {}).items()
+        ):
+            raise RuntimeError("lineage baseline changed before apply")
+        new_chunk_ids = [str(point["id"]) for point in chunk_points if str(point["id"]) not in old_ids]
+        chunk_collisions = read_back_exact_records(qdrant, collection_name, new_chunk_ids)
+        if chunk_collisions:
+            raise RuntimeError(f"lineage chunk identity collision: {sorted(chunk_collisions)}")
+        source_id = str(plan["source_point_id"])
+        source_now = read_back_exact_records(qdrant, collection_name, [source_id])
+        if plan.get("source_expected"):
+            if source_id not in source_now:
+                raise RuntimeError("lineage source disappeared before apply")
+            if _capture_fingerprint(source_now[source_id]) != plan["source_fingerprint"]:
+                raise RuntimeError("lineage source changed before apply")
+        elif source_id in source_now:
+            head = (source_now[source_id].get("payload") or {}).get("current_version_id")
+            if head and head != plan.get("version_point_id"):
+                raise RuntimeError("lineage source appeared with conflicting head before apply")
+            raise RuntimeError("lineage source appeared before apply")
+        owned_now = read_owned_chunks()
+        owned_ids = {str(point.get("id")) for point in owned_now if point.get("id") is not None}
+        if owned_ids != set(old_ids):
+            raise RuntimeError("lineage chunk inventory changed before apply")
+        records = list(plan.get("structural_records") or [])
+        record_ids = [str(record["id"]) for record in records]
+        existing = read_back_exact_records(qdrant, collection_name, record_ids)
+        writes, updates, repairs = [], [], []
+        for record in records:
+            point_id, payload, prior = str(record["id"]), dict(record["payload"]), existing.get(str(record["id"]))
+            unchanged = False
+            if prior:
+                prior_payload = prior.get("payload") or {}
+                if prior_payload.get("lineage_identity_digest") != payload.get("lineage_identity_digest"):
+                    raise RuntimeError(f"lineage identity collision at {point_id}")
+                if prior_payload.get("head_event_id") or prior_payload.get("pending_event_id"):
+                    raise RuntimeError("W1 refuses event-managed sources")
+                if ("current_version_id" in payload
+                        and prior_payload.get("current_version_id")
+                        and prior_payload.get("current_version_id") != payload["current_version_id"]):
+                    raise RuntimeError("lineage head conflict before apply")
+                payload = {**prior_payload, **payload}
+                for key in ("created_at", "updated_at", "canonical", "requires_review",
+                            "fact_status", "stale", "truth_confidence", "usefulness_weight"):
+                    if key in prior_payload:
+                        payload[key] = prior_payload[key]
+                unchanged = _record_matches(prior, payload)
+                if not unchanged:
+                    repairs.append(point_id)
+            elif not plan.get("is_new"):
+                repairs.append(point_id)
+            decision = evaluate_mechanical_lineage_write(
+                payload, operation="index_capture", evidence=record["evidence"],
+                collection_name=collection_name)
+            if decision.decision != "store":
+                raise RuntimeError(f"mechanical lineage gate rejected {point_id}: {decision.reasons}")
+            if unchanged:
+                continue
+            if prior:
+                updates.append((point_id, payload))
+            else:
+                writes.append({"id": point_id, "vector": {}, "payload": payload})
+        if writes:
+            qdrant.upsert(collection_name, writes)
+        for point_id, payload in updates:
+            qdrant.update_payload(collection_name, point_id, payload)
+        for chunk in plan.get("chunk_patches") or []:
+            matches = [point for point in chunk_points if str(point.get("id")) == str(chunk.id)]
+            if not matches:
+                raise RuntimeError(f"missing prepared chunk point {chunk.id}")
+            if chunk.id in old_ids:
+                payload = matches[0]["payload"]
+                keys = ("lineage_schema_version", "lineage_entity_id", "file_version_id",
+                        "file_version_entity_id", "chunker_version", "file_mtime_ns",
+                        "lineage_pending", "derived_from", "manifest_version")
+                patch = {key: payload[key] for key in keys if key in payload}
+                old_payload = reread[chunk.id].get("payload") or {}
+                if "memory_kind" not in old_payload:
+                    patch["memory_kind"] = "source_chunk"
+                if any(old_payload.get(key) != value for key, value in patch.items()):
+                    qdrant.update_payload(collection_name, chunk.id, patch)
+                    repairs.append(str(chunk.id))
+            else:
+                qdrant.upsert(collection_name, matches)
+        expected_ids = record_ids + [str(point["id"]) for point in chunk_points]
+        read_back = read_back_exact_records(qdrant, collection_name, expected_ids)
+        if set(read_back) != set(expected_ids):
+            raise RuntimeError(f"lineage read-back missing exact IDs: {sorted(set(expected_ids) - set(read_back))}")
+        for record in records:
+            if not _record_matches(read_back[str(record["id"])], record["payload"]):
+                raise RuntimeError(f"lineage read-back invariant mismatch: {record['id']}")
+        for point in chunk_points:
+            actual, expected = read_back[str(point["id"])].get("payload", {}), point["payload"]
+            for key in ("file_version_id", "lineage_entity_id", "file_sha256", "chunk_hash", "chunk_index"):
+                if actual.get(key) != expected.get(key):
+                    raise RuntimeError(f"chunk read-back invariant mismatch: {point['id']}:{key}")
+        return {"acknowledged_ids": [str(item["id"]) for item in writes] + [point_id for point_id, _ in updates] + [str(point["id"]) for point in chunk_points],
+                "read_back_ids": sorted(read_back),
+                "repair_ids": sorted(set(repairs))}

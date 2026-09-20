@@ -9,7 +9,10 @@ absent on teardown.
 
 from __future__ import annotations
 
+import hashlib
+import math
 import os
+import re
 import urllib.parse
 import uuid
 from dataclasses import dataclass
@@ -36,14 +39,43 @@ def integration_enabled() -> bool:
 
 
 def _qdrant_test_settings() -> dict[str, Any]:
+    fake_embeddings = os.environ.get("QDRANT_TEST_FAKE_EMBEDDINGS", "").strip().lower() in TRUTHY
     return {
-        "qdrant_url": os.environ.get("QDRANT_TEST_URL", "http://127.0.0.1:6333"),
+        "qdrant_url": os.environ.get("QDRANT_TEST_URL", "").strip(),
         "api_key": os.environ.get("QDRANT_TEST_API_KEY", ""),
         "embedding_url": os.environ.get("QDRANT_TEST_EMBEDDING_URL", "http://127.0.0.1:8080/v1"),
         "embedding_model": os.environ.get("QDRANT_TEST_EMBEDDING_MODEL", "bge-m3"),
-        "vector_size": int(os.environ.get("QDRANT_TEST_VECTOR_SIZE", "1024")),
+        "vector_size": int(os.environ.get("QDRANT_TEST_VECTOR_SIZE", "64" if fake_embeddings else "1024")),
         "distance": os.environ.get("QDRANT_TEST_DISTANCE", "Cosine"),
+        "fake_embeddings": fake_embeddings,
     }
+
+
+class DeterministicEmbedding:
+    """Local integration-only vectors; Qdrant transport stays real."""
+
+    def __init__(self, vector_size: int):
+        self.vector_size = vector_size
+
+    def _embed(self, text: str) -> list[float]:
+        vector = [0.0] * self.vector_size
+        for token in re.findall(r"[a-z0-9_-]+", text.casefold()):
+            digest = hashlib.sha256(token.encode()).digest()
+            vector[int.from_bytes(digest[:4], "big") % self.vector_size] += 1.0
+        norm = math.sqrt(sum(value * value for value in vector)) or 1.0
+        return [value / norm for value in vector]
+
+    def embed_document(self, text: str) -> list[float]:
+        return self._embed(text)
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed(text)
+
+
+def _embedding_client(settings: dict[str, Any]) -> Any:
+    if settings["fake_embeddings"]:
+        return DeterministicEmbedding(settings["vector_size"])
+    return EmbeddingClient(settings["embedding_url"], settings["embedding_model"], timeout=30.0)
 
 
 def _delete_and_verify(qdrant: QdrantClient, created: list[str], prefix: str) -> None:
@@ -74,7 +106,7 @@ def _delete_and_verify(qdrant: QdrantClient, created: list[str], prefix: str) ->
 @dataclass(frozen=True)
 class LiveContext:
     qdrant: QdrantClient
-    embeddings: EmbeddingClient
+    embeddings: Any
     memory_collection: str
     learning_collection: str
     prefix: str
@@ -93,8 +125,10 @@ def live_context() -> Iterator[LiveContext]:
         pytest.fail(f"refusing production collection prefix: {prefix!r}")
 
     settings = _qdrant_test_settings()
+    if not settings["qdrant_url"]:
+        pytest.skip("set QDRANT_TEST_URL to run live Qdrant integration tests")
     qdrant = QdrantClient(settings["qdrant_url"], timeout=10.0, **{"api_key": settings["api_key"]})
-    embeddings = EmbeddingClient(settings["embedding_url"], settings["embedding_model"], timeout=30.0)
+    embeddings = _embedding_client(settings)
 
     try:
         qdrant._request("GET", "/collections")
@@ -145,7 +179,7 @@ def live_context() -> Iterator[LiveContext]:
 @dataclass(frozen=True)
 class LineageContext:
     qdrant: QdrantClient
-    embeddings: EmbeddingClient
+    embeddings: Any
     primary_collection: str
     restore_collection: str
     prefix: str
@@ -173,8 +207,10 @@ def lineage_context() -> Iterator[LineageContext]:
         pytest.fail(f"refusing production collection prefix: {prefix!r}")
 
     settings = _qdrant_test_settings()
+    if not settings["qdrant_url"]:
+        pytest.skip("set QDRANT_TEST_URL to run live Qdrant integration tests")
     qdrant = QdrantClient(settings["qdrant_url"], timeout=10.0, **{"api_key": settings["api_key"]})
-    embeddings = EmbeddingClient(settings["embedding_url"], settings["embedding_model"], timeout=30.0)
+    embeddings = _embedding_client(settings)
 
     try:
         qdrant._request("GET", "/collections")

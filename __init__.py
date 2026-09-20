@@ -1324,11 +1324,9 @@ class QdrantMemoryProvider(MemoryProvider):
             paths = [paths]
         if not isinstance(paths, list) or not [p for p in paths if str(p).strip()]:
             return _json_error("paths are required when qdrant_memory.index_dirs is empty")
-        if "dry_run" in args:
-            dry_run = bool(args.get("dry_run"))
-        else:
-            dry_run = bool(self._config.get("index_dry_run_default", True))
-        force = bool(args.get("force", False))
+        default_dry_run = parse_bool_arg(self._config.get("index_dry_run_default"), default=True)
+        dry_run = parse_bool_arg(args.get("dry_run"), default=default_dry_run)
+        force = parse_bool_arg(args.get("force"), default=False)
         max_files = args.get("max_files") or None
         try:
             max_files = int(max_files) if max_files is not None else None

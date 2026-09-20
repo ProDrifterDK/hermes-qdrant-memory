@@ -85,7 +85,7 @@ def _report_and_points():
         "review_point_snapshots": [
             {
                 "id": point["id"],
-                "projection": {"name": "memory-pr-review-point", "version": 1},
+                "projection": {"name": "memory-pr-review-point", "version": 2},
                 "snapshot_digest": stable_point_snapshot_digest(point),
             }
             for point in points
@@ -162,7 +162,7 @@ def test_review_snapshot_projection_is_versioned_and_ignores_access_bookkeeping(
 
     assert proposal["review_point_snapshots"][0]["projection"] == {
         "name": "memory-pr-review-point",
-        "version": 1,
+        "version": 2,
     }
     assert after["drift_status"] == "unchanged"
     assert {item["drift_status"] for item in after["current_evidence"]} == {"unchanged"}
@@ -211,6 +211,67 @@ def test_unversioned_legacy_snapshots_are_not_compared_as_current_projection():
 
     assert packet["drift_status"] == "unknown"
     assert {item["report_snapshot_projection"] for item in packet["current_evidence"]} == {None}
+
+
+def test_old_projection_version_is_unknown_after_lineage_inputs_change():
+    report, _, points = _report_and_points()
+    for snapshot in report["proposals"][0]["review_point_snapshots"]:
+        snapshot["projection"]["version"] = 1
+
+    packet = _build(report=report, points=points)
+
+    assert packet["drift_status"] == "unknown"
+    assert {item["drift_status"] for item in packet["current_evidence"]} == {"unknown"}
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("file_sha256", "a" * 64),
+        ("file_mtime_ns", 123),
+        ("file_size", 5),
+        ("chunk_hash", "b" * 64),
+        ("chunk_index", 0),
+        ("chunk_count", 1),
+        ("manifest_version", 1),
+        ("lineage_schema_version", 1),
+        ("lineage_record", True),
+        ("lineage_pending", False),
+        ("lineage_identity_digest", "c" * 64),
+        ("lineage_scope_key", "d" * 64),
+        ("lineage_source_key", "e" * 64),
+        ("lineage_role", "file_source"),
+        ("lineage_operation", "index_capture"),
+        ("lineage_observation", "read_bytes"),
+        ("lineage_entity_id", "entity-1111111111111111"),
+        ("file_version_id", "11111111-1111-1111-1111-111111111111"),
+        ("file_version_entity_id", "entity-2222222222222222"),
+        ("current_version_id", "22222222-2222-2222-2222-222222222222"),
+        ("source_deleted", False),
+        ("lineage_history_complete", False),
+        ("chunker_version", "text-markdown-v1"),
+    ],
+)
+def test_every_w1_lineage_snapshot_field_affects_digest(field, value):
+    _, _, points = _report_and_points()
+    base = stable_point_snapshot_digest(points[0])
+    changed = json.loads(json.dumps(points[0]))
+    changed["payload"][field] = value
+
+    assert _snapshot_projection(changed)["payload"][field] == value
+    assert stable_point_snapshot_digest(changed) != base
+
+
+def test_arbitrary_snapshot_fields_fail_closed_without_leaking_values():
+    _, _, points = _report_and_points()
+    base = stable_point_snapshot_digest(points[0])
+    arbitrary = json.loads(json.dumps(points[0]))
+    arbitrary["payload"]["unreviewed_graph_extra"] = "first private value"
+    arbitrary_other = json.loads(json.dumps(points[0]))
+    arbitrary_other["payload"]["unreviewed_graph_extra"] = "second private value"
+
+    assert stable_point_snapshot_digest(arbitrary) != base
+    assert stable_point_snapshot_digest(arbitrary) == stable_point_snapshot_digest(arbitrary_other)
 
 
 def test_boolean_snapshot_projection_version_is_rejected_not_compared_as_v1():
@@ -1128,4 +1189,4 @@ def test_consolidation_report_snapshots_cover_every_proposal_affected_id(tmp_pat
 
     assert {item["id"] for item in proposal["review_point_snapshots"]} == set(proposal["affected_ids"])
     assert all(len(item["snapshot_digest"]) == 64 for item in proposal["review_point_snapshots"])
-    assert {item["projection"]["version"] for item in proposal["review_point_snapshots"]} == {1}
+    assert {item["projection"]["version"] for item in proposal["review_point_snapshots"]} == {2}

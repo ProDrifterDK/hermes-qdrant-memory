@@ -1367,6 +1367,17 @@ def _format_inspect_summary(payload: dict[str, Any]) -> str:
         values = raw_values if isinstance(raw_values, list) else []
         if values:
             lines.append(f"{key}: {len(values)}")
+    lineage = source if source.get("lineage_schema_version") else {}
+    for key in ("lineage_schema_version", "lineage_role", "lineage_operation",
+                "file_version_id", "current_version_id", "lineage_entity_id",
+                "source_deleted", "lineage_history_complete", "upstream_count"):
+        if lineage.get(key) not in (None, "", [], {}):
+            lines.append(f"{key}: {_safe_scalar(lineage.get(key))}")
+    upstream_ids = lineage.get("upstream_point_ids") if isinstance(lineage.get("upstream_point_ids"), list) else []
+    if upstream_ids:
+        lines.append(f"upstream_point_ids: {len(upstream_ids)}")
+        for upstream_id in upstream_ids[:5]:
+            lines.append(f"  - {_safe_scalar(upstream_id)}")
     derived = source.get("derived_from") if isinstance(source.get("derived_from"), list) else []
     if derived:
         lines.append(f"derived_from: {len(derived)}")
@@ -1383,6 +1394,11 @@ def _format_trace_summary(payload: dict[str, Any]) -> str:
     for key in ("fact_status", "observed_at", "valid_from", "valid_until"):
         if payload.get(key) not in (None, "", [], {}):
             lines.append(f"{key}: {_safe_scalar(payload.get(key))}")
+    lineage = payload.get("lineage") if isinstance(payload.get("lineage"), dict) else {}
+    for key in ("lineage_role", "lineage_operation", "file_version_id",
+                "current_version_id", "lineage_entity_id", "upstream_count"):
+        if lineage.get(key) not in (None, "", [], {}):
+            lines.append(f"{key}: {_safe_scalar(lineage.get(key))}")
     supersession_raw = payload.get("supersession")
     supersession: dict[str, Any] = supersession_raw if isinstance(supersession_raw, dict) else {}
     for key in ("supersedes", "superseded_by", "invalidated_by"):
@@ -1671,12 +1687,52 @@ def _format_store_summary(payload: dict[str, Any], *, learning: bool = False) ->
 
 
 def _format_index_summary(payload: dict[str, Any]) -> str:
-    mode = "dry-run" if payload.get("dry_run", True) else "applied"
+    mode = (
+        "refused" if payload.get("refused")
+        else "partial failure" if payload.get("partial_failure")
+        else "dry-run" if payload.get("dry_run", True)
+        else "applied"
+    )
     lines = [f"Index {mode}: files={payload.get('files_indexed', 0)}/{payload.get('files_seen', 0)} chunks_prepared={payload.get('chunks_prepared', 0)}"]
+    if payload.get("refused"):
+        lines.append("refused: true")
+    if payload.get("partial_failure"):
+        lines.append("partial_failure: true")
     if payload.get("chunks_upserted"):
         lines.append(f"chunks_upserted: {payload.get('chunks_upserted')}")
     if payload.get("stale_count"):
         lines.append(f"stale_chunks: {payload.get('stale_count')} delete_mode={payload.get('delete_mode')}")
+    if payload.get("lineage_mode") and payload.get("lineage_mode") != "off":
+        lines.append(f"lineage_mode: {_safe_scalar(payload.get('lineage_mode'))}")
+        coverage = payload.get("lineage_coverage") if isinstance(payload.get("lineage_coverage"), dict) else {}
+        if coverage:
+            lines.append(
+                "lineage_coverage: "
+                f"eligible={coverage.get('eligible_files', 0)}/{coverage.get('selected_files', 0)} files "
+                f"captured={coverage.get('captured_files', 0)} "
+                f"legacy_blocked={coverage.get('legacy_blocked_files', 0)}"
+            )
+        for key in ("lineage_entity_ids", "lineage_edge_ids", "lineage_point_ids",
+                    "lineage_existing_ids", "lineage_repair_ids",
+                    "lineage_acknowledged_ids", "lineage_read_back_ids"):
+            values = payload.get(key) if isinstance(payload.get(key), list) else []
+            if values:
+                lines.append(f"{key}: {len(values)}")
+    blocked = payload.get("lineage_blocked_files") if isinstance(payload.get("lineage_blocked_files"), list) else []
+    for item in blocked:
+        if isinstance(item, dict):
+            lines.append(
+                f"blocked: {_safe_scalar(item.get('file_path'))} "
+                f"reason={_safe_scalar(item.get('lineage_blocked_reason'))}"
+            )
+    foreign = payload.get("foreign_scope_chunks") if isinstance(payload.get("foreign_scope_chunks"), list) else []
+    for item in foreign:
+        if isinstance(item, dict):
+            count = item.get("count")
+            if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+                chunk_ids = item.get("chunk_ids") if isinstance(item.get("chunk_ids"), list) else []
+                count = len(chunk_ids)
+            lines.append(f"foreign_scope_chunks: {_safe_scalar(item.get('file_path'))} count={count}")
     if payload.get("errors"):
         lines.append(f"errors: {len(payload.get('errors') or [])}")
     return "\n".join(lines)
@@ -2490,8 +2546,9 @@ def execute_command(
         parsed["guarded_auto"] = guarded_auto
         result = json.dumps(parsed, sort_keys=True)
     _record_watcher_run(args, parsed)
-    if _json_flag(args):
-        print(result, file=stdout)
-    else:
-        print(_format_human_payload(parsed, args, tool_name), file=stdout)
-    return 0
+    index_failed = tool_name == "qdrant_memory_index" and bool(
+        parsed.get("refused") or parsed.get("partial_failure") or parsed.get("errors")
+    )
+    output = result if _json_flag(args) else _format_human_payload(parsed, args, tool_name)
+    print(output, file=stderr if index_failed else stdout)
+    return 1 if index_failed else 0

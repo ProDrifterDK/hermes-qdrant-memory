@@ -103,6 +103,8 @@ DEFAULTS: dict[str, Any] = {
     # Default/fail-closed value is off. In W0 no writer is enabled: capture
     # becomes operational in W1 and reconcile stays closed until W2.
     "lineage_mode": "off",
+    "lineage_lock_dir": "",
+    "lineage_lock_timeout_seconds": 5.0,
 }
 
 _BOOL_KEYS = {
@@ -150,7 +152,7 @@ _INT_KEYS = {
     "manual_store_duplicate_top_k",
     "auto_recall_shadow_max_per_session",
 }
-_FLOAT_KEYS = {"decay_rate", "min_raw_score", "min_final_score", "learning_auto_extract_min_confidence", "learning_auto_extract_semantic_dedupe_threshold", "source_extraction_min_confidence", "consolidation_duplicate_threshold", "guarded_auto_duplicate_min_confidence", "guarded_auto_learning_min_confidence", "reconsolidation_min_confidence", "manual_store_duplicate_threshold"}
+_FLOAT_KEYS = {"decay_rate", "min_raw_score", "min_final_score", "learning_auto_extract_min_confidence", "learning_auto_extract_semantic_dedupe_threshold", "source_extraction_min_confidence", "consolidation_duplicate_threshold", "guarded_auto_duplicate_min_confidence", "guarded_auto_learning_min_confidence", "reconsolidation_min_confidence", "manual_store_duplicate_threshold", "lineage_lock_timeout_seconds"}
 _LIST_KEYS = {"index_dirs", "index_extensions", "index_exclude_dirs"}
 
 

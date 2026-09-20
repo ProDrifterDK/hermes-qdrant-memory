@@ -10,6 +10,10 @@ This project is currently public beta / experimental. The format follows Keep a 
 
 - Configurable embedding input chunking in `EmbeddingClient` via `qdrant_memory.embedding_max_input_chars` and `qdrant_memory.embedding_max_chunks`, covering conversation writes, learning writes, indexing, search queries, and CLI/script clients through one centralized guard.
 
+### Changed
+
+- Index refusals and partial failures now keep exit status 1 but write their human or JSON payload to stderr, matching the documented CLI output contract. Successful index output remains on stdout.
+
 ### Safety
 
 - Embedding requests that exceed the local llama.cpp physical batch/context budget are split into bounded chunks and combined into one normalized vector instead of failing the memory write/search path. Oversize-server-error fallback remains in place for tokenizer/Unicode cases where char estimates are imperfect.
