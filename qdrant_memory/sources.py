@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 from urllib.parse import unquote, urlsplit
 
+from .graph_schema import LINEAGE_OBSERVATIONS, LINEAGE_OPERATIONS, LINEAGE_ROLES, is_uuid_string
+from .lineage import is_sha256_hex
 from .schema import sanitize_point_id_links, valid_fact_status, valid_memory_kind, valid_relation_type
 
 
@@ -985,8 +987,49 @@ def retrieve_point(qdrant: Any, collection_name: str, point_id: str, *, with_pay
     return None
 
 
+def _lineage_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    if payload.get("lineage_record") is True:
+        metadata["lineage_record"] = True
+    if payload.get("lineage_schema_version") == 1 and not isinstance(payload.get("lineage_schema_version"), bool):
+        metadata["lineage_schema_version"] = 1
+    for key in ("lineage_identity_digest", "lineage_scope_key", "lineage_source_key"):
+        if is_sha256_hex(payload.get(key)):
+            metadata[key] = payload[key]
+    for key, allowed in (("lineage_role", LINEAGE_ROLES),
+                         ("lineage_operation", LINEAGE_OPERATIONS),
+                         ("lineage_observation", LINEAGE_OBSERVATIONS)):
+        value = payload.get(key)
+        if isinstance(value, str) and value in allowed:
+            metadata[key] = value
+    chunker_version = _compact_expand_token(payload.get("chunker_version"))
+    if chunker_version:
+        metadata["chunker_version"] = chunker_version
+    for key in ("file_version_id", "current_version_id", "source_point_id", "target_point_id"):
+        value = payload.get(key)
+        if is_uuid_string(value):
+            metadata[key] = value
+    entity_id = payload.get("lineage_entity_id")
+    if isinstance(entity_id, str) and entity_id.startswith("entity-") and len(entity_id) <= 128:
+        metadata["lineage_entity_id"] = entity_id
+    for key in ("source_deleted", "lineage_history_complete", "lineage_pending"):
+        if isinstance(payload.get(key), bool):
+            metadata[key] = payload[key]
+    mtime_ns = payload.get("file_mtime_ns")
+    if isinstance(mtime_ns, int) and not isinstance(mtime_ns, bool) and mtime_ns >= 0:
+        metadata["file_mtime_ns"] = mtime_ns
+    derived = payload.get("derived_from")
+    if isinstance(derived, list):
+        upstream_ids = [str(item.get("point_id")) for item in derived
+                        if isinstance(item, dict) and is_uuid_string(item.get("point_id"))]
+        metadata["upstream_count"] = len(upstream_ids)
+        if upstream_ids:
+            metadata["upstream_point_ids"] = upstream_ids[:20]
+    return metadata
+
+
 def source_metadata(payload: dict[str, Any]) -> dict[str, Any]:
-    return expand_source_metadata(payload)
+    return {**expand_source_metadata(payload), **_lineage_metadata(payload)}
 
 
 def expand_locator_metadata(locator: dict[str, Any] | None) -> dict[str, Any]:
@@ -1418,6 +1461,9 @@ def trace_point(qdrant: Any, collection_name: str, point_id: str, *, collection:
         "collection_name": collection_name,
         "direction": direction,
     }
+    lineage = _lineage_metadata(payload)
+    if lineage:
+        result["lineage"] = lineage
     temporal = _temporal_fact_metadata(payload)
     for key in ("fact_status", "observed_at", "valid_from", "valid_until"):
         if key in temporal:

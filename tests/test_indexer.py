@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 from datetime import datetime
 
+import pytest
+
 from qdrant_memory.config import load_config
-from qdrant_memory.indexer import FileChunk, FileIndexer, chunk_markdown, chunk_text, classify_source_type, make_file_chunk_id
+from qdrant_memory.indexer import FileChunk, FileIndexer, chunk_markdown, chunk_text, classify_source_type, file_path_filter, make_file_chunk_id
 from qdrant_memory.tools import FORGET_SCHEMA, INDEX_SCHEMA
 
 
@@ -20,16 +22,49 @@ class FakeEmbedding:
 class FakeQdrant:
     def __init__(self):
         self.upserts = []
+        self.updates = []
         self.deleted = []
         self.delete_filters = []
         self.points = []
+        self.call_log = []
 
     def upsert(self, name, points):
+        self.call_log.append(("upsert", name, [str(point["id"]) for point in points]))
         self.upserts.append((name, points))
+        by_id = {str(point["id"]): dict(point) for point in self.points}
+        for point in points:
+            by_id[str(point["id"])] = dict(point)
+        self.points = list(by_id.values())
         return {"status": "ok"}
 
+    def update_payload(self, name, point_id, payload):
+        self.call_log.append(("update_payload", name, str(point_id)))
+        self.updates.append((name, str(point_id), dict(payload)))
+        for point in self.points:
+            if str(point.get("id")) == str(point_id):
+                point["payload"] = {**(point.get("payload") or {}), **payload}
+                return {"status": "ok"}
+        raise KeyError(point_id)
+
+    def retrieve(self, name, ids, with_payload=True, with_vector=False):
+        wanted = {str(point_id) for point_id in ids}
+        result = []
+        for point in self.points:
+            if str(point.get("id")) not in wanted:
+                continue
+            item = {"id": point["id"]}
+            if with_payload:
+                item["payload"] = dict(point.get("payload") or {})
+            if with_vector and "vector" in point:
+                item["vector"] = point["vector"]
+            result.append(item)
+        return result
+
     def delete_ids(self, name, ids):
+        self.call_log.append(("delete_ids", name, list(ids)))
         self.deleted.append((name, ids))
+        wanted = {str(point_id) for point_id in ids}
+        self.points = [point for point in self.points if str(point.get("id")) not in wanted]
         return {"status": "ok"}
 
     def delete_filter(self, name, filter):
@@ -343,9 +378,9 @@ def test_dry_run_reports_stale_chunk_ids_when_file_shrinks(tmp_path):
     stale_ids = [make_file_chunk_id(file_path, 1), make_file_chunk_id(file_path, 2)]
     qdrant = FakeQdrant()
     qdrant.points = [
-        {"id": make_file_chunk_id(file_path, 0), "payload": {"file_path": file_path}},
-        {"id": stale_ids[0], "payload": {"file_path": file_path}},
-        {"id": stale_ids[1], "payload": {"file_path": file_path}},
+        {"id": make_file_chunk_id(file_path, 0), "payload": {"file_path": file_path, "chunk_type": "file_chunk", "profile_id": "default"}},
+        {"id": stale_ids[0], "payload": {"file_path": file_path, "chunk_type": "file_chunk", "profile_id": "default"}},
+        {"id": stale_ids[1], "payload": {"file_path": file_path, "chunk_type": "file_chunk", "profile_id": "default"}},
     ]
     emb = FakeEmbedding()
     indexer = FileIndexer(qdrant=qdrant, embeddings=emb, collection_name="c", config={"max_chunk_tokens": 128})
@@ -369,8 +404,8 @@ def test_live_index_deletes_only_stale_ids_before_upsert(tmp_path):
     stale_id = make_file_chunk_id(file_path, 1)
     qdrant = FakeQdrant()
     qdrant.points = [
-        {"id": make_file_chunk_id(file_path, 0), "payload": {"file_path": file_path}},
-        {"id": stale_id, "payload": {"file_path": file_path}},
+        {"id": make_file_chunk_id(file_path, 0), "payload": {"file_path": file_path, "chunk_type": "file_chunk", "profile_id": "default"}},
+        {"id": stale_id, "payload": {"file_path": file_path, "chunk_type": "file_chunk", "profile_id": "default"}},
     ]
     emb = FakeEmbedding()
     indexer = FileIndexer(qdrant=qdrant, embeddings=emb, collection_name="c", config={"max_chunk_tokens": 128})
@@ -390,7 +425,7 @@ def test_live_index_prefers_id_sync_over_filter_delete_even_with_force(tmp_path)
     file_path = str(path.resolve())
     stale_id = make_file_chunk_id(file_path, 1)
     qdrant = FakeQdrant()
-    qdrant.points = [{"id": stale_id, "payload": {"file_path": file_path}}]
+    qdrant.points = [{"id": stale_id, "payload": {"file_path": file_path, "chunk_type": "file_chunk", "profile_id": "default"}}]
     indexer = FileIndexer(qdrant=qdrant, embeddings=FakeEmbedding(), collection_name="c", config={"max_chunk_tokens": 128})
 
     summary = indexer.index([path], dry_run=False, force=True)
@@ -400,17 +435,82 @@ def test_live_index_prefers_id_sync_over_filter_delete_even_with_force(tmp_path)
     assert qdrant.delete_filters == []
 
 
-def test_live_index_falls_back_to_delete_filter_when_scroll_unavailable_and_force_true(tmp_path):
+def test_scroll_capable_force_on_fresh_file_uses_exact_empty_inventory(tmp_path):
+    path = tmp_path / "note.txt"
+    path.write_text("alpha", encoding="utf-8")
+    qdrant = FakeQdrant()
+    indexer = FileIndexer(
+        qdrant=qdrant, embeddings=FakeEmbedding(), collection_name="c",
+        config={"max_chunk_tokens": 128},
+    )
+
+    dry = indexer.index([path], dry_run=True, force=True)
+    live = indexer.index([path], dry_run=False, force=True)
+
+    for result in (dry, live):
+        assert result["manifest_checked"] is True
+        assert result["delete_mode"] == "none"
+        assert result["chunks_deleted"] == 0
+        assert result["filter_delete_paths"] == []
+        assert result["errors"] == []
+        assert result["partial_failure"] is False
+    assert qdrant.delete_filters == []
+
+
+def test_force_filter_delete_is_predicted_and_has_an_explicit_receipt(tmp_path):
     path = tmp_path / "note.txt"
     path.write_text("alpha", encoding="utf-8")
     qdrant = FakeLegacyQdrant()
-    indexer = FileIndexer(qdrant=qdrant, embeddings=FakeEmbedding(), collection_name="c", config={"max_chunk_tokens": 128})
+    indexer = FileIndexer(
+        qdrant=qdrant, embeddings=FakeEmbedding(), collection_name="c",
+        config={"max_chunk_tokens": 128}, user_id_hash="u1", chat_id_hash="c1",
+    )
 
+    dry = indexer.index([path], dry_run=True, force=True)
     summary = indexer.index([path], dry_run=False, force=True)
 
-    assert summary["manifest_checked"] is False
+    assert dry["manifest_checked"] is False
+    assert dry["delete_mode"] == "filter"
+    assert dry["filter_delete_paths"] == [str(path.resolve())]
+    assert dry["filter_deletes_issued"] == 0
     assert summary["delete_mode"] == "filter"
-    assert qdrant.delete_filters == [("c", {"must": [{"key": "file_path", "match": {"value": str(path.resolve())}}]})]
+    assert summary["chunks_deleted"] is None
+    assert summary["filter_deletes_issued"] == 1
+    assert summary["filter_delete_receipts"] == [{
+        "file_path": str(path.resolve()), "status": "issued", "observed_matches": None,
+    }]
+    assert summary["partial_failure"] is True
+    assert summary["errors"] == [{
+        "file_path": str(path.resolve()),
+        "error": "filter delete issued; exact deletion count unavailable",
+    }]
+    assert qdrant.delete_filters == [("c", file_path_filter(
+        str(path.resolve()), profile_id="default", user_id_hash="u1", chat_id_hash="c1",
+    ))]
+
+
+@pytest.mark.parametrize(("user_id_hash", "chat_id_hash"), [("", ""), ("u1", ""), ("", "c1")])
+def test_inexact_scope_force_refuses_legacy_broad_filter_delete(tmp_path, user_id_hash, chat_id_hash):
+    path = tmp_path / "note.txt"
+    path.write_text("alpha", encoding="utf-8")
+    qdrant = FakeLegacyQdrant()
+    indexer = FileIndexer(
+        qdrant=qdrant, embeddings=FakeEmbedding(), collection_name="c",
+        config={"max_chunk_tokens": 128},
+        user_id_hash=user_id_hash, chat_id_hash=chat_id_hash,
+    )
+
+    dry = indexer.index([path], dry_run=True, force=True)
+    live = indexer.index([path], dry_run=False, force=True)
+
+    expected_refusal = [{"reason": "force_filter_delete_requires_exact_scope"}]
+    assert dry["delete_mode"] == live["delete_mode"] == "none"
+    assert dry.get("refused") is live.get("refused") is True
+    assert dry.get("refusals") == live.get("refusals") == expected_refusal
+    assert dry["errors"] == live["errors"] == []
+    assert dry.get("partial_failure") is live.get("partial_failure") is True
+    assert live["filter_deletes_issued"] == 0
+    assert qdrant.delete_filters == []
 
 
 def test_empty_file_with_existing_chunks_reports_all_existing_as_stale(tmp_path):
@@ -419,7 +519,7 @@ def test_empty_file_with_existing_chunks_reports_all_existing_as_stale(tmp_path)
     file_path = str(path.resolve())
     old_ids = [make_file_chunk_id(file_path, 0), make_file_chunk_id(file_path, 1)]
     qdrant = FakeQdrant()
-    qdrant.points = [{"id": point_id, "payload": {"file_path": file_path}} for point_id in old_ids]
+    qdrant.points = [{"id": point_id, "payload": {"file_path": file_path, "chunk_type": "file_chunk", "profile_id": "default"}} for point_id in old_ids]
     indexer = FileIndexer(qdrant=qdrant, embeddings=FakeEmbedding(), collection_name="c", config={"max_chunk_tokens": 128})
 
     dry = indexer.index([path], dry_run=True)
@@ -438,8 +538,8 @@ def test_dry_run_directory_sync_reports_deleted_files_without_mutation(tmp_path)
     removed_id = make_file_chunk_id(removed_path, 0)
     qdrant = FakeQdrant()
     qdrant.points = [
-        {"id": make_file_chunk_id(str(keep.resolve()), 0), "payload": {"file_path": str(keep.resolve()), "chunk_type": "file_chunk"}},
-        {"id": removed_id, "payload": {"file_path": removed_path, "chunk_type": "file_chunk"}},
+        {"id": make_file_chunk_id(str(keep.resolve()), 0), "payload": {"file_path": str(keep.resolve()), "chunk_type": "file_chunk", "profile_id": "default"}},
+        {"id": removed_id, "payload": {"file_path": removed_path, "chunk_type": "file_chunk", "profile_id": "default"}},
     ]
     emb = FakeEmbedding()
     indexer = FileIndexer(qdrant=qdrant, embeddings=emb, collection_name="c", config={"max_chunk_tokens": 128})
@@ -463,7 +563,7 @@ def test_live_directory_sync_deletes_chunks_for_removed_files(tmp_path):
     removed_id = make_file_chunk_id(removed_path, 0)
     qdrant = FakeQdrant()
     qdrant.points = [
-        {"id": removed_id, "payload": {"file_path": removed_path, "chunk_type": "file_chunk"}},
+        {"id": removed_id, "payload": {"file_path": removed_path, "chunk_type": "file_chunk", "profile_id": "default"}},
     ]
     indexer = FileIndexer(qdrant=qdrant, embeddings=FakeEmbedding(), collection_name="c", config={"max_chunk_tokens": 128})
 
@@ -481,7 +581,7 @@ def test_directory_sync_does_not_delete_existing_but_excluded_file(tmp_path):
     file_path = str(path.resolve())
     point_id = make_file_chunk_id(file_path, 0)
     qdrant = FakeQdrant()
-    qdrant.points = [{"id": point_id, "payload": {"file_path": file_path, "chunk_type": "file_chunk"}}]
+    qdrant.points = [{"id": point_id, "payload": {"file_path": file_path, "chunk_type": "file_chunk", "profile_id": "default"}}]
     indexer = FileIndexer(
         qdrant=qdrant,
         embeddings=FakeEmbedding(),
@@ -508,7 +608,7 @@ def test_directory_sync_is_skipped_when_max_files_truncates_walk_after_many_skip
     removed_path = str((tmp_path / "z_removed.md").resolve())
     removed_id = make_file_chunk_id(removed_path, 0)
     qdrant = FakeQdrant()
-    qdrant.points = [{"id": removed_id, "payload": {"file_path": removed_path, "chunk_type": "file_chunk"}}]
+    qdrant.points = [{"id": removed_id, "payload": {"file_path": removed_path, "chunk_type": "file_chunk", "profile_id": "default"}}]
     indexer = FileIndexer(
         qdrant=qdrant,
         embeddings=FakeEmbedding(),

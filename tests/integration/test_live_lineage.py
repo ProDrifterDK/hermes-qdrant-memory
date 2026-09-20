@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import urllib.parse
+from pathlib import Path
 
 import pytest
 
@@ -26,6 +27,7 @@ from conftest import LINEAGE_TEST_PREFIX, LineageContext
 from qdrant_memory import lineage
 from qdrant_memory.backup import create_backup, restore_backup
 from qdrant_memory.graph_schema import is_uuid_string, make_graph_point_id
+from qdrant_memory.indexer import FileIndexer
 
 TRUTHY = {"1", "true", "yes", "on"}
 
@@ -154,7 +156,7 @@ def test_graph_storage_ids_and_payload_only_roundtrip(lineage_context: LineageCo
 
     # --- backup / restore round-trip of the payload-only points ---
     config = {
-        "qdrant_url": "http://127.0.0.1:6333",
+        "qdrant_url": os.environ["QDRANT_TEST_URL"],
         "collection_name": collection,
         "learning_collection_name": ctx.restore_collection,
         "vector_size": ctx.vector_size,
@@ -200,8 +202,241 @@ def test_graph_storage_ids_and_payload_only_roundtrip(lineage_context: LineageCo
 
 def _hermes_home(tmp_path: str | None = None) -> str:
     import tempfile
-    from pathlib import Path
 
     base = Path(tempfile.gettempdir()) / "hermes-lineage-itest-home"
     base.mkdir(parents=True, exist_ok=True)
     return str(base)
+
+
+def _all_points(ctx: LineageContext) -> list[dict]:
+    data = ctx.qdrant._request(
+        "POST",
+        f"/collections/{urllib.parse.quote(ctx.primary_collection, safe='')}/points/scroll",
+        {"limit": 256, "with_payload": True, "with_vector": False},
+    )
+    result = data.get("result", {}) or {}
+    assert result.get("next_page_offset") is None, "lineage integration fixture exceeded one bounded page"
+    return result.get("points", []) or []
+
+
+def _live_indexer(ctx: LineageContext, tmp_path: Path, *, profile_id: str, mode: str = "capture") -> FileIndexer:
+    return FileIndexer(
+        qdrant=ctx.qdrant,
+        embeddings=ctx.embeddings,
+        collection_name=ctx.primary_collection,
+        profile_id=profile_id,
+        platform="pytest",
+        config={
+            "lineage_mode": mode,
+            "qdrant_url": os.environ["QDRANT_TEST_URL"],
+            "lineage_lock_dir": str(tmp_path / "locks"),
+            "max_chunk_tokens": 128,
+        },
+    )
+
+
+def test_index_capture_roundtrip(lineage_context: LineageContext, tmp_path: Path):
+    path = tmp_path / "capture.md"
+    path.write_text("# Capture\nalpha\n\n## Detail\nbeta", encoding="utf-8")
+    negative = os.environ.get("LINEAGE_CAPTURE_NEGATIVE_CONTROL") == "off"
+    indexer = _live_indexer(
+        lineage_context, tmp_path, profile_id="lineage-itest",
+        mode="off" if negative else "capture",
+    )
+
+    result = indexer.index([path], dry_run=False)
+    points = _all_points(lineage_context)
+    structural = [point for point in points if (point.get("payload") or {}).get("lineage_record") is True]
+    assert structural, "missing lineage graph records after index capture"
+    assert result["partial_failure"] is False
+    assert result["lineage_coverage"]["captured_files"] == 1
+    assert len(points) == len(result["lineage_point_ids"]) + result["chunks_prepared"]
+    retrieved = lineage_context.qdrant.retrieve(
+        lineage_context.primary_collection,
+        result["lineage_read_back_ids"],
+        with_payload=True,
+        with_vector=False,
+    )
+    assert {str(point["id"]) for point in retrieved} == set(result["lineage_read_back_ids"])
+    ids = {str(point["id"]) for point in points}
+    for edge in [point for point in points if (point.get("payload") or {}).get("memory_kind") == "graph_edge"]:
+        assert edge["payload"]["source_point_id"] in ids
+        assert edge["payload"]["target_point_id"] in ids
+
+
+def test_capture_repair_and_scope_isolation(lineage_context: LineageContext, tmp_path: Path):
+    path = tmp_path / "scoped.md"
+    path.write_text("# Scoped\nalpha", encoding="utf-8")
+    first_indexer = _live_indexer(lineage_context, tmp_path, profile_id="lineage-itest-a")
+    first = first_indexer.index([path], dry_run=False)
+    assert first["partial_failure"] is False
+    points = _all_points(lineage_context)
+    missing_edge = next(
+        point for point in points
+        if (point.get("payload") or {}).get("relation_type") == "DERIVED_FROM"
+        and point["payload"].get("profile_id") == "lineage-itest-a"
+    )
+    lineage_context.qdrant.delete_ids(lineage_context.primary_collection, [str(missing_edge["id"])])
+
+    repaired = first_indexer.index([path], dry_run=False)
+    assert repaired["partial_failure"] is False
+    assert repaired["lineage_repair_ids"] == [str(missing_edge["id"])]
+
+    second = _live_indexer(
+        lineage_context, tmp_path, profile_id="lineage-itest-b"
+    ).index([path], dry_run=False)
+    assert second["partial_failure"] is False
+    points = _all_points(lineage_context)
+    sources = [
+        point for point in points
+        if (point.get("payload") or {}).get("lineage_role") == "file_source"
+    ]
+    chunks = [
+        point for point in points
+        if (point.get("payload") or {}).get("memory_kind") == "source_chunk"
+    ]
+    assert {point["payload"]["profile_id"] for point in sources} == {
+        "lineage-itest-a", "lineage-itest-b",
+    }
+    assert len({str(point["id"]) for point in sources}) == 2
+    assert {point["payload"]["profile_id"] for point in chunks} == {
+        "lineage-itest-a", "lineage-itest-b",
+    }
+    assert any(str(point["id"]) == str(missing_edge["id"]) for point in points)
+
+
+def test_off_mode_fresh_store_has_no_lineage_graph(lineage_context: LineageContext, tmp_path: Path):
+    path = tmp_path / "legacy.md"
+    path.write_text("legacy path", encoding="utf-8")
+
+    result = _live_indexer(
+        lineage_context, tmp_path, profile_id="lineage-itest", mode="off"
+    ).index([path], dry_run=False)
+    points = _all_points(lineage_context)
+
+    assert result["chunks_upserted"] == 1
+    assert len(points) == 1
+    assert not any((point.get("payload") or {}).get("lineage_record") for point in points)
+    assert not any((point.get("payload") or {}).get("memory_kind") in {"graph_entity", "graph_edge"} for point in points)
+
+
+def test_off_mode_inventory_failure_fails_closed_live(
+    lineage_context: LineageContext, tmp_path: Path, monkeypatch
+):
+    path = tmp_path / "inventory-failure.md"
+    path.write_text("# Inventory failure\nalpha", encoding="utf-8")
+    profile = "lineage-itest-fail-closed"
+    owner = _live_indexer(lineage_context, tmp_path, profile_id=profile)
+    assert owner.index([path], dry_run=False)["partial_failure"] is False
+    before_points = _all_points(lineage_context)
+    before = json.dumps(before_points, sort_keys=True, separators=(",", ":"))
+    original_scroll = lineage_context.qdrant.scroll_by_filter
+    raised = False
+
+    def raise_once(name, filter, limit=256, with_payload=True, with_vector=False):
+        nonlocal raised
+        if not raised and str(path.resolve()) in json.dumps(filter):
+            raised = True
+            raise RuntimeError("simulated live inventory transport error")
+        return original_scroll(
+            name, filter, limit=limit, with_payload=with_payload, with_vector=with_vector
+        )
+
+    monkeypatch.setattr(lineage_context.qdrant, "scroll_by_filter", raise_once)
+    result = _live_indexer(
+        lineage_context, tmp_path, profile_id=profile, mode="off"
+    ).index([path], dry_run=False)
+    after = json.dumps(_all_points(lineage_context), sort_keys=True, separators=(",", ":"))
+
+    assert raised is True
+    assert result["refused"] is True
+    assert result["partial_failure"] is True
+    assert result["chunks_upserted"] == 0
+    assert result["chunks_deleted"] == 0
+    assert result["foreign_scope_chunks"] == []
+    assert result["refusals"] == [{
+        "file_path": str(path.resolve()),
+        "reason": "lineage_inventory_unavailable_refused_fail_closed",
+    }]
+    assert result["errors"] == [{
+        "file_path": str(path.resolve()),
+        "error": "manifest sync failed: simulated live inventory transport error",
+    }]
+    assert after == before
+
+
+def test_foreign_scope_dry_run_redacts_chunk_ids_live(
+    lineage_context: LineageContext, tmp_path: Path
+):
+    path = tmp_path / "foreign-report.md"
+    path.write_text("# Foreign report\nalpha", encoding="utf-8")
+    owner = _live_indexer(lineage_context, tmp_path, profile_id="lineage-itest-owner")
+    assert owner.index([path], dry_run=False)["partial_failure"] is False
+    owner_ids = {
+        str(point["id"])
+        for point in _all_points(lineage_context)
+        if (point.get("payload") or {}).get("memory_kind") == "source_chunk"
+    }
+    before = json.dumps(_all_points(lineage_context), sort_keys=True, separators=(",", ":"))
+
+    result = _live_indexer(
+        lineage_context, tmp_path, profile_id="lineage-itest-other", mode="off"
+    ).index([path], dry_run=True)
+
+    report = result["foreign_scope_chunks"]
+    rendered = json.dumps(report, sort_keys=True)
+    assert report == [{"file_path": str(path.resolve()), "count": len(owner_ids)}]
+    assert all("chunk_ids" not in item for item in report)
+    assert all(point_id not in rendered for point_id in owner_ids)
+    assert json.dumps(_all_points(lineage_context), sort_keys=True, separators=(",", ":")) == before
+
+
+def test_index_failure_payload_uses_stderr_live(
+    lineage_context: LineageContext, tmp_path: Path
+):
+    import argparse
+    import importlib.util
+    import io
+
+    from qdrant_memory.cli_core import execute_command
+
+    path = tmp_path / "cli-channel.md"
+    path.write_text("# CLI channel\nalpha", encoding="utf-8")
+    owner = _live_indexer(lineage_context, tmp_path, profile_id="lineage-itest-cli-owner")
+    assert owner.index([path], dry_run=False)["partial_failure"] is False
+    summary = _live_indexer(
+        lineage_context, tmp_path, profile_id="lineage-itest-cli-other", mode="off"
+    ).index([path], dry_run=True)
+    raw = json.dumps(summary)
+
+    class Provider:
+        def handle_tool_call(self, tool_name, args):
+            assert tool_name == "qdrant_memory_index"
+            return raw
+
+    spec = importlib.util.spec_from_file_location(
+        "qdrant_plugin_cli_fix4_live", Path(__file__).resolve().parents[2] / "cli.py"
+    )
+    plugin_cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(plugin_cli)
+    parser = argparse.ArgumentParser(prog="hermes")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    qdrant_parser = subparsers.add_parser("qdrant")
+    plugin_cli.register_cli(qdrant_parser)
+
+    stdout, stderr = io.StringIO(), io.StringIO()
+    human_args = parser.parse_args(["qdrant", "index", str(path)])
+    assert execute_command(
+        human_args, provider_factory=Provider, stdout=stdout, stderr=stderr
+    ) == 1
+    assert stdout.getvalue() == ""
+    assert "Index refused" in stderr.getvalue()
+    assert f"foreign_scope_chunks: {path.resolve()} count=1" in stderr.getvalue()
+
+    stdout, stderr = io.StringIO(), io.StringIO()
+    json_args = parser.parse_args(["qdrant", "index", str(path), "--json"])
+    assert execute_command(
+        json_args, provider_factory=Provider, stdout=stdout, stderr=stderr
+    ) == 1
+    assert stdout.getvalue() == ""
+    assert stderr.getvalue() == raw + "\n"

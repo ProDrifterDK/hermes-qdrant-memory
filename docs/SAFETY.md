@@ -852,8 +852,8 @@ post-filter defensively. The semantic graph's direct-ID source-reference path
 is narrower: it caps each entity's `source_point_ids` at the first eight
 before fetching payloads, then applies structural exclusion defensively. A
 structural or pending ID within those eight therefore consumes a reference
-slot, and an active ID beyond the cap is not fetched. Three known gaps remain
-open and are NOT covered by the search-path qualification:
+slot, and an active ID beyond the cap is not fetched. Two search-path gaps
+remain open and are NOT covered by the qualification:
 
 - N1: the RAPTOR direct-ID search and builder paths can still admit
   `lineage_pending` chunks into their own pools.
@@ -862,8 +862,13 @@ open and are NOT covered by the search-path qualification:
   point without preserving pending-state markers. Pending state can therefore
   be lost before the semantic gate sees the candidate; two retained N2 probes
   still fail.
-- N3: the ordinary indexer still deletes persisted structural source records
-  it does not recognize.
+
+The W0 ordinary-indexer deletion gap is closed in W1 where the backend exposes
+`scroll_by_filter`: structural records stay outside stale-chunk deletion, and
+off mode blocks lineage-managed chunks instead of deleting or duplicating them.
+A no-scroll compatibility backend cannot discover that state; force deletion is
+then limited to the explicit legacy fallback and is refused without an exact
+user-and-chat scope.
 
 No lineage writer is enabled (`lineage_mode` defaults to `off`).
 
@@ -967,3 +972,55 @@ No lineage writer is enabled (`lineage_mode` defaults to `off`).
   caps `source_point_ids` at eight before payload fetch and only then applies
   the defensive structural filter, so excluded IDs can consume those eight
   slots. Consolidation apply refuses proposals selecting structural records.
+
+---
+
+## 21. Lineage W1 additive capture limits
+
+W1 remains disabled by default: `lineage_mode="off"`. Capture adds deterministic
+file-source, file-version, `PART_OF`, and `DERIVED_FROM` records. It does not
+retire or delete lineage state.
+
+- Where the backend exposes `scroll_by_filter`, off mode reads every chunk for
+  the selected path without a scope filter and fails closed when any is
+  lineage-managed or when that inventory read fails. It performs no delete,
+  embedding, or legacy-ID upsert for that file, including when the caller is
+  unscoped or has a different profile or user/chat hashes. Read failures retain
+  the transport error and use the distinct
+  `lineage_inventory_unavailable_refused_fail_closed` refusal. Deletion
+  inventory remains exact-owner-only. Foreign-scope reports expose only a count
+  for paths within the requested roots, never point IDs. The report discloses
+  foreign paths under those roots, including paths no longer on disk, not only
+  counts; no tool consumes a reported path for deletion. The bundled client
+  pages `next_page_offset` until completion, and these inventory reads do not
+  set a `max_total` cap. On a no-scroll compatibility backend, this protection
+  cannot inspect lineage state; broad force deletion is refused unless user and
+  chat scope are both present.
+- `lineage_repair_ids` names structural writes and chunk payload patches issued
+  by the current apply. "Repair" covers the fixed read-back invariant key set,
+  not full payload reconciliation; drift in fields outside that set can remain
+  unchanged and unreported.
+- `_owned_file_chunks` normalizes a stored null ownership hash to the empty
+  string before exact-owner comparison. The later capture-plan scope check also
+  rejects null using its raw comparison, so that second capture-side check is a
+  redundant fail-closed guard rather than a separate acceptance path.
+- Intentional lineage or capability refusal is reported as `refused` plus
+  structured `refusals`; it also sets `partial_failure` because requested work
+  was not applied. Transport and write errors set `partial_failure` without
+  `refused`, so callers can distinguish the cause. Successful summaries keep
+  `partial_failure=false`.
+- An interrupted multi-chunk capture may resume only when the durable source head
+  and version match, every surviving owned chunk belongs to the deterministic
+  expected ID set, and no unexpected owned chunk exists. Other partial states
+  stay blocked as `incomplete_capture`; nothing is retired.
+- External deletion of a lineage-managed chunk can leave a legacy edge pointing
+  at a missing target. W1 does not delete or retire that edge. Reconciliation and
+  retirement remain W2 inputs. A non-lineage legacy chunk at the same path and
+  deterministic legacy point ID is overwritten regardless of scope; this is
+  unchanged W0 behavior.
+- The W0 RAPTOR direct-ID/pending-state gap (N1) and extraction/improve
+  pending-marker loss (N2) remain open. W1 capture does not change those paths.
+- Boolean argument coercion outside the index tool remains out of scope. In
+  particular, `_tool_forget` treats an empty-string `dry_run` value as false and
+  can perform a live delete. Callers must omit the argument or send an actual
+  boolean until a separate bounded fix closes that interface.

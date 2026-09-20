@@ -26,7 +26,7 @@ from qdrant_memory.schema import FACT_STATUSES, MEMORY_KINDS, RELATION_TYPES
 SCHEMA_NAME = "hermes-qdrant-memory.memory-pr"
 SCHEMA_VERSION = 1
 REVIEW_SNAPSHOT_PROJECTION_NAME = "memory-pr-review-point"
-REVIEW_SNAPSHOT_PROJECTION_VERSION = 1
+REVIEW_SNAPSHOT_PROJECTION_VERSION = 2
 PERSISTED_EVIDENCE_SCHEMA_NAME = "memory-pr-persisted-evidence"
 PERSISTED_EVIDENCE_SCHEMA_VERSION = 1
 MAX_ID_CHARS = 128
@@ -131,6 +131,29 @@ _REVIEW_SNAPSHOT_PAYLOAD_KEYS = (
     "supersedes",
     "deprecated_at",
     "consolidation_quarantined",
+    "file_sha256",
+    "file_mtime_ns",
+    "file_size",
+    "chunk_hash",
+    "chunk_index",
+    "chunk_count",
+    "manifest_version",
+    "lineage_schema_version",
+    "lineage_record",
+    "lineage_pending",
+    "lineage_identity_digest",
+    "lineage_scope_key",
+    "lineage_source_key",
+    "lineage_role",
+    "lineage_operation",
+    "lineage_observation",
+    "lineage_entity_id",
+    "file_version_id",
+    "file_version_entity_id",
+    "current_version_id",
+    "source_deleted",
+    "lineage_history_complete",
+    "chunker_version",
 )
 _SAFE_DERIVATION_TYPES = {
     "completed_turn",
@@ -208,6 +231,29 @@ _REVIEW_SAFE_SCHEMAS: dict[str, dict[str, str]] = {
         "provider": "token",
         "target": "token",
         "memory_target": "token",
+        "file_sha256": "text",
+        "file_mtime_ns": "nonnegative_int",
+        "file_size": "nonnegative_int",
+        "chunk_hash": "text",
+        "chunk_index": "nonnegative_int",
+        "chunk_count": "nonnegative_int",
+        "manifest_version": "nonnegative_int",
+        "lineage_schema_version": "nonnegative_int",
+        "lineage_record": "bool",
+        "lineage_pending": "bool",
+        "lineage_identity_digest": "text",
+        "lineage_scope_key": "text",
+        "lineage_source_key": "text",
+        "lineage_role": "token",
+        "lineage_operation": "token",
+        "lineage_observation": "token",
+        "lineage_entity_id": "exact_id",
+        "file_version_id": "exact_id",
+        "file_version_entity_id": "exact_id",
+        "current_version_id": "exact_id",
+        "source_deleted": "bool",
+        "lineage_history_complete": "bool",
+        "chunker_version": "token",
     },
     "evidence": {
         "id": "exact_id",

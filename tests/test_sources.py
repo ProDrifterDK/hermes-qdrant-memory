@@ -12,6 +12,7 @@ from qdrant_memory.sources import (
     expand_source_metadata,
     inspect_point,
     retrieve_point,
+    source_metadata,
     source_status_for_point,
     trace_point,
 )
@@ -19,6 +20,46 @@ from qdrant_memory.sources import (
 
 def _sha256_text(text: str) -> str:
     return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def test_source_metadata_exposes_only_validated_compact_lineage_links():
+    digest = "a" * 64
+    version_id = "11111111-1111-1111-1111-111111111111"
+    metadata = source_metadata({
+        "lineage_schema_version": 1,
+        "lineage_scope_key": digest,
+        "lineage_source_key": digest,
+        "lineage_identity_digest": digest,
+        "lineage_role": "file_version",
+        "file_version_id": version_id,
+        "current_version_id": "not-a-uuid",
+        "lineage_history_complete": False,
+        "derived_from": [{"point_id": version_id}, {"point_id": "bad"}],
+        "raw_historical_content": "must not escape",
+    })
+    assert metadata["lineage_schema_version"] == 1
+    assert metadata["file_version_id"] == version_id
+    assert metadata["upstream_count"] == 1
+    assert metadata["upstream_point_ids"] == [version_id]
+    assert "current_version_id" not in metadata
+    assert "raw_historical_content" not in metadata
+
+
+def test_source_metadata_caps_validated_upstream_links_in_input_order():
+    valid_ids = [f"11111111-1111-1111-1111-{index:012d}" for index in range(21)]
+    derived = [{"point_id": valid_ids[0]}, {"point_id": "invalid"}]
+    derived.extend({"point_id": point_id} for point_id in valid_ids[1:])
+
+    metadata = source_metadata({
+        "derived_from": derived,
+        "raw_historical_content": "must not escape",
+    })
+
+    assert metadata["upstream_count"] == 21
+    assert metadata["upstream_point_ids"] == valid_ids[:20]
+    assert len(metadata["upstream_point_ids"]) == 20
+    assert "raw_historical_content" not in metadata
+    assert "derived_from" not in metadata
 
 
 def test_registry_returns_structured_unsupported_for_unknown_scheme():
