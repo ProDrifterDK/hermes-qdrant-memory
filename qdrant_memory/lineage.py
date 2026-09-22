@@ -1806,33 +1806,84 @@ LINEAGE_LOCK_REFUSAL_MARKERS = (
     "lineage lock directory unavailable",
     "lineage lock directory must not be a symlink",
     "lineage lock directory has unsafe ownership, type, or permissions",
+    "lineage lock file unavailable",
     "lineage lock file has unsafe ownership, type, or permissions",
     "lineage locking is unsupported on this platform",
     "lineage locking requires O_NOFOLLOW support",
 )
 
 
+def _refusal_offset(value: str) -> int | None:
+    """Offset of the first marker that reads as a refusal clause, or ``None``.
+
+    A refusal is a standalone clause: the marker either starts the string or follows
+    whitespace, because every operation prefix the callers add ends in ``": "``. A
+    marker glued to a non-space character is part of a path, a directory name or an
+    identifier — the operator's own data — and rewriting it would corrupt a summary
+    field that has nothing to do with locking. Plain substring matching cannot tell
+    those two apart, so the clause boundary is what decides.
+    """
+    best: int | None = None
+    for marker in LINEAGE_LOCK_REFUSAL_MARKERS:
+        start = 0
+        while True:
+            found = value.find(marker, start)
+            if found < 0:
+                break
+            if found == 0 or value[found - 1].isspace():
+                if best is None or found < best:
+                    best = found
+                break
+            start = found + 1
+    return best
+
+
 def redact_lock_refusals(value: Any) -> Any:
     """Collapse a raw lineage lock refusal to the single fixed contract text.
 
-    Every string that mentions a lock refusal is truncated at the refusal marker and
-    suffixed with ``LINEAGE_LOCK_UNAVAILABLE``, so the operation prefix survives and
-    the OS detail does not. Strings already carrying the fixed text and non-string
-    values pass through untouched, which makes the transform idempotent.
+    Every string that carries a refusal clause is truncated at the clause and suffixed
+    with ``LINEAGE_LOCK_UNAVAILABLE``, so the operation prefix survives and the OS
+    detail does not. Strings already carrying the fixed text, strings where a marker
+    appears as data rather than as a clause, and non-string values pass through
+    untouched, which makes the transform idempotent.
     """
     if isinstance(value, str):
-        positions = [
-            value.find(marker) for marker in LINEAGE_LOCK_REFUSAL_MARKERS
-            if marker in value
-        ]
-        if not positions:
+        offset = _refusal_offset(value)
+        if offset is None:
             return value
-        return value[: min(positions)] + LINEAGE_LOCK_UNAVAILABLE
+        return value[:offset] + LINEAGE_LOCK_UNAVAILABLE
     if isinstance(value, dict):
         return {key: redact_lock_refusals(item) for key, item in value.items()}
     if isinstance(value, list):
         return [redact_lock_refusals(item) for item in value]
     return value
+
+
+def collect_lock_refusals(value: Any) -> list[str]:
+    """Raw refusal clauses a response boundary is about to rewrite, in order.
+
+    The tool response must not carry them; the server log must, or a misconfigured
+    ``lineage_lock_dir`` becomes undiagnosable once its errno and path are dropped.
+    Logging the clauses themselves (not a prefix of the whole payload) is what keeps
+    the detail reachable, independently of how long the rest of the summary is.
+    """
+    found: list[str] = []
+
+    def walk(item: Any) -> None:
+        if isinstance(item, str):
+            if _refusal_offset(item) is not None:
+                found.append(item)
+            return
+        if isinstance(item, dict):
+            for nested in item.values():
+                walk(nested)
+            return
+        if isinstance(item, (list, tuple)):
+            for nested in item:
+                walk(nested)
+
+    walk(value)
+    return found
 
 
 @contextmanager
@@ -1868,10 +1919,28 @@ def collection_write_lock(
     if not hasattr(os, "O_NOFOLLOW"):
         raise RuntimeError("lineage locking requires O_NOFOLLOW support")
     flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
-    fd = os.open(path, flags, 0o600)
-    handle = os.fdopen(fd, "a+")
+    # Every OS-level failure of the lock file itself has to leave this helper as a
+    # RuntimeError carrying a refusal marker. A bare OSError from open/fdopen/fstat/
+    # flock is neither TimeoutError nor RuntimeError, so it would bypass the callers'
+    # normalization *and* the response redaction at the same time, forwarding the
+    # errno and the lock-file path into a tool response.
     try:
-        info = os.fstat(handle.fileno())
+        fd = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise RuntimeError(f"lineage lock file unavailable: {exc}") from exc
+    try:
+        handle = os.fdopen(fd, "a+")
+    except OSError as exc:
+        try:
+            os.close(fd)
+        except OSError:  # pragma: no cover - best effort while already failing
+            pass
+        raise RuntimeError(f"lineage lock file unavailable: {exc}") from exc
+    try:
+        try:
+            info = os.fstat(handle.fileno())
+        except OSError as exc:
+            raise RuntimeError(f"lineage lock file unavailable: {exc}") from exc
         if info.st_uid != uid or not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
             raise RuntimeError("lineage lock file has unsafe ownership, type, or permissions")
         deadline = time.monotonic() + max(0.0, float(timeout))
@@ -1883,12 +1952,22 @@ def collection_write_lock(
                 if time.monotonic() >= deadline:
                     raise TimeoutError("lineage collection lock acquisition timed out")
                 time.sleep(0.05)
+            except OSError as exc:
+                # Any other errno (ENOLCK on NFS, EINVAL, EBADF) is a refusal too.
+                raise RuntimeError(f"lineage lock file unavailable: {exc}") from exc
         yield path
     finally:
+        # Cleanup is best-effort on purpose: the kernel releases the flock when the
+        # file description closes, so a failed unlock or close must not mask the
+        # body's exception nor turn a completed write into a lock refusal.
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        finally:
+        except OSError:  # pragma: no cover - close below releases the lock
+            pass
+        try:
             handle.close()
+        except OSError:  # pragma: no cover - nothing left to release
+            pass
 
 
 def read_back_exact_records(

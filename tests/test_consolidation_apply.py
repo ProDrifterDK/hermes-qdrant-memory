@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
+import os
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -2546,13 +2549,18 @@ def test_index_tool_response_redacts_a_lock_failure_raised_out_of_the_indexer(mo
     assert "/tmp/conf/locks" not in text
 
 
-def test_locked_writer_body_failure_is_not_reported_as_a_lock_refusal(tmp_path):
-    """N2: the normalization wraps the acquisition only, never the guarded body."""
+@pytest.mark.parametrize("body_error", [RuntimeError, TimeoutError])
+def test_locked_writer_body_failure_is_not_reported_as_a_lock_refusal(tmp_path, body_error):
+    """N2/I1: the normalization wraps the acquisition only, never the guarded body.
+
+    Both exception types a lock handler catches are covered: a body failure of either
+    type must surface as itself, never as a lock refusal.
+    """
     from qdrant_memory.source_extraction import extract_source_candidates_from_text
 
     class BodyFailsOnUpsert(FakeQdrant):
         def upsert(self, name, points):
-            raise RuntimeError("store exploded inside the locked body")
+            raise body_error("store exploded inside the locked body")
 
     provider = _provider(tmp_path)
     provider._qdrant = BodyFailsOnUpsert({"memory": [], "learnings": []})
@@ -2598,5 +2606,194 @@ def test_lock_refusal_redactor_is_idempotent_and_leaves_other_text_alone():
     assert redact_lock_refusals(
         "lineage capture failed: lineage lock directory must not be a symlink"
     ) == fixed
+
+
+# ===========================================================================
+# W2 closure review (delta 6) F1/F2/F3 + I1: OS-level lock failures, the
+# per-clause log, and the clause boundary of the redactor.
+# ===========================================================================
+
+def _locked_provider(tmp_path, *, mode="off"):
+    """Provider whose writers lock inside tmp_path, never in the shared default."""
+    provider = _provider(tmp_path)
+    provider._qdrant = FakeQdrant({"memory": [], "learnings": []})
+    provider._embeddings = FakeEmbedding()
+    lock_dir = Path(tmp_path) / "locks"
+    lock_dir.mkdir(mode=0o700, exist_ok=True)
+    provider._config["lineage_lock_dir"] = str(lock_dir)
+    provider._config["lineage_mode"] = mode
+    return provider, lock_dir
+
+
+def _lock_file(lock_dir, collection="memory"):
+    from qdrant_memory.lineage import _collection_lock_digest
+
+    return Path(lock_dir) / f"{_collection_lock_digest(collection, os.getuid())}.lock"
+
+
+def test_lock_file_os_failure_is_normalized_by_the_helper(tmp_path):
+    """F1: a bare OSError must not leave `collection_write_lock`."""
+    from qdrant_memory.lineage import collection_write_lock
+
+    lock_dir = Path(tmp_path) / "locks"
+    lock_dir.mkdir(mode=0o700)
+    os.symlink(str(tmp_path / "missing-target"), str(_lock_file(lock_dir)))
+
+    with pytest.raises(RuntimeError) as excinfo:
+        with collection_write_lock(collection_name="memory", timeout=0.2, lock_dir=str(lock_dir)):
+            raise AssertionError("the lock must not be acquired through a symlinked lock file")
+
+    # RuntimeError is what the callers' normalization catches; a bare OSError is not.
+    assert isinstance(excinfo.value, (TimeoutError, RuntimeError))
+    assert str(excinfo.value).startswith("lineage lock file unavailable:")
+    assert "Errno" in str(excinfo.value)  # direct callers keep the OS detail
+
+
+def test_lock_file_os_failure_never_reaches_the_tool_response(tmp_path):
+    """F1: the forget path takes the lock unconditionally, so it is reachable."""
+    provider, lock_dir = _locked_provider(tmp_path)
+    victim = _lock_file(lock_dir)
+    os.symlink(str(tmp_path / "missing-target"), str(victim))
+
+    text = provider.handle_tool_call(
+        "qdrant_memory_forget",
+        {"ids": ["00000000-0000-0000-0000-000000000001"], "dry_run": False},
+    )
+
+    assert json.loads(text) == {"error": LINEAGE_LOCK_FIXED_TEXT}
+    assert "Errno" not in text
+    assert str(victim) not in text
+
+
+def test_lock_file_os_failure_never_reaches_the_index_capture_response(tmp_path):
+    """F1: lineage capture is the other tool surface reachable with a broken lock file."""
+    provider, lock_dir = _locked_provider(tmp_path, mode="capture")
+    victim = _lock_file(lock_dir)
+    os.symlink(str(tmp_path / "missing-target"), str(victim))
+    note = Path(tmp_path) / "notes" / "a.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text("# Note\n\nOrdinary text for the indexer.\n", encoding="utf-8")
+
+    text = provider.handle_tool_call(
+        "qdrant_memory_index", {"paths": [str(note)], "dry_run": False, "force": True},
+    )
+    payload = json.loads(text)
+
+    assert [entry["error"] for entry in payload["errors"]] == [
+        "lineage capture failed: lineage collection lock unavailable",
+    ]
+    assert payload["chunks_upserted"] == 0  # fail-closed: nothing was written
+    assert "Errno" not in text
+    assert str(victim) not in text
+
+
+def test_raw_lock_refusal_is_logged_as_its_own_clause(monkeypatch, tmp_path, caplog):
+    """F2: the diagnosis must survive a payload whose errors[] falls past a 600-char cut."""
+    provider, lock_dir = _locked_provider(tmp_path)
+    long_root = "/" + "/".join(["workspaces", "qdrant-lineage", "vault", "notes"] * 20)
+    refusal = (
+        "lineage capture failed: lineage lock directory unavailable: "
+        f"[Errno 20] Not a directory: '{lock_dir}'"
+    )
+
+    def fake_index(self, paths, **kwargs):
+        return {
+            "dry_run": False,
+            "files_seen": 1,
+            "files_indexed": 1,
+            "directory_roots_checked": [long_root],
+            "deleted_file_paths": [],
+            "deleted_file_ids": [],
+            "delete_mode": "none",
+            "errors": [{"file_path": f"{long_root}/note.md", "error": refusal}],
+            "lineage_blocked_files": [],
+        }
+
+    monkeypatch.setattr("__init__.FileIndexer.index", fake_index)
+    with caplog.at_level(logging.WARNING, logger="__init__"):
+        text = provider.handle_tool_call(
+            "qdrant_memory_index", {"paths": ["/notes/a.md"], "dry_run": False, "force": True},
+        )
+
+    payload = json.loads(text)
+    assert [entry["error"] for entry in payload["errors"]] == [
+        "lineage capture failed: lineage collection lock unavailable",
+    ]
+    assert str(lock_dir) not in text  # the response stays clean
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "Not a directory" in logged  # ... and the log keeps the diagnosis
+    assert str(lock_dir) in logged
+
+
+def test_a_path_that_spells_a_marker_is_data_not_a_refusal(tmp_path, caplog):
+    """F3: a directory named like a marker must not be truncated out of a summary."""
+    provider, _ = _locked_provider(tmp_path)
+    spelled = Path(tmp_path) / "lineage lock directory unavailable"
+    spelled.mkdir()
+    (spelled / "a.md").write_text("# Note\n\nOrdinary text for the indexer.\n", encoding="utf-8")
+    provider._config["index_dirs"] = [str(spelled)]
+
+    with caplog.at_level(logging.WARNING, logger="__init__"):
+        text = provider.handle_tool_call("qdrant_memory_index", {"dry_run": True})
+    payload = json.loads(text)
+
+    assert payload["directory_roots_checked"] == [str(spelled)]
+    assert payload["paths"] == [str(spelled)]
+    assert "lineage collection lock unavailable" not in text
+    assert not [record for record in caplog.records if "redacted" in record.getMessage()]
+
+
+def test_redactor_collapses_every_marker_and_keeps_marker_shaped_data():
+    """F3/I1: the clause rule in both directions, over the whole marker list."""
+    from qdrant_memory.lineage import LINEAGE_LOCK_REFUSAL_MARKERS, redact_lock_refusals
+
+    fixed = "lineage capture failed: lineage collection lock unavailable"
+    # Presence is part of the contract: a marker dropped from the tuple stops
+    # redacting that shape on every surface at once.
+    assert set(LINEAGE_LOCK_REFUSAL_MARKERS) == {
+        "lineage collection lock acquisition timed out",
+        "lineage lock directory unavailable",
+        "lineage lock directory must not be a symlink",
+        "lineage lock directory has unsafe ownership, type, or permissions",
+        "lineage lock file unavailable",
+        "lineage lock file has unsafe ownership, type, or permissions",
+        "lineage locking is unsupported on this platform",
+        "lineage locking requires O_NOFOLLOW support",
+    }
+    for marker in LINEAGE_LOCK_REFUSAL_MARKERS:
+        assert redact_lock_refusals(marker) == "lineage collection lock unavailable"
+        assert redact_lock_refusals(
+            f"lineage capture failed: {marker}: [Errno 5] Input/output error: '/locks/x.lock'"
+        ) == fixed
+    # A refusal inside a joined list keeps everything before its own clause, which
+    # includes the operation prefix that belongs to it.
+    assert redact_lock_refusals(
+        "a: lineage capture failed: lineage lock directory must not be a symlink; b"
+    ) == "a: lineage capture failed: lineage collection lock unavailable"
+    # Markers glued to a non-space character are paths or identifiers, not clauses.
+    for data in (
+        "/home/ops/lineage lock directory unavailable/notes/a.md",
+        "/home/ops/pre-lineage lock file unavailable-suffix/notes/a.md",
+        "notes/lineage lock file has unsafe ownership, type, or permissions.md",
+    ):
+        assert redact_lock_refusals(data) == data
+
+
+def test_collect_lock_refusals_walks_the_payload_and_skips_data_markers():
+    """F2: the walker feeds the log, so it must find clauses anywhere and nothing else."""
+    from qdrant_memory.lineage import collect_lock_refusals
+
+    raw = (
+        "lineage capture failed: lineage lock file unavailable: "
+        "[Errno 40] Too many levels of symbolic links: '/locks/x.lock'"
+    )
+    payload = {
+        "a": [{"b": raw}, "/path/lineage lock directory unavailable/file.md"],
+        "c": raw,
+        "d": "ordinary text",
+    }
+
+    assert collect_lock_refusals(payload) == [raw, raw]
+
 
 

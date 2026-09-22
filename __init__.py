@@ -63,6 +63,7 @@ from qdrant_memory.lineage import (
     LINEAGE_LOCK_UNAVAILABLE,
     LineageLockUnavailable,
     build_lineage_impact_snapshot,
+    collect_lock_refusals,
     collection_write_lock,
     find_direct_dependents,
     lineage_impact_proposal_digest,
@@ -1367,9 +1368,11 @@ class QdrantMemoryProvider(MemoryProvider):
             summary = indexer.index([str(p) for p in paths if str(p).strip()], dry_run=dry_run, force=force, max_files=max_files)
             redacted = redact_lock_refusals(summary)
             if redacted != summary:
-                logger.warning(
-                    "%s: %s", _LOCK_REFUSAL_REDACTED, json.dumps(summary, default=str)[:600],
-                )
+                # Log the refusal clauses, not a prefix of the whole payload: the
+                # errno and the lock path are the diagnosis, and a summary dump capped
+                # at 600 chars loses them as soon as the indexer reports real paths.
+                for refusal in collect_lock_refusals(summary):
+                    logger.warning("%s: %s", _LOCK_REFUSAL_REDACTED, refusal[:400])
             return json.dumps(redacted)
         except Exception as exc:
             raw = f"Index failed: {exc}"

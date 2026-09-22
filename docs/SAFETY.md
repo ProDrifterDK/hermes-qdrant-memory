@@ -1058,16 +1058,30 @@ string: `lineage collection lock unavailable`. The constant, the refusal excepti
 (`LineageLockUnavailable`) and the redactor live next to the lock helper in
 `qdrant_memory/lineage.py` as the single source.
 
+- The helper normalizes its own OS failures: the lock *directory* and the lock *file*
+  both report a refusal marker (`lineage lock directory unavailable`,
+  `lineage lock file unavailable`) instead of letting a bare `OSError` out. That
+  matters in both directions: an `OSError` is neither `TimeoutError` nor
+  `RuntimeError`, so it would bypass the callers' normalization *and* the response
+  redaction at the same time. Cleanup (unlock, close) is best-effort on purpose —
+  the kernel releases the flock when the file description closes, so a failed unlock
+  must not mask the body's exception nor turn a completed write into a refusal.
 - The consolidation fence, `qdrant_memory_forget` and the locked-upsert writers
   (extraction approval, improve apply, RAPTOR apply) return that text, with the
   writers keeping only an operation prefix. Each normalizes the acquisition only,
   so a failure raised inside the guarded body is still reported as itself.
 - The `qdrant_memory_index` response is redacted at the tool boundary:
-  `redact_lock_refusals` truncates any raw refusal at its marker and appends the
+  `redact_lock_refusals` truncates a refusal clause at its marker and appends the
   fixed text, preserving the operation prefix (`lineage capture failed: lineage
   collection lock unavailable`) while dropping the errno and the lock-directory
-  path. The raw text stays in the server log, so a misconfigured
-  `lineage_lock_dir` is still diagnosable.
+  path. A marker glued to a non-space character is data (a path or a directory name
+  that happens to spell a marker), not a refusal clause, and is left untouched.
+- The raw clauses are logged — one `logger.warning` per clause, before the response
+  is redacted — so a misconfigured `lineage_lock_dir` stays diagnosable: the server
+  log carries the errno and the path even though the tool response does not.
+- `qdrant_memory_consolidation_apply` answers an unusable lock with its own generic
+  `consolidation_apply_failed`. It carries no lock detail at all: the same promise
+  with a different wording.
 - Direct callers keep the raw texts (`lineage collection lock acquisition timed
   out`, `lineage lock directory unavailable: …`), because the frozen W1 tests pin
   those messages on the helper itself. Redaction is a response-boundary concern,
