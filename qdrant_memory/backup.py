@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from qdrant_memory.consolidation import is_structural_lineage_payload
 from qdrant_memory.lineage import (
     build_lineage_impact_snapshot,
     collection_write_lock,
@@ -642,10 +643,12 @@ def _lineage_managed(payload: dict[str, Any]) -> bool:
     transition wrote — the same shape the store and extraction routes refuse — and
     targets carrying only ``lineage_role``, ``lineage_scope_key`` or
     ``lineage_source_key``. It now reads the shared overwrite predicate (identity plus
-    review state) and keeps the structural marker, which is a separate write class
-    this route also owns.
+    review state) and the shared structural test (a separate write class this route
+    also owns), so no field list survives here to drift from the others.
     """
-    return payload.get("lineage_record") is True or bool(lineage_overwrite_protected_reasons(payload))
+    return is_structural_lineage_payload(payload) or bool(
+        lineage_overwrite_protected_reasons(payload)
+    )
 
 
 def _retired_lineage_point(

@@ -874,6 +874,84 @@ def test_off_mode_refuses_to_destroy_or_duplicate_captured_file(tmp_path):
     assert embeddings.documents == []
 
 
+# The off-mode reindex is an overwrite route: it rewrites every chunk payload in
+# place at its content-derived id, and under --force it deletes the ids it is about
+# to rewrite. Its block decision therefore has to answer from the shared overwrite
+# predicate. The predecessor test only covers a captured file (identity fields); the
+# shapes below are what a transition writes onto an otherwise ordinary chunk, and a
+# local subset decision let an ordinary reindex — cron or operator, under `off` or
+# after a downgrade — re-serve a stale-pending-review fact as active.
+
+
+def _demote_chunk(qdrant, **fields):
+    """Apply the transition's demotion patch to the single indexed chunk."""
+    chunk = _points(qdrant, kind="source_chunk")[0]
+    payload = chunk["payload"]
+    patch = {"requires_review": True, "fact_status": "review_required",
+             "lineage_review_event_ids": ["40dfae4c-0000-4000-8000-000000000001"]}
+    patch.update(fields)
+    payload.update(patch)
+    return chunk, patch
+
+
+def _off_reindex(tmp_path, qdrant, embeddings, *, force):
+    qdrant.call_log.clear()
+    qdrant.deleted.clear()
+    qdrant.upserts.clear()
+    embeddings.documents.clear()
+    return _indexer(qdrant, embeddings, mode="off").index(
+        [tmp_path / "note.md"], dry_run=False, force=force,
+    )
+
+
+@pytest.mark.parametrize("force", [False, True], ids=("plain", "force"))
+def test_off_mode_refuses_to_rewrite_a_chunk_carrying_only_review_state(tmp_path, force):
+    path = tmp_path / "note.md"
+    path.write_text("# Note\nalpha", encoding="utf-8")
+    qdrant, embeddings = FakeQdrant(), FakeEmbedding()
+    _indexer(qdrant, embeddings, mode="off").index([path], dry_run=False)
+    chunk, patch = _demote_chunk(qdrant)
+    before = json.dumps(chunk["payload"], sort_keys=True, separators=(",", ":")).encode()
+
+    result = _off_reindex(tmp_path, qdrant, embeddings, force=force)
+
+    assert result["lineage_blocked_files"][0]["lineage_blocked_reason"] == "lineage_managed_requires_capture_or_retirement"
+    assert result["partial_failure"] is True
+    after = _points(qdrant, kind="source_chunk")[0]
+    assert json.dumps(after["payload"], sort_keys=True, separators=(",", ":")).encode() == before
+    assert after["payload"]["requires_review"] is True
+    assert after["payload"]["fact_status"] == "review_required"
+    assert qdrant.deleted == []
+    assert qdrant.upserts == []
+    assert embeddings.documents == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("lineage_role", "chunk"),
+        ("lineage_scope_key", "a" * 64),
+        ("lineage_source_key", "b" * 64),
+    ],
+    ids=("role", "scope-key", "source-key"),
+)
+def test_off_mode_refuses_to_rewrite_a_chunk_carrying_one_identity_field(tmp_path, field, value):
+    path = tmp_path / "note.md"
+    path.write_text("# Note\nalpha", encoding="utf-8")
+    qdrant, embeddings = FakeQdrant(), FakeEmbedding()
+    _indexer(qdrant, embeddings, mode="off").index([path], dry_run=False)
+    chunk, _ = _demote_chunk(qdrant, **{field: value})
+    before = json.dumps(chunk["payload"], sort_keys=True, separators=(",", ":")).encode()
+
+    result = _off_reindex(tmp_path, qdrant, embeddings, force=True)
+
+    assert result["lineage_blocked_files"][0]["lineage_blocked_reason"] == "lineage_managed_requires_capture_or_retirement"
+    after = _points(qdrant, kind="source_chunk")[0]
+    assert json.dumps(after["payload"], sort_keys=True, separators=(",", ":")).encode() == before
+    assert qdrant.deleted == []
+    assert qdrant.upserts == []
+
+
 @pytest.mark.parametrize(
     ("off_profile", "off_user", "off_chat"),
     [("default", "", ""), ("default", "u2", "c2"), ("other", "u1", "c1")],
@@ -985,11 +1063,22 @@ def test_off_mode_force_skips_lineage_managed_filter_delete_in_dry_and_live_runs
     assert embeddings.documents == []
 
 
-def test_directory_off_mode_does_not_delete_removed_lineage_managed_chunks(tmp_path):
+@pytest.mark.parametrize("shape", ["captured", "review_only"], ids=("captured", "review-only"))
+def test_directory_off_mode_does_not_delete_removed_lineage_managed_chunks(tmp_path, shape):
+    """A removed file's chunks are the second place the off-mode block decision runs.
+
+    It used to decide from three identity fields, so a chunk whose only lineage state
+    was the review marker a transition wrote was deleted as stale — the same payload
+    the store, extraction and restore routes refuse to replace.
+    """
     path = tmp_path / "note.md"
     path.write_text("# Note\nalpha", encoding="utf-8")
     qdrant, embeddings = FakeQdrant(), FakeEmbedding()
-    _indexer(qdrant, embeddings).index([path], dry_run=False)
+    if shape == "captured":
+        _indexer(qdrant, embeddings).index([path], dry_run=False)
+    else:
+        _indexer(qdrant, embeddings, mode="off").index([path], dry_run=False)
+        _demote_chunk(qdrant)
     v2_chunks = {str(point["id"]) for point in _points(qdrant, kind="source_chunk")}
     path.unlink()
     qdrant.call_log.clear()

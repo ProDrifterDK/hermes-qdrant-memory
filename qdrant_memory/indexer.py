@@ -14,6 +14,7 @@ from .lineage import (
     CHUNKER_VERSION,
     apply_capture_plan,
     apply_reconciliation_plan,
+    lineage_overwrite_protected_reasons,
     make_scope_key,
     make_source_key,
     make_version_identity_digest,
@@ -783,9 +784,14 @@ class FileIndexer:
                     desired = {chunk.id for chunk in chunks_by_file[file_path]}
                     desired_ids_by_file[file_path] = desired
                     if not capture and not reconcile:
+                        # A reindex replaces every chunk payload in place at its
+                        # content-derived id, so it is an overwrite route: it answers
+                        # from the shared overwrite predicate, never from a local
+                        # subset of the identity fields. A miss here rewrites the
+                        # transition's review state away (or deletes the chunk under
+                        # --force) while §27 promises `off` refuses managed files.
                         lineage_managed = any(
-                            any((point.get("payload") or {}).get(key) not in (None, "")
-                                for key in ("file_version_id", "lineage_entity_id", "lineage_schema_version"))
+                            lineage_overwrite_protected_reasons(point.get("payload") or {})
                             for point in existing
                         )
                         if lineage_managed:
@@ -861,9 +867,7 @@ class FileIndexer:
                         if not path or point_id is None or path in desired_ids_by_file or Path(path).exists():
                             continue
                         if any(is_path_within(path, root) for root in roots):
-                            if not capture and not reconcile and any(payload.get(key) not in (None, "") for key in (
-                                "file_version_id", "lineage_entity_id", "lineage_schema_version"
-                            )):
+                            if not capture and not reconcile and lineage_overwrite_protected_reasons(payload):
                                 if path not in off_blocked_files:
                                     blocked = {
                                         "file_path": path,

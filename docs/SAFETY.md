@@ -1124,16 +1124,21 @@ removed evidence, and it is the reason a retired root can always be explained.
   block destructive consolidation`, `lineage dependents block forget`), and so
   is an incomplete or failed dependency lookup.
 - **Reindex retirement**: under `capture` a reindex never retires; a file whose
-  content changed is reported with `retirement_requires_reconcile`. Under `off`,
-  files that are already lineage-managed are refused with
-  `lineage_managed_requires_capture_or_retirement` instead of being replaced.
+  content changed is reported with `retirement_requires_capture_or_retirement`. Under
+  `off`, files that are already lineage-managed are refused with
+  `lineage_managed_requires_capture_or_retirement` instead of being replaced. A
+  reindex replaces every chunk payload in place at its content-derived id and, under
+  `--force`, deletes the ids it is about to rewrite, so "managed" here is the shared
+  **overwrite** predicate (identity **or** the review state a transition wrote) and
+  not a subset of the identity fields: a demoted chunk is blocked in every mode, with
+  or without `--force`, and so are the chunks of a file that was removed from disk.
 - **Restore**: a backup restore that would replace content carrying lineage identity
   **or** the review state a transition wrote is refused (`restore would overwrite
   lineage-managed content; run explicit reconciliation`), and so is a restore that
   would resurrect content whose lineage records are already retired (`restore would
   resurrect retired lineage-managed content; run explicit reconciliation`). Restore
-  reads the same in-place predicate as the other overwrite routes, plus the
-  structural marker it also owns.
+  reads the shared in-place predicate plus the shared structural test
+  (`lineage_record` / `lineage_pending`), in both the memory and the learnings scope.
 - **Store and extraction-approval upserts**: both routes target an id derived
   from the content, so re-storing the same text, or approving a regenerated
   candidate, can land on a point that already exists. When that point carries
@@ -1143,8 +1148,13 @@ removed evidence, and it is the reason a retired root can always be explained.
   level. Both routes refuse before writing but **without** the collection lock (the
   store takes none; extraction reads, then locks for its upsert, the same shape as
   improve apply), so the window between read and write is declared rather than
-  closed. Neither guard is consulted by its preview path: a dry-run store or a
-  review-only approval can still report that it would write.
+  closed. The store's unlocked upsert is also the one that can abort a concurrent
+  transition at that transition's read-back: the failure is fail-closed and surfaced,
+  not silent, but it is a second consequence of the same window. Consolidation's
+  managed check runs before it takes the lock and is not repeated on the guarded-auto
+  re-retrieval, so no test pins the ordering of those two. Neither guard is consulted
+  by its preview path: a dry-run store or a review-only approval can still report that
+  it would write.
 - **Ordinary points without dependents**: `qdrant_memory_forget` still retires a
   plain memory point that carries no lineage identity in every mode, so the
   refusal is not a blanket ban on deletion. Destructive consolidation does not:
@@ -1217,8 +1227,16 @@ Verdict every destructive route must give, pinned by
 - `forget`, lineage-managed point — refuse in all three modes.
 - `forget`, demoted ordinary dependent (history marker only, no identity field) —
   delete in all three modes; the history marker is not identity. The consequence is
-  recorded above: a fence that reads the orphaned edge answers incomplete until that
-  edge is forgotten, which `forget` can do.
+  recorded above: the dependency edge the transition wrote survives with its source
+  gone, so the next fence on the cited root answers `lineage dependency fence is
+  incomplete` in all three modes. That edge is a **structural** record (mechanical
+  edge, `lineage_record=True`), so `forget` cannot retire it — asking it to answers
+  `refusing to touch structural lineage records` — and the unblocking path is a
+  reviewed transition that marks it `lineage_retired`, which the fence skips. A
+  hand-built edge without the structural marker would be deletable, but no writer in
+  this tree produces that shape for a point-cited dependency: the only writer of
+  `target_point_id` edges is the mechanical builder, which always sets the marker,
+  and the live collection holds no `target_point_id` at all.
 - `consolidation delete/merge/quarantine`, lineage-managed point — refuse in all
   three modes.
 - `consolidation delete/merge/quarantine`, ordinary root with dependents —
@@ -1236,15 +1254,39 @@ Verdict every destructive route must give, pinned by
 - either overwrite route, target unreadable (Qdrant retrieval error) — refuse; the
   store reports the failure, the approval answers `Unable to verify target point
   identity`.
-- restore, replacement of a live payload carrying lineage identity or the review
-  state, or a structural record — refuse in all three modes, pinned over the whole
-  predicate.
+- restore, replacement of a live payload carrying lineage identity, the review state,
+  or a structural marker (`lineage_record` / `lineage_pending`) — refuse in all three
+  modes, in **both** scopes, pinned over the whole predicate.
 - restore, resurrection of retired lineage-managed content — refuse in all three
-  modes (code-supported; no test pin yet).
+  modes, pinned by `tests/test_backup_cli.py::test_restore_refuses_missing_chunk_retired_by_committed_event`.
+- reindex under `off`, a file whose owned chunk carries lineage identity **or** the
+  review state a transition wrote — the file is blocked
+  (`lineage_managed_requires_capture_or_retirement`), so neither the payload rewrite
+  nor the stale-id deletion runs, with or without `--force`. Same for a removed file's
+  chunks. Pinned by `tests/test_lineage.py` (`test_off_mode_refuses_to_rewrite_a_chunk_carrying_only_review_state`,
+  `..._one_identity_field`, `..._destroy_or_duplicate_captured_file`,
+  `test_directory_off_mode_does_not_delete_removed_lineage_managed_chunks`,
+  `test_off_mode_force_skips_lineage_managed_filter_delete_in_dry_and_live_runs`).
 - improve apply (not an exact replay) and RAPTOR apply (differing node metadata) —
-  refuse by their own checks; read, not executed, in the W2 closure reviews.
+  refuse by their own checks; read, not executed, in the W2 closure reviews, and
+  declared `uncovered` in `tests/test_route_inventory.py`.
 - reindex retirement — not reachable: `retirement_requires_reconcile` under
   `capture`, planned through the reviewed path under `reconcile`.
+
+Every row above is enumerated as a classified entry point in
+`tests/test_route_inventory.py`, which derives the tool and CLI surface from the code,
+fails when an entry point is unclassified, and resolves each claimed pin to a test that
+exists. A new route cannot ship unclassified, and this table cannot claim a pin that
+was renamed away.
+
+### Route for an ordinary demoted point
+
+The restore refusal tells the operator to run explicit reconciliation. For an ordinary
+demoted point that path does not exist, and the working one is the route table's second
+row: `forget` is allowed on a history-only dependent, and restoring the id the backup
+still holds recreates the pre-demotion payload. Two permitted steps compose into the
+effect the restore refusal prevents on its own; that is the ratified contract, not a gap
+in it.
 
 ### Preview caveat
 

@@ -3536,6 +3536,55 @@ def test_a_demoted_dependent_stays_retirable(mode, tmp_path):
     assert provider._qdrant.deleted_ids == [("memory", ["demoted-1"])]
 
 
+@pytest.mark.parametrize("mode", ["off", "capture", "reconcile"])
+def test_the_orphan_dependency_edge_cannot_be_forgotten(mode, tmp_path):
+    """The consequence this docstring describes is pinned, not asserted in prose.
 
+    A third review read §27's promise that "the edge can be forgotten" against a
+    hand-built edge payload without the structural marker — a shape no writer here
+    produces (the only caller that puts a point id on an edge is
+    ``build_mechanical_edge_payload``, which always sets ``lineage_record=True``, and
+    it refuses non-UUID point ids). This builds the shape the code actually writes and
+    records the two answers: the cited root stays fenced, and the edge itself is a
+    structural record forget refuses to touch.
+    """
+    from qdrant_memory import lineage as lineage_module
 
+    root = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+    source = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
+    edge_id = "cccccccc-3333-4333-8333-cccccccccccc"
+    profile = "architect"
+    edge_payload = lineage_module.build_mechanical_edge_payload(
+        relation_type="DERIVED_FROM",
+        source_entity_id=lineage_module.make_entity_id("memory_point", source, profile_id=profile),
+        target_entity_id=lineage_module.make_entity_id("memory_point", root, profile_id=profile),
+        profile_id=profile,
+        source_point_id=source,
+        target_point_id=root,
+        source_entity_type="memory_point",
+        target_entity_type="memory_point",
+        lineage_operation="index_capture",
+        observation="indexed_payload",
+    )
+    assert edge_payload["lineage_record"] is True
+    provider = _provider(tmp_path)
+    provider._config["lineage_mode"] = mode
+    provider._config["lineage_lock_dir"] = str(tmp_path / "locks")
+    provider._qdrant = FakeQdrant({
+        "memory": [
+            _point(root, "ordinary root", source_type="manual", profile_id=profile),
+            {"id": edge_id, "vector": [], "payload": edge_payload},
+        ],
+        "learnings": [],
+    })
 
+    root_answer = json.loads(provider.handle_tool_call(
+        "qdrant_memory_forget", {"ids": [root], "dry_run": False},
+    ))
+    edge_answer = json.loads(provider.handle_tool_call(
+        "qdrant_memory_forget", {"ids": [edge_id], "dry_run": False},
+    ))
+
+    assert root_answer == {"error": "lineage dependency fence is incomplete"}
+    assert edge_answer["error"].startswith("refusing to touch structural lineage records:")
+    assert provider._qdrant.deleted_ids == []
