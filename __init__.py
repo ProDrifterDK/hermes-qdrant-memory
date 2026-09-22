@@ -9,6 +9,7 @@ import os
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
@@ -58,6 +59,13 @@ from qdrant_memory.consolidation import (
 from qdrant_memory.embeddings import EmbeddingClient
 from qdrant_memory.indexer import FileIndexer
 from qdrant_memory.learning import LearningStore, build_learning_payload, classify_learning_type
+from qdrant_memory.lineage import (
+    build_lineage_impact_snapshot,
+    collection_write_lock,
+    find_direct_dependents,
+    lineage_impact_proposal_digest,
+    validate_lineage_impact_snapshot,
+)
 from qdrant_memory.lesson_extractor import LearningCandidate, candidate_to_learning_args, contains_secret, extract_learning_candidates_from_messages
 from qdrant_memory.memory_pr import (
     MemoryPRValidationError,
@@ -121,6 +129,21 @@ from qdrant_memory.tools import TOOL_SCHEMAS
 from qdrant_memory.writer import ConversationWriter
 
 logger = logging.getLogger(__name__)
+
+# One fixed operator-facing contract for every lineage collection lock refusal.
+# The consolidation fence, the forget path and the locked-upsert writers all
+# report this exact inner text; callers may add an operation prefix, but the
+# underlying lock error is never forwarded raw (a lock-directory OS error must
+# not reach a tool response).
+LINEAGE_LOCK_UNAVAILABLE = "lineage collection lock unavailable"
+
+
+class LineageLockUnavailable(RuntimeError):
+    """Fixed-text refusal raised when the lineage collection lock is unavailable.
+
+    Subclasses RuntimeError so every existing ``except (TimeoutError, RuntimeError)``
+    lock handler keeps working, while carrying only the single fixed contract text.
+    """
 
 
 def _json_error(message: str) -> str:
@@ -1350,6 +1373,66 @@ class QdrantMemoryProvider(MemoryProvider):
         except Exception as exc:
             return _json_error(f"Index failed: {exc}")
 
+    def _lineage_dependency_fence(
+        self, collection_name: str, root_point_ids: list[str], *, mode: str,
+    ) -> tuple[list[Any], dict[str, Any]]:
+        try:
+            points = self._retrieve_consolidation_points(collection_name, root_point_ids)
+        except StructuralLineageRefusal:
+            raise
+        except Exception:
+            logger.exception("Lineage dependency fence root lookup failed")
+            return [], {"mode": mode, "status": "lookup_failed", "complete": False, "blocked": True}
+        if not points:
+            return points, {
+                "mode": mode, "status": "clear", "complete": True,
+                "blocked": False, "dependent_count": 0,
+            }
+        try:
+            dependents = find_direct_dependents(
+                qdrant=self._qdrant,
+                collection_name=collection_name,
+                target_point_id=root_point_ids,
+                profile_id=self._profile_id,
+                user_id_hash=self._user_id_hash,
+                chat_id_hash=self._chat_id_hash,
+            )
+        except Exception:
+            logger.exception("Lineage dependency fence lookup failed")
+            return points, {"mode": mode, "status": "lookup_failed", "complete": False, "blocked": True}
+        if dependents.get("complete") is not True:
+            logger.warning(
+                "Lineage dependency fence lookup was incomplete: %s",
+                "; ".join(dependents.get("errors") or []),
+            )
+            return points, {"mode": mode, "status": "incomplete", "complete": False, "blocked": True}
+        dependent_count = len(dependents.get("points") or [])
+        return points, {
+            "mode": mode,
+            "status": "blocked" if dependent_count else "clear",
+            "complete": True,
+            "blocked": bool(dependent_count),
+            "dependent_count": dependent_count,
+        }
+
+    def _lineage_locked_upsert(self, collection_name: str, points: list[dict[str, Any]]) -> None:
+        lock_stack = ExitStack()
+        try:
+            lock_stack.enter_context(collection_write_lock(
+                collection_name=collection_name,
+                timeout=float(self._config.get("lineage_lock_timeout_seconds", 5.0)),
+                lock_dir=str(self._config.get("lineage_lock_dir") or ""),
+            ))
+        except (TimeoutError, RuntimeError) as exc:
+            # Normalize both refusal shapes (contention timeout and unusable lock
+            # directory) to the single fixed inner contract used by the
+            # consolidation fence and the forget path. The raw lock/OS text is
+            # deliberately dropped here: it must never be forwarded into a tool
+            # response. Callers keep their own operation prefix as context.
+            raise LineageLockUnavailable(LINEAGE_LOCK_UNAVAILABLE) from exc
+        with lock_stack:
+            self._qdrant.upsert(collection_name, points)
+
     def _tool_forget(self, args: dict) -> str:
         ids = args.get("ids") or []
         if isinstance(ids, str):
@@ -1362,11 +1445,34 @@ class QdrantMemoryProvider(MemoryProvider):
             return json.dumps({"dry_run": True, "ids": ids, "deleted": 0})
         if not self._qdrant:
             return _json_error("Qdrant memory provider is not initialized")
+        collection_name = self._config["collection_name"]
+        lock_stack = ExitStack()
         try:
-            self._qdrant.delete_ids(self._config["collection_name"], ids)
+            try:
+                lock_stack.enter_context(collection_write_lock(
+                    collection_name=collection_name,
+                    timeout=float(self._config.get("lineage_lock_timeout_seconds", 5.0)),
+                    lock_dir=str(self._config.get("lineage_lock_dir") or ""),
+                ))
+            except (TimeoutError, RuntimeError):
+                return _json_error(LINEAGE_LOCK_UNAVAILABLE)
+            _, verdict = self._lineage_dependency_fence(
+                collection_name, ids, mode=str(self._config.get("lineage_mode") or "off"),
+            )
+            if verdict["status"] == "lookup_failed":
+                return _json_error("lineage dependency fence lookup failed")
+            if verdict["status"] == "incomplete":
+                return _json_error("lineage dependency fence is incomplete")
+            if verdict["blocked"]:
+                return _json_error("lineage dependents block forget")
+            self._qdrant.delete_ids(collection_name, ids)
             return json.dumps({"dry_run": False, "ids": ids, "deleted": len(ids)})
+        except StructuralLineageRefusal as exc:
+            return _json_error(str(exc))
         except Exception as exc:
             return _json_error(f"Forget failed: {exc}")
+        finally:
+            lock_stack.close()
 
     def _collection_name_from_tool_args(self, args: dict[str, Any]) -> tuple[str, str] | None:
         collection = str(args.get("collection") or "memory").strip().lower()
@@ -1521,6 +1627,29 @@ class QdrantMemoryProvider(MemoryProvider):
                 reconsolidation_min_confidence=float(self._config.get("reconsolidation_min_confidence", 0.6)),
             )
             attach_review_point_snapshots(report, [*memory_points, *learning_points])
+            lineage_mode = str(self._config.get("lineage_mode") or "off")
+            for proposal in report.get("proposals", []):
+                if not isinstance(proposal, dict):
+                    continue
+                action = expected_action_for_proposal(str(proposal.get("proposal_type") or ""))
+                if action not in {"delete", "merge", "quarantine"}:
+                    continue
+                collection_name = str(proposal.get("collection_name") or "")
+                affected_ids = [str(value) for value in proposal.get("affected_ids") or [] if str(value)]
+                if lineage_mode == "reconcile":
+                    proposal["lineage_impact"] = build_lineage_impact_snapshot(
+                        qdrant=self._qdrant,
+                        collection_name=collection_name,
+                        root_point_ids=affected_ids,
+                        profile_id=self._profile_id,
+                        user_id_hash=self._user_id_hash,
+                        chat_id_hash=self._chat_id_hash,
+                    )
+                    proposal["lineage_impact_proposal_sha256"] = lineage_impact_proposal_digest(proposal)
+                else:
+                    _, proposal["lineage_fence"] = self._lineage_dependency_fence(
+                        collection_name, affected_ids, mode=lineage_mode,
+                    )
             seal_guarded_auto_proposals(
                 report,
                 [*memory_points, *learning_points],
@@ -1571,8 +1700,11 @@ class QdrantMemoryProvider(MemoryProvider):
             if is_structural_lineage_payload(point.get("payload") or {})
         )
         if structural_ids:
+            # Caller-agnostic wording: this refusal is raised for the
+            # consolidation apply path and for qdrant_memory_forget, where no
+            # proposal exists at all.
             raise StructuralLineageRefusal(
-                "refusing to apply proposal touching structural lineage records: "
+                "refusing to touch structural lineage records: "
                 + ", ".join(structural_ids)
             )
         return points_from_qdrant(raw, collection_name=collection_name)
@@ -1680,6 +1812,7 @@ class QdrantMemoryProvider(MemoryProvider):
             "fact_key",
             "current_or_newer_id",
             "superseded_candidate_ids",
+            "lineage_impact",
         ):
             if key in proposal:
                 plan[key] = proposal[key]
@@ -1729,6 +1862,7 @@ class QdrantMemoryProvider(MemoryProvider):
             return _json_error("approve=true is required when dry_run=false")
         if not dry_run and not str(args.get("action") or "").strip():
             return _json_error("action is required when dry_run=false")
+        lock_stack = ExitStack()
         try:
             report = load_consolidation_report(report_id, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))
             if str(report.get("profile_id") or self._profile_id) != self._profile_id:
@@ -1758,6 +1892,51 @@ class QdrantMemoryProvider(MemoryProvider):
             points = self._retrieve_consolidation_points(collection_name, affected_ids)
             if len(points) != len(set(affected_ids)):
                 return _json_error("affected point missing; rerun consolidation")
+            lineage_mode = str(self._config.get("lineage_mode") or "off")
+            destructive_action = action in {"merge", "delete", "quarantine"}
+            fence_verdict: dict[str, Any] | None = None
+            if lineage_mode in {"off", "capture"} and destructive_action:
+                try:
+                    lock_stack.enter_context(collection_write_lock(
+                        collection_name=collection_name,
+                        timeout=float(self._config.get("lineage_lock_timeout_seconds", 5.0)),
+                        lock_dir=str(self._config.get("lineage_lock_dir") or ""),
+                    ))
+                except (TimeoutError, RuntimeError):
+                    return _json_error(LINEAGE_LOCK_UNAVAILABLE)
+                points, fence_verdict = self._lineage_dependency_fence(
+                    collection_name, affected_ids, mode=lineage_mode,
+                )
+                if len(points) != len(set(affected_ids)):
+                    return _json_error("affected point missing; rerun consolidation")
+                if fence_verdict["status"] == "lookup_failed":
+                    return json.dumps({
+                        "error": "lineage dependency fence lookup failed",
+                        "lineage_fence": fence_verdict,
+                    })
+                if fence_verdict["status"] == "incomplete":
+                    return json.dumps({
+                        "error": "lineage dependency fence is incomplete",
+                        "lineage_fence": fence_verdict,
+                    })
+                if fence_verdict["blocked"]:
+                    return json.dumps({
+                        "error": "lineage dependents block destructive consolidation",
+                        "lineage_fence": fence_verdict,
+                    })
+            if lineage_mode == "reconcile" and destructive_action:
+                impact_validation = validate_lineage_impact_snapshot(
+                    qdrant=self._qdrant,
+                    collection_name=collection_name,
+                    impact=proposal.get("lineage_impact"),
+                    expected_root_ids=affected_ids,
+                    proposal=proposal,
+                )
+                if not impact_validation["valid"]:
+                    return _json_error(
+                        "lineage impact blocks ordinary-root transition: "
+                        + "; ".join(impact_validation["problems"])
+                    )
             if guarded_auto_apply and action in {"merge", "delete", "quarantine", "promote_to_skill"}:
                 if any(contains_secret(p.text) or contains_secret(json.dumps(p.payload or {}, sort_keys=True, default=str)) for p in points):
                     return _json_error("secret-bearing point requires manual review")
@@ -1775,6 +1954,8 @@ class QdrantMemoryProvider(MemoryProvider):
                 if not eligible:
                     return _json_error(validation_reason)
             plan = self._proposal_apply_plan(report, proposal, action, points)
+            if fence_verdict is not None:
+                plan["lineage_fence"] = fence_verdict
             if dry_run:
                 return json.dumps({"dry_run": True, "would_apply": True, **plan})
             pre_apply: dict[str, Any] = {}
@@ -1899,6 +2080,8 @@ class QdrantMemoryProvider(MemoryProvider):
             return _json_error(str(exc))
         except Exception:
             return _json_error("consolidation_apply_failed")
+        finally:
+            lock_stack.close()
 
     def _ensure_learning_store(self) -> Optional[LearningStore]:
         if self._learning_store:
@@ -2220,7 +2403,10 @@ class QdrantMemoryProvider(MemoryProvider):
                 return _json_error("extraction candidate requires manual review before storing")
             text = str(payload.get("text") or payload.get("claim_text") or "")
             vector = self._embeddings.embed_document(text)
-            self._qdrant.upsert(self._config["collection_name"], [{"id": candidate.candidate_id, "vector": vector, "payload": payload}])
+            self._lineage_locked_upsert(
+                self._config["collection_name"],
+                [{"id": candidate.candidate_id, "vector": vector, "payload": payload}],
+            )
             self._pending_extraction_candidates.pop(candidate_id, None)
             self._reviewed_extraction_candidate_ids.discard(candidate_id)
             return json.dumps(
@@ -2591,7 +2777,10 @@ class QdrantMemoryProvider(MemoryProvider):
 
             text = str(payload.get("text") or payload.get("claim_text") or "")
             vector = self._embeddings.embed_document(text)
-            self._qdrant.upsert(self._config["collection_name"], [{"id": target_pid, "vector": vector, "payload": payload}])
+            self._lineage_locked_upsert(
+                self._config["collection_name"],
+                [{"id": target_pid, "vector": vector, "payload": payload}],
+            )
 
             # Blocker 2: Persist application record for idempotent repeat
             record_candidate_applied(
@@ -2826,7 +3015,7 @@ class QdrantMemoryProvider(MemoryProvider):
 
                 text = str(enriched.get("text") or "")
                 vector = self._embeddings.embed_document(text)
-                self._qdrant.upsert(
+                self._lineage_locked_upsert(
                     collection_name,
                     [{"id": node_id, "vector": vector, "payload": enriched}],
                 )

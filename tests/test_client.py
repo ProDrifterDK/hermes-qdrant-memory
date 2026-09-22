@@ -17,6 +17,16 @@ class RecordingQdrantClient(QdrantClient):
         raise AssertionError("unexpected extra scroll call")
 
 
+def test_scroll_page_returns_one_page_and_explicit_continuation():
+    client = RecordingQdrantClient()
+
+    points, next_offset = client.scroll_page("memory", {"must": []}, limit=1)
+
+    assert [point["id"] for point in points] == [0]
+    assert next_offset == 0
+    assert len(client.calls) == 1
+
+
 def test_scroll_by_filter_continues_when_next_page_offset_is_zero():
     client = RecordingQdrantClient()
 

@@ -5,9 +5,12 @@ import json
 import os
 import re
 import uuid
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from qdrant_memory.lineage import build_lineage_impact_snapshot, collection_write_lock
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from qdrant_memory.client import QdrantClient
@@ -619,9 +622,123 @@ def plan_restore(qdrant: Any, config: dict[str, Any], manifest: dict[str, Any], 
             "changed": len(changed),
             "missing": len(missing),
             "would_upsert": len(to_upsert),
+            "changed_ids": sorted(str(record["id"]) for record in changed),
+            "missing_ids": sorted(str(record["id"]) for record in missing),
             "upserted": 0,
         }
     return plan_collections, upserts_by_scope
+
+
+def _lineage_managed(payload: dict[str, Any]) -> bool:
+    return payload.get("lineage_record") is True or any(
+        payload.get(key) not in (None, "")
+        for key in ("file_version_id", "lineage_entity_id", "lineage_schema_version")
+    )
+
+
+def _retired_lineage_point(
+    qdrant: Any, collection_name: str, point_id: str, payload: dict[str, Any],
+) -> bool:
+    try:
+        events = qdrant.scroll_by_filter(
+            collection_name,
+            {"must": [
+                {"key": "lineage_role", "match": {"value": "change_event"}},
+                {"key": "event_state", "match": {"value": "committed"}},
+                {"key": "retired_point_ids", "match": {"value": point_id}},
+            ]},
+            limit=1,
+            with_payload=True,
+            with_vector=False,
+            max_total=1,
+        )
+    except Exception as exc:
+        raise BackupError("restore retired-lineage fence lookup failed") from exc
+    if any(
+        (event.get("payload") or {}).get("lineage_role") == "change_event"
+        and (event.get("payload") or {}).get("event_state") == "committed"
+        and point_id in ((event.get("payload") or {}).get("retired_point_ids") or [])
+        for event in events
+    ):
+        return True
+    retired_statuses = {"superseded", "stale", "deleted", "tombstoned"}
+    if (
+        payload.get("source_deleted") is True
+        or payload.get("tombstoned") is True
+        or payload.get("fact_status") in retired_statuses
+    ):
+        return True
+    version_id = payload.get("file_version_id")
+    if version_id in (None, ""):
+        return False
+    versions = qdrant.retrieve(
+        collection_name, [str(version_id)], with_payload=True, with_vector=False,
+    )
+    if not versions:
+        return False
+    version_payload = versions[0].get("payload") or {}
+    return (
+        version_payload.get("source_deleted") is True
+        or version_payload.get("tombstoned") is True
+        or version_payload.get("fact_status") in retired_statuses
+    )
+
+
+def _preflight_restore_scope(
+    qdrant: Any, config: dict[str, Any], collection_name: str,
+    scope_plan: dict[str, Any], points: list[dict[str, Any]],
+) -> None:
+    changed_ids = list(scope_plan.get("changed_ids") or [])
+    if changed_ids:
+        changed_points = qdrant.retrieve(
+            collection_name, changed_ids, with_payload=True, with_vector=True,
+        )
+        if any(_lineage_managed(point.get("payload") or {}) for point in changed_points):
+            raise BackupError(
+                "restore would overwrite lineage-managed content; run explicit reconciliation"
+            )
+        restored_by_id = {str(point.get("id")): point for point in points}
+        scoped_roots: dict[tuple[str, str, str], list[str]] = {}
+        for point_id in changed_ids:
+            restored = restored_by_id.get(str(point_id))
+            payload = (restored or {}).get("payload")
+            if not isinstance(payload, dict):
+                raise BackupError("restore lineage impact scope is incomplete")
+            scope_key = (
+                str(payload.get("profile_id") or config.get("profile_id") or "default"),
+                str(payload.get("user_id_hash") or ""),
+                str(payload.get("chat_id_hash") or ""),
+            )
+            scoped_roots.setdefault(scope_key, []).append(str(point_id))
+        for (profile_id, user_id_hash, chat_id_hash), root_ids in scoped_roots.items():
+            impact = build_lineage_impact_snapshot(
+                qdrant=qdrant, collection_name=collection_name,
+                root_point_ids=root_ids, profile_id=profile_id,
+                user_id_hash=user_id_hash, chat_id_hash=chat_id_hash,
+                event_id=str(uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"backup-restore-fence:{collection_name}:{','.join(sorted(root_ids))}",
+                )),
+            )
+            if (impact.get("complete") is not True or impact.get("errors")
+                    or impact.get("dependent_ids")):
+                raise BackupError(
+                    "restore lineage impact is incomplete or has dependents; "
+                    "explicit typed transition is required"
+                )
+    missing_ids = set(scope_plan.get("missing_ids") or [])
+    for point in points:
+        point_id = str(point.get("id") or "")
+        payload = point.get("payload") or {}
+        if (
+            point_id in missing_ids
+            and _lineage_managed(payload)
+            and _retired_lineage_point(qdrant, collection_name, point_id, payload)
+        ):
+            raise BackupError(
+                "restore would resurrect retired lineage-managed content; "
+                "run explicit reconciliation"
+            )
 
 
 def restore_backup(
@@ -649,14 +766,35 @@ def restore_backup(
     pre_restore_backup_id = str(pre_restore.get("backup_id") or "")
     result["pre_restore_backup_id"] = pre_restore_backup_id
     manifest_collections = manifest.get("collections") or {}
+    collection_names = {
+        scope: _collection_name_for_scope(
+            config,
+            scope,
+            (manifest_collections.get(scope) or {})
+            if isinstance(manifest_collections, dict) else {},
+        )
+        for scope in records_by_scope
+    }
     total_upserted = 0
-    for scope, points in upserts_by_scope.items():
-        if not points:
-            continue
-        details = manifest_collections.get(scope) if isinstance(manifest_collections, dict) else {}
-        collection_name = _collection_name_for_scope(config, scope, details if isinstance(details, dict) else {})
-        qdrant.upsert(collection_name, points)
-        collections[scope]["upserted"] = len(points)
-        total_upserted += len(points)
+    with ExitStack() as locks:
+        for collection_name in sorted(set(collection_names.values())):
+            locks.enter_context(collection_write_lock(
+                collection_name=collection_name,
+                timeout=float(config.get("lineage_lock_timeout_seconds", 5.0)),
+                lock_dir=str(config.get("lineage_lock_dir") or ""),
+            ))
+        collections, upserts_by_scope = plan_restore(
+            qdrant, config, manifest, records_by_scope,
+        )
+        result["collections"] = collections
+        for scope, points in upserts_by_scope.items():
+            _preflight_restore_scope(
+                qdrant, config, collection_names[scope], collections[scope], points,
+            )
+        for scope, points in upserts_by_scope.items():
+            if points:
+                qdrant.upsert(collection_names[scope], points)
+                collections[scope]["upserted"] = len(points)
+                total_upserted += len(points)
     result.update({"applied": True, "upserted": total_upserted})
     return result

@@ -1,10 +1,8 @@
-"""Pure lineage identity, evidence, and structural payload helpers (W0).
+"""Lineage identity, frozen W0 validation, W1 capture, and W2 reconciliation.
 
-W0 scope only: canonical identity material, exact write-ownership checks, the
-typed :class:`LineageEvidence` internal evidence record, structural graph
-payload builders, and strict payload validation. There is deliberately no
-Qdrant orchestration, indexing, reconciliation, locking, or propagation here —
-those belong to later waves.
+The W0 identity/evidence builders and validators remain the frozen admission
+surface. W2 change events and transition orchestration use their own strict
+builders below; they do not widen the W0 write gate.
 
 Identity conventions (approved plan, section 4):
 
@@ -75,6 +73,9 @@ APPROVED_CITATION_RELATIONS = ("SUMMARIZES", "EXTRACTED_FROM")
 # Every relation a mechanical edge payload may carry.
 MECHANICAL_EDGE_RELATIONS = STRUCTURAL_MECHANICAL_RELATIONS + APPROVED_CITATION_RELATIONS
 CLAIM_RELATIONS = ("SUPPORTS", "CONTRADICTS")
+NON_DEPENDENCY_RELATIONS = frozenset({
+    "SUPPORTS", "CONTRADICTS", "REFERENCES", "PART_OF", "SUPERSEDES",
+})
 
 # Operation -> permitted mechanical relation types (claims stay forbidden).
 OPERATION_RELATION_MATRIX: dict[str, tuple[str, ...]] = {
@@ -1488,6 +1489,20 @@ def _missing_bindings(payload: dict[str, Any]) -> list[str]:
     return missing
 
 
+def _w1_chunk_binding_problems(payload: dict[str, Any]) -> list[str]:
+    problems = _missing_bindings(payload)
+    if problems:
+        return problems
+    problems.extend(w0_sha256_hex_problems(payload.get("file_sha256"), "file_sha256"))
+    problems.extend(w0_sha256_hex_problems(payload.get("chunk_hash"), "chunk_hash"))
+    problems.extend(w0_content_hash_problems(payload.get("content_hash"), "content_hash"))
+    problems.extend(w0_uri_problems(payload.get("source_uri"), "source_uri"))
+    problems.extend(w0_locator_problems(payload.get("locator")))
+    if payload.get("content_hash") != f"sha256:{payload.get('chunk_hash')}":
+        problems.append("content_hash must bind the chunk_hash")
+    return problems
+
+
 def plan_file_lineage(
     *, collection_name: str, profile_id: str, user_id_hash: str,
     chat_id_hash: str, manifest: dict[str, Any], chunks: list[Any],
@@ -1780,7 +1795,16 @@ def collection_write_lock(
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("lineage locking is unsupported on this platform") from exc
     uid = os.getuid()
-    directory = Path(lock_dir) if lock_dir else Path(f"/tmp/hermes-qdrant-lineage-{uid}")
+    # Same naming/reading convention as the plugin's other
+    # HERMES_QDRANT_MEMORY_<KEY> overrides (qdrant_memory/config.py): the
+    # environment value only supplies the default, an explicit lock_dir wins.
+    resolved_lock_dir = str(lock_dir or "").strip() or os.environ.get(
+        "HERMES_QDRANT_MEMORY_LINEAGE_LOCK_DIR", ""
+    ).strip()
+    directory = (
+        Path(resolved_lock_dir) if resolved_lock_dir
+        else Path(f"/tmp/hermes-qdrant-lineage-{uid}")
+    )
     if directory.is_symlink():
         raise RuntimeError("lineage lock directory must not be a symlink")
     try:
@@ -1954,3 +1978,1490 @@ def apply_capture_plan(
         return {"acknowledged_ids": [str(item["id"]) for item in writes] + [point_id for point_id, _ in updates] + [str(point["id"]) for point in chunk_points],
                 "read_back_ids": sorted(read_back),
                 "repair_ids": sorted(set(repairs))}
+
+
+DEPENDENCY_RELATIONS = frozenset({"DERIVED_FROM", "EXTRACTED_FROM", "SUMMARIZES"})
+REVIEW_CAUSE_CAP = 32
+DEFAULT_INVALIDATION_DEPTH = 8
+HARD_INVALIDATION_DEPTH = 16
+DEFAULT_INVALIDATION_POINTS = 4096
+DEFAULT_INVALIDATION_EDGES = 8192
+EVENT_STATES = (
+    "prepared",
+    "dependents_marked",
+    "chunks_staged",
+    "roots_retired",
+    "committed",
+)
+EVENT_KINDS = frozenset({
+    "observed", "modified", "rechunked", "deleted", "restored",
+    "source_stale", "source_verified",
+})
+
+
+def _point_snapshot(point: dict[str, Any]) -> str:
+    return lineage_digest([
+        "lineage-transition-point-v1",
+        str(point.get("id") or ""),
+        point.get("payload") if isinstance(point.get("payload"), dict) else {},
+        point.get("vector") if "vector" in point else None,
+    ])
+
+
+def _scope_matches(
+    payload: dict[str, Any], *, profile_id: str,
+    user_id_hash: str, chat_id_hash: str,
+) -> bool:
+    return (
+        payload.get("profile_id") == profile_id
+        and payload.get("user_id_hash", "") == user_id_hash
+        and payload.get("chat_id_hash", "") == chat_id_hash
+    )
+
+
+def _scroll_bounded(
+    qdrant: Any,
+    collection_name: str,
+    filter_value: dict[str, Any],
+    *,
+    limit: int,
+    with_vector: bool = True,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Read at most ``limit`` points plus one sentinel and report completeness."""
+    wanted = max(0, int(limit))
+    if wanted == 0:
+        return [], False
+    points: list[dict[str, Any]] = []
+    offset: Any = None
+    if callable(getattr(qdrant, "scroll_page", None)):
+        while len(points) <= wanted:
+            batch, offset = qdrant.scroll_page(
+                collection_name,
+                filter_value,
+                limit=min(256, wanted + 1 - len(points)),
+                offset=offset,
+                with_payload=True,
+                with_vector=with_vector,
+            )
+            points.extend(batch)
+            if offset is None or not batch:
+                break
+        return points[:wanted], len(points) <= wanted and offset is None
+    try:
+        points = qdrant.scroll_by_filter(
+            collection_name,
+            filter_value,
+            limit=min(256, wanted + 1),
+            with_payload=True,
+            with_vector=with_vector,
+            max_total=wanted + 1,
+        )
+    except TypeError:
+        points = qdrant.scroll_by_filter(
+            collection_name,
+            filter_value,
+            limit=wanted + 1,
+            with_payload=True,
+            with_vector=with_vector,
+        )
+    return list(points[:wanted]), len(points) <= wanted
+
+
+def _exact_filter(**values: Any) -> dict[str, Any]:
+    return {
+        "must": [
+            {"key": key, "match": {"value": value}}
+            for key, value in values.items()
+        ]
+    }
+
+
+def _inline_target(entry: dict[str, Any]) -> tuple[str, str, str]:
+    relation_raw = entry.get("relation_type")
+    relation = "DERIVED_FROM" if relation_raw in (None, "") else str(relation_raw)
+    point_id = str(entry.get("point_id") or entry.get("child_node_id") or "")
+    source_uri = str(entry.get("source_uri") or "")
+    if not point_id and source_uri.startswith("memory://point/"):
+        point_id = source_uri.removeprefix("memory://point/")
+    collection = str(entry.get("collection") or entry.get("collection_name") or "")
+    return point_id, relation, collection
+
+
+def find_direct_dependents(
+    *,
+    qdrant: Any,
+    collection_name: str,
+    target_point_id: str | list[str],
+    profile_id: str,
+    user_id_hash: str = "",
+    chat_id_hash: str = "",
+    max_results: int = DEFAULT_INVALIDATION_POINTS,
+) -> dict[str, Any]:
+    """Find exact incoming dependency citations without mutating Qdrant."""
+    targets = sorted({
+        str(value) for value in (
+            target_point_id if isinstance(target_point_id, list) else [target_point_id]
+        ) if str(value)
+    })
+    if not targets:
+        return {"complete": False, "points": [], "edge_keys": [], "errors": ["target_point_id is required"]}
+    target_match = {"value": targets[0]} if len(targets) == 1 else {"any": targets}
+    remaining = max(0, int(max_results))
+    found: dict[str, dict[str, Any]] = {}
+    edge_keys: set[tuple[str, str, str]] = set()
+    errors: list[str] = []
+
+    graph_filter = {
+        "must": [
+            {"key": "target_point_id", "match": target_match},
+            {"key": "relation_type", "match": {"any": sorted(DEPENDENCY_RELATIONS)}},
+            {"key": "profile_id", "match": {"value": profile_id}},
+        ],
+        "must_not": [
+            {"key": "lineage_retired", "match": {"value": True}},
+        ],
+    }
+    graph_edges, complete = _scroll_bounded(
+        qdrant, collection_name, graph_filter, limit=remaining + 1, with_vector=False,
+    )
+    if not complete or len(graph_edges) > remaining:
+        errors.append("direct dependency graph lookup exceeded bound")
+    graph_edges = graph_edges[:remaining]
+    source_ids: set[str] = set()
+    for edge in graph_edges:
+        payload = edge.get("payload") if isinstance(edge, dict) else None
+        if not isinstance(payload, dict):
+            errors.append("dependency edge payload is missing")
+            continue
+        if not _scope_matches(payload, profile_id=profile_id, user_id_hash=user_id_hash, chat_id_hash=chat_id_hash):
+            # Category only: an out-of-scope edge id must never be echoed into a
+            # persisted impact report or a reconcile refusal string.
+            errors.append("dependency edge scope mismatch")
+            continue
+        relation = payload.get("relation_type")
+        actual_target = str(payload.get("target_point_id") or "")
+        if actual_target not in targets or relation not in DEPENDENCY_RELATIONS:
+            errors.append(f"dependency edge post-parse mismatch: {edge.get('id')}")
+            continue
+        source_id = str(payload.get("source_point_id") or "")
+        if not source_id:
+            errors.append(f"dependency edge source point is missing: {edge.get('id')}")
+            continue
+        if (
+            relation == "DERIVED_FROM"
+            and payload.get("lineage_operation") in {"index_capture", "index_reconcile"}
+            and payload.get("target_entity_type") == "source"
+            and is_uuid_string(payload.get("lineage_retired_by_event_id"))
+        ):
+            continue
+        source_ids.add(source_id)
+        edge_keys.add((source_id, actual_target, str(relation)))
+
+    if source_ids:
+        source_points = qdrant.retrieve(
+            collection_name, sorted(source_ids), with_payload=True, with_vector=True,
+        )
+        by_id = {str(point.get("id")): point for point in source_points}
+        missing = source_ids - set(by_id)
+        if missing:
+            errors.append(f"dependency source points are missing: {sorted(missing)}")
+        for point_id, point in by_id.items():
+            payload = point.get("payload") if isinstance(point, dict) else None
+            if not isinstance(payload, dict) or not _scope_matches(
+                payload, profile_id=profile_id,
+                user_id_hash=user_id_hash, chat_id_hash=chat_id_hash,
+            ):
+                errors.append("dependency point scope mismatch")
+                continue
+            found[point_id] = point
+
+    nested_filters = [
+        {"nested": {"key": "derived_from", "filter": {"must": [
+            {"key": key, "match": ({"value": values[0]} if len(values) == 1 else {"any": values})}
+        ]}}}
+        for key, values in (
+            ("point_id", targets),
+            ("child_node_id", targets),
+            ("source_uri", [f"memory://point/{target}" for target in targets]),
+        )
+    ]
+    for nested in nested_filters:
+        inline_filter = {"must": [
+            {"key": "profile_id", "match": {"value": profile_id}}, nested,
+        ]}
+        offset: Any = None
+        while True:
+            try:
+                if hasattr(qdrant, "scroll_page"):
+                    points, offset = qdrant.scroll_page(
+                        collection_name, inline_filter, limit=256, offset=offset,
+                        with_payload=True, with_vector=True,
+                    )
+                else:
+                    points = qdrant.scroll_by_filter(
+                        collection_name, inline_filter, limit=256,
+                        with_payload=True, with_vector=True,
+                    )
+                    offset = None
+            except Exception as exc:
+                errors.append(f"direct dependency inline lookup failed: {exc}")
+                break
+            for point in points:
+                point_id = str(point.get("id") or "")
+                payload = point.get("payload") if isinstance(point, dict) else None
+                if not point_id or not isinstance(payload, dict):
+                    errors.append("inline dependency payload is missing")
+                    continue
+                if not _scope_matches(payload, profile_id=profile_id, user_id_hash=user_id_hash, chat_id_hash=chat_id_hash):
+                    errors.append("inline dependency scope mismatch")
+                    continue
+                matched = False
+                derivations = payload.get("derived_from")
+                if not isinstance(derivations, list):
+                    errors.append(f"inline dependency list is malformed: {point_id}")
+                    continue
+                for entry in derivations:
+                    if not isinstance(entry, dict):
+                        errors.append(f"inline dependency entry is malformed: {point_id}")
+                        continue
+                    cited_id, relation, cited_collection = _inline_target(entry)
+                    if cited_id not in targets:
+                        continue
+                    if cited_collection and cited_collection != collection_name:
+                        errors.append(f"cross-collection dependency is unsupported: {point_id}")
+                        continue
+                    if relation not in DEPENDENCY_RELATIONS:
+                        if relation not in NON_DEPENDENCY_RELATIONS and entry.get("relation_type") not in (None, ""):
+                            errors.append(f"unsupported dependency relation: {point_id}:{relation}")
+                        continue
+                    matched = True
+                    edge_keys.add((point_id, cited_id, relation))
+                if matched:
+                    found[point_id] = point
+                    if len(found) > int(max_results):
+                        errors.append("direct dependency inline lookup exceeded bound")
+                        break
+            if len(found) > int(max_results) or offset is None or not points:
+                break
+        if len(found) > int(max_results):
+            break
+
+    if len(found) > int(max_results):
+        found = {key: found[key] for key in sorted(found)[:int(max_results)]}
+    return {
+        "complete": not errors,
+        "points": [found[key] for key in sorted(found)],
+        "edge_keys": [list(item) for item in sorted(edge_keys)],
+        "errors": errors,
+    }
+
+
+def plan_invalidation(
+    *,
+    qdrant: Any,
+    collection_name: str,
+    root_point_ids: list[str],
+    event_id: str | None,
+    profile_id: str,
+    user_id_hash: str = "",
+    chat_id_hash: str = "",
+    max_depth: int = DEFAULT_INVALIDATION_DEPTH,
+    max_points: int = DEFAULT_INVALIDATION_POINTS,
+    max_edges: int = DEFAULT_INVALIDATION_EDGES,
+) -> dict[str, Any]:
+    """Plan a bounded exact-ID invalidation closure. This function never writes."""
+    errors: list[str] = []
+    ordinary_refusal = not event_id
+    if event_id and not is_uuid_string(event_id):
+        errors.append("event_id must be a UUID")
+    if isinstance(max_depth, bool) or not isinstance(max_depth, int) or not 0 <= max_depth <= HARD_INVALIDATION_DEPTH:
+        errors.append(f"max_depth must be between 0 and {HARD_INVALIDATION_DEPTH}")
+    if isinstance(max_points, bool) or not isinstance(max_points, int) or not 1 <= max_points <= DEFAULT_INVALIDATION_POINTS:
+        errors.append(f"max_points must be between 1 and {DEFAULT_INVALIDATION_POINTS}")
+    if isinstance(max_edges, bool) or not isinstance(max_edges, int) or not 1 <= max_edges <= DEFAULT_INVALIDATION_EDGES:
+        errors.append(f"max_edges must be between 1 and {DEFAULT_INVALIDATION_EDGES}")
+    roots = sorted({str(point_id) for point_id in root_point_ids if str(point_id)})
+    if errors:
+        return {"complete": False, "root_ids": roots, "dependent_ids": [], "changes": [], "errors": errors}
+
+    visited = {(collection_name, profile_id, point_id) for point_id in roots}
+    frontier = roots
+    depth = 0
+    dependent_roots: dict[str, set[str]] = {}
+    points: dict[str, dict[str, Any]] = {}
+    edges: set[tuple[str, str, str]] = set()
+    while frontier and not errors:
+        direct = find_direct_dependents(
+            qdrant=qdrant, collection_name=collection_name,
+            target_point_id=frontier, profile_id=profile_id,
+            user_id_hash=user_id_hash, chat_id_hash=chat_id_hash,
+            max_results=max_points - len(points),
+        )
+        if not direct["complete"]:
+            errors.extend(direct["errors"])
+            break
+        direct_edges = {tuple(item) for item in direct["edge_keys"]}
+        if len(edges | direct_edges) > max_edges:
+            errors.append("dependency edge cap exceeded")
+            break
+        edges.update(direct_edges)
+        unseen = [point for point in direct["points"] if (
+            collection_name, profile_id, str(point.get("id") or "")
+        ) not in visited]
+        if depth >= max_depth and unseen:
+            errors.append("dependency depth bound reached with unseen dependents")
+            break
+        next_frontier: list[str] = []
+        for point in sorted(unseen, key=lambda item: str(item.get("id") or "")):
+            point_id = str(point.get("id") or "")
+            if len(points) >= max_points:
+                errors.append("dependency point cap exceeded")
+                break
+            parents = {target for source, target, _relation in direct_edges if source == point_id}
+            inherited: set[str] = set()
+            for parent_id in parents:
+                inherited.update(dependent_roots.get(parent_id, {parent_id} if parent_id in roots else set()))
+            visited.add((collection_name, profile_id, point_id))
+            points[point_id] = point
+            dependent_roots.setdefault(point_id, set()).update(inherited)
+            next_frontier.append(point_id)
+        frontier = sorted(next_frontier)
+        depth += 1
+
+    if ordinary_refusal:
+        errors.append("ordinary_root_transition_cause_unratified")
+    changes: list[dict[str, Any]] = []
+    if not errors:
+        for point_id in sorted(points):
+            point = points[point_id]
+            payload = point.get("payload") or {}
+            causes = payload.get("lineage_review_event_ids", [])
+            if causes in (None, ""):
+                causes = []
+            if not isinstance(causes, list) or any(not is_uuid_string(value) for value in causes):
+                errors.append(f"malformed lineage review causes: {point_id}")
+                break
+            merged = list(dict.fromkeys(str(value) for value in causes))
+            patch: dict[str, Any] = {"requires_review": True}
+            if event_id not in merged:
+                if len(merged) < REVIEW_CAUSE_CAP:
+                    merged.append(str(event_id))
+                else:
+                    patch["lineage_review_causes_truncated"] = True
+            patch["lineage_review_event_ids"] = merged
+            status = payload.get("fact_status")
+            if status in (None, "", "active"):
+                patch["fact_status"] = "review_required"
+            changes.append({
+                "point_id": point_id,
+                "snapshot_digest": _point_snapshot(point),
+                "before_payload": payload,
+                "before_vector": point.get("vector") if "vector" in point else None,
+                "patch": patch,
+                "root_ids": sorted(dependent_roots.get(point_id, set())),
+            })
+    return {
+        "complete": not errors,
+        "root_ids": roots,
+        "dependent_ids": sorted(points),
+        "edge_count": len(edges),
+        "changes": changes if not errors else [],
+        "bounds": {"max_depth": max_depth, "max_points": max_points, "max_edges": max_edges},
+        "errors": errors,
+    }
+
+
+def lineage_impact_proposal_digest(proposal: dict[str, Any]) -> str:
+    """Bind persisted lineage impact to the proposal that contains it."""
+    excluded = {
+        "lineage_impact_proposal_sha256",
+        "guarded_auto_proposal_sha256",
+        "guarded_auto_snapshot",
+    }
+    return lineage_digest({key: value for key, value in proposal.items() if key not in excluded})
+
+
+def build_lineage_impact_snapshot(
+    *,
+    qdrant: Any,
+    collection_name: str,
+    root_point_ids: list[str],
+    profile_id: str,
+    user_id_hash: str = "",
+    chat_id_hash: str = "",
+    event_id: str | None = None,
+) -> dict[str, Any]:
+    """Build a read-only exact snapshot for a proposed root action."""
+    try:
+        plan = plan_invalidation(
+            qdrant=qdrant, collection_name=collection_name,
+            root_point_ids=root_point_ids, event_id=event_id, profile_id=profile_id,
+            user_id_hash=user_id_hash, chat_id_hash=chat_id_hash,
+        )
+        ids = sorted(set(plan.get("root_ids") or []) | set(plan.get("dependent_ids") or []))
+        points = {
+            str(point.get("id")): point
+            for point in qdrant.retrieve(
+                collection_name, ids, with_payload=True, with_vector=True,
+            )
+        }
+    except Exception as exc:
+        return {
+            "schema_version": 1,
+            "root_ids": sorted(set(str(value) for value in root_point_ids)),
+            "dependent_ids": [],
+            "snapshot_digests": {},
+            "bounds": {},
+            "complete": False,
+            "errors": [f"lineage impact lookup failed: {exc}"],
+            "proposed_review_changes": [],
+        }
+    missing = sorted(set(ids) - set(points))
+    errors = list(plan.get("errors") or [])
+    if missing:
+        errors.append(f"lineage impact points are missing: {missing}")
+    return {
+        "schema_version": 1,
+        "root_ids": sorted(set(plan.get("root_ids") or [])),
+        "dependent_ids": sorted(set(plan.get("dependent_ids") or [])),
+        "snapshot_digests": {
+            point_id: _point_snapshot(points[point_id])
+            for point_id in sorted(points)
+        },
+        "bounds": dict(plan.get("bounds") or {}),
+        "complete": plan.get("complete") is True and not missing,
+        "errors": errors,
+        "proposed_review_changes": [
+            {"point_id": change["point_id"], "patch": dict(change["patch"])}
+            for change in plan.get("changes") or []
+        ],
+    }
+
+
+def validate_lineage_impact_snapshot(
+    *,
+    qdrant: Any,
+    collection_name: str,
+    impact: Any,
+    expected_root_ids: list[str],
+    proposal: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate a persisted impact snapshot against current exact points."""
+    problems: list[str] = []
+    if not isinstance(impact, dict) or impact.get("schema_version") != 1:
+        return {"valid": False, "problems": ["lineage impact snapshot is missing"]}
+    if impact.get("complete") is not True or impact.get("errors"):
+        problems.append("lineage impact is incomplete")
+    if proposal is not None:
+        expected_digest = str(proposal.get("lineage_impact_proposal_sha256") or "")
+        if not expected_digest or expected_digest != lineage_impact_proposal_digest(proposal):
+            problems.append("lineage impact proposal digest changed")
+    roots = sorted(set(str(value) for value in impact.get("root_ids") or []))
+    if roots != sorted(set(expected_root_ids)):
+        problems.append("lineage impact roots changed")
+    digests = impact.get("snapshot_digests")
+    if not isinstance(digests, dict):
+        problems.append("lineage impact digests are missing")
+        digests = {}
+    ids = sorted(digests)
+    current = {
+        str(point.get("id")): point
+        for point in qdrant.retrieve(
+            collection_name, ids, with_payload=True, with_vector=True,
+        )
+    }
+    if set(current) != set(ids):
+        problems.append("lineage impact point set changed")
+    elif any(_point_snapshot(current[point_id]) != digests[point_id] for point_id in ids):
+        problems.append("lineage impact point state changed")
+    return {"valid": not problems, "problems": problems}
+
+
+def validate_transition_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    """Validate a transition plan before any persistence boundary."""
+    problems: list[str] = []
+    if not isinstance(plan, dict):
+        return {"valid": False, "problems": ["transition plan must be an object"]}
+    if plan.get("complete") is not True:
+        problems.append("transition plan is incomplete")
+    event_id = plan.get("event_id")
+    if not is_uuid_string(event_id):
+        problems.append("transition event_id must be a UUID")
+    invalidation = plan.get("invalidation")
+    if not isinstance(invalidation, dict) or invalidation.get("complete") is not True:
+        problems.append("invalidation plan is incomplete")
+    for key in ("retired_ids", "new_chunk_ids"):
+        values = plan.get(key)
+        if not isinstance(values, list) or any(not isinstance(value, str) or not value for value in values):
+            problems.append(f"{key} must be a list of exact point IDs")
+    overlap = set(plan.get("retired_ids") or []) & set(plan.get("new_chunk_ids") or [])
+    if overlap:
+        problems.append(f"retired and new inventories overlap: {sorted(overlap)}")
+    return {"valid": not problems, "problems": problems}
+
+
+def apply_invalidation(
+    *, qdrant: Any, collection_name: str, plan: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply and verify exact payload-only review demotions."""
+    if plan.get("complete") is not True:
+        raise RuntimeError(f"invalidation plan is incomplete: {plan.get('errors') or []}")
+    changes = list(plan.get("changes") or [])
+    ids = [str(change["point_id"]) for change in changes]
+    current = {
+        str(point.get("id")): point
+        for point in qdrant.retrieve(collection_name, ids, with_payload=True, with_vector=True)
+    }
+    if set(current) != set(ids):
+        raise RuntimeError(f"dependent lookup drift: {sorted(set(ids) - set(current))}")
+    changed: list[str] = []
+    for change in changes:
+        point_id = str(change["point_id"])
+        point = current[point_id]
+        before_payload = change.get("before_payload")
+        before_vector = change.get("before_vector")
+        current_payload = point.get("payload") or {}
+        if before_payload is not None:
+            expected_payload = {**before_payload, **change["patch"]}
+            if point.get("vector") != before_vector:
+                raise RuntimeError(f"dependent vector drift: {point_id}")
+            if current_payload == expected_payload:
+                continue
+        elif all(current_payload.get(key) == value for key, value in change["patch"].items()):
+            continue
+        if _point_snapshot(point) != change["snapshot_digest"]:
+            raise RuntimeError(f"dependent payload drift: {point_id}")
+        qdrant.update_payload(collection_name, point_id, dict(change["patch"]))
+        changed.append(point_id)
+    read_back = {
+        str(point.get("id")): point
+        for point in qdrant.retrieve(collection_name, ids, with_payload=True, with_vector=True)
+    }
+    if set(read_back) != set(ids):
+        raise RuntimeError("dependent read-back is incomplete")
+    for change in changes:
+        point_id = str(change["point_id"])
+        point = read_back[point_id]
+        before_payload = change.get("before_payload")
+        if before_payload is not None:
+            expected_payload = {**before_payload, **change["patch"]}
+            valid = point.get("payload") == expected_payload and point.get("vector") == change.get("before_vector")
+        else:
+            payload = point.get("payload") or {}
+            valid = all(payload.get(key) == value for key, value in change["patch"].items())
+        if not valid:
+            raise RuntimeError(f"dependent review update verification failed: {point_id}")
+    return {"changed_ids": changed, "verified_ids": sorted(ids)}
+
+
+def build_change_event(
+    *,
+    source_key: str,
+    scope_key: str,
+    profile_id: str,
+    file_path: str,
+    source_uri: str,
+    event_kind: str,
+    previous_event_id: str | None,
+    from_version_id: str | None,
+    to_version_id: str | None,
+    desired_inventory_digest: str,
+    created_point_ids: list[str],
+    retired_point_ids: list[str],
+    new_chunk_ids: list[str] | None = None,
+    patched_point_ids: list[str],
+    lineage_baseline_basis: str,
+    lineage_missing_fields: list[str],
+    review_changes: list[dict[str, Any]] | None = None,
+    lineage_observation: str = "read_bytes",
+    lineage_history_complete: bool = False,
+    from_file_sha256: str | None = None,
+    to_file_sha256: str | None = None,
+    event_state: str = "prepared",
+    observed_at: str | None = None,
+    user_id_hash: str = "",
+    chat_id_hash: str = "",
+) -> tuple[str, dict[str, Any]]:
+    """Build the strict W2-owned change-event record without widening W0."""
+    if event_kind not in EVENT_KINDS:
+        raise ValueError(f"unsupported event_kind: {event_kind}")
+    if event_state not in EVENT_STATES:
+        raise ValueError(f"unsupported event_state: {event_state}")
+    if previous_event_id not in (None, "") and not is_uuid_string(previous_event_id):
+        raise ValueError("previous_event_id must be a UUID or null")
+    for key, value in (("from_version_id", from_version_id), ("to_version_id", to_version_id)):
+        if value not in (None, "") and not is_uuid_string(value):
+            raise ValueError(f"{key} must be a UUID or null")
+    for key, value in (("from_file_sha256", from_file_sha256), ("to_file_sha256", to_file_sha256)):
+        if value is not None and not is_sha256_hex(value):
+            raise ValueError(f"{key} must be a lowercase SHA-256 or absent")
+    if not is_sha256_hex(desired_inventory_digest):
+        raise ValueError("desired_inventory_digest must be a lowercase SHA-256")
+    identity_digest = lineage_digest([
+        "lineage-event-v1", source_key, previous_event_id or "", event_kind,
+        from_version_id or "", to_version_id or "", desired_inventory_digest,
+    ])
+    logical_id = make_entity_id("event", identity_digest, profile_id=profile_id)
+    point_id = storage_point_id(logical_id)
+    payload = build_entity_payload(
+        entity_type="event",
+        label=f"lineage-event-{identity_digest}",
+        logical_entity_id=logical_id,
+        profile_id=profile_id,
+        source_uri=source_uri,
+        created_at=observed_at,
+        file_path=file_path,
+        lineage_record=True,
+        lineage_schema_version=LINEAGE_SCHEMA_VERSION,
+        lineage_operation="index_reconcile",
+        lineage_identity_digest=entity_identity_digest("event", identity_digest, profile_id=profile_id),
+        lineage_source_key=source_key,
+        lineage_scope_key=scope_key,
+        lineage_observation=lineage_observation,
+        lineage_role="change_event",
+    )
+    payload.update({
+        "user_id_hash": user_id_hash,
+        "chat_id_hash": chat_id_hash,
+        "event_kind": event_kind,
+        "previous_event_id": previous_event_id,
+        "from_version_id": from_version_id,
+        "to_version_id": to_version_id,
+        "event_state": event_state,
+        "desired_inventory_digest": desired_inventory_digest,
+        "created_point_ids": sorted(set(created_point_ids)),
+        "retired_point_ids": sorted(set(retired_point_ids)),
+        "new_chunk_ids": sorted(set(new_chunk_ids or [])),
+        "patched_point_ids": sorted(set(patched_point_ids)),
+        "lineage_baseline_basis": lineage_baseline_basis,
+        "lineage_missing_fields": sorted(set(lineage_missing_fields)),
+        "lineage_history_complete": bool(lineage_history_complete),
+        "review_changes": list(review_changes or []),
+        "observed_at": payload.get("created_at"),
+    })
+    if from_file_sha256 is not None:
+        payload["from_file_sha256"] = from_file_sha256
+    if to_file_sha256 is not None:
+        payload["to_file_sha256"] = to_file_sha256
+    return point_id, payload
+
+
+def plan_reconciliation(
+    *,
+    qdrant: Any,
+    collection_name: str,
+    profile_id: str,
+    user_id_hash: str,
+    chat_id_hash: str,
+    file_path: str,
+    manifest: dict[str, Any] | None,
+    chunks: list[Any],
+    existing_points: list[dict[str, Any]],
+    existing_source: dict[str, Any] | None,
+    ownership_errors: list[str] | None = None,
+    max_depth: int = DEFAULT_INVALIDATION_DEPTH,
+    max_points: int = DEFAULT_INVALIDATION_POINTS,
+    max_edges: int = DEFAULT_INVALIDATION_EDGES,
+) -> dict[str, Any]:
+    """Build one deterministic W2 file transition without writing."""
+    scope_key = make_scope_key(
+        collection_name=collection_name, profile_id=profile_id,
+        user_id_hash=user_id_hash, chat_id_hash=chat_id_hash,
+    )
+    source_key = make_source_key(scope_key=scope_key, resolved_file_path=file_path)
+    source_entity = source_logical_id(source_key=source_key, profile_id=profile_id)
+    source_id = storage_point_id(source_entity)
+    errors = list(ownership_errors or [])
+    source_payload = (existing_source or {}).get("payload") or {}
+    pending_event_id = source_payload.get("pending_event_id")
+    if pending_event_id in (None, "") and source_payload.get("head_event_id") not in (None, ""):
+        head_event_id = str(source_payload["head_event_id"])
+        head_event = read_back_exact_records(qdrant, collection_name, [head_event_id]).get(head_event_id)
+        if ((head_event or {}).get("payload") or {}).get("event_state") != "committed":
+            pending_event_id = head_event_id
+    pending_event_payload: dict[str, Any] = {}
+    pending_new_chunk_ids: set[str] = set()
+    if pending_event_id not in (None, ""):
+        if not is_uuid_string(pending_event_id):
+            errors.append("source pending_event_id is malformed")
+        else:
+            pending_event = read_back_exact_records(
+                qdrant, collection_name, [str(pending_event_id)]
+            ).get(str(pending_event_id))
+            pending_event_payload = (pending_event or {}).get("payload") or {}
+            if (
+                not pending_event
+                or pending_event_payload.get("lineage_role") != "change_event"
+                or pending_event_payload.get("lineage_source_key") != source_key
+                or pending_event_payload.get("lineage_scope_key") != scope_key
+            ):
+                errors.append("pending event binding mismatch")
+            else:
+                pending_new_chunk_ids = {
+                    str(value) for value in pending_event_payload.get("new_chunk_ids", [])
+                    if isinstance(value, str) and value
+                }
+    if existing_source and (
+        str(existing_source.get("id") or "") != source_id
+        or source_payload.get("lineage_source_key") != source_key
+        or source_payload.get("lineage_scope_key") != scope_key
+        or not _scope_matches(source_payload, profile_id=profile_id, user_id_hash=user_id_hash, chat_id_hash=chat_id_hash)
+    ):
+        errors.append("source head binding mismatch")
+
+    old_hashes: set[str] = set()
+    missing_fields: set[str] = set()
+    for point in existing_points:
+        if str(point.get("id") or "") in pending_new_chunk_ids:
+            continue
+        payload = point.get("payload") if isinstance(point, dict) else None
+        if not isinstance(payload, dict) or not _scope_matches(
+            payload, profile_id=profile_id,
+            user_id_hash=user_id_hash, chat_id_hash=chat_id_hash,
+        ):
+            errors.append("owned inventory scope mismatch")
+            continue
+        value = payload.get("file_sha256")
+        binding_gaps = _w1_chunk_binding_problems(payload)
+        if value in (None, "") or binding_gaps:
+            missing_fields.update(binding_gaps or ["file_sha256"])
+        elif not is_sha256_hex(value):
+            errors.append(f"malformed old file_sha256: {point.get('id')}")
+        else:
+            old_hashes.add(str(value))
+    if len(old_hashes) > 1 or (old_hashes and missing_fields):
+        errors.append("ambiguous old hash basis")
+
+    old_version_id = source_payload.get("current_version_id")
+    old_version: dict[str, Any] | None = None
+    old_hash = next(iter(old_hashes), None)
+    if old_version_id not in (None, ""):
+        if not is_uuid_string(old_version_id):
+            errors.append("source current_version_id is malformed")
+        else:
+            records = read_back_exact_records(qdrant, collection_name, [str(old_version_id)])
+            old_version = records.get(str(old_version_id))
+            if old_version:
+                payload = old_version.get("payload") or {}
+                head_hash = payload.get("file_sha256")
+                if (
+                    payload.get("lineage_role") != "file_version"
+                    or payload.get("lineage_source_key") != source_key
+                    or payload.get("lineage_scope_key") != scope_key
+                    or not is_sha256_hex(head_hash)
+                ):
+                    errors.append("source head version binding mismatch")
+                elif old_hash and old_hash != head_hash:
+                    errors.append("source head disagrees with old chunk hashes")
+                else:
+                    old_hash = str(head_hash)
+            elif not old_hash:
+                errors.append("source head version is missing without an old hash basis")
+    elif old_hash:
+        old_version_digest = make_version_identity_digest(source_key=source_key, file_sha256=old_hash)
+        old_version_id = storage_point_id(version_logical_id(
+            version_identity_digest=old_version_digest, profile_id=profile_id,
+        ))
+
+    if existing_source is None and any(
+        isinstance(point, dict)
+        and isinstance(point.get("payload"), dict)
+        and (
+            point["payload"].get("file_version_id") not in (None, "")
+            or not _w1_chunk_binding_problems(point["payload"])
+        )
+        for point in existing_points
+    ):
+        errors.append("event-free W1 source baseline is incomplete")
+    bootstrap_required = bool(
+        existing_source
+        and old_version_id not in (None, "")
+        and source_payload.get("head_event_id") in (None, "")
+        and source_payload.get("pending_event_id") in (None, "")
+    )
+    if bootstrap_required:
+        if old_version is None or not old_hash:
+            errors.append("event-free W1 source baseline is incomplete")
+        chunk_counts = [
+            (point.get("payload") or {}).get("chunk_count")
+            for point in existing_points if isinstance(point, dict)
+        ]
+        chunk_indices = [
+            (point.get("payload") or {}).get("chunk_index")
+            for point in existing_points if isinstance(point, dict)
+        ]
+        invalid_inventory = (
+            bool(existing_points)
+            and (
+                any(isinstance(value, bool) or not isinstance(value, int) for value in chunk_counts)
+                or len(set(chunk_counts)) != 1
+                or chunk_counts[0] != len(existing_points)
+                or any(isinstance(value, bool) or not isinstance(value, int) for value in chunk_indices)
+                or sorted(chunk_indices) != list(range(len(existing_points)))
+            )
+        ) or (
+            not existing_points
+            and (
+                int(((old_version or {}).get("payload") or {}).get("file_size") or 0) > 0
+                or old_hash != hashlib.sha256(b"").hexdigest()
+            )
+        )
+        if invalid_inventory:
+            errors.append("event-free W1 chunk inventory is incomplete or ambiguous")
+        for point in existing_points:
+            payload = point.get("payload") if isinstance(point, dict) else None
+            expected_chunk_id = None
+            if isinstance(payload, dict) and all(
+                payload.get(key) not in (None, "")
+                for key in ("chunker_version", "chunk_index", "chunk_hash")
+            ):
+                try:
+                    expected_chunk_id = make_versioned_file_chunk_id(
+                        scope_key=scope_key,
+                        resolved_file_path=file_path,
+                        file_sha256=str(old_hash),
+                        chunker_version=str(payload["chunker_version"]),
+                        chunk_index=payload["chunk_index"],
+                        chunk_hash=str(payload["chunk_hash"]),
+                    )
+                except (TypeError, ValueError):
+                    expected_chunk_id = None
+            if not isinstance(payload, dict) or (
+                payload.get("file_version_id") != old_version_id
+                or payload.get("file_sha256") != old_hash
+                or _w1_chunk_binding_problems(payload)
+                or expected_chunk_id != str(point.get("id") or "")
+            ):
+                errors.append(f"event-free W1 chunk binding mismatch: {point.get('id')}")
+
+    if pending_event_payload:
+        pending_from_hash = pending_event_payload.get("from_file_sha256")
+        pending_from_version = pending_event_payload.get("from_version_id")
+        if pending_from_hash is not None and not is_sha256_hex(pending_from_hash):
+            errors.append("pending event from_file_sha256 is malformed")
+        else:
+            old_hash = pending_from_hash
+        if pending_from_version not in (None, ""):
+            if not is_uuid_string(pending_from_version):
+                errors.append("pending event from_version_id is malformed")
+            else:
+                old_version_id = str(pending_from_version)
+                old_version = read_back_exact_records(
+                    qdrant, collection_name, [old_version_id]
+                ).get(old_version_id)
+    new_hash = None if manifest is None else manifest.get("file_sha256")
+    if new_hash is not None and not is_sha256_hex(new_hash):
+        errors.append("new file_sha256 is malformed")
+    if pending_event_payload and pending_event_payload.get("to_file_sha256") != new_hash:
+        errors.append("pending event snapshot no longer matches the prepared file")
+    source_uri = (
+        str(manifest.get("source_uri") or "") if manifest is not None
+        else str(source_payload.get("source_uri") or expected_file_uri(file_path) or "")
+    )
+    if not source_uri:
+        errors.append("source_uri is required")
+
+    desired_ids: list[str] = []
+    new_version_id: str | None = None
+    new_version_entity: str | None = None
+    if new_hash is not None:
+        new_version_digest = make_version_identity_digest(source_key=source_key, file_sha256=str(new_hash))
+        new_version_entity = version_logical_id(
+            version_identity_digest=new_version_digest, profile_id=profile_id,
+        )
+        new_version_id = storage_point_id(new_version_entity)
+        for chunk in chunks:
+            chunk.id = make_versioned_file_chunk_id(
+                scope_key=scope_key, resolved_file_path=file_path,
+                file_sha256=str(new_hash), chunker_version=chunk.chunker_version,
+                chunk_index=int(chunk.chunk_index), chunk_hash=chunk.chunk_hash,
+            )
+            chunk.manifest_version = 2
+            chunk.lineage_schema_version = LINEAGE_SCHEMA_VERSION
+            chunk.lineage_entity_id = memory_point_endpoint_logical_id(
+                scope_key=scope_key, point_id=chunk.id, profile_id=profile_id,
+            )
+            chunk.file_version_id = new_version_id
+            chunk.file_version_entity_id = new_version_entity
+            chunk.lineage_pending = True
+            chunk.derived_from = [{
+                "point_id": new_version_id,
+                "source_uri": f"memory://point/{new_version_id}",
+                "relation_type": "DERIVED_FROM",
+                "derivation_type": "indexed_chunk",
+                "content_hash": f"sha256:{new_hash}",
+            }]
+            desired_ids.append(str(chunk.id))
+    inventory_ids = sorted(str(point.get("id")) for point in existing_points if point.get("id") is not None)
+    if pending_event_payload:
+        retired_ids = sorted(str(value) for value in pending_event_payload.get("retired_point_ids", []) if isinstance(value, str))
+        new_chunk_ids = sorted(pending_new_chunk_ids)
+        old_ids = retired_ids
+        if set(new_chunk_ids) - set(desired_ids):
+            errors.append("pending event desired chunk inventory drift")
+    else:
+        old_ids = inventory_ids
+        retired_ids = sorted(set(old_ids) - set(desired_ids))
+        new_chunk_ids = sorted(set(desired_ids) - set(old_ids))
+    for chunk in chunks:
+        if str(chunk.id) not in new_chunk_ids:
+            chunk.lineage_pending = False
+    bootstrap_only = bool(
+        bootstrap_required and manifest is not None and old_hash == new_hash
+        and set(old_ids) == set(desired_ids)
+    )
+    if (not bootstrap_required and not pending_event_payload and manifest is not None
+            and old_hash == new_hash and set(old_ids) == set(desired_ids)):
+        return {
+            "complete": not errors,
+            "noop": True,
+            "errors": errors,
+            "file_path": file_path,
+            "source_point_id": source_id,
+        }
+
+    if errors:
+        return {"complete": False, "noop": False, "errors": sorted(set(errors)), "file_path": file_path}
+    if manifest is None and not old_ids and old_version_id in (None, ""):
+        return {"complete": True, "noop": True, "errors": [], "file_path": file_path, "source_point_id": source_id}
+
+    baseline_basis = (
+        "indexed_file_sha256" if old_hash or not old_ids
+        else "missing_indexed_file_sha256"
+    )
+    if pending_event_payload:
+        baseline_basis = str(pending_event_payload.get("lineage_baseline_basis") or baseline_basis)
+        missing_fields = set(pending_event_payload.get("lineage_missing_fields") or [])
+    previous_event_id = (
+        pending_event_payload.get("previous_event_id")
+        if pending_event_payload else source_payload.get("head_event_id")
+    )
+    bootstrap_event_point: dict[str, Any] | None = None
+    if bootstrap_required and not (
+        manifest is not None and old_hash == new_hash and set(old_ids) == set(desired_ids)
+    ):
+        bootstrap_digest = lineage_digest([
+            "lineage-inventory-v1", source_key, str(old_hash), sorted(old_ids), [],
+        ])
+        bootstrap_id, bootstrap_payload = build_change_event(
+            source_key=source_key, scope_key=scope_key, profile_id=profile_id,
+            file_path=file_path, source_uri=str(source_payload.get("source_uri") or source_uri),
+            event_kind="observed", previous_event_id=None, from_version_id=None,
+            to_version_id=str(old_version_id), desired_inventory_digest=bootstrap_digest,
+            created_point_ids=[], retired_point_ids=[], patched_point_ids=[],
+            lineage_baseline_basis="indexed_file_sha256", lineage_missing_fields=[],
+            to_file_sha256=str(old_hash), lineage_observation="indexed_payload",
+            lineage_history_complete=False, event_state="committed",
+            user_id_hash=user_id_hash,
+            chat_id_hash=chat_id_hash,
+        )
+        existing_bootstrap = read_back_exact_records(
+            qdrant, collection_name, [bootstrap_id]
+        ).get(bootstrap_id)
+        if existing_bootstrap:
+            bootstrap_payload = dict(existing_bootstrap.get("payload") or {})
+        bootstrap_event_point = {"id": bootstrap_id, "vector": {}, "payload": bootstrap_payload}
+        previous_event_id = bootstrap_id
+    if previous_event_id not in (None, "") and not is_uuid_string(previous_event_id):
+        return {"complete": False, "errors": ["source head_event_id is malformed"], "file_path": file_path}
+    desired_digest = lineage_digest([
+        "lineage-inventory-v1", source_key, str(new_hash or ""), sorted(desired_ids), retired_ids,
+    ])
+    if pending_event_payload:
+        event_kind = str(pending_event_payload.get("event_kind") or "")
+        if event_kind not in EVENT_KINDS:
+            errors.append("pending event_kind is malformed")
+    elif bootstrap_only:
+        event_kind = "observed"
+    elif manifest is None:
+        event_kind = "deleted"
+    elif old_hash is None:
+        event_kind = "observed"
+    elif old_hash == new_hash:
+        event_kind = "rechunked"
+    else:
+        prior_new = read_back_exact_records(qdrant, collection_name, [str(new_version_id)]).get(str(new_version_id))
+        event_kind = "restored" if prior_new else "modified"
+
+    event_from_version_id = None if event_kind == "observed" else (str(old_version_id) if old_hash else None)
+    event_observation = "indexed_payload" if bootstrap_required and event_kind == "observed" else "read_bytes"
+
+    # First build obtains the deterministic event ID needed by invalidation and edges.
+    event_id, _ = build_change_event(
+        source_key=source_key, scope_key=scope_key, profile_id=profile_id,
+        file_path=file_path, source_uri=source_uri, event_kind=event_kind,
+        previous_event_id=previous_event_id, from_version_id=event_from_version_id,
+        to_version_id=new_version_id, desired_inventory_digest=desired_digest,
+        created_point_ids=new_chunk_ids, retired_point_ids=retired_ids, patched_point_ids=[],
+        lineage_baseline_basis=baseline_basis,
+        lineage_missing_fields=sorted(missing_fields),
+        from_file_sha256=None if event_kind == "observed" else old_hash,
+        to_file_sha256=str(new_hash) if new_hash is not None else None,
+        lineage_observation=event_observation,
+        lineage_history_complete=False,
+        user_id_hash=user_id_hash, chat_id_hash=chat_id_hash,
+    )
+    if pending_event_id not in (None, "") and str(pending_event_id) != event_id:
+        return {"complete": False, "errors": ["pending event identity drift"], "file_path": file_path}
+    existing_event = read_back_exact_records(qdrant, collection_name, [event_id]).get(event_id)
+    existing_event_payload = (existing_event or {}).get("payload") or {}
+    observed_at = existing_event_payload.get("created_at")
+    event_state = str(existing_event_payload.get("event_state") or "prepared")
+    if event_state not in EVENT_STATES:
+        return {"complete": False, "errors": ["pending event state is malformed"], "file_path": file_path}
+    roots = list(retired_ids)
+    if old_hash and old_version_id and (new_hash is None or old_hash != new_hash):
+        roots.append(str(old_version_id))
+    invalidation = plan_invalidation(
+        qdrant=qdrant, collection_name=collection_name,
+        root_point_ids=roots, event_id=event_id, profile_id=profile_id,
+        user_id_hash=user_id_hash, chat_id_hash=chat_id_hash,
+        max_depth=max_depth, max_points=max_points, max_edges=max_edges,
+    )
+    if invalidation.get("complete") is not True:
+        return {
+            "complete": False, "errors": list(invalidation.get("errors") or []),
+            "file_path": file_path, "invalidation": invalidation,
+        }
+
+    metadata_points: list[dict[str, Any]] = []
+    root_state_updates: list[dict[str, Any]] = []
+    if old_hash and old_version_id:
+        if old_version is None:
+            sample = (existing_points[0].get("payload") or {}) if existing_points else {}
+            old_id, old_payload, _ = build_file_version(
+                collection_name=collection_name, profile_id=profile_id,
+                user_id_hash=user_id_hash, chat_id_hash=chat_id_hash,
+                scope_key=scope_key, source_key=source_key, file_path=file_path,
+                source_uri=source_uri, file_sha256=old_hash,
+                file_size=int(sample.get("file_size") or 0),
+                file_mtime=str(sample.get("file_mtime") or ""),
+                file_mtime_ns=int(sample.get("file_mtime_ns") or 0),
+            )
+            old_payload["lineage_operation"] = "index_reconcile"
+            metadata_points.append({"id": old_id, "vector": {}, "payload": old_payload})
+        if old_version_id != new_version_id:
+            root_state_updates.append({
+                "point_id": str(old_version_id),
+                "patch": {"fact_status": "stale" if manifest is None else "superseded", "stale": manifest is None},
+            })
+
+    created_ids = list(new_chunk_ids)
+    if (not bootstrap_only and new_hash is not None and manifest is not None
+            and new_version_id and new_version_entity):
+        version_id, version_payload, _ = build_file_version(
+            collection_name=collection_name, profile_id=profile_id,
+            user_id_hash=user_id_hash, chat_id_hash=chat_id_hash,
+            scope_key=scope_key, source_key=source_key, file_path=file_path,
+            source_uri=source_uri, file_sha256=str(new_hash),
+            file_size=int(manifest["file_size"]), file_mtime=str(manifest["file_mtime_iso"]),
+            file_mtime_ns=int(manifest["file_mtime_ns"]),
+        )
+        version_payload.update(lineage_operation="index_reconcile", fact_status="active", stale=False)
+        metadata_points.append({"id": version_id, "vector": {}, "payload": version_payload})
+        created_ids.append(version_id)
+
+        part_payload = build_mechanical_edge_payload(
+            relation_type="PART_OF", source_entity_id=new_version_entity,
+            target_entity_id=source_entity, profile_id=profile_id,
+            source_point_id=version_id, target_point_id=source_id,
+            source_entity_type="source", target_entity_type="source",
+            lineage_operation="index_reconcile", lineage_source_key=source_key,
+            lineage_scope_key=scope_key, observation="read_bytes",
+            source_content_hash=f"sha256:{new_hash}", file_version_id=version_id,
+            file_path=file_path, file_sha256=str(new_hash), lineage_event_id=event_id,
+        )
+        part_payload.update(user_id_hash=user_id_hash, chat_id_hash=chat_id_hash)
+        part_id = storage_point_id(str(part_payload["edge_id"]))
+        metadata_points.append({"id": part_id, "vector": {}, "payload": part_payload})
+        created_ids.append(part_id)
+        for chunk in chunks:
+            edge_payload = build_mechanical_edge_payload(
+                relation_type="DERIVED_FROM",
+                source_entity_id=chunk.lineage_entity_id,
+                target_entity_id=new_version_entity,
+                profile_id=profile_id, source_point_id=chunk.id,
+                target_point_id=version_id,
+                source_entity_type="memory_point", target_entity_type="source",
+                lineage_operation="index_reconcile", lineage_source_key=source_key,
+                lineage_scope_key=scope_key, observation="indexed_payload",
+                source_content_hash=f"sha256:{chunk.chunk_hash}",
+                target_content_hash=f"sha256:{new_hash}",
+                file_version_id=version_id, file_path=file_path,
+                file_sha256=str(new_hash), locator=chunk.locator(),
+                lineage_event_id=event_id,
+            )
+            edge_payload.update(user_id_hash=user_id_hash, chat_id_hash=chat_id_hash)
+            edge_id = storage_point_id(str(edge_payload["edge_id"]))
+            metadata_points.append({"id": edge_id, "vector": {}, "payload": edge_payload})
+            created_ids.append(edge_id)
+        if old_hash and old_hash != new_hash and old_version_id:
+            old_version_entity = version_logical_id(
+                version_identity_digest=make_version_identity_digest(
+                    source_key=source_key, file_sha256=old_hash,
+                ),
+                profile_id=profile_id,
+            )
+            supersedes = build_mechanical_edge_payload(
+                relation_type="SUPERSEDES", source_entity_id=new_version_entity,
+                target_entity_id=old_version_entity, profile_id=profile_id,
+                source_point_id=version_id, target_point_id=str(old_version_id),
+                source_entity_type="source", target_entity_type="source",
+                lineage_operation="index_reconcile", lineage_source_key=source_key,
+                lineage_scope_key=scope_key, observation="read_bytes",
+                source_content_hash=f"sha256:{new_hash}",
+                target_content_hash=f"sha256:{old_hash}",
+                file_path=file_path, file_sha256=str(new_hash),
+                lineage_event_id=event_id,
+            )
+            supersedes.update(user_id_hash=user_id_hash, chat_id_hash=chat_id_hash)
+            edge_id = storage_point_id(str(supersedes["edge_id"]))
+            metadata_points.append({"id": edge_id, "vector": {}, "payload": supersedes})
+            created_ids.append(edge_id)
+
+    review_changes = [
+        {
+            "point_id": change["point_id"],
+            "snapshot_digest": change["snapshot_digest"],
+            "patch": change["patch"],
+            "root_ids": change["root_ids"],
+        }
+        for change in invalidation["changes"]
+    ]
+    event_id, event_payload = build_change_event(
+        source_key=source_key, scope_key=scope_key, profile_id=profile_id,
+        file_path=file_path, source_uri=source_uri, event_kind=event_kind,
+        previous_event_id=previous_event_id, from_version_id=event_from_version_id,
+        to_version_id=new_version_id, desired_inventory_digest=desired_digest,
+        created_point_ids=created_ids, retired_point_ids=retired_ids,
+        new_chunk_ids=new_chunk_ids,
+        patched_point_ids=invalidation["dependent_ids"],
+        lineage_baseline_basis=baseline_basis,
+        lineage_missing_fields=sorted(missing_fields), review_changes=review_changes,
+        from_file_sha256=None if event_kind == "observed" else old_hash,
+        to_file_sha256=str(new_hash) if new_hash is not None else None,
+        lineage_observation=event_observation,
+        lineage_history_complete=False,
+        event_state=event_state, observed_at=observed_at,
+        user_id_hash=user_id_hash, chat_id_hash=chat_id_hash,
+    )
+    if existing_event:
+        event_payload = {**existing_event_payload, **event_payload}
+    metadata_points.append({"id": event_id, "vector": {}, "payload": event_payload})
+
+    source_created = source_payload.get("created_at")
+    pending_source = build_source_node_payload(
+        source_key=source_key, scope_key=scope_key, profile_id=profile_id,
+        file_path=file_path, source_uri=source_uri,
+        lineage_operation="index_reconcile", created_at=source_created,
+    )
+    pending_source.update({
+        "user_id_hash": user_id_hash,
+        "chat_id_hash": chat_id_hash,
+        "current_version_id": str(old_version_id) if old_hash else None,
+        "head_event_id": previous_event_id,
+        "pending_event_id": event_id,
+        "source_deleted": False,
+    })
+    metadata_points.append({"id": source_id, "vector": {}, "payload": pending_source})
+    baseline_records = list(existing_points) + ([existing_source] if existing_source else [])
+    if old_version:
+        baseline_records.append(old_version)
+    baseline_ids = sorted({
+        str(point["id"]) for point in baseline_records
+        if point and point.get("id") is not None
+    })
+    full_baseline = {
+        str(point.get("id")): point
+        for point in qdrant.retrieve(
+            collection_name, baseline_ids, with_payload=True, with_vector=True,
+        )
+    }
+    if set(full_baseline) != set(baseline_ids):
+        return {"complete": False, "errors": ["reconciliation baseline read is incomplete"], "file_path": file_path}
+    baseline_snapshots = {
+        point_id: _point_snapshot(full_baseline[point_id])
+        for point_id in baseline_ids
+    }
+    return {
+        "complete": True,
+        "noop": False,
+        "errors": [],
+        "file_path": file_path,
+        "event_id": event_id,
+        "event_kind": event_kind,
+        "source_point_id": source_id,
+        "new_version_id": new_version_id,
+        "old_version_id": str(old_version_id) if old_hash else None,
+        "retired_ids": retired_ids,
+        "new_chunk_ids": new_chunk_ids,
+        "desired_chunk_ids": desired_ids,
+        "metadata_points": metadata_points,
+        "bootstrap_event_point": bootstrap_event_point,
+        "baseline_snapshots": baseline_snapshots,
+        "invalidation": invalidation,
+        "invalidation_context": {
+            "profile_id": profile_id,
+            "user_id_hash": user_id_hash,
+            "chat_id_hash": chat_id_hash,
+        },
+        "root_state_updates": root_state_updates,
+        "source_commit_patch": {
+            "current_version_id": new_version_id,
+            "head_event_id": event_id,
+            "pending_event_id": None,
+            "source_deleted": manifest is None,
+        },
+        "lineage_baseline_basis": baseline_basis,
+        "lineage_missing_fields": sorted(missing_fields),
+    }
+
+
+def _set_event_state(
+    qdrant: Any, collection_name: str, event_id: str, state: str,
+) -> None:
+    current = read_back_exact_records(qdrant, collection_name, [event_id])
+    payload = (current.get(event_id) or {}).get("payload") or {}
+    prior = str(payload.get("event_state") or "prepared")
+    if prior in EVENT_STATES and EVENT_STATES.index(prior) >= EVENT_STATES.index(state):
+        return
+    qdrant.update_payload(collection_name, event_id, {"event_state": state})
+
+
+def _retire_chunk_derivation_edges(
+    *, qdrant: Any, collection_name: str, retired_ids: list[str],
+    old_version_id: str | None, profile_id: str, event_id: str,
+) -> None:
+    if not retired_ids or not old_version_id:
+        return
+    edges, complete = _scroll_bounded(
+        qdrant,
+        collection_name,
+        {"must": [
+            {"key": "source_point_id", "match": {"any": retired_ids}},
+            {"key": "relation_type", "match": {"value": "DERIVED_FROM"}},
+            {"key": "profile_id", "match": {"value": profile_id}},
+        ]},
+        limit=DEFAULT_INVALIDATION_EDGES,
+        with_vector=False,
+    )
+    if not complete:
+        raise RuntimeError("retired chunk derivation lookup exceeded bound")
+    marked: list[str] = []
+    for edge in edges:
+        payload = edge.get("payload") if isinstance(edge, dict) else None
+        if not isinstance(payload, dict):
+            raise RuntimeError("retired chunk derivation payload is missing")
+        if (
+            str(payload.get("source_point_id") or "") in retired_ids
+            and str(payload.get("target_point_id") or "") == old_version_id
+            and payload.get("lineage_operation") in {"index_capture", "index_reconcile"}
+            and payload.get("target_entity_type") == "source"
+        ):
+            edge_id = str(edge.get("id") or "")
+            if not edge_id:
+                raise RuntimeError("retired chunk derivation ID is missing")
+            qdrant.update_payload(
+                collection_name, edge_id, {
+                    "lineage_retired": True,
+                    "lineage_retired_by_event_id": event_id,
+                },
+            )
+            marked.append(edge_id)
+    if marked:
+        read_back = read_back_exact_records(qdrant, collection_name, marked)
+        if any(
+            ((read_back.get(edge_id) or {}).get("payload") or {}).get("lineage_retired") is not True
+            or ((read_back.get(edge_id) or {}).get("payload") or {}).get(
+                "lineage_retired_by_event_id"
+            ) != event_id
+            for edge_id in marked
+        ):
+            raise RuntimeError("retired chunk derivation marking failed")
+
+
+def apply_reconciliation_plan(
+    *,
+    qdrant: Any,
+    collection_name: str,
+    plan: dict[str, Any],
+    chunk_points: list[dict[str, Any]],
+    lock_timeout: float = 5.0,
+    lock_dir: str = "",
+) -> dict[str, Any]:
+    """Persist one resumable W2 file transition in the mandated order."""
+    validation = validate_transition_plan(plan)
+    if not validation["valid"]:
+        raise RuntimeError(f"invalid transition plan: {validation['problems']}")
+    expected_chunk_ids = list(plan.get("new_chunk_ids") or [])
+    provided_chunk_ids = [str(point.get("id") or "") for point in chunk_points]
+    if sorted(provided_chunk_ids) != sorted(expected_chunk_ids):
+        raise RuntimeError("chunk_points do not exactly cover new_chunk_ids")
+    with collection_write_lock(
+        collection_name=collection_name, timeout=lock_timeout, lock_dir=lock_dir,
+    ):
+        baseline_ids = sorted((plan.get("baseline_snapshots") or {}).keys())
+        baseline = {
+            str(point.get("id")): point
+            for point in qdrant.retrieve(
+                collection_name, baseline_ids, with_payload=True, with_vector=True,
+            )
+        }
+        if set(baseline) != set(baseline_ids):
+            raise RuntimeError("reconciliation baseline disappeared before apply")
+        for point_id, digest in (plan.get("baseline_snapshots") or {}).items():
+            if _point_snapshot(baseline[point_id]) != digest:
+                raise RuntimeError(f"reconciliation baseline drift: {point_id}")
+
+        planned_invalidation = plan["invalidation"]
+        context = plan.get("invalidation_context") or {}
+        bounds = planned_invalidation.get("bounds") or {}
+        locked_invalidation = plan_invalidation(
+            qdrant=qdrant,
+            collection_name=collection_name,
+            root_point_ids=list(planned_invalidation.get("root_ids") or []),
+            event_id=str(plan["event_id"]),
+            profile_id=str(context.get("profile_id") or ""),
+            user_id_hash=str(context.get("user_id_hash") or ""),
+            chat_id_hash=str(context.get("chat_id_hash") or ""),
+            max_depth=int(bounds.get("max_depth", DEFAULT_INVALIDATION_DEPTH)),
+            max_points=int(bounds.get("max_points", DEFAULT_INVALIDATION_POINTS)),
+            max_edges=int(bounds.get("max_edges", DEFAULT_INVALIDATION_EDGES)),
+        )
+        if locked_invalidation.get("complete") is not True:
+            raise RuntimeError(
+                "locked invalidation closure is incomplete: "
+                + "; ".join(locked_invalidation.get("errors") or [])
+            )
+        planned_ids = set(planned_invalidation.get("dependent_ids") or [])
+        locked_ids = set(locked_invalidation.get("dependent_ids") or [])
+        if not locked_ids.issubset(planned_ids):
+            raise RuntimeError(
+                f"locked invalidation closure grew: {sorted(locked_ids - planned_ids)}"
+            )
+        if (
+            locked_invalidation.get("dependent_ids") != planned_invalidation.get("dependent_ids")
+            or locked_invalidation.get("changes") != planned_invalidation.get("changes")
+        ):
+            raise RuntimeError("locked invalidation closure changed; re-plan required")
+
+        bootstrap_event = plan.get("bootstrap_event_point")
+        if bootstrap_event:
+            bootstrap_id = str(bootstrap_event["id"])
+            qdrant.upsert(collection_name, [bootstrap_event])
+            bootstrap_read = read_back_exact_records(qdrant, collection_name, [bootstrap_id])
+            if (bootstrap_read.get(bootstrap_id) or {}).get("payload") != bootstrap_event["payload"]:
+                raise RuntimeError("W1 baseline event read-back failed")
+            qdrant.update_payload(collection_name, plan["source_point_id"], {
+                "head_event_id": bootstrap_id,
+                "pending_event_id": None,
+                "current_version_id": plan.get("old_version_id"),
+                "source_deleted": False,
+            })
+            source_read = read_back_exact_records(
+                qdrant, collection_name, [plan["source_point_id"]]
+            )
+            if ((source_read.get(plan["source_point_id"]) or {}).get("payload") or {}).get("head_event_id") != bootstrap_id:
+                raise RuntimeError("W1 baseline event head commit failed")
+
+        metadata_points = list(plan.get("metadata_points") or [])
+        source_points = [
+            point for point in metadata_points
+            if str(point["id"]) == str(plan["source_point_id"])
+        ]
+        metadata_records = [
+            point for point in metadata_points
+            if str(point["id"]) != str(plan["source_point_id"])
+        ]
+        if metadata_records:
+            qdrant.upsert(collection_name, metadata_records)
+        metadata_ids = [str(point["id"]) for point in metadata_records]
+        read_back = read_back_exact_records(qdrant, collection_name, metadata_ids)
+        if set(read_back) != set(metadata_ids):
+            raise RuntimeError("reconciliation metadata read-back is incomplete")
+        if source_points:
+            qdrant.upsert(collection_name, source_points)
+            source_read = read_back_exact_records(
+                qdrant, collection_name, [plan["source_point_id"]]
+            )
+            if plan["source_point_id"] not in source_read:
+                raise RuntimeError("reconciliation source read-back is incomplete")
+
+        invalidation_result = apply_invalidation(
+            qdrant=qdrant, collection_name=collection_name,
+            plan=locked_invalidation,
+        )
+        _set_event_state(qdrant, collection_name, plan["event_id"], "dependents_marked")
+
+        if chunk_points:
+            qdrant.upsert(collection_name, chunk_points)
+            chunks_read = {
+                str(point.get("id")): point
+                for point in qdrant.retrieve(
+                    collection_name, plan["new_chunk_ids"],
+                    with_payload=True, with_vector=False,
+                )
+            }
+            if set(chunks_read) != set(plan["new_chunk_ids"]):
+                raise RuntimeError("staged chunk read-back is incomplete")
+            for point in chunk_points:
+                actual = chunks_read[str(point["id"])].get("payload") or {}
+                expected = point.get("payload") or {}
+                if actual.get("content_hash") != expected.get("content_hash") or actual.get("lineage_pending") is not True:
+                    raise RuntimeError(f"staged chunk verification failed: {point['id']}")
+        _set_event_state(qdrant, collection_name, plan["event_id"], "chunks_staged")
+
+        for update in plan.get("root_state_updates") or []:
+            qdrant.update_payload(collection_name, update["point_id"], update["patch"])
+        retired_ids = list(plan.get("retired_ids") or [])
+        if retired_ids:
+            _retire_chunk_derivation_edges(
+                qdrant=qdrant,
+                collection_name=collection_name,
+                retired_ids=retired_ids,
+                old_version_id=plan.get("old_version_id"),
+                profile_id=str((plan.get("invalidation_context") or {}).get("profile_id") or ""),
+                event_id=str(plan["event_id"]),
+            )
+            qdrant.delete_ids(collection_name, retired_ids)
+            if qdrant.retrieve(collection_name, retired_ids, with_payload=True, with_vector=False):
+                raise RuntimeError("retired chunk IDs remain after delete")
+        _set_event_state(qdrant, collection_name, plan["event_id"], "roots_retired")
+
+        for point_id in plan.get("new_chunk_ids") or []:
+            qdrant.update_payload(collection_name, point_id, {"lineage_pending": False})
+        qdrant.update_payload(collection_name, plan["source_point_id"], dict(plan["source_commit_patch"]))
+        _set_event_state(qdrant, collection_name, plan["event_id"], "committed")
+        committed = read_back_exact_records(
+            qdrant, collection_name,
+            [plan["event_id"], plan["source_point_id"]] + list(plan.get("new_chunk_ids") or []),
+        )
+        event_payload = (committed.get(plan["event_id"]) or {}).get("payload") or {}
+        source_payload = (committed.get(plan["source_point_id"]) or {}).get("payload") or {}
+        if event_payload.get("event_state") != "committed":
+            raise RuntimeError("event commit read-back failed")
+        if source_payload.get("pending_event_id") is not None or source_payload.get("head_event_id") != plan["event_id"]:
+            raise RuntimeError("source commit read-back failed")
+        return {
+            "event_id": plan["event_id"],
+            "retired_ids": retired_ids,
+            "new_chunk_ids": list(plan.get("new_chunk_ids") or []),
+            "dependent_ids": invalidation_result["verified_ids"],
+            "committed": True,
+        }
+
+
+def resume_reconciliation(
+    *,
+    qdrant: Any,
+    collection_name: str,
+    plan: dict[str, Any],
+    chunk_points: list[dict[str, Any]],
+    lock_timeout: float = 5.0,
+    lock_dir: str = "",
+) -> dict[str, Any]:
+    """Resume the exact deterministic plan; apply is idempotent by event and ID."""
+    return apply_reconciliation_plan(
+        qdrant=qdrant, collection_name=collection_name, plan=plan,
+        chunk_points=chunk_points, lock_timeout=lock_timeout, lock_dir=lock_dir,
+    )

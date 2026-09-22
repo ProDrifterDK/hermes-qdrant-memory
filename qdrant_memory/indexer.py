@@ -13,10 +13,12 @@ from .fact_metadata import derive_fact_metadata
 from .lineage import (
     CHUNKER_VERSION,
     apply_capture_plan,
+    apply_reconciliation_plan,
     make_scope_key,
     make_source_key,
     make_version_identity_digest,
     plan_file_lineage,
+    plan_reconciliation,
     read_back_exact_records,
     source_logical_id,
     storage_point_id,
@@ -614,6 +616,12 @@ class FileIndexer:
             chunks_by_file.setdefault(chunk.file_path, []).append(chunk)
         lineage_mode = str(self.config.get("lineage_mode") or "off")
         capture = lineage_mode == "capture"
+        reconcile = lineage_mode == "reconcile"
+        invalidation_limits = {
+            "max_depth": max(0, min(16, int(self.config.get("lineage_invalidation_max_depth", 8)))),
+            "max_points": max(1, min(4096, int(self.config.get("lineage_invalidation_max_points", 4096)))),
+            "max_edges": max(1, min(8192, int(self.config.get("lineage_invalidation_max_edges", 8192)))),
+        }
         summary: dict[str, Any] = {
             "dry_run": bool(dry_run), "files_seen": prepared["files_seen"],
             "files_indexed": prepared["files_indexed"], "files_skipped": prepared["files_skipped"],
@@ -628,6 +636,7 @@ class FileIndexer:
             "lineage_edge_ids": [], "lineage_point_ids": [], "lineage_existing_ids": [],
             "lineage_repair_ids": [], "lineage_blocked_files": [],
             "lineage_acknowledged_ids": [], "lineage_read_back_ids": [],
+            "lineage_event_ids": [], "lineage_dependent_ids": [],
             "refusals": [], "foreign_scope_chunks": [],
             "lineage_coverage": {"selected_files": len(manifests), "selected_chunks": len(chunks),
                                  "eligible_files": 0, "eligible_chunks": 0,
@@ -653,7 +662,7 @@ class FileIndexer:
                 summary["partial_failure"] = True
             foreign: list[dict[str, Any]] = []
             for path, ids in sorted(foreign_ids_by_file.items()):
-                overwritten = desired_ids_by_file.get(path, set()) if not capture and path not in off_blocked_files else set()
+                overwritten = desired_ids_by_file.get(path, set()) if not capture and not reconcile and path not in off_blocked_files else set()
                 leftover_ids = ids - overwritten
                 if (leftover_ids and path not in inventory_unavailable_files
                         and (path in requested_file_paths
@@ -683,60 +692,97 @@ class FileIndexer:
                         str(point["id"]) for point in existing
                         if point.get("id") is not None and str(point["id"]) not in owned_ids
                     )
-                    if capture:
+                    if capture or reconcile:
                         scope_key = make_scope_key(
                             collection_name=self.collection_name, profile_id=self.profile_id,
                             user_id_hash=self.user_id_hash, chat_id_hash=self.chat_id_hash)
                         source_key = make_source_key(scope_key=scope_key, resolved_file_path=file_path)
                         source_id = storage_point_id(source_logical_id(source_key=source_key, profile_id=self.profile_id))
-                        version_digest = make_version_identity_digest(
-                            source_key=source_key,
-                            file_sha256=str(manifest_by_path[file_path]["file_sha256"]),
-                        )
-                        version_id = storage_point_id(version_logical_id(
-                            version_identity_digest=version_digest, profile_id=self.profile_id))
-                        graph_records = read_back_exact_records(
-                            self.qdrant, self.collection_name, [source_id, version_id])
-                        plan = plan_file_lineage(
-                            collection_name=self.collection_name, profile_id=self.profile_id,
-                            user_id_hash=self.user_id_hash, chat_id_hash=self.chat_id_hash,
-                            manifest=manifest_by_path[file_path], chunks=chunks_by_file[file_path],
-                            existing_points=owned, existing_source=graph_records.get(source_id),
-                            existing_version=graph_records.get(version_id),
-                            ownership_errors=ownership_errors,
-                        )
-                        plans.append(plan)
-                        summary["lineage_files"].append({
-                            key: plan[key] for key in ("file_path", "lineage_baseline_basis",
-                                                       "lineage_missing_fields", "lineage_blocked_reason",
-                                                       "lineage_history_complete")
-                        })
-                        for key in ("lineage_entity_ids", "lineage_edge_ids", "lineage_point_ids", "lineage_existing_ids"):
-                            summary[key].extend(plan[key])
-                        if plan["capturable"]:
-                            summary["lineage_coverage"]["eligible_files"] += 1
-                            summary["lineage_coverage"]["eligible_chunks"] += len(chunks_by_file[file_path])
-                            graph_existing = read_back_exact_records(self.qdrant, self.collection_name, plan["lineage_point_ids"])
-                            plan["lineage_repair_ids"] = (
-                                [] if plan["is_new"]
-                                else sorted(set(plan["lineage_point_ids"]) - set(graph_existing))
+                        if capture:
+                            version_digest = make_version_identity_digest(
+                                source_key=source_key,
+                                file_sha256=str(manifest_by_path[file_path]["file_sha256"]),
                             )
-                            if dry_run:
-                                summary["lineage_repair_ids"].extend(plan["lineage_repair_ids"])
-                        else:
-                            blocked = summary["lineage_files"][-1]
-                            summary["lineage_blocked_files"].append(blocked)
-                            summary["refused"] = True
-                            summary["refusals"].append({
-                                "file_path": file_path,
-                                "reason": str(plan["lineage_blocked_reason"]),
+                            version_id = storage_point_id(version_logical_id(
+                                version_identity_digest=version_digest, profile_id=self.profile_id))
+                            graph_records = read_back_exact_records(
+                                self.qdrant, self.collection_name, [source_id, version_id])
+                            plan = plan_file_lineage(
+                                collection_name=self.collection_name, profile_id=self.profile_id,
+                                user_id_hash=self.user_id_hash, chat_id_hash=self.chat_id_hash,
+                                manifest=manifest_by_path[file_path], chunks=chunks_by_file[file_path],
+                                existing_points=owned, existing_source=graph_records.get(source_id),
+                                existing_version=graph_records.get(version_id),
+                                ownership_errors=ownership_errors,
+                            )
+                            plan["kind"] = "capture"
+                            plans.append(plan)
+                            summary["lineage_files"].append({
+                                key: plan[key] for key in ("file_path", "lineage_baseline_basis",
+                                                           "lineage_missing_fields", "lineage_blocked_reason",
+                                                           "lineage_history_complete")
                             })
-                            if plan["lineage_baseline_basis"] == "missing_indexed_file_sha256":
-                                summary["lineage_coverage"]["legacy_blocked_files"] += 1
-                                summary["lineage_coverage"]["legacy_blocked_chunks"] += len(owned)
+                            for key in ("lineage_entity_ids", "lineage_edge_ids", "lineage_point_ids", "lineage_existing_ids"):
+                                summary[key].extend(plan[key])
+                            if plan["capturable"]:
+                                summary["lineage_coverage"]["eligible_files"] += 1
+                                summary["lineage_coverage"]["eligible_chunks"] += len(chunks_by_file[file_path])
+                                graph_existing = read_back_exact_records(self.qdrant, self.collection_name, plan["lineage_point_ids"])
+                                plan["lineage_repair_ids"] = (
+                                    [] if plan["is_new"]
+                                    else sorted(set(plan["lineage_point_ids"]) - set(graph_existing))
+                                )
+                                if dry_run:
+                                    summary["lineage_repair_ids"].extend(plan["lineage_repair_ids"])
+                            else:
+                                blocked = summary["lineage_files"][-1]
+                                summary["lineage_blocked_files"].append(blocked)
+                                summary["refused"] = True
+                                summary["refusals"].append({
+                                    "file_path": file_path,
+                                    "reason": str(plan["lineage_blocked_reason"]),
+                                })
+                                if plan["lineage_baseline_basis"] == "missing_indexed_file_sha256":
+                                    summary["lineage_coverage"]["legacy_blocked_files"] += 1
+                                    summary["lineage_coverage"]["legacy_blocked_chunks"] += len(owned)
+                        else:
+                            source_record = read_back_exact_records(
+                                self.qdrant, self.collection_name, [source_id]
+                            ).get(source_id)
+                            plan = plan_reconciliation(
+                                qdrant=self.qdrant, collection_name=self.collection_name,
+                                profile_id=self.profile_id, user_id_hash=self.user_id_hash,
+                                chat_id_hash=self.chat_id_hash, file_path=file_path,
+                                manifest=manifest_by_path[file_path], chunks=chunks_by_file[file_path],
+                                existing_points=owned, existing_source=source_record,
+                                ownership_errors=ownership_errors,
+                                **invalidation_limits,
+                            )
+                            plan["kind"] = "reconcile"
+                            plans.append(plan)
+                            entry = {
+                                "file_path": file_path,
+                                "lineage_baseline_basis": plan.get("lineage_baseline_basis", "incomplete_indexed_provenance"),
+                                "lineage_missing_fields": plan.get("lineage_missing_fields", []),
+                                "lineage_blocked_reason": "" if plan.get("complete") else "; ".join(plan.get("errors") or []),
+                                "lineage_history_complete": False,
+                                "event_kind": plan.get("event_kind"),
+                                "event_id": plan.get("event_id"),
+                            }
+                            summary["lineage_files"].append(entry)
+                            if plan.get("complete"):
+                                summary["lineage_coverage"]["eligible_files"] += 1
+                                summary["lineage_coverage"]["eligible_chunks"] += len(chunks_by_file[file_path])
+                                if plan.get("event_id"):
+                                    summary["lineage_event_ids"].append(plan["event_id"])
+                                summary["lineage_dependent_ids"].extend((plan.get("invalidation") or {}).get("dependent_ids") or [])
+                            else:
+                                summary["lineage_blocked_files"].append(entry)
+                                summary["refused"] = True
+                                summary["refusals"].append({"file_path": file_path, "reason": entry["lineage_blocked_reason"]})
                     desired = {chunk.id for chunk in chunks_by_file[file_path]}
                     desired_ids_by_file[file_path] = desired
-                    if not capture:
+                    if not capture and not reconcile:
                         lineage_managed = any(
                             any((point.get("payload") or {}).get(key) not in (None, "")
                                 for key in ("file_version_id", "lineage_entity_id", "lineage_schema_version"))
@@ -767,7 +813,7 @@ class FileIndexer:
                 except Exception as exc:
                     summary["errors"].append({"file_path": file_path, "error": f"manifest sync failed: {exc}"})
                     summary["partial_failure"] = True
-                    if not capture:
+                    if not capture and not reconcile:
                         reason = "lineage_inventory_unavailable_refused_fail_closed"
                         blocked = {
                             "file_path": file_path,
@@ -785,7 +831,8 @@ class FileIndexer:
                         summary["refusals"].append({"file_path": file_path, "reason": reason})
 
             roots = requested_directory_roots
-            if roots and not prepared.get("max_files_truncated"):
+            if (roots and not prepared.get("max_files_truncated")
+                    and (not reconcile or not prepared.get("errors"))):
                 summary["directory_manifest_checked"] = True
                 summary["directory_roots_checked"] = [str(root) for root in roots]
                 try:
@@ -807,14 +854,14 @@ class FileIndexer:
                                 and str(point_id) not in owned_directory_ids
                                 and any(is_path_within(path, root) for root in roots)):
                             foreign_ids_by_file.setdefault(path, set()).add(str(point_id))
-                    deleted: dict[str, list[str]] = {}
+                    deleted: dict[str, list[dict[str, Any]]] = {}
                     for point in existing_chunks:
                         payload = point.get("payload") or {}
                         path, point_id = str(payload.get("file_path") or ""), point.get("id")
                         if not path or point_id is None or path in desired_ids_by_file or Path(path).exists():
                             continue
                         if any(is_path_within(path, root) for root in roots):
-                            if not capture and any(payload.get(key) not in (None, "") for key in (
+                            if not capture and not reconcile and any(payload.get(key) not in (None, "") for key in (
                                 "file_version_id", "lineage_entity_id", "lineage_schema_version"
                             )):
                                 if path not in off_blocked_files:
@@ -834,8 +881,27 @@ class FileIndexer:
                                         "reason": "lineage_managed_requires_capture_or_retirement",
                                     })
                                 continue
-                            deleted.setdefault(path, []).append(str(point_id))
-                    for path, ids in sorted(deleted.items()):
+                            deleted.setdefault(path, []).append(point)
+                    if reconcile:
+                        source_filter = {"must": [
+                            {"key": "lineage_role", "match": {"value": "file_source"}},
+                            {"key": "profile_id", "match": {"value": self.profile_id}},
+                        ]}
+                        for source in self.qdrant.scroll_by_filter(
+                            self.collection_name, source_filter, limit=256,
+                            with_payload=True, with_vector=False,
+                        ):
+                            payload = source.get("payload") or {}
+                            path = str(payload.get("file_path") or "")
+                            if (not path or payload.get("source_deleted") is True
+                                    or path in desired_ids_by_file or path in deleted or Path(path).exists()
+                                    or payload.get("user_id_hash", "") != self.user_id_hash
+                                    or payload.get("chat_id_hash", "") != self.chat_id_hash
+                                    or not any(is_path_within(path, root) for root in roots)):
+                                continue
+                            deleted[path] = []
+                    for path, old_points in sorted(deleted.items()):
+                        ids = [str(point["id"]) for point in old_points]
                         summary["deleted_file_paths"].append(path)
                         summary["deleted_file_ids"].extend(ids)
                         if capture:
@@ -852,6 +918,43 @@ class FileIndexer:
                                 "file_path": path,
                                 "reason": "retirement_requires_reconcile",
                             })
+                        elif reconcile:
+                            scope_key = make_scope_key(
+                                collection_name=self.collection_name, profile_id=self.profile_id,
+                                user_id_hash=self.user_id_hash, chat_id_hash=self.chat_id_hash)
+                            source_key = make_source_key(scope_key=scope_key, resolved_file_path=path)
+                            source_id = storage_point_id(source_logical_id(source_key=source_key, profile_id=self.profile_id))
+                            source_record = read_back_exact_records(
+                                self.qdrant, self.collection_name, [source_id]
+                            ).get(source_id)
+                            plan = plan_reconciliation(
+                                qdrant=self.qdrant, collection_name=self.collection_name,
+                                profile_id=self.profile_id, user_id_hash=self.user_id_hash,
+                                chat_id_hash=self.chat_id_hash, file_path=path,
+                                manifest=None, chunks=[], existing_points=old_points,
+                                existing_source=source_record,
+                                **invalidation_limits,
+                            )
+                            plan["kind"] = "reconcile"
+                            plans.append(plan)
+                            entry = {
+                                "file_path": path,
+                                "lineage_baseline_basis": plan.get("lineage_baseline_basis", "incomplete_indexed_provenance"),
+                                "lineage_missing_fields": plan.get("lineage_missing_fields", []),
+                                "lineage_blocked_reason": "" if plan.get("complete") else "; ".join(plan.get("errors") or []),
+                                "lineage_history_complete": False,
+                                "event_kind": plan.get("event_kind"),
+                                "event_id": plan.get("event_id"),
+                            }
+                            summary["lineage_files"].append(entry)
+                            if plan.get("complete"):
+                                if plan.get("event_id"):
+                                    summary["lineage_event_ids"].append(plan["event_id"])
+                                summary["lineage_dependent_ids"].extend((plan.get("invalidation") or {}).get("dependent_ids") or [])
+                            else:
+                                summary["lineage_blocked_files"].append(entry)
+                                summary["refused"] = True
+                                summary["refusals"].append({"file_path": path, "reason": entry["lineage_blocked_reason"]})
                         else:
                             stale_ids.extend(ids)
                     summary["files_with_stale_chunks"] += len(deleted)
@@ -859,10 +962,10 @@ class FileIndexer:
                     summary["errors"].append({"error": f"directory manifest sync failed: {exc}"})
                     summary["partial_failure"] = True
 
-        if capture and not manifest_capable:
+        if (capture or reconcile) and not manifest_capable:
             summary["refused"] = True
             summary["refusals"].append({"reason": "lineage_capture_requires_exact_scroll_support"})
-        if not capture and force and manifest_capable:
+        if not capture and not reconcile and force and manifest_capable:
             for file_path in sorted(set(desired_ids_by_file) - off_blocked_files):
                 stale_ids.extend(existing_ids_by_file[file_path] or [])
         stale_ids = list(dict.fromkeys(stale_ids))
@@ -870,7 +973,7 @@ class FileIndexer:
         force_filter_paths: list[str] = []
         if stale_ids:
             summary["delete_mode"] = "ids"
-        elif (not capture and force and not manifest_capable and desired_ids_by_file
+        elif (not capture and not reconcile and force and not manifest_capable and desired_ids_by_file
               and hasattr(self.qdrant, "delete_filter")):
             candidates = sorted(set(desired_ids_by_file) - off_blocked_files)
             if candidates and (not self.user_id_hash or not self.chat_id_hash):
@@ -887,7 +990,7 @@ class FileIndexer:
         if dry_run:
             summary["errors"] = summary["errors"][:20]
             return finish()
-        if not self.qdrant or (not capture and chunks and not self.embeddings):
+        if not self.qdrant or (not capture and not reconcile and chunks and not self.embeddings):
             summary["errors"].append({"error": "qdrant and embeddings are required when dry_run is false"})
             summary["partial_failure"] = True
             return finish()
@@ -938,6 +1041,59 @@ class FileIndexer:
                     summary["partial_failure"] = True
             summary["lineage_acknowledged_ids"] = sorted(set(summary["lineage_acknowledged_ids"]))
             summary["lineage_read_back_ids"] = sorted(set(summary["lineage_read_back_ids"]))
+            summary["errors"] = summary["errors"][:20]
+            return finish()
+
+        if reconcile:
+            for plan in plans:
+                if plan.get("kind") != "reconcile" or not plan.get("complete") or plan.get("noop"):
+                    continue
+                plan_chunks = chunks_by_file.get(plan["file_path"], [])
+                points: list[dict[str, Any]] = []
+                try:
+                    new_ids = set(plan.get("new_chunk_ids") or [])
+                    for chunk in plan_chunks:
+                        if chunk.id not in new_ids:
+                            continue
+                        if not self.embeddings:
+                            raise RuntimeError("embeddings are required for new reconciliation chunks")
+                        payload = chunk.payload(
+                            profile_id=self.profile_id, platform=self.platform,
+                            session_id=self.session_id, user_id_hash=self.user_id_hash,
+                            chat_id_hash=self.chat_id_hash, project_path=self.project_path,
+                            model=self.model,
+                        )
+                        points.append({
+                            "id": chunk.id,
+                            "vector": self.embeddings.embed_document(chunk.text),
+                            "payload": payload,
+                        })
+                    applied = apply_reconciliation_plan(
+                        qdrant=self.qdrant, collection_name=self.collection_name,
+                        plan=plan, chunk_points=points,
+                        lock_timeout=float(self.config.get("lineage_lock_timeout_seconds", 5.0)),
+                        lock_dir=str(self.config.get("lineage_lock_dir") or ""),
+                    )
+                    summary["lineage_acknowledged_ids"].extend(
+                        [applied["event_id"], *applied["new_chunk_ids"]]
+                    )
+                    summary["lineage_read_back_ids"].extend(
+                        [applied["event_id"], plan["source_point_id"], *applied["new_chunk_ids"]]
+                    )
+                    summary["lineage_dependent_ids"].extend(applied["dependent_ids"])
+                    summary["chunks_upserted"] += len(applied["new_chunk_ids"])
+                    summary["chunks_deleted"] += len(applied["retired_ids"])
+                    summary["lineage_coverage"]["captured_files"] += 1
+                    summary["lineage_coverage"]["captured_chunks"] += len(plan_chunks)
+                except Exception as exc:
+                    summary["errors"].append({
+                        "file_path": plan["file_path"],
+                        "error": f"lineage reconciliation failed: {exc}",
+                    })
+                    summary["partial_failure"] = True
+            for key in ("lineage_acknowledged_ids", "lineage_read_back_ids",
+                        "lineage_event_ids", "lineage_dependent_ids"):
+                summary[key] = sorted(set(summary[key]))
             summary["errors"] = summary["errors"][:20]
             return finish()
 

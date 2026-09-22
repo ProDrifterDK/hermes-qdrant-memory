@@ -1024,3 +1024,28 @@ retire or delete lineage state.
   particular, `_tool_forget` treats an empty-string `dry_run` value as false and
   can perform a live delete. Callers must omit the argument or send an actual
   boolean until a separate bounded fix closes that interface.
+
+---
+
+## 22. Lineage W2 — the dependency fence is profile-scoped
+
+The destructive-operation dependency fence (`find_direct_dependents`, used by the
+consolidation apply fence, `qdrant_memory_forget`, and the reconcile lineage-impact
+snapshot) matches dependents inside a single scope: `profile_id`, `user_id_hash`
+and `chat_id_hash` must equal the caller's. A dependency edge whose `profile_id`
+belongs to a **different profile** is therefore invisible to the fence.
+
+This boundary is a recorded decision, not an accident:
+
+- A dependent that lives in another profile does **not** block a forget or a
+  destructive consolidation. The named target is deleted and the out-of-profile
+  edge is left pointing at a missing target.
+- The boundary already applied to the consolidation fence, and
+  `qdrant_memory_forget` inherits it because it reuses the same lookup.
+- Widening the fence would mean reading and reasoning about records outside the
+  caller's profile, so no broadening is done.
+
+Operators sharing one collection across profiles must treat a cross-profile
+dependency as unenforced: the fence is a per-profile safety check, not a
+collection-wide referential-integrity guarantee.
+
