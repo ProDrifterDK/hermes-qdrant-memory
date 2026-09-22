@@ -1371,8 +1371,12 @@ class QdrantMemoryProvider(MemoryProvider):
                 # Log the refusal clauses, not a prefix of the whole payload: the
                 # errno and the lock path are the diagnosis, and a summary dump capped
                 # at 600 chars loses them as soon as the indexer reports real paths.
+                # The per-clause cap exists only to bound a pathological marker-bearing
+                # string; it sits far above PATH_MAX plus the longest wording, because
+                # the lock path is the LAST thing in the clause and a tighter cap would
+                # silently truncate the very detail this log exists to preserve.
                 for refusal in collect_lock_refusals(summary):
-                    logger.warning("%s: %s", _LOCK_REFUSAL_REDACTED, refusal[:400])
+                    logger.warning("%s: %s", _LOCK_REFUSAL_REDACTED, refusal[:4200])
             return json.dumps(redacted)
         except Exception as exc:
             raw = f"Index failed: {exc}"

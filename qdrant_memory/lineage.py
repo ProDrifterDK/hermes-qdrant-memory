@@ -1854,8 +1854,11 @@ def redact_lock_refusals(value: Any) -> Any:
         return value[:offset] + LINEAGE_LOCK_UNAVAILABLE
     if isinstance(value, dict):
         return {key: redact_lock_refusals(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [redact_lock_refusals(item) for item in value]
+    if isinstance(value, (list, tuple)):
+        # Tuples are walked by collect_lock_refusals, so they have to be redacted
+        # too: an asymmetry between the two would log a refusal it never removes.
+        redacted = [redact_lock_refusals(item) for item in value]
+        return tuple(redacted) if isinstance(value, tuple) else redacted
     return value
 
 
@@ -1905,12 +1908,18 @@ def collection_write_lock(
         Path(resolved_lock_dir) if resolved_lock_dir
         else Path(f"/tmp/hermes-qdrant-lineage-{uid}")
     )
-    if directory.is_symlink():
-        raise RuntimeError("lineage lock directory must not be a symlink")
     try:
+        # The symlink check runs inside the guard on purpose. `Path.is_symlink`
+        # swallows only ENOENT/ENOTDIR/EBADF/ELOOP and re-raises everything else
+        # (EACCES on an unsearchable parent component, ENAMETOOLONG for an over-long
+        # one), which would leave this helper as a bare OSError and reach a tool
+        # response with the errno and the lock-directory path. A path containing a NUL
+        # byte raises ValueError for the same reason: it is a refusal, not a crash.
+        if directory.is_symlink():
+            raise RuntimeError("lineage lock directory must not be a symlink")
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         info = directory.stat(follow_symlinks=False)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise RuntimeError(f"lineage lock directory unavailable: {exc}") from exc
     if (info.st_uid != uid or not stat.S_ISDIR(info.st_mode)
             or stat.S_IMODE(info.st_mode) & 0o077):
@@ -1926,11 +1935,11 @@ def collection_write_lock(
     # errno and the lock-file path into a tool response.
     try:
         fd = os.open(path, flags, 0o600)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise RuntimeError(f"lineage lock file unavailable: {exc}") from exc
     try:
         handle = os.fdopen(fd, "a+")
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         try:
             os.close(fd)
         except OSError:  # pragma: no cover - best effort while already failing
@@ -1939,7 +1948,7 @@ def collection_write_lock(
     try:
         try:
             info = os.fstat(handle.fileno())
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             raise RuntimeError(f"lineage lock file unavailable: {exc}") from exc
         if info.st_uid != uid or not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
             raise RuntimeError("lineage lock file has unsafe ownership, type, or permissions")
@@ -1952,7 +1961,7 @@ def collection_write_lock(
                 if time.monotonic() >= deadline:
                     raise TimeoutError("lineage collection lock acquisition timed out")
                 time.sleep(0.05)
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
                 # Any other errno (ENOLCK on NFS, EINVAL, EBADF) is a refusal too.
                 raise RuntimeError(f"lineage lock file unavailable: {exc}") from exc
         yield path

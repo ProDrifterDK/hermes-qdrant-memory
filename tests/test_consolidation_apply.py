@@ -2749,8 +2749,10 @@ def test_redactor_collapses_every_marker_and_keeps_marker_shaped_data():
 
     fixed = "lineage capture failed: lineage collection lock unavailable"
     # Presence is part of the contract: a marker dropped from the tuple stops
-    # redacting that shape on every surface at once.
-    assert set(LINEAGE_LOCK_REFUSAL_MARKERS) == {
+    # redacting that shape on every surface at once. A superset, not equality: the
+    # contract is "every wording the helper can emit is redacted", so a ninth wording
+    # must be allowed to arrive with its own test rather than forcing an edit here.
+    assert set(LINEAGE_LOCK_REFUSAL_MARKERS) >= {
         "lineage collection lock acquisition timed out",
         "lineage lock directory unavailable",
         "lineage lock directory must not be a symlink",
@@ -2794,6 +2796,183 @@ def test_collect_lock_refusals_walks_the_payload_and_skips_data_markers():
     }
 
     assert collect_lock_refusals(payload) == [raw, raw]
+
+
+# ===========================================================================
+# W2 closure review (delta 7) H1/H2/H3 + I2: the lock-directory lstat, the
+# clause log cap, NUL-byte paths and the guard sites that had no pin.
+# ===========================================================================
+
+def test_lock_directory_lstat_failure_never_reaches_the_tool_response(tmp_path):
+    """H1: `Path.is_symlink` re-raises EACCES/ENAMETOOLONG, so it must sit in the guard."""
+    unsearchable = tmp_path / "unsearchable-parent"
+    unsearchable.mkdir()
+    cases = [unsearchable / "locks", tmp_path / ("x" * 300) / "locks"]
+    try:
+        os.chmod(unsearchable, 0o000)
+        for lock_dir in cases:
+            provider, _ = _locked_provider(tmp_path)
+            provider._config["lineage_lock_dir"] = str(lock_dir)
+            try:
+                text = provider.handle_tool_call(
+                    "qdrant_memory_forget",
+                    {"ids": ["00000000-0000-0000-0000-000000000001"], "dry_run": False},
+                )
+            finally:
+                if lock_dir == cases[0]:
+                    os.chmod(unsearchable, 0o700)
+            assert json.loads(text) == {"error": LINEAGE_LOCK_FIXED_TEXT}
+            assert "Errno" not in text
+            assert str(lock_dir) not in text
+    finally:
+        os.chmod(unsearchable, 0o700)
+
+
+def test_nul_byte_in_the_lock_dir_is_a_refusal_not_a_value_error(tmp_path):
+    """H3: a NUL byte raises ValueError from the path calls; it is still a refusal."""
+    provider, _ = _locked_provider(tmp_path)
+    provider._config["lineage_lock_dir"] = f"{tmp_path}/locks\x00tail"
+
+    text = provider.handle_tool_call(
+        "qdrant_memory_forget",
+        {"ids": ["00000000-0000-0000-0000-000000000001"], "dry_run": False},
+    )
+
+    assert json.loads(text) == {"error": LINEAGE_LOCK_FIXED_TEXT}
+    assert "embedded null byte" not in text
+
+
+def test_every_lock_file_guard_site_is_normalized_and_releases_the_fd(tmp_path, monkeypatch):
+    """I2: only the `os.open` path had a pin; fdopen and fstat had none."""
+    import errno
+
+    import qdrant_memory.lineage as lineage_module
+    from qdrant_memory.lineage import collection_write_lock
+
+    lock_dir = Path(tmp_path) / "locks"
+    lock_dir.mkdir(mode=0o700)
+    handed_out = []
+
+    class OsWithFstatBoom:
+        def __init__(self, real):
+            self._real = real
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def fstat(self, *args, **kwargs):
+            raise OSError(errno.EIO, "Input/output error")
+
+    real_fdopen = os.fdopen
+
+    def fdopen_boom(fd, *args, **kwargs):
+        handed_out.append(fd)
+        raise OSError(errno.EIO, "Input/output error")
+
+    # fdopen failure: the descriptor must be closed on the way out.
+    monkeypatch.setattr(os, "fdopen", fdopen_boom)
+    with pytest.raises(RuntimeError) as excinfo:
+        with collection_write_lock(collection_name="memory", timeout=0.2, lock_dir=str(lock_dir)):
+            raise AssertionError("the lock must not be acquired when fdopen fails")
+    monkeypatch.setattr(os, "fdopen", real_fdopen)
+    assert str(excinfo.value).startswith("lineage lock file unavailable:")
+    assert handed_out, "the fdopen guard did not run"
+    with pytest.raises(OSError):
+        os.fstat(handed_out[-1])  # closed, not leaked
+
+    # fstat failure: normalized like every other lock-file failure.
+    monkeypatch.setattr(lineage_module, "os", OsWithFstatBoom(os))
+    with pytest.raises(RuntimeError) as excinfo:
+        with collection_write_lock(collection_name="memory", timeout=0.2, lock_dir=str(lock_dir)):
+            raise AssertionError("the lock must not be acquired when fstat fails")
+    assert str(excinfo.value).startswith("lineage lock file unavailable:")
+
+
+def test_flock_failure_is_normalized_and_cleanup_does_not_strand_the_lock(tmp_path, monkeypatch):
+    """I2: the non-blocking flock errno path and the swallowed cleanup, pinned together."""
+    import errno
+    import fcntl
+
+    from qdrant_memory.lineage import collection_write_lock
+
+    lock_dir = Path(tmp_path) / "locks"
+    lock_dir.mkdir(mode=0o700)
+    real_flock = fcntl.flock
+
+    def flock_enolck(fd, operation):
+        raise OSError(errno.ENOLCK, "No locks available")
+
+    monkeypatch.setattr(fcntl, "flock", flock_enolck)
+    with pytest.raises(RuntimeError) as excinfo:
+        with collection_write_lock(collection_name="memory", timeout=0.2, lock_dir=str(lock_dir)):
+            raise AssertionError("the lock must not be acquired when flock fails")
+    assert str(excinfo.value).startswith("lineage lock file unavailable:")
+
+    # Cleanup: unlock fails, close succeeds. The context must exit cleanly and the
+    # kernel must release the flock with the closed description.
+    def unlock_boom(fd, operation):
+        if operation == fcntl.LOCK_UN:
+            raise OSError(errno.EIO, "Input/output error")
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(fcntl, "flock", unlock_boom)
+    with collection_write_lock(collection_name="memory", timeout=0.2, lock_dir=str(lock_dir)):
+        pass  # no exception out of the context despite the failed unlock
+    monkeypatch.setattr(fcntl, "flock", real_flock)
+
+    handle = os.open(_lock_file(lock_dir), os.O_RDWR | os.O_CREAT)
+    try:
+        real_flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)  # would raise if still held
+        real_flock(handle, fcntl.LOCK_UN)
+    finally:
+        os.close(handle)
+
+
+def test_a_long_lock_path_survives_the_clause_log(monkeypatch, tmp_path, caplog):
+    """H2: the lock path is the last thing in the clause, so a tight cap eats it."""
+    provider, _ = _locked_provider(tmp_path)
+    long_lock_dir = str(Path(tmp_path) / ("deep-" + "d" * 550))
+    provider._config["lineage_lock_dir"] = long_lock_dir
+    refusal = (
+        "lineage capture failed: lineage lock directory unavailable: "
+        f"[Errno 20] Not a directory: '{long_lock_dir}'"
+    )
+
+    def fake_index(self, paths, **kwargs):
+        return {
+            "dry_run": False,
+            "files_seen": 1,
+            "directory_roots_checked": ["/root"],
+            "errors": [{"file_path": "/root/note.md", "error": refusal}],
+        }
+
+    monkeypatch.setattr("__init__.FileIndexer.index", fake_index)
+    with caplog.at_level(logging.WARNING, logger="__init__"):
+        text = provider.handle_tool_call(
+            "qdrant_memory_index", {"paths": ["/notes/a.md"], "dry_run": False, "force": True},
+        )
+
+    assert long_lock_dir not in text
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert len(long_lock_dir) > 550
+    assert f"'{long_lock_dir}'" in logged  # the path, complete, in the log
+
+
+def test_the_redactor_and_the_walker_agree_on_tuples():
+    """I2: the walker already recursed into tuples; the redactor did not."""
+    from qdrant_memory.lineage import collect_lock_refusals, redact_lock_refusals
+
+    raw = "lineage capture failed: lineage lock file unavailable: [Errno 37] No locks available"
+    payload = {"a": (raw, "plain"), "b": [raw]}
+
+    assert collect_lock_refusals(payload) == [raw, raw]
+    redacted = redact_lock_refusals(payload)
+    assert redacted == {
+        "a": ("lineage capture failed: lineage collection lock unavailable", "plain"),
+        "b": ["lineage capture failed: lineage collection lock unavailable"],
+    }
+    assert isinstance(redacted["a"], tuple)
+
 
 
 

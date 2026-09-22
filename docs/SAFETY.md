@@ -1058,14 +1058,18 @@ string: `lineage collection lock unavailable`. The constant, the refusal excepti
 (`LineageLockUnavailable`) and the redactor live next to the lock helper in
 `qdrant_memory/lineage.py` as the single source.
 
-- The helper normalizes its own OS failures: the lock *directory* and the lock *file*
-  both report a refusal marker (`lineage lock directory unavailable`,
-  `lineage lock file unavailable`) instead of letting a bare `OSError` out. That
-  matters in both directions: an `OSError` is neither `TimeoutError` nor
-  `RuntimeError`, so it would bypass the callers' normalization *and* the response
-  redaction at the same time. Cleanup (unlock, close) is best-effort on purpose —
-  the kernel releases the flock when the file description closes, so a failed unlock
-  must not mask the body's exception nor turn a completed write into a refusal.
+- The helper normalizes its own OS failures: the lock *directory* check (including
+  its symlink test, whose `lstat` re-raises `EACCES` on an unsearchable parent
+  component and `ENAMETOOLONG` for an over-long one) and the lock *file*
+  (`open`/`fdopen`/`fstat`/`flock`) both report a refusal marker instead of letting a
+  bare `OSError` or `ValueError` out (`lineage lock directory unavailable`,
+  `lineage lock file unavailable`). A NUL byte in the configured path is a refusal
+  for the same reason. This matters in both directions: neither an `OSError` nor a
+  `ValueError` is a `TimeoutError`/`RuntimeError`, so either would bypass the callers'
+  normalization *and* the response redaction at the same time. Cleanup (unlock,
+  close) is best-effort on purpose — the kernel releases the flock when the file
+  description closes, so a failed unlock must not mask the body's exception nor turn
+  a completed write into a refusal.
 - The consolidation fence, `qdrant_memory_forget` and the locked-upsert writers
   (extraction approval, improve apply, RAPTOR apply) return that text, with the
   writers keeping only an operation prefix. Each normalizes the acquisition only,
