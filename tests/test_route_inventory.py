@@ -254,9 +254,16 @@ _declare(["backup create", "eval-capture"], "read_only",
 
 
 # --- frozen classification -------------------------------------------------
-# A hand-written classification that nothing defends is a claim surface. These two maps
-# are the contract: a row reclassified away from `protection`, or a pin list trimmed,
-# fails here even though every individual route still looks fine.
+# A hand-written classification that nothing defends is a claim surface. These maps are
+# the contract: a row reclassified away from `protection`, or a pin list trimmed, fails
+# here even though every individual route still looks fine.
+#
+# The pin lists in EXPECTED_PROTECTION_ROUTES are written out as literals on purpose.
+# Referencing the constants above would compare each list with itself, so trimming a
+# constant (or a row's `pins=`) would move both sides together and the frozen map would
+# survive its own mutation. That is the defect this file exists to catch, one level up:
+# a check that reads the same source twice is not a check. Because these are duplicates,
+# adding a pin means updating both the constant and this literal.
 
 # The derived surface — 25 tools, 50 CLI commands, 12 provider hooks. A route added or
 # removed changes this number, which forces someone to touch this file and classify it,
@@ -264,22 +271,86 @@ _declare(["backup create", "eval-capture"], "read_only",
 FROZEN_SURFACE_SIZE = 87
 
 EXPECTED_PROTECTION_ROUTES = {
-    "qdrant_memory_store": STORE_PINS,
-    "store": STORE_PINS,
-    "qdrant_memory_forget": FORGET_PINS,
-    "forget": FORGET_PINS,
-    "qdrant_memory_extraction_approve": EXTRACTION_PINS,
-    "learning approve": EXTRACTION_PINS,
-    "restore": RESTORE_PINS,
-    "qdrant_memory_index [off]": INDEX_OFF_PINS,
-    "index [off]": INDEX_OFF_PINS,
-    "qdrant_memory_consolidation_apply": CONSOLIDATION_PINS,
-    "apply": CONSOLIDATION_PINS,
-    "qdrant_learning_store": LEARNING_STORE_PINS,
-    "learning store": LEARNING_STORE_PINS,
-    "qdrant_learning_approve": LEARNING_STORE_PINS,
-    "watcher run": GUARDED_AUTO_PINS,
-    "sync_turn": SYNC_TURN_PINS,
+    "qdrant_memory_store": (
+        "tests/test_consolidation_apply.py::test_store_refuses_to_overwrite_a_protected_point_in_every_mode",
+        "tests/test_consolidation_apply.py::test_store_refuses_a_history_only_dependent_in_every_mode",
+        "tests/test_consolidation_apply.py::test_store_fails_closed_when_the_target_cannot_be_read",
+        "tests/test_consolidation_apply.py::test_store_answers_the_retirement_text_for_a_point_that_carries_both",
+    ),
+    "store": (
+        "tests/test_consolidation_apply.py::test_store_refuses_to_overwrite_a_protected_point_in_every_mode",
+        "tests/test_consolidation_apply.py::test_store_refuses_a_history_only_dependent_in_every_mode",
+        "tests/test_consolidation_apply.py::test_store_fails_closed_when_the_target_cannot_be_read",
+        "tests/test_consolidation_apply.py::test_store_answers_the_retirement_text_for_a_point_that_carries_both",
+    ),
+    "qdrant_memory_forget": (
+        "tests/test_consolidation_apply.py::test_structural_lineage_refusal_wording_is_caller_agnostic",
+        "tests/test_consolidation_apply.py::test_a_demoted_dependent_stays_retirable",
+        "tests/test_consolidation_apply.py::test_forget_refuses_any_dependent_and_deletes_all_clear_targets",
+        "tests/test_consolidation_apply.py::test_forget_lock_contention_refuses_without_any_write_and_respects_timeout",
+    ),
+    "forget": (
+        "tests/test_consolidation_apply.py::test_structural_lineage_refusal_wording_is_caller_agnostic",
+        "tests/test_consolidation_apply.py::test_a_demoted_dependent_stays_retirable",
+        "tests/test_consolidation_apply.py::test_forget_refuses_any_dependent_and_deletes_all_clear_targets",
+        "tests/test_consolidation_apply.py::test_forget_lock_contention_refuses_without_any_write_and_respects_timeout",
+    ),
+    "qdrant_memory_extraction_approve": (
+        "tests/test_consolidation_apply.py::test_extraction_approval_refuses_to_overwrite_a_protected_point",
+        "tests/test_consolidation_apply.py::test_extraction_approval_refuses_a_history_only_dependent",
+        "tests/test_consolidation_apply.py::test_extraction_approval_fails_closed_when_the_target_cannot_be_read",
+    ),
+    "learning approve": (
+        "tests/test_consolidation_apply.py::test_extraction_approval_refuses_to_overwrite_a_protected_point",
+        "tests/test_consolidation_apply.py::test_extraction_approval_refuses_a_history_only_dependent",
+        "tests/test_consolidation_apply.py::test_extraction_approval_fails_closed_when_the_target_cannot_be_read",
+    ),
+    "restore": (
+        "tests/test_backup_cli.py::test_restore_refuses_to_overwrite_every_protected_payload",
+        "tests/test_backup_cli.py::test_restore_refuses_a_protected_target_in_the_learnings_scope",
+        "tests/test_backup_cli.py::test_restore_refuses_the_review_only_shape",
+        "tests/test_backup_cli.py::test_restore_still_overwrites_an_ordinary_payload",
+        "tests/test_backup_cli.py::test_restore_refuses_missing_chunk_retired_by_committed_event",
+    ),
+    "qdrant_memory_index [off]": (
+        "tests/test_lineage.py::test_off_mode_refuses_to_rewrite_a_chunk_carrying_only_review_state",
+        "tests/test_lineage.py::test_off_mode_refuses_to_rewrite_a_chunk_carrying_one_identity_field",
+        "tests/test_lineage.py::test_off_mode_refuses_to_destroy_or_duplicate_captured_file",
+        "tests/test_lineage.py::test_directory_off_mode_does_not_delete_removed_lineage_managed_chunks",
+        "tests/test_lineage.py::test_a_removed_file_whose_siblings_are_ordinary_is_blocked_as_a_file",
+        "tests/test_lineage.py::test_a_removed_file_with_one_protected_sibling_survives_force_too",
+        "tests/test_lineage.py::test_off_mode_force_skips_lineage_managed_filter_delete_in_dry_and_live_runs",
+    ),
+    "index [off]": (
+        "tests/test_lineage.py::test_off_mode_refuses_to_rewrite_a_chunk_carrying_only_review_state",
+        "tests/test_lineage.py::test_off_mode_refuses_to_rewrite_a_chunk_carrying_one_identity_field",
+        "tests/test_lineage.py::test_off_mode_refuses_to_destroy_or_duplicate_captured_file",
+        "tests/test_lineage.py::test_directory_off_mode_does_not_delete_removed_lineage_managed_chunks",
+        "tests/test_lineage.py::test_a_removed_file_whose_siblings_are_ordinary_is_blocked_as_a_file",
+        "tests/test_lineage.py::test_a_removed_file_with_one_protected_sibling_survives_force_too",
+        "tests/test_lineage.py::test_off_mode_force_skips_lineage_managed_filter_delete_in_dry_and_live_runs",
+    ),
+    "qdrant_memory_consolidation_apply": (
+        "tests/test_consolidation_apply.py::test_destructive_consolidation_refuses_lineage_dependents_outside_reconcile",
+    ),
+    "apply": (
+        "tests/test_consolidation_apply.py::test_destructive_consolidation_refuses_lineage_dependents_outside_reconcile",
+    ),
+    "qdrant_learning_store": (
+        "tests/test_config_schema_scoring.py::test_config_rejects_one_collection_for_memories_and_learnings",
+    ),
+    "learning store": (
+        "tests/test_config_schema_scoring.py::test_config_rejects_one_collection_for_memories_and_learnings",
+    ),
+    "qdrant_learning_approve": (
+        "tests/test_config_schema_scoring.py::test_config_rejects_one_collection_for_memories_and_learnings",
+    ),
+    "watcher run": (
+        "tests/test_consolidation_apply.py::test_watcher_guarded_auto_refuses_a_lineage_managed_target",
+    ),
+    "sync_turn": (
+        "tests/test_consolidation_apply.py::test_the_sync_turn_hook_cannot_overwrite_a_protected_target",
+    ),
 }
 
 
@@ -418,7 +489,7 @@ def test_the_protection_set_is_exactly_this():
     off-mode reindex), the two the plan opened (forget, destructive consolidation), the
     learning store's collection invariant, the guarded-auto caller, and the hook writer.
     """
-    protected = {entry: row["pins"] for entry, row in ROUTE_INVENTORY.items() if row["kind"] == "protection"}
+    protected = {entry: tuple(row["pins"]) for entry, row in ROUTE_INVENTORY.items() if row["kind"] == "protection"}
     assert protected == EXPECTED_PROTECTION_ROUTES
 
 
