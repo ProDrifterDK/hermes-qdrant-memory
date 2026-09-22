@@ -843,7 +843,7 @@ full public surface.
 
 ---
 
-## 20. Lineage W0 prerequisites — identity, mechanical gate, containment
+## 23. Lineage W0 prerequisites — identity, mechanical gate, containment
 
 Structural lineage groundwork is valid-point-safe. Dense and sparse search,
 the semantic-graph entity-scroll path, and consolidation candidate selection
@@ -975,7 +975,7 @@ No lineage writer is enabled (`lineage_mode` defaults to `off`).
 
 ---
 
-## 21. Lineage W1 additive capture limits
+## 24. Lineage W1 additive capture limits
 
 W1 remains disabled by default: `lineage_mode="off"`. Capture adds deterministic
 file-source, file-version, `PART_OF`, and `DERIVED_FROM` records. It does not
@@ -1027,7 +1027,7 @@ retire or delete lineage state.
 
 ---
 
-## 22. Lineage W2 — the dependency fence is profile-scoped
+## 25. Lineage W2 — the dependency fence is profile-scoped
 
 The destructive-operation dependency fence (`find_direct_dependents`, used by the
 consolidation apply fence, `qdrant_memory_forget`, and the reconcile lineage-impact
@@ -1051,7 +1051,7 @@ collection-wide referential-integrity guarantee.
 
 ---
 
-## 23. Lineage W2 — one lock-refusal contract on every tool surface
+## 26. Lineage W2 — one lock-refusal contract on every tool surface
 
 Failing to take the lineage collection lock is one condition, so it reads as one
 string: `lineage collection lock unavailable`. The constant, the refusal exception
