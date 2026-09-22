@@ -1127,11 +1127,13 @@ removed evidence, and it is the reason a retired root can always be explained.
   content changed is reported with `retirement_requires_reconcile`. Under `off`,
   files that are already lineage-managed are refused with
   `lineage_managed_requires_capture_or_retirement` instead of being replaced.
-- **Restore**: a backup restore that would overwrite lineage-managed content is
-  refused (`restore would overwrite lineage-managed content; run explicit
-  reconciliation`), and so is a restore that would resurrect content whose
-  lineage records are already retired (`restore would resurrect retired
-  lineage-managed content; run explicit reconciliation`).
+- **Restore**: a backup restore that would replace content carrying lineage identity
+  **or** the review state a transition wrote is refused (`restore would overwrite
+  lineage-managed content; run explicit reconciliation`), and so is a restore that
+  would resurrect content whose lineage records are already retired (`restore would
+  resurrect retired lineage-managed content; run explicit reconciliation`). Restore
+  reads the same in-place predicate as the other overwrite routes, plus the
+  structural marker it also owns.
 - **Store and extraction-approval upserts**: both routes target an id derived
   from the content, so re-storing the same text, or approving a regenerated
   candidate, can land on a point that already exists. When that point carries
@@ -1184,13 +1186,14 @@ has no ratified transition or cause representation yet. Two consequences:
   retirement is what keeps a demoted dependent retirable (it has no reviewed path
   otherwise), and including it in overwrite is what keeps its review state from
   being erased. Both texts are refusals; neither falls back to a legacy write.
-- Retiring a demoted dependent is allowed and is not free. The dependency edge the
-  transition wrote survives with its source gone, so the fence on the root answers
-  `lineage dependency fence is incomplete` under `off` and `capture` until a
-  `reconcile` transition, and a lineage-written structural edge cannot itself be
-  forgotten. Fail-closed and non-destructive, not a silent loss, and pre-existing
-  for dependents a transition never demoted; treating the marker as identity would
-  have made it permanent for every demoted point too.
+- Retiring a demoted dependent is allowed and is not free, and the remedy is in the
+  operator's hands. The dependency edge the graph layer wrote survives with its source
+  gone, so a fence that reads it answers `lineage dependency fence is incomplete` in
+  all three modes; `qdrant_memory_forget` retires that edge like any ordinary point, and
+  doing so unblocks the root in all three modes. A file root's live chunks are
+  unaffected. The failure is fail-closed and non-destructive, and pre-existing for
+  dependents a transition never demoted; treating the marker as identity would have
+  made it permanent for every demoted point too.
 
 Recorded support limitation, in the terms the plan asks for: **complete planning
 plus zero root retirement or overwrite on every unsupported route, with the
@@ -1214,8 +1217,8 @@ Verdict every destructive route must give, pinned by
 - `forget`, lineage-managed point — refuse in all three modes.
 - `forget`, demoted ordinary dependent (history marker only, no identity field) —
   delete in all three modes; the history marker is not identity. The consequence is
-  recorded above: the root's fence reports an incomplete dependency until a
-  `reconcile` transition.
+  recorded above: a fence that reads the orphaned edge answers incomplete until that
+  edge is forgotten, which `forget` can do.
 - `consolidation delete/merge/quarantine`, lineage-managed point — refuse in all
   three modes.
 - `consolidation delete/merge/quarantine`, ordinary root with dependents —
@@ -1233,8 +1236,9 @@ Verdict every destructive route must give, pinned by
 - either overwrite route, target unreadable (Qdrant retrieval error) — refuse; the
   store reports the failure, the approval answers `Unable to verify target point
   identity`.
-- restore, overwrite of lineage-managed content — refuse in all three modes
-  (code-supported; no test pin yet).
+- restore, replacement of a live payload carrying lineage identity or the review
+  state, or a structural record — refuse in all three modes, pinned over the whole
+  predicate.
 - restore, resurrection of retired lineage-managed content — refuse in all three
   modes (code-supported; no test pin yet).
 - improve apply (not an exact replay) and RAPTOR apply (differing node metadata) —

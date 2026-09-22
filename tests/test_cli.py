@@ -1336,6 +1336,42 @@ def test_doctor_returns_structured_checks_and_success_exit(monkeypatch, tmp_path
         assert checks[name]["ok"] is True
 
 
+def test_doctor_reports_a_refused_configuration_instead_of_tracebacking(monkeypatch, tmp_path, capsys):
+    """`doctor` is the tool an operator runs when the plugin will not start.
+
+    The collection-name invariant refuses the configuration at load, so doctor has to
+    report that refusal as a failed check instead of dying with the same exception and
+    telling them nothing.
+    """
+    from qdrant_memory.cli_core import execute_command
+
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "qdrant_memory.json").write_text(
+        json.dumps({"collection_name": "one", "learning_collection_name": "one"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    built = []
+
+    def factory():
+        built.append(True)
+        raise AssertionError("provider must not be built for a refused configuration")
+
+    args = _parser().parse_args(["qdrant", "doctor", "--json"])
+
+    exit_code = execute_command(args, provider_factory=factory)
+
+    assert exit_code == 1
+    assert built == []
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    refused = [check for check in payload["checks"] if check["name"] == "config_invariants"]
+    assert len(refused) == 1
+    assert refused[0]["ok"] is False
+    assert "must differ" in refused[0]["summary"]
+
+
 def test_doctor_defaults_to_human_checklist_and_nonzero_failures(monkeypatch, tmp_path, capsys):
     from qdrant_memory.cli_core import execute_command
 

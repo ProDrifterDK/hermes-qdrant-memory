@@ -498,6 +498,15 @@ refusal means *unsupported*, not *broken*; do not work around it by turning line
 off or editing payloads. See `docs/SAFETY.md` for the per-route table, the preview
 caveat and the recorded support limitation.
 
+`collection_name` and `learning_collection_name` must differ; the defaults
+(`hermes_memory`, `hermes_learnings`) already do. The learning store writes without
+the lineage overwrite guard, so a shared collection would let a learning upsert
+replace a protected payload, and `load_config` refuses that configuration with a
+`ValueError` instead of relying on the names happening to differ. The refusal
+surfaces as an exception from provider construction and from `is_available`, and
+`hermes qdrant doctor` reports it as a failed `config_invariants` check rather than
+dying with the same traceback.
+
 Example config:
 
 ```yaml

@@ -3314,6 +3314,76 @@ def test_store_fails_closed_when_the_target_cannot_be_read(mode, tmp_path):
     assert provider._qdrant.upserts == []
 
 
+@pytest.mark.parametrize("empty", [None, "", [], {}])
+def test_an_empty_review_marker_does_not_protect_a_point(empty, tmp_path):
+    """Value semantics, pinned on the route that reads the wider predicate.
+
+    ``None``, ``""``, ``[]`` and ``{}`` read as absence, so an empty marker must not
+    turn an ordinary overwrite into a refusal. Without this, a predicate written as
+    ``value is not None`` passes every other test in this file.
+    """
+    provider = _store_provider(tmp_path, "capture")
+    text = "a memory an empty marker must not protect"
+    target_id = provider._writer.preview_text(text, source_type="manual")["id"]
+    provider._qdrant.by_collection["memory"] = [
+        _point(target_id, text, source_type="manual", lineage_review_event_ids=empty),
+    ]
+
+    result = json.loads(provider.handle_tool_call(
+        "qdrant_memory_store", {"text": text, "dry_run": False, "approve": True},
+    ))
+
+    assert result["saved"] is True
+    assert [name for name, _ in provider._qdrant.upserts] == ["memory"]
+
+
+def test_identity_wins_the_refusal_text_when_a_point_carries_both():
+    """Precedence is a documented contract, not an accident of iteration order.
+
+    A point that is both bound to a version and flagged by a transition answers with
+    the retirement text, because that is the path that can release it. Without this,
+    "the last reason wins" is indistinguishable from the contract.
+    """
+    from qdrant_memory.lineage import (
+        LINEAGE_MANAGED_RETIREMENT_REFUSED,
+        LINEAGE_REVIEW_STATE_REFUSAL,
+        lineage_overwrite_refusal,
+    )
+
+    assert lineage_overwrite_refusal({}) is None
+    assert lineage_overwrite_refusal({"lineage_review_event_ids": ["event-1"]}) == LINEAGE_REVIEW_STATE_REFUSAL
+    assert lineage_overwrite_refusal({"file_version_id": "v1"}) == LINEAGE_MANAGED_RETIREMENT_REFUSED
+    assert (
+        lineage_overwrite_refusal({"file_version_id": "v1", "lineage_review_event_ids": ["event-1"]})
+        == LINEAGE_MANAGED_RETIREMENT_REFUSED
+    )
+    assert (
+        lineage_overwrite_refusal({"lineage_role": "chunk", "lineage_review_event_ids": ["event-1"]})
+        == LINEAGE_MANAGED_RETIREMENT_REFUSED
+    )
+
+
+@pytest.mark.parametrize("mode", ["off", "capture", "reconcile"])
+def test_store_answers_the_retirement_text_for_a_point_that_carries_both(mode, tmp_path):
+    """The same precedence through the route: an operator must be pointed at the
+    reviewed retirement path when one exists for the target."""
+    provider = _store_provider(tmp_path, mode)
+    text = "a memory that is both version-bound and flagged by a transition"
+    target_id = provider._writer.preview_text(text, source_type="manual")["id"]
+    provider._qdrant.by_collection["memory"] = [
+        _point(target_id, text, source_type="file", file_version_id="identity-1",
+               requires_review=True, fact_status="review_required",
+               lineage_review_event_ids=["event-1"]),
+    ]
+
+    result = json.loads(provider.handle_tool_call(
+        "qdrant_memory_store", {"text": text, "dry_run": False, "approve": True},
+    ))
+
+    assert result == {"error": LINEAGE_MANAGED_REFUSED_TEXT}
+    assert provider._qdrant.upserts == []
+
+
 @pytest.mark.parametrize("mode", ["off", "capture", "reconcile"])
 def test_store_still_overwrites_an_unmanaged_point_at_the_same_id(mode, tmp_path):
     """Negative control: the refusal is about the existing payload's identity,
