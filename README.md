@@ -484,12 +484,15 @@ boundary before turning it on: retirement of an ordinary (non-file) memory point
 is **not supported** yet, so the destructive routes refuse instead of degrading
 to a legacy delete. Under `reconcile` every consolidation delete/merge/quarantine
 returns `lineage impact blocks ordinary-root transition:
-ordinary_root_transition_cause_unratified`, and a point that belongs to a
-captured file (it carries a file version or lineage identity) is refused by both
-`qdrant_memory_forget` and destructive consolidation with `lineage-managed points
-require the reviewed retirement path`. That refusal means *unsupported*, not
-*broken*; do not work around it by turning lineage off or editing payloads. See
-`docs/SAFETY.md` for the per-route table and the recorded support limitation.
+ordinary_root_transition_cause_unratified`. A point that carries lineage identity
+(a file version or lineage binding) is refused in every mode by
+`qdrant_memory_forget`, by destructive consolidation, by the store upsert and by
+the extraction-approval upsert, all with `lineage-managed points require the
+reviewed retirement path`. A demotion marker such as `lineage_review_event_ids`
+is history rather than identity and does not make an ordinary dependent
+unretirable. That refusal means *unsupported*, not *broken*; do not work around it
+by turning lineage off or editing payloads. See `docs/SAFETY.md` for the
+per-route table and the recorded support limitation.
 
 Example config:
 

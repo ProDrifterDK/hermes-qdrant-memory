@@ -32,6 +32,12 @@ class FakeQdrant:
         self.upserts.append((name, points))
         return {"status": "ok"}
 
+    def retrieve(self, name, ids, *, with_payload=True, with_vector=False):
+        # This double keeps no point state, so it has none to return. The
+        # extraction-approval path reads the target id before writing to refuse a
+        # lineage-managed overwrite, and needs the interface to exist.
+        return []
+
 
 def _provider_for_source_extraction(tmp_path: Path) -> QdrantMemoryProvider:
     provider = QdrantMemoryProvider()

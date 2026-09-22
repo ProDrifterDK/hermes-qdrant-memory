@@ -3,7 +3,19 @@ from __future__ import annotations
 from typing import Any
 
 from .fact_metadata import derive_fact_metadata
+from .lineage import lineage_managed_reasons
 from .schema import build_payload, clean_text_for_memory, make_point_id, score_importance
+
+
+class ManagedOverwriteRefused(RuntimeError):
+    """Raised when a write would replace a point that carries lineage identity.
+
+    The store path upserts by a deterministic id, so re-storing the same text
+    replaces the existing payload. When that payload is bound to a lineage
+    version/entity record, the replacement orphans the binding exactly as a
+    delete would; the caller must answer with the canonical refusal instead of
+    writing.
+    """
 
 
 def strip_injected_context(text: str) -> str:
@@ -133,6 +145,17 @@ class ConversationWriter:
         if not clean:
             return ""
         point_id = preview["id"]
+        # Fail closed before replacing an existing point: a store at an id that
+        # already carries lineage identity is an overwrite of a managed binding,
+        # not a create. A retrieval error propagates; the caller's handler
+        # reports the store as failed rather than writing blind.
+        existing = self.qdrant.retrieve(self.collection_name, [point_id], with_payload=True)
+        for item in existing or []:
+            payload = item.get("payload") if isinstance(item, dict) else None
+            if isinstance(payload, dict) and lineage_managed_reasons(payload):
+                raise ManagedOverwriteRefused(
+                    f"point {point_id} carries lineage identity; refusing to overwrite"
+                )
         vector = self.embeddings.embed_document(clean)
         self.qdrant.upsert(self.collection_name, [{"id": point_id, "vector": vector, "payload": preview["payload"]}])
         return point_id

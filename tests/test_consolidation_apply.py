@@ -2225,7 +2225,7 @@ def test_foreign_profile_dependent_does_not_block_forget(mode, tmp_path):
     A dependency edge whose ``profile_id`` belongs to another profile is
     invisible to ``find_direct_dependents``, so the forget proceeds and the
     out-of-profile edge survives pointing at the deleted target. This is a
-    recorded boundary decision (docs/SAFETY.md section 22), not a regression.
+    recorded boundary decision (docs/SAFETY.md section 25), not a regression.
     """
     class MutableFakeQdrant(FakeQdrant):
         def delete_ids(self, name, ids):
@@ -3057,15 +3057,21 @@ _RETIREMENT_MANAGED_FIELDS = (
     "lineage_scope_key",
     "lineage_source_key",
     "lineage_role",
-    "lineage_review_event_ids",
 )
 
 
 def test_the_retirement_oracle_exercises_every_managed_field():
-    """A field dropped from the exercised shapes silently reopens a route."""
+    """A field dropped from the module silently reopens a route.
+
+    Equality, not subset: a field the module manages but the shapes here stop
+    exercising would otherwise pass. The reverse gap is undetectable by
+    construction (a field removed from the shapes and from the module together
+    leaves this test green), so this test pins the module side only, and nothing
+    here should be cited as proving the shapes are exhaustive.
+    """
     from qdrant_memory.lineage import LINEAGE_MANAGED_FIELDS
 
-    assert set(_RETIREMENT_MANAGED_FIELDS) <= set(LINEAGE_MANAGED_FIELDS)
+    assert set(_RETIREMENT_MANAGED_FIELDS) == set(LINEAGE_MANAGED_FIELDS)
 
 
 @pytest.mark.parametrize("mode", ["off", "capture", "reconcile"])
@@ -3074,9 +3080,8 @@ def test_forget_refuses_a_managed_root_in_every_mode(field, mode, tmp_path):
     provider = _provider(tmp_path)
     provider._config["lineage_mode"] = mode
     provider._config["lineage_lock_dir"] = str(tmp_path / "locks")
-    value = ["event-1"] if field == "lineage_review_event_ids" else "identity-1"
     provider._qdrant = FakeQdrant({
-        "memory": [_point("chunk-1", "managed chunk", source_type="file", **{field: value})],
+        "memory": [_point("chunk-1", "managed chunk", source_type="file", **{field: "identity-1"})],
         "learnings": [],
     })
     before = copy.deepcopy(provider._qdrant.by_collection)
@@ -3153,6 +3158,136 @@ def test_destructive_consolidation_refuses_a_managed_root(action, mode, tmp_path
     assert provider._qdrant.deleted_ids == []
     assert provider._qdrant.upserts == []
     assert provider._qdrant.payload_updates == []
+
+
+def _store_provider(tmp_path, mode):
+    """A provider whose writer is wired like ``initialize`` wires it."""
+    from qdrant_memory.writer import ConversationWriter
+
+    provider = _provider(tmp_path)
+    provider._config["lineage_mode"] = mode
+    provider._config["lineage_lock_dir"] = str(tmp_path / "locks")
+    provider._embeddings = FakeEmbedding()
+    provider._qdrant = FakeQdrant({"memory": [], "learnings": []})
+    provider._writer = ConversationWriter(
+        qdrant=provider._qdrant, embeddings=provider._embeddings, collection_name="memory",
+    )
+    return provider
+
+
+@pytest.mark.parametrize("mode", ["off", "capture", "reconcile"])
+def test_store_refuses_to_overwrite_a_managed_point_in_every_mode(mode, tmp_path):
+    """The store id is derived from the content, so re-storing the same text is
+    an overwrite. When the existing payload carries lineage identity, replacing
+    it retires the binding exactly as a delete would."""
+    provider = _store_provider(tmp_path, mode)
+    text = "a memory whose deterministic id already belongs to a captured file"
+    target_id = provider._writer.preview_text(text, source_type="manual")["id"]
+    provider._qdrant.by_collection["memory"] = [
+        _point(target_id, text, source_type="file", file_version_id="identity-1"),
+    ]
+    before = copy.deepcopy(provider._qdrant.by_collection)
+
+    result = json.loads(provider.handle_tool_call(
+        "qdrant_memory_store", {"text": text, "dry_run": False, "approve": True},
+    ))
+
+    assert result == {"error": LINEAGE_MANAGED_REFUSED_TEXT}
+    assert provider._qdrant.by_collection == before
+    assert provider._qdrant.upserts == []
+
+
+@pytest.mark.parametrize("mode", ["off", "capture", "reconcile"])
+def test_store_still_overwrites_an_unmanaged_point_at_the_same_id(mode, tmp_path):
+    """Negative control: the refusal is about the existing payload's identity,
+    not about the store route, which keeps its idempotent overwrite."""
+    provider = _store_provider(tmp_path, mode)
+    text = "a memory whose deterministic id is an ordinary point"
+    target_id = provider._writer.preview_text(text, source_type="manual")["id"]
+    provider._qdrant.by_collection["memory"] = [
+        _point(target_id, text, source_type="manual"),
+    ]
+
+    result = json.loads(provider.handle_tool_call(
+        "qdrant_memory_store", {"text": text, "dry_run": False, "approve": True},
+    ))
+
+    assert result["saved"] is True
+    assert result["id"] == target_id
+    assert [name for name, _ in provider._qdrant.upserts] == ["memory"]
+
+
+@pytest.mark.parametrize("mode", ["off", "capture", "reconcile"])
+def test_extraction_approval_refuses_to_overwrite_a_managed_point(mode, tmp_path):
+    """The candidate id is deterministic, so approving a regenerated candidate
+    can land on a point that already belongs to a captured file."""
+    from qdrant_memory.source_extraction import extract_source_candidates_from_text
+
+    provider = _provider(tmp_path)
+    provider._config["lineage_mode"] = mode
+    provider._qdrant = FakeQdrant({"memory": [], "learnings": []})
+    provider._embeddings = FakeEmbedding()
+    provider._config.update({
+        "source_extraction_enabled": True,
+        "source_extraction_mode": "preview",
+        "source_extraction_min_confidence": 0.65,
+        "source_extraction_max_candidates_per_session": 8,
+        "lineage_lock_dir": str(tmp_path / "locks"),
+    })
+    candidate = extract_source_candidates_from_text(
+        "Decision: keep extraction approvals behind the configured collection lock.",
+        source_uri="session://lineage-managed/extraction",
+    )[0]
+    provider._pending_extraction_candidates[candidate.candidate_id] = candidate
+    provider._qdrant.by_collection["memory"] = [
+        _point(candidate.candidate_id, "already captured", source_type="file",
+               file_version_id="identity-1"),
+    ]
+    before = copy.deepcopy(provider._qdrant.by_collection)
+
+    reviewed = json.loads(provider.handle_tool_call(
+        "qdrant_memory_extraction_approve", {"candidate_id": candidate.candidate_id},
+    ))
+    assert reviewed["dry_run"] is True
+
+    result = json.loads(provider.handle_tool_call(
+        "qdrant_memory_extraction_approve",
+        {"candidate_id": candidate.candidate_id, "dry_run": False, "approve": True},
+    ))
+
+    assert result == {"error": LINEAGE_MANAGED_REFUSED_TEXT}
+    assert provider._qdrant.by_collection == before
+    assert provider._qdrant.upserts == []
+
+
+@pytest.mark.parametrize("mode", ["off", "capture", "reconcile"])
+def test_a_demoted_dependent_stays_retirable(mode, tmp_path):
+    """Membership is an identity binding, not a history of being affected.
+
+    The demotion patch is the only writer of ``lineage_review_event_ids``, and it
+    marks ordinary dependents a transition touched. Treating that marker as
+    lineage identity would make them permanently unretirable with no reviewed
+    path available; their protection against silent retirement is the dependency
+    fence, which is exercised by their own edges.
+    """
+    provider = _provider(tmp_path)
+    provider._config["lineage_mode"] = mode
+    provider._config["lineage_lock_dir"] = str(tmp_path / "locks")
+    provider._qdrant = FakeQdrant({
+        "memory": [
+            _point("demoted-1", "derived memory", source_type="conversation",
+                   requires_review=True, fact_status="review_required",
+                   lineage_review_event_ids=["event-1"]),
+        ],
+        "learnings": [],
+    })
+
+    result = json.loads(provider.handle_tool_call(
+        "qdrant_memory_forget", {"ids": ["demoted-1"], "dry_run": False},
+    ))
+
+    assert result == {"dry_run": False, "ids": ["demoted-1"], "deleted": 1}
+    assert provider._qdrant.deleted_ids == [("memory", ["demoted-1"])]
 
 
 

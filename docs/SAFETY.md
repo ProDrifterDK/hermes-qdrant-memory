@@ -1129,10 +1129,19 @@ removed evidence, and it is the reason a retired root can always be explained.
   `lineage_managed_requires_capture_or_retirement` instead of being replaced.
 - **Restore**: a backup restore that would overwrite lineage-managed content is
   refused (`restore would overwrite lineage-managed content; run explicit
-  reconciliation`).
-- **Ordinary points without dependents**: a plain memory point that carries no
-  lineage identity still retires normally in every mode, so the refusal is not a
-  blanket ban on deletion.
+  reconciliation`), and so is a restore that would resurrect content whose
+  lineage records are already retired (`restore would resurrect retired
+  lineage-managed content; run explicit reconciliation`).
+- **Store and extraction-approval upserts**: both routes target an id derived
+  from the content, so re-storing the same text, or approving a regenerated
+  candidate, can land on a point that already carries lineage identity. When it
+  does, the write is refused with the same text as a delete instead of replacing
+  the payload. The turn-sync hook skips such a turn and logs at debug level.
+- **Ordinary points without dependents**: `qdrant_memory_forget` still retires a
+  plain memory point that carries no lineage identity in every mode, so the
+  refusal is not a blanket ban on deletion. Destructive consolidation does not:
+  under `reconcile` it refuses an ordinary root by impact validation, as the
+  route table records.
 
 ### What is not supported
 
@@ -1143,18 +1152,28 @@ has no ratified transition or cause representation yet. Two consequences:
   root returns `lineage impact blocks ordinary-root transition:
   ordinary_root_transition_cause_unratified`. There is no operator override, and
   the refusal never falls back to the legacy delete path.
-- A point that belongs to a captured file carries a file version or lineage
-  identity while staying an ordinary content point. Both `qdrant_memory_forget`
-  and destructive consolidation refuse it with `lineage-managed points require
-  the reviewed retirement path`, in `off`, `capture` and `reconcile`. The `off`
-  refusal is deliberate: turning the mode off, or downgrading, must not turn an
-  unsupported retirement into a silent delete.
+- A point that belongs to a captured file carries lineage **identity** while
+  staying an ordinary content point. Membership is the identity binding
+  (`file_version_id`, `lineage_entity_id`, `lineage_schema_version`,
+  `lineage_scope_key`, `lineage_source_key`, `lineage_role`). The demotion marker
+  `lineage_review_event_ids` is history, not identity: it records that a
+  transition touched an ordinary dependent, and it deliberately does not make
+  that dependent unretirable. Every unsupported route that would retire or
+  replace such a point — `qdrant_memory_forget`, destructive consolidation, the
+  store upsert and the extraction-approval upsert — refuses with
+  `lineage-managed points require the reviewed retirement path`, in `off`,
+  `capture` and `reconcile`. The `off` refusal is deliberate: turning the mode
+  off, or downgrading, must not turn an unsupported retirement into a silent
+  delete. Sequence note: that refusal is decided from the payloads, so `forget`
+  answers it after the dependency fence and consolidation before it; for a
+  managed point that also has dependents the canonical text therefore depends on
+  the route, and both are refusals.
 
 Recorded support limitation, in the terms the plan asks for: **complete planning
-plus zero root retirement on every unsupported route, with the limitation
-reported rather than hidden.** No ordinary-root retirement proof is claimed,
-because none exists yet. To retire such a point today, change the file it belongs
-to and let the file transition run under `reconcile`, or wait for the
+plus zero root retirement or overwrite on every unsupported route, with the
+limitation reported rather than hidden.** No ordinary-root retirement proof is
+claimed, because none exists yet. To retire such a point today, change the file it
+belongs to and let the file transition run under `reconcile`, or wait for the
 ordinary-root transition contract. Stripping the lineage fields from a payload to
 make a delete succeed is not a supported path.
 
@@ -1170,6 +1189,8 @@ Verdict every destructive route must give, pinned by
 - `forget`, structural record (truthy `lineage_record` / `lineage_pending`) —
   refuse in all three modes.
 - `forget`, lineage-managed point — refuse in all three modes.
+- `forget`, demoted ordinary dependent (history marker only, no identity field) —
+  delete in all three modes; the history marker is not identity.
 - `consolidation delete/merge/quarantine`, lineage-managed point — refuse in all
   three modes.
 - `consolidation delete/merge/quarantine`, ordinary root with dependents —
@@ -1177,6 +1198,14 @@ Verdict every destructive route must give, pinned by
   validation refuses first.
 - `consolidation delete/merge/quarantine`, ordinary root under `reconcile` —
   refuse with the unratified-cause text.
+- store upsert, existing point at the content-derived id is lineage-managed —
+  refuse in all three modes. Unmanaged — overwrite, unchanged.
+- extraction-approval upsert, existing point at the candidate id is
+  lineage-managed — refuse in all three modes.
+- restore, overwrite of lineage-managed content — refuse in all three modes
+  (code-supported; no test pin yet).
+- restore, resurrection of retired lineage-managed content — refuse in all three
+  modes (code-supported; no test pin yet).
 - reindex retirement — not reachable: `retirement_requires_reconcile` under
   `capture`, planned through the reviewed path under `reconcile`.
 

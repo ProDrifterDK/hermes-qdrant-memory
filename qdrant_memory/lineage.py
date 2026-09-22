@@ -1822,6 +1822,15 @@ LINEAGE_MANAGED_RETIREMENT_REFUSED = "lineage-managed points require the reviewe
 # ``is_structural_lineage_payload``; a point can be managed without being
 # structural, and that is precisely the shape a bare exact-ID delete would
 # orphan.
+#
+# ``lineage_review_event_ids`` is deliberately NOT here. The demotion patch is
+# its only writer, and it marks points a transition *touched* (ordinary
+# dependents carrying ``requires_review`` / ``fact_status=review_required``), not
+# points bound to a version record. Membership is an identity binding; history is
+# not. Including it would make a demoted ordinary point permanently unretirable
+# in every mode with no reviewed path available to it, while its protection
+# against silent retirement is the dependency fence that already runs on every
+# destructive route.
 LINEAGE_MANAGED_FIELDS = (
     "file_version_id",
     "lineage_entity_id",
@@ -1829,7 +1838,6 @@ LINEAGE_MANAGED_FIELDS = (
     "lineage_scope_key",
     "lineage_source_key",
     "lineage_role",
-    "lineage_review_event_ids",
 )
 
 

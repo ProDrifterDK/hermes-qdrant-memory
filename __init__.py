@@ -132,7 +132,7 @@ HARD_CONTEXT_CHAR_BUDGET: int = 16000
 HARD_MAX_SOURCE_CHARS: int = 2400
 from qdrant_memory.write_gate import evaluate_raptor_summary_write, evaluate_write_candidate
 from qdrant_memory.tools import TOOL_SCHEMAS
-from qdrant_memory.writer import ConversationWriter
+from qdrant_memory.writer import ConversationWriter, ManagedOverwriteRefused
 
 logger = logging.getLogger(__name__)
 
@@ -1257,7 +1257,14 @@ class QdrantMemoryProvider(MemoryProvider):
                 return json.dumps({"dry_run": False, "saved": False, "would_store": False, **base})
             if write_decision.decision != "store":
                 return _json_error("write gate requires review before storing memory candidate")
-            point_id = self._writer.store_text(text, source_type=source_type, importance=importance, tags=tags)
+            try:
+                point_id = self._writer.store_text(text, source_type=source_type, importance=importance, tags=tags)
+            except ManagedOverwriteRefused:
+                # The store id is derived from the content, so re-storing the same
+                # text targets the existing point. Replacing a payload that carries
+                # lineage identity retires the binding just as a delete would,
+                # which is why one refusal text covers both.
+                return _json_error(LINEAGE_MANAGED_RETIREMENT_REFUSED)
             return json.dumps({"dry_run": False, "saved": bool(point_id), "id": point_id, "source_type": source_type, "collection_name": self._config["collection_name"], "write_decision": write_decision.to_dict()})
         except Exception as exc:
             return _json_error(f"Failed to store memory: {exc}")
@@ -2436,6 +2443,25 @@ class QdrantMemoryProvider(MemoryProvider):
                 )
             if persisted_decision.decision != "store":
                 return _json_error("extraction candidate requires manual review before storing")
+            try:
+                existing_points = self._qdrant.retrieve(
+                    self._config["collection_name"], [candidate.candidate_id], with_payload=True
+                )
+            except Exception:
+                return _json_error(
+                    "Unable to verify target point identity; refusing to overwrite "
+                    "(Qdrant retrieval error)"
+                )
+            if any(
+                lineage_managed_reasons(item.get("payload") or {})
+                for item in existing_points or []
+                if isinstance(item, dict)
+            ):
+                # The candidate id is deterministic, so approving a regenerated
+                # candidate can land on a point that already carries lineage
+                # identity. Same refusal text as every other unsupported
+                # destructive route.
+                return _json_error(LINEAGE_MANAGED_RETIREMENT_REFUSED)
             text = str(payload.get("text") or payload.get("claim_text") or "")
             vector = self._embeddings.embed_document(text)
             self._lineage_locked_upsert(
