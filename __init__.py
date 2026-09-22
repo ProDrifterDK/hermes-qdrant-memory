@@ -69,6 +69,7 @@ from qdrant_memory.lineage import (
     find_direct_dependents,
     lineage_impact_proposal_digest,
     lineage_managed_reasons,
+    lineage_overwrite_refusal,
     redact_lock_refusals,
     validate_lineage_impact_snapshot,
 )
@@ -1259,12 +1260,13 @@ class QdrantMemoryProvider(MemoryProvider):
                 return _json_error("write gate requires review before storing memory candidate")
             try:
                 point_id = self._writer.store_text(text, source_type=source_type, importance=importance, tags=tags)
-            except ManagedOverwriteRefused:
+            except ManagedOverwriteRefused as exc:
                 # The store id is derived from the content, so re-storing the same
                 # text targets the existing point. Replacing a payload that carries
-                # lineage identity retires the binding just as a delete would,
-                # which is why one refusal text covers both.
-                return _json_error(LINEAGE_MANAGED_RETIREMENT_REFUSED)
+                # lineage identity retires the binding just as a delete would, and
+                # replacing one that carries W2 review state erases the gate the
+                # retriever reads. The exception carries which refusal applies.
+                return _json_error(str(exc))
             return json.dumps({"dry_run": False, "saved": bool(point_id), "id": point_id, "source_type": source_type, "collection_name": self._config["collection_name"], "write_decision": write_decision.to_dict()})
         except Exception as exc:
             return _json_error(f"Failed to store memory: {exc}")
@@ -2452,16 +2454,24 @@ class QdrantMemoryProvider(MemoryProvider):
                     "Unable to verify target point identity; refusing to overwrite "
                     "(Qdrant retrieval error)"
                 )
-            if any(
-                lineage_managed_reasons(item.get("payload") or {})
-                for item in existing_points or []
-                if isinstance(item, dict)
-            ):
-                # The candidate id is deterministic, so approving a regenerated
-                # candidate can land on a point that already carries lineage
-                # identity. Same refusal text as every other unsupported
-                # destructive route.
-                return _json_error(LINEAGE_MANAGED_RETIREMENT_REFUSED)
+            # The candidate id is deterministic, so approving a regenerated candidate
+            # can land on a point that already carries lineage identity or the review
+            # state a W2 transition wrote. Replacing either erases state this route
+            # does not own, so the refusal text names which one applies.
+            overwrite_refusal = next(
+                (
+                    refusal
+                    for refusal in (
+                        lineage_overwrite_refusal(item.get("payload") or {})
+                        for item in existing_points or []
+                        if isinstance(item, dict)
+                    )
+                    if refusal
+                ),
+                None,
+            )
+            if overwrite_refusal:
+                return _json_error(overwrite_refusal)
             text = str(payload.get("text") or payload.get("claim_text") or "")
             vector = self._embeddings.embed_document(text)
             self._lineage_locked_upsert(

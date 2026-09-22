@@ -80,6 +80,9 @@ class FakeQdrant:
         self.deleted_filters = []
         self.searches = []
         self.ensure_calls = []
+        # Injected outage for the fail-closed branches of the overwrite guards: a
+        # guard that cannot read its target must fail the write, not skip the check.
+        self.retrieve_error = None
 
     def scroll_by_filter(self, name, filter, *, limit=256, with_payload=True, with_vector=False, max_total=None):
         self.scrolls.append(
@@ -102,6 +105,8 @@ class FakeQdrant:
         return points[:max_total] if max_total is not None else points
 
     def retrieve(self, name, ids, *, with_payload=True, with_vector=False):
+        if self.retrieve_error is not None:
+            raise RuntimeError(self.retrieve_error)
         wanted = {str(item) for item in ids}
         return [p for p in self.by_collection.get(name, []) if str(p.get("id")) in wanted]
 
@@ -3027,28 +3032,47 @@ def test_a_symlinked_lock_dir_keeps_its_dedicated_wording(tmp_path):
 # --- W2 retirement route oracle (R09 refusal branch) --------------------------
 #
 # R09 requires the refusal-only activation branch to prove "zero root
-# retirement/overwrite on EVERY unsupported route". The routes that can retire
-# an existing point, and the verdict each must give:
+# retirement/overwrite on EVERY unsupported route". Two effect classes are in scope
+# and the predicate differs by class: a retirement REMOVES the point, an overwrite
+# REPLACES it in place and keeps the id. Both are destructive; only the second can
+# erase the review state a W2 transition wrote, and only the first would become
+# unrecoverable if the review-state marker widened it (see lineage.py above the
+# constants). The routes that can retire or replace an existing point, and the
+# verdict each must give:
 #
 #   route                                            off     capture  reconcile
 #   forget, ordinary root, no dependents             delete  delete   delete
 #   forget, ordinary root, dependents                refuse  refuse   refuse
 #   forget, structural record                        refuse  refuse   refuse
 #   forget, managed root (lineage identity)          refuse  refuse   refuse
+#   forget, demoted dependent (review state only)    delete  delete   delete
 #   consolidation delete/merge/quarantine, managed   refuse  refuse   refuse
-#   indexer reindex retirement                       not reachable: blocked with
+#   store at the content-derived id, managed         refuse  refuse   refuse
+#   store at the content-derived id, review state    refuse  refuse   refuse
+#   store at the content-derived id, ordinary        write   write    write
+#   extraction approval, managed                     refuse  refuse   refuse
+#   extraction approval, review state only           refuse  refuse   refuse
+#   improve apply, not an exact replay               refuse (existing check, read)
+#   [RAPTOR] apply, differing node metadata          refuse (existing check, read)
+#   backup restore, out-of-scope payload             refuse (preflight, read)
+#   indexer reindex retirement                       unreachable: blocked with
 #                                                    retirement_requires_reconcile
-#                                                    under capture, and planned
-#                                                    through the reviewed path
-#                                                    under reconcile (test_lineage.py)
+#                                                    under capture, planned through
+#                                                    the reviewed path under reconcile
 #
-# The managed rows are this commit's closure. Before them, a bare exact-ID
-# delete retired a version-bound chunk in all three modes, orphaning the
-# version/entity bookkeeping the reviewed path maintains. The dependents and
-# structural rows are pinned elsewhere in this file; the indexer rows in
-# tests/test_lineage.py.
+# The managed and overwrite rows are this commit's closure. Before them a bare
+# exact-ID delete retired a version-bound chunk in all three modes, orphaning the
+# version/entity bookkeeping the reviewed path maintains, and a re-store at the
+# content-derived id replaced one silently. The dependents and structural rows are
+# pinned elsewhere in this file; the indexer rows in tests/test_lineage.py.
+#
+# Third class, declared rather than proved: retiring an ORDINARY root has no
+# ratified transition, so under reconcile every consolidation delete/merge/
+# quarantine on one returns the unratified-cause refusal. Nothing here exercises a
+# successful ordinary-root retirement, because no supported path exists yet.
 
 LINEAGE_MANAGED_REFUSED_TEXT = "lineage-managed points require the reviewed retirement path"
+LINEAGE_REVIEW_STATE_REFUSED_TEXT = "lineage review state requires the reviewed transition path"
 
 _RETIREMENT_MANAGED_FIELDS = (
     "file_version_id",
@@ -3058,6 +3082,24 @@ _RETIREMENT_MANAGED_FIELDS = (
     "lineage_source_key",
     "lineage_role",
 )
+
+# The marker the demotion patch writes. Membership is an identity binding, so the
+# retirement predicate excludes it and the overwrite predicate includes it.
+LINEAGE_REVIEW_STATE_MARKER = "lineage_review_event_ids"
+
+_OVERWRITE_PROTECTED_FIELDS = _RETIREMENT_MANAGED_FIELDS + (LINEAGE_REVIEW_STATE_MARKER,)
+
+
+def _field_value(field):
+    """A present, non-empty value in the shape each predicate reads as set."""
+    return ["event-1"] if field == LINEAGE_REVIEW_STATE_MARKER else "identity-1"
+
+
+def _overwrite_refusal_text(field):
+    """The text a refusal on ``field`` must give: identity wins when both apply."""
+    if field in _RETIREMENT_MANAGED_FIELDS:
+        return LINEAGE_MANAGED_REFUSED_TEXT
+    return LINEAGE_REVIEW_STATE_REFUSED_TEXT
 
 
 def test_the_retirement_oracle_exercises_every_managed_field():
@@ -3072,6 +3114,28 @@ def test_the_retirement_oracle_exercises_every_managed_field():
     from qdrant_memory.lineage import LINEAGE_MANAGED_FIELDS
 
     assert set(_RETIREMENT_MANAGED_FIELDS) == set(LINEAGE_MANAGED_FIELDS)
+    assert LINEAGE_REVIEW_STATE_MARKER not in set(LINEAGE_MANAGED_FIELDS)
+
+
+def test_the_overwrite_oracle_exercises_every_protected_field():
+    """The overwrite predicate is the identity set plus exactly the review state.
+
+    Pins the relation, not only the membership: a marker that leaks into the
+    retirement predicate, or an identity field that stops being protected on the
+    in-place routes, fails here rather than in a route the shapes happen to cover.
+    """
+    from qdrant_memory.lineage import (
+        LINEAGE_MANAGED_FIELDS,
+        LINEAGE_OVERWRITE_PROTECTED_FIELDS,
+        LINEAGE_REVIEW_STATE_FIELDS,
+    )
+
+    assert set(_OVERWRITE_PROTECTED_FIELDS) == set(LINEAGE_OVERWRITE_PROTECTED_FIELDS)
+    assert set(LINEAGE_OVERWRITE_PROTECTED_FIELDS) == set(LINEAGE_MANAGED_FIELDS) | set(
+        LINEAGE_REVIEW_STATE_FIELDS
+    )
+    assert LINEAGE_REVIEW_STATE_MARKER in set(LINEAGE_REVIEW_STATE_FIELDS)
+    assert not (set(LINEAGE_MANAGED_FIELDS) & set(LINEAGE_REVIEW_STATE_FIELDS))
 
 
 @pytest.mark.parametrize("mode", ["off", "capture", "reconcile"])
@@ -3176,24 +3240,77 @@ def _store_provider(tmp_path, mode):
 
 
 @pytest.mark.parametrize("mode", ["off", "capture", "reconcile"])
-def test_store_refuses_to_overwrite_a_managed_point_in_every_mode(mode, tmp_path):
-    """The store id is derived from the content, so re-storing the same text is
-    an overwrite. When the existing payload carries lineage identity, replacing
-    it retires the binding exactly as a delete would."""
+@pytest.mark.parametrize("field", _OVERWRITE_PROTECTED_FIELDS)
+def test_store_refuses_to_overwrite_a_protected_point_in_every_mode(field, mode, tmp_path):
+    """The store id is derived from the content, so re-storing the same text is an
+    overwrite, not a create.
+
+    Parametrized over the whole overwrite predicate: a route-local narrowing (a
+    guard that reads one field instead of the module predicate) survives a test
+    that exercises a single field, and that is exactly how a reopened route hides.
+    Identity and review-state targets refuse with their own text.
+    """
     provider = _store_provider(tmp_path, mode)
-    text = "a memory whose deterministic id already belongs to a captured file"
+    text = "a memory whose deterministic id already carries protected state"
     target_id = provider._writer.preview_text(text, source_type="manual")["id"]
     provider._qdrant.by_collection["memory"] = [
-        _point(target_id, text, source_type="file", file_version_id="identity-1"),
+        _point(target_id, text, source_type="file", **{field: _field_value(field)}),
     ]
-    before = copy.deepcopy(provider._qdrant.by_collection)
 
     result = json.loads(provider.handle_tool_call(
         "qdrant_memory_store", {"text": text, "dry_run": False, "approve": True},
     ))
 
-    assert result == {"error": LINEAGE_MANAGED_REFUSED_TEXT}
-    assert provider._qdrant.by_collection == before
+    assert result == {"error": _overwrite_refusal_text(field)}
+    assert provider._qdrant.upserts == []
+    assert provider._qdrant.payload_updates == []
+
+
+@pytest.mark.parametrize("mode", ["off", "capture", "reconcile"])
+def test_store_refuses_a_history_only_dependent_in_every_mode(mode, tmp_path):
+    """The shape the first review pass reproduced by hand.
+
+    No identity field is present, so a predicate built from identity alone lets the
+    store replace it and erase ``requires_review``, ``fact_status`` and the marker.
+    ``requires_review`` is the gate the retriever and auto-recall read, so the fact
+    W2 flagged as stale-pending-review would be served as an active one. Protecting
+    it here does not make the point unretirable: the retirement predicate stays
+    narrow, which ``test_a_demoted_dependent_stays_retirable`` pins.
+    """
+    provider = _store_provider(tmp_path, mode)
+    text = "a fact a W2 transition flagged for review"
+    target_id = provider._writer.preview_text(text, source_type="manual")["id"]
+    provider._qdrant.by_collection["memory"] = [
+        _point(target_id, text, source_type="conversation", requires_review=True,
+               fact_status="review_required", lineage_review_event_ids=["event-1"]),
+    ]
+
+    result = json.loads(provider.handle_tool_call(
+        "qdrant_memory_store", {"text": text, "dry_run": False, "approve": True},
+    ))
+
+    assert result == {"error": LINEAGE_REVIEW_STATE_REFUSED_TEXT}
+    assert provider._qdrant.upserts == []
+    assert provider._qdrant.by_collection["memory"][0]["payload"]["requires_review"] is True
+    assert provider._qdrant.by_collection["memory"][0]["payload"]["lineage_review_event_ids"] == ["event-1"]
+
+
+@pytest.mark.parametrize("mode", ["off", "capture", "reconcile"])
+def test_store_fails_closed_when_the_target_cannot_be_read(mode, tmp_path):
+    """The guard is only as good as the read behind it.
+
+    An outage must fail the store rather than fall back to writing blind at an id
+    the guard could not inspect. The store path had no Qdrant read before this
+    change, so this is the new failure class it accepts in exchange for the guard.
+    """
+    provider = _store_provider(tmp_path, mode)
+    provider._qdrant.retrieve_error = "simulated retrieve outage"
+
+    result = json.loads(provider.handle_tool_call(
+        "qdrant_memory_store", {"text": "any text", "dry_run": False, "approve": True},
+    ))
+
+    assert "simulated retrieve outage" in result["error"]
     assert provider._qdrant.upserts == []
 
 
@@ -3217,10 +3334,12 @@ def test_store_still_overwrites_an_unmanaged_point_at_the_same_id(mode, tmp_path
     assert [name for name, _ in provider._qdrant.upserts] == ["memory"]
 
 
-@pytest.mark.parametrize("mode", ["off", "capture", "reconcile"])
-def test_extraction_approval_refuses_to_overwrite_a_managed_point(mode, tmp_path):
-    """The candidate id is deterministic, so approving a regenerated candidate
-    can land on a point that already belongs to a captured file."""
+def _extraction_provider(tmp_path, mode):
+    """A provider with one pending extraction candidate, ready to approve.
+
+    Returns ``(provider, candidate)``; the caller decides what already exists at the
+    candidate's deterministic id.
+    """
     from qdrant_memory.source_extraction import extract_source_candidates_from_text
 
     provider = _provider(tmp_path)
@@ -3239,24 +3358,74 @@ def test_extraction_approval_refuses_to_overwrite_a_managed_point(mode, tmp_path
         source_uri="session://lineage-managed/extraction",
     )[0]
     provider._pending_extraction_candidates[candidate.candidate_id] = candidate
-    provider._qdrant.by_collection["memory"] = [
-        _point(candidate.candidate_id, "already captured", source_type="file",
-               file_version_id="identity-1"),
-    ]
-    before = copy.deepcopy(provider._qdrant.by_collection)
+    return provider, candidate
 
+
+def _approve(provider, candidate):
+    """Dry-run review then live approval, the shape the tool requires."""
     reviewed = json.loads(provider.handle_tool_call(
         "qdrant_memory_extraction_approve", {"candidate_id": candidate.candidate_id},
     ))
     assert reviewed["dry_run"] is True
-
-    result = json.loads(provider.handle_tool_call(
+    return json.loads(provider.handle_tool_call(
         "qdrant_memory_extraction_approve",
         {"candidate_id": candidate.candidate_id, "dry_run": False, "approve": True},
     ))
 
-    assert result == {"error": LINEAGE_MANAGED_REFUSED_TEXT}
-    assert provider._qdrant.by_collection == before
+
+@pytest.mark.parametrize("mode", ["off", "capture", "reconcile"])
+@pytest.mark.parametrize("field", _OVERWRITE_PROTECTED_FIELDS)
+def test_extraction_approval_refuses_to_overwrite_a_protected_point(field, mode, tmp_path):
+    """The candidate id is deterministic, so approving a regenerated candidate can
+    land on a point that already carries protected state.
+
+    Parametrized over the whole overwrite predicate for the same reason as the store
+    route: a single-field narrowing hides behind a single-field test.
+    """
+    provider, candidate = _extraction_provider(tmp_path, mode)
+    provider._qdrant.by_collection["memory"] = [
+        _point(candidate.candidate_id, "already captured", source_type="file",
+               **{field: _field_value(field)}),
+    ]
+
+    result = _approve(provider, candidate)
+
+    assert result == {"error": _overwrite_refusal_text(field)}
+    assert provider._qdrant.upserts == []
+    assert provider._qdrant.payload_updates == []
+
+
+@pytest.mark.parametrize("mode", ["off", "capture", "reconcile"])
+def test_extraction_approval_refuses_a_history_only_dependent(mode, tmp_path):
+    """The exact first-pass input, through the route that regenerated it: no
+    identity field, only the review state a W2 transition wrote."""
+    provider, candidate = _extraction_provider(tmp_path, mode)
+    provider._qdrant.by_collection["memory"] = [
+        _point(candidate.candidate_id, "a fact a transition flagged", source_type="conversation",
+               requires_review=True, fact_status="review_required",
+               lineage_review_event_ids=["event-1"]),
+    ]
+
+    result = _approve(provider, candidate)
+
+    assert result == {"error": LINEAGE_REVIEW_STATE_REFUSED_TEXT}
+    assert provider._qdrant.upserts == []
+
+
+@pytest.mark.parametrize("mode", ["off", "capture", "reconcile"])
+def test_extraction_approval_fails_closed_when_the_target_cannot_be_read(mode, tmp_path):
+    """The live approval refuses on an unreadable target; the preview does not
+    consult the guard at all, which is the same "preview is not a promise" shape as
+    forget and consolidation and is documented as such."""
+    provider, candidate = _extraction_provider(tmp_path, mode)
+    provider._qdrant.retrieve_error = "simulated retrieve outage"
+
+    result = _approve(provider, candidate)
+
+    assert result == {
+        "error": "Unable to verify target point identity; refusing to overwrite "
+                 "(Qdrant retrieval error)"
+    }
     assert provider._qdrant.upserts == []
 
 
@@ -3265,10 +3434,17 @@ def test_a_demoted_dependent_stays_retirable(mode, tmp_path):
     """Membership is an identity binding, not a history of being affected.
 
     The demotion patch is the only writer of ``lineage_review_event_ids``, and it
-    marks ordinary dependents a transition touched. Treating that marker as
-    lineage identity would make them permanently unretirable with no reviewed
-    path available; their protection against silent retirement is the dependency
-    fence, which is exercised by their own edges.
+    marks ordinary dependents a transition touched. Treating that marker as lineage
+    identity would make them permanently unretirable with no reviewed path
+    available, which is why the retirement predicate excludes it while the
+    overwrite predicate includes it (the two are pinned as a relation in
+    ``test_the_overwrite_oracle_exercises_every_protected_field``).
+
+    Retiring one is not free, and §27 documents the consequence rather than hiding
+    it: the dependency edge the transition wrote survives with a missing source, so
+    the next fence on the root reports ``lineage dependency fence is incomplete``
+    until a ``reconcile`` transition, and a lineage-written structural edge cannot be
+    forgotten either. Fail-closed and non-destructive, so the route stays open.
     """
     provider = _provider(tmp_path)
     provider._config["lineage_mode"] = mode

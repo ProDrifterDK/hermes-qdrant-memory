@@ -1134,9 +1134,15 @@ removed evidence, and it is the reason a retired root can always be explained.
   lineage-managed content; run explicit reconciliation`).
 - **Store and extraction-approval upserts**: both routes target an id derived
   from the content, so re-storing the same text, or approving a regenerated
-  candidate, can land on a point that already carries lineage identity. When it
-  does, the write is refused with the same text as a delete instead of replacing
-  the payload. The turn-sync hook skips such a turn and logs at debug level.
+  candidate, can land on a point that already exists. When that point carries
+  lineage identity or the W2 review state, the write is refused — the retirement
+  text in the first case, the review-state text in the second — instead of
+  replacing the payload. The turn-sync hook skips such a turn and logs at debug
+  level. Both routes refuse before writing but **without** the collection lock (the
+  store takes none; extraction reads, then locks for its upsert, the same shape as
+  improve apply), so the window between read and write is declared rather than
+  closed. Neither guard is consulted by its preview path: a dry-run store or a
+  review-only approval can still report that it would write.
 - **Ordinary points without dependents**: `qdrant_memory_forget` still retires a
   plain memory point that carries no lineage identity in every mode, so the
   refusal is not a blanket ban on deletion. Destructive consolidation does not:
@@ -1153,21 +1159,38 @@ has no ratified transition or cause representation yet. Two consequences:
   ordinary_root_transition_cause_unratified`. There is no operator override, and
   the refusal never falls back to the legacy delete path.
 - A point that belongs to a captured file carries lineage **identity** while
-  staying an ordinary content point. Membership is the identity binding
-  (`file_version_id`, `lineage_entity_id`, `lineage_schema_version`,
-  `lineage_scope_key`, `lineage_source_key`, `lineage_role`). The demotion marker
-  `lineage_review_event_ids` is history, not identity: it records that a
-  transition touched an ordinary dependent, and it deliberately does not make
-  that dependent unretirable. Every unsupported route that would retire or
-  replace such a point — `qdrant_memory_forget`, destructive consolidation, the
-  store upsert and the extraction-approval upsert — refuses with
-  `lineage-managed points require the reviewed retirement path`, in `off`,
-  `capture` and `reconcile`. The `off` refusal is deliberate: turning the mode
-  off, or downgrading, must not turn an unsupported retirement into a silent
-  delete. Sequence note: that refusal is decided from the payloads, so `forget`
-  answers it after the dependency fence and consolidation before it; for a
-  managed point that also has dependents the canonical text therefore depends on
-  the route, and both are refusals.
+  staying an ordinary content point. Which fields protect it is decided **per
+  effect class**, because retiring a point and replacing one in place destroy
+  different things:
+  - **Retirement** (`qdrant_memory_forget`, destructive consolidation) removes the
+    point, so it reads the identity binding alone: `file_version_id`,
+    `lineage_entity_id`, `lineage_schema_version`, `lineage_scope_key`,
+    `lineage_source_key`, `lineage_role`. It refuses with `lineage-managed points
+    require the reviewed retirement path` in `off`, `capture` and `reconcile`. The
+    `off` refusal is deliberate: turning the mode off, or downgrading, must not turn
+    an unsupported retirement into a silent delete. Sequence note: that refusal is
+    decided from the payloads, so `forget` answers it after the dependency fence and
+    consolidation before it; for a managed point that also has dependents the
+    canonical text therefore depends on the route, and both are refusals.
+  - **In-place overwrite** (the store upsert at the content-derived id, the
+    extraction-approval upsert at the candidate id) keeps the id and replaces the
+    payload, so it protects the demotion marker `lineage_review_event_ids` as well,
+    refusing with `lineage review state requires the reviewed transition path`. The
+    harm there is not bookkeeping: the replacement erases `requires_review`,
+    `fact_status` and the recorded causes, and `requires_review` is the gate the
+    retriever and auto-recall read — a fact a transition flagged as
+    stale-pending-review would be served as an active one.
+  So the marker's membership is effect-dependent by construction: excluding it from
+  retirement is what keeps a demoted dependent retirable (it has no reviewed path
+  otherwise), and including it in overwrite is what keeps its review state from
+  being erased. Both texts are refusals; neither falls back to a legacy write.
+- Retiring a demoted dependent is allowed and is not free. The dependency edge the
+  transition wrote survives with its source gone, so the fence on the root answers
+  `lineage dependency fence is incomplete` under `off` and `capture` until a
+  `reconcile` transition, and a lineage-written structural edge cannot itself be
+  forgotten. Fail-closed and non-destructive, not a silent loss, and pre-existing
+  for dependents a transition never demoted; treating the marker as identity would
+  have made it permanent for every demoted point too.
 
 Recorded support limitation, in the terms the plan asks for: **complete planning
 plus zero root retirement or overwrite on every unsupported route, with the
@@ -1190,7 +1213,9 @@ Verdict every destructive route must give, pinned by
   refuse in all three modes.
 - `forget`, lineage-managed point — refuse in all three modes.
 - `forget`, demoted ordinary dependent (history marker only, no identity field) —
-  delete in all three modes; the history marker is not identity.
+  delete in all three modes; the history marker is not identity. The consequence is
+  recorded above: the root's fence reports an incomplete dependency until a
+  `reconcile` transition.
 - `consolidation delete/merge/quarantine`, lineage-managed point — refuse in all
   three modes.
 - `consolidation delete/merge/quarantine`, ordinary root with dependents —
@@ -1199,13 +1224,21 @@ Verdict every destructive route must give, pinned by
 - `consolidation delete/merge/quarantine`, ordinary root under `reconcile` —
   refuse with the unratified-cause text.
 - store upsert, existing point at the content-derived id is lineage-managed —
-  refuse in all three modes. Unmanaged — overwrite, unchanged.
+  refuse in all three modes with the retirement text. Ordinary point — overwrite,
+  unchanged. Demoted dependent carrying the review state — refuse in all three
+  modes with the review-state text.
 - extraction-approval upsert, existing point at the candidate id is
-  lineage-managed — refuse in all three modes.
+  lineage-managed or carries the review state — refuse in all three modes, with the
+  text matching the case.
+- either overwrite route, target unreadable (Qdrant retrieval error) — refuse; the
+  store reports the failure, the approval answers `Unable to verify target point
+  identity`.
 - restore, overwrite of lineage-managed content — refuse in all three modes
   (code-supported; no test pin yet).
 - restore, resurrection of retired lineage-managed content — refuse in all three
   modes (code-supported; no test pin yet).
+- improve apply (not an exact replay) and RAPTOR apply (differing node metadata) —
+  refuse by their own checks; read, not executed, in the W2 closure reviews.
 - reindex retirement — not reachable: `retirement_requires_reconcile` under
   `capture`, planned through the reviewed path under `reconcile`.
 
@@ -1215,5 +1248,7 @@ Verdict every destructive route must give, pinned by
 does not evaluate the dependency fence or the managed check, so a preview is not
 a promise that the live call would succeed. The live call is the one that
 refuses; the consolidation apply validates its fences before its own dry-run
-branch, so its preview does report them.
+branch, so its preview does report them. The store upsert and the extraction
+approval behave the same way: their previews do not read the target, so an
+outage or an existing protected payload appears only when the live call runs.
 

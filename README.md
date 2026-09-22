@@ -488,11 +488,15 @@ ordinary_root_transition_cause_unratified`. A point that carries lineage identit
 (a file version or lineage binding) is refused in every mode by
 `qdrant_memory_forget`, by destructive consolidation, by the store upsert and by
 the extraction-approval upsert, all with `lineage-managed points require the
-reviewed retirement path`. A demotion marker such as `lineage_review_event_ids`
-is history rather than identity and does not make an ordinary dependent
-unretirable. That refusal means *unsupported*, not *broken*; do not work around it
-by turning lineage off or editing payloads. See `docs/SAFETY.md` for the
-per-route table and the recorded support limitation.
+reviewed retirement path`. What protects a point is decided per **effect class**,
+because a retirement removes it while an in-place overwrite keeps the id: the
+demotion marker `lineage_review_event_ids` is history rather than identity, so it
+does not stop an ordinary dependent from being retired, but it does stop the two
+overwrite routes, which refuse with `lineage review state requires the reviewed
+transition path` instead of erasing the review state the retriever reads. That
+refusal means *unsupported*, not *broken*; do not work around it by turning lineage
+off or editing payloads. See `docs/SAFETY.md` for the per-route table, the preview
+caveat and the recorded support limitation.
 
 Example config:
 
