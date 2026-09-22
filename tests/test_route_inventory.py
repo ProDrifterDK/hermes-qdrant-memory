@@ -7,21 +7,27 @@ of fields. Every one of them was found by reading code, none by a failing test, 
 route table in ``docs/SAFETY.md`` claimed coverage that did not exist.
 
 The fix for the four sites is the shared predicate. The fix for the *pattern* is this
-file: the mutating surface is derived from the code, every derived entry has to be
-classified, and a route declared protected has to name a test that actually exists.
-Adding a tool or a CLI command now fails until someone decides what it does to a
-protected payload, and ``docs/SAFETY.md`` cannot claim a pin that has been renamed or
-deleted.
+file: the mutating surface is derived from the code — tool dispatch, CLI commands and
+provider hook overrides — every derived entry has to be classified, and a route declared
+protected has to name a test that actually exists. Adding a tool, a command or a hook
+now fails until someone decides what it does to a protected payload, and the SAFETY
+route table cannot claim a pin that has been renamed or deleted.
 
 Classification is by hand because "does this command mutate Qdrant?" is not derivable
 from the parser. ``uncovered`` exists so that the honest answer has a place to go: a
 route whose refusal was reasoned from code but never executed stays visible as debt
 instead of being silently counted as covered.
+
+The classification is itself pinned: the exact protection set and the exact pin list of
+every protection row are frozen below, and the detectors that consume them are tested
+against deliberately unclassified and deliberately broken inputs. A hand-written
+classification that no test defends is the same claim surface that failed three times.
 """
 from __future__ import annotations
 
 import argparse
 import ast
+import importlib.util
 import re
 from pathlib import Path
 
@@ -53,8 +59,6 @@ def _cli_commands() -> set[str]:
     Loaded by path: ``import cli`` resolves to the host application's module, not this
     plugin's.
     """
-    import importlib.util
-
     spec = importlib.util.spec_from_file_location("_route_inventory_cli", REPO / "cli.py")
     assert spec and spec.loader
     cli = importlib.util.module_from_spec(spec)
@@ -78,6 +82,32 @@ def _cli_commands() -> set[str]:
     return commands
 
 
+def _provider_hooks() -> set[str]:
+    """Provider hook overrides — the write routes the runtime calls directly.
+
+    ``sync_turn`` reaches the same deterministic id as the store and is enabled by a
+    config flag, so it is a write route; it is invisible to both the dispatch parser and
+    the CLI parser. Derived by comparing the provider class against its bases, so a new
+    hook override appears here without anyone remembering to add it.
+    """
+    spec = importlib.util.spec_from_file_location("_route_inventory_plugin", REPO / "__init__.py")
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    provider_cls = module.QdrantMemoryProvider
+    own = {name for name, value in vars(provider_cls).items() if callable(value) and not name.startswith("_")}
+    inherited: set[str] = set()
+    for klass in provider_cls.__mro__[1:]:
+        inherited |= {name for name, value in vars(klass).items() if callable(value) and not name.startswith("_")}
+    hooks = {name for name in own if name in inherited}
+    assert hooks, "no provider hook overrides could be derived"
+    return hooks
+
+
+def _surface() -> set[str]:
+    return _tool_names() | _cli_commands() | _provider_hooks()
+
+
 # --- the inventory ---------------------------------------------------------
 #
 # kind:
@@ -85,7 +115,9 @@ def _cli_commands() -> set[str]:
 #               the protected shapes and its refusal must be pinned by a test that
 #               exists in this tree
 #   transition  the reviewed lineage path, which is allowed to write
-#   read_only   does not touch Qdrant payloads (may write local artifacts)
+#   read_only   never deletes or replaces a payload; may read, may set access metadata
+#               on the points it returns, and may write local artifacts
+#   dispatch    a router; every route it can reach is classified separately
 #   uncovered   mutates, and its refusal is reasoned from code but not executed
 
 FORGET_PINS = [
@@ -117,6 +149,8 @@ INDEX_OFF_PINS = [
     "tests/test_lineage.py::test_off_mode_refuses_to_rewrite_a_chunk_carrying_one_identity_field",
     "tests/test_lineage.py::test_off_mode_refuses_to_destroy_or_duplicate_captured_file",
     "tests/test_lineage.py::test_directory_off_mode_does_not_delete_removed_lineage_managed_chunks",
+    "tests/test_lineage.py::test_a_removed_file_whose_siblings_are_ordinary_is_blocked_as_a_file",
+    "tests/test_lineage.py::test_a_removed_file_with_one_protected_sibling_survives_force_too",
     "tests/test_lineage.py::test_off_mode_force_skips_lineage_managed_filter_delete_in_dry_and_live_runs",
 ]
 CONSOLIDATION_PINS = [
@@ -126,6 +160,15 @@ CONSOLIDATION_PINS = [
 # invariant, because an upsert there would otherwise be able to replace a memory point.
 LEARNING_STORE_PINS = [
     "tests/test_config_schema_scoring.py::test_config_rejects_one_collection_for_memories_and_learnings",
+]
+# `watcher run` only reaches a mutation through `--autonomy-mode guarded-auto`, which
+# calls `apply_guarded_auto` → the apply path, so its refusal is pinned through that
+# caller rather than through the tool it eventually invokes.
+GUARDED_AUTO_PINS = [
+    "tests/test_consolidation_apply.py::test_watcher_guarded_auto_refuses_a_lineage_managed_target",
+]
+SYNC_TURN_PINS = [
+    "tests/test_consolidation_apply.py::test_the_sync_turn_hook_cannot_overwrite_a_protected_target",
 ]
 
 ROUTE_INVENTORY: dict[str, dict[str, object]] = {}
@@ -149,7 +192,7 @@ _declare(
 )
 _declare(["restore"], "protection", pins=RESTORE_PINS, note="the third in-place overwrite route")
 _declare(["qdrant_memory_index [off]", "index [off]"], "protection", pins=INDEX_OFF_PINS,
-         note="rewrites chunk payloads at content-derived ids and deletes stale ids")
+         note="rewrites chunk payloads at content-derived ids and deletes stale ids, per file")
 _declare(["qdrant_memory_consolidation_apply", "apply"], "protection", pins=CONSOLIDATION_PINS,
          note="merge/delete/quarantine; the managed check runs before the lock (N5)")
 _declare(
@@ -157,11 +200,27 @@ _declare(
     pins=LEARNING_STORE_PINS,
     note="no payload predicate: protected by the collection-separation invariant only",
 )
+_declare(["watcher run"], "protection", pins=GUARDED_AUTO_PINS,
+         note="report-only by default; --guarded-auto reaches the apply path through apply_guarded_auto")
 _declare(["qdrant_memory_index [capture]", "index [capture]"], "transition")
 _declare(["qdrant_memory_index [reconcile]", "index [reconcile]"], "transition")
-_declare(["watcher run"], "protection", pins=[
-    "tests/test_consolidation_apply.py::test_apply_guarded_auto_preauthorized_maintenance_refuses_sensitive_points",
-], note="report-only by default; --guarded-auto reaches the apply path")
+
+# --- provider hooks --------------------------------------------------------
+# The runtime calls these directly, so none of them is reachable from the parsers above.
+
+_declare(["sync_turn"], "protection", pins=SYNC_TURN_PINS,
+         note="writes the turn through ConversationWriter at the store's deterministic id")
+_declare(["handle_tool_call", "get_tool_schemas"], "dispatch",
+         note="the router itself; every route it can reach is classified in this file")
+_declare(
+    [
+        "initialize", "shutdown", "is_available", "system_prompt_block",
+        "prefetch", "queue_prefetch", "on_session_switch",
+    ], "read_only",
+    note="config, client construction, in-process cache and session bookkeeping; no payload write",
+)
+_declare(["on_pre_compress", "on_session_end"], "read_only",
+         note="collects extraction candidates into local artifacts; the store modes that would write are inert")
 
 _declare(["qdrant_memory_improve_apply", "improve apply"], "uncovered",
          reason="predicate read on 567eeac; stricter than the shared one on the traced shapes, never executed")
@@ -185,37 +244,121 @@ _declare([
     "improve", "improve preview", "backup", "backup list", "backup inspect",
     "watcher", "watcher status", "watcher logs", "watcher inspect-state",
     "watcher install", "watcher uninstall", "watcher reset-signature",
-], "read_only", note="no Qdrant payload mutation; some write local artifacts")
+], "read_only",
+    note="searches set access metadata on the points they return (set/merge, never delete or replace); "
+         "watcher status/install and the report commands write local artifacts only")
 
 # Writes outside Qdrant (files, reports, proposal state) with no payload to protect.
 _declare(["backup create", "eval-capture"], "read_only",
          note="writes files only; the restore route that consumes them is the protection row")
 
 
+# --- frozen classification -------------------------------------------------
+# A hand-written classification that nothing defends is a claim surface. These two maps
+# are the contract: a row reclassified away from `protection`, or a pin list trimmed,
+# fails here even though every individual route still looks fine.
+
+EXPECTED_PROTECTION_ROUTES = {
+    "qdrant_memory_store": STORE_PINS,
+    "store": STORE_PINS,
+    "qdrant_memory_forget": FORGET_PINS,
+    "forget": FORGET_PINS,
+    "qdrant_memory_extraction_approve": EXTRACTION_PINS,
+    "learning approve": EXTRACTION_PINS,
+    "restore": RESTORE_PINS,
+    "qdrant_memory_index [off]": INDEX_OFF_PINS,
+    "index [off]": INDEX_OFF_PINS,
+    "qdrant_memory_consolidation_apply": CONSOLIDATION_PINS,
+    "apply": CONSOLIDATION_PINS,
+    "qdrant_learning_store": LEARNING_STORE_PINS,
+    "learning store": LEARNING_STORE_PINS,
+    "qdrant_learning_approve": LEARNING_STORE_PINS,
+    "watcher run": GUARDED_AUTO_PINS,
+    "sync_turn": SYNC_TURN_PINS,
+}
+
+
 # --- assertions ------------------------------------------------------------
+
+
+# The `[mode]` suffix exists for the routes whose behaviour depends on the lineage mode,
+# and for those only. A `forget [off]` row would otherwise classify the base `forget`
+# route while describing a mode it does not have, which is the same claim-surface hole
+# one level up: the row exists, the label is wrong, and completeness says fine.
+_MODE_SCOPED = ("qdrant_memory_index", "index")
+_MODES = ("off", "capture", "reconcile")
 
 
 def _base(entry: str) -> str:
     return entry.split(" [", 1)[0]
 
 
+def _classified_by(name: str, inventory) -> bool:
+    if name in inventory:
+        return True
+    if name not in _MODE_SCOPED:
+        return False
+    return any(f"{name} [{mode}]" in inventory for mode in _MODES)
+
+
+def _unclassified(derived: set[str], inventory=None) -> list[str]:
+    inventory = ROUTE_INVENTORY if inventory is None else inventory
+    return sorted(name for name in derived if not _classified_by(name, inventory))
+
+
+def _unresolved_pins(inventory=None, repo: Path | None = None) -> list[str]:
+    inventory = ROUTE_INVENTORY if inventory is None else inventory
+    repo = REPO if repo is None else repo
+    unresolved: list[str] = []
+    for entry, row in sorted(inventory.items()):
+        if row["kind"] != "protection":
+            continue
+        for node in row["pins"]:  # type: ignore[union-attr]
+            path, _, name = node.partition("::")
+            name = name.split("[", 1)[0]
+            target = repo / path
+            if not target.is_file() or not re.search(
+                rf"^def {re.escape(name)}\(", target.read_text(encoding="utf-8"), re.M
+            ):
+                unresolved.append(f"{entry} -> {node}")
+    return unresolved
+
+
 def test_every_surface_entry_is_classified():
-    """A new tool or command must be classified before it can ship."""
-    derived = _tool_names() | _cli_commands()
-    missing = sorted(
-        name for name in derived
-        if name not in ROUTE_INVENTORY and f"{name} [off]" not in ROUTE_INVENTORY
-    )
+    """A new tool, command or hook must be classified before it can ship."""
+    missing = _unclassified(_surface())
     assert missing == [], (
         "these entry points are not classified in ROUTE_INVENTORY: "
         f"{missing}. Decide what each one does to a protected payload: protection "
-        "(with pins), transition, read_only, or uncovered with a reason."
+        "(with pins), transition, read_only, dispatch, or uncovered with a reason."
     )
 
 
+def test_the_completeness_detector_rejects_an_unclassified_entry():
+    """The detector must fail when it should: this is what makes the row above a gate."""
+    assert _unclassified({"qdrant_memory_newroute"}, ROUTE_INVENTORY) == ["qdrant_memory_newroute"]
+    assert _unclassified({"qdrant_memory_store"}, ROUTE_INVENTORY) == []
+    assert _unclassified({"index"}, ROUTE_INVENTORY) == []
+
+
+def test_a_mode_suffix_only_classifies_a_mode_scoped_route():
+    """`forget [off]` must not stand in for `forget`."""
+    suffix_only = {"forget [off]": {"kind": "read_only", "pins": [], "note": "", "reason": ""}}
+    assert _unclassified({"forget"}, suffix_only) == ["forget"]
+    index_suffix = {
+        key: {"kind": "protection" if "[" in key else "read_only", "pins": [], "note": "", "reason": ""}
+        for key in ("index [off]", "index [capture]", "index [reconcile]", "forget")
+    }
+    assert _unclassified({"index", "forget"}, index_suffix) == []
+
+
 def test_no_inventory_row_is_stale():
-    derived = _tool_names() | _cli_commands()
-    stale = sorted(key for key in ROUTE_INVENTORY if _base(key) not in derived)
+    derived = _surface()
+    stale = sorted(
+        key for key in ROUTE_INVENTORY
+        if _base(key) not in derived
+        or (" [" in key and _base(key) not in _MODE_SCOPED)
+    )
     assert stale == [], f"ROUTE_INVENTORY rows that no longer name a real entry point: {stale}"
 
 
@@ -225,19 +368,16 @@ def test_every_protection_route_names_a_pin_that_exists():
     ``docs/SAFETY.md`` said "pinned" three times for rows no test covered. A claim is
     only as good as its resolvable node id, so this resolves them.
     """
-    unresolved: list[str] = []
-    for entry, row in sorted(ROUTE_INVENTORY.items()):
-        if row["kind"] != "protection":
-            continue
-        pins = row["pins"]
-        assert pins, f"{entry} is a protection route with no pins"
-        for node in pins:  # type: ignore[union-attr]
-            path, _, name = node.partition("::")
-            name = name.split("[", 1)[0]
-            target = REPO / path
-            if not target.is_file() or not re.search(rf"^def {re.escape(name)}\(", target.read_text(encoding="utf-8"), re.M):
-                unresolved.append(f"{entry} -> {node}")
+    unresolved = _unresolved_pins()
     assert unresolved == [], f"protection routes naming a pin that does not exist: {unresolved}"
+
+
+def test_the_pin_resolver_rejects_a_pin_that_does_not_exist():
+    """The resolver must fail when it should, including on a renamed node."""
+    broken = {"route": {"kind": "protection", "pins": ["tests/test_lineage.py::test_not_a_real_node"], "note": "", "reason": ""}}
+    assert _unresolved_pins(broken) == ["route -> tests/test_lineage.py::test_not_a_real_node"]
+    renamed = {"route": {"kind": "protection", "pins": ["tests/test_lineage.py::test_off_mode_refuses_to_rewrite_a_chunk_carrying_only_review_state"], "note": "", "reason": ""}}
+    assert _unresolved_pins(renamed) == []
 
 
 def test_every_uncovered_route_declares_a_reason():
@@ -249,14 +389,30 @@ def test_every_uncovered_route_declares_a_reason():
 
 
 def test_a_route_is_classified_once_with_one_kind():
-    kinds = {"protection", "transition", "read_only", "uncovered"}
+    kinds = {"protection", "transition", "read_only", "dispatch", "uncovered"}
     bad = {entry: row["kind"] for entry, row in ROUTE_INVENTORY.items() if row["kind"] not in kinds}
     assert bad == {}, f"unknown kinds: {bad}"
 
 
-@pytest.mark.parametrize("name", ["qdrant_memory_store", "restore", "qdrant_memory_index [off]"])
-def test_the_inventory_sees_the_four_routes_that_failed_reviews(name):
-    """The four historical blocker routes stay classified as protection routes."""
-    assert name in ROUTE_INVENTORY
-    assert ROUTE_INVENTORY[name]["kind"] == "protection"
-    assert ROUTE_INVENTORY[name]["pins"]
+def test_the_protection_set_is_exactly_this():
+    """Frozen: reclassifying any of these away from `protection` fails here.
+
+    Covers the four routes four reviews opened (store, extraction approval, restore, the
+    off-mode reindex), the two the plan opened (forget, destructive consolidation), the
+    learning store's collection invariant, the guarded-auto caller, and the hook writer.
+    """
+    protected = {entry: row["pins"] for entry, row in ROUTE_INVENTORY.items() if row["kind"] == "protection"}
+    assert protected == EXPECTED_PROTECTION_ROUTES
+
+
+def test_every_protection_row_keeps_its_exact_pin_list():
+    """Frozen: trimming a pin list to one entry fails here.
+
+    A list that is only checked for "some pins exist and they resolve" survives
+    mutation; the point of the list is that every claim in it is enumerated.
+    """
+    trimmed = {
+        entry: row["pins"] for entry, row in ROUTE_INVENTORY.items()
+        if row["kind"] == "protection" and list(row["pins"]) != list(EXPECTED_PROTECTION_ROUTES.get(entry, []))  # type: ignore[arg-type]
+    }
+    assert trimmed == {}, f"protection rows whose pin list drifted: {sorted(trimmed)}"

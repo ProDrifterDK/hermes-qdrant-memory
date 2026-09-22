@@ -1124,7 +1124,7 @@ removed evidence, and it is the reason a retired root can always be explained.
   block destructive consolidation`, `lineage dependents block forget`), and so
   is an incomplete or failed dependency lookup.
 - **Reindex retirement**: under `capture` a reindex never retires; a file whose
-  content changed is reported with `retirement_requires_capture_or_retirement`. Under
+  content changed is reported with `retirement_requires_reconcile`. Under
   `off`, files that are already lineage-managed are refused with
   `lineage_managed_requires_capture_or_retirement` instead of being replaced. A
   reindex replaces every chunk payload in place at its content-derived id and, under
@@ -1235,8 +1235,12 @@ Verdict every destructive route must give, pinned by
   reviewed transition that marks it `lineage_retired`, which the fence skips. A
   hand-built edge without the structural marker would be deletable, but no writer in
   this tree produces that shape for a point-cited dependency: the only writer of
-  `target_point_id` edges is the mechanical builder, which always sets the marker,
-  and the live collection holds no `target_point_id` at all.
+  `target_point_id` edges is the mechanical builder, which always sets the marker. The
+  live collection was measured while writing this section — 15,387 points and zero
+  carrying `target_point_id`, `lineage_record`, `file_version_id`, `lineage_entity_id`,
+  `lineage_role`, `lineage_scope_key`, `lineage_source_key` or
+  `lineage_review_event_ids`. That is an observation about the deployed collection at
+  that moment, not part of the contract above; the contract is pinned by test either way.
 - `consolidation delete/merge/quarantine`, lineage-managed point — refuse in all
   three modes.
 - `consolidation delete/merge/quarantine`, ordinary root with dependents —
@@ -1262,11 +1266,20 @@ Verdict every destructive route must give, pinned by
 - reindex under `off`, a file whose owned chunk carries lineage identity **or** the
   review state a transition wrote — the file is blocked
   (`lineage_managed_requires_capture_or_retirement`), so neither the payload rewrite
-  nor the stale-id deletion runs, with or without `--force`. Same for a removed file's
-  chunks. Pinned by `tests/test_lineage.py` (`test_off_mode_refuses_to_rewrite_a_chunk_carrying_only_review_state`,
+  nor the stale-id deletion runs, with or without `--force`. Decided **per file**, the
+  same way the present-file site decides: a removed file whose chunks are gone from
+  disk is blocked whole when any one of its chunks is protected, so a demoted sibling
+  cannot be retired through the file it belongs to, and the path is not reported as
+  deleted. Pinned by `tests/test_lineage.py` (`test_off_mode_refuses_to_rewrite_a_chunk_carrying_only_review_state`,
   `..._one_identity_field`, `..._destroy_or_duplicate_captured_file`,
   `test_directory_off_mode_does_not_delete_removed_lineage_managed_chunks`,
+  `test_a_removed_file_whose_siblings_are_ordinary_is_blocked_as_a_file`,
+  `test_a_removed_file_with_one_protected_sibling_survives_force_too`,
   `test_off_mode_force_skips_lineage_managed_filter_delete_in_dry_and_live_runs`).
+- provider hook `sync_turn` (`sync_turns` on), target at the store's deterministic id
+  is protected — the write is suppressed by the same guard the store uses, and the
+  failure is logged at debug rather than surfaced, since the runtime calls it with no
+  caller to answer.
 - improve apply (not an exact replay) and RAPTOR apply (differing node metadata) —
   refuse by their own checks; read, not executed, in the W2 closure reviews, and
   declared `uncovered` in `tests/test_route_inventory.py`.
@@ -1274,10 +1287,13 @@ Verdict every destructive route must give, pinned by
   `capture`, planned through the reviewed path under `reconcile`.
 
 Every row above is enumerated as a classified entry point in
-`tests/test_route_inventory.py`, which derives the tool and CLI surface from the code,
-fails when an entry point is unclassified, and resolves each claimed pin to a test that
-exists. A new route cannot ship unclassified, and this table cannot claim a pin that
-was renamed away.
+`tests/test_route_inventory.py`, which derives the tool dispatch, the CLI commands and
+the provider hook overrides from the code, fails when an entry point is unclassified,
+resolves each claimed pin to a test that exists, and freezes both the protection set and
+every protection row's pin list. A new route cannot ship unclassified, this table cannot
+claim a pin that was renamed away, and a row cannot be quietly reclassified or its list
+trimmed. The `[mode]` suffix is accepted for the reindex routes only, so a `forget [off]`
+row cannot stand in for `forget`.
 
 ### Route for an ordinary demoted point
 

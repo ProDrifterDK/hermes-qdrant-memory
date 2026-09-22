@@ -1787,6 +1787,96 @@ def test_guarded_auto_caller_rejects_removed_preauthorization_metadata(tmp_path)
     assert provider._qdrant.deleted_ids == []
 
 
+def test_watcher_guarded_auto_refuses_a_lineage_managed_target(tmp_path):
+    """The `watcher run` inventory row points here.
+
+    `watcher run` is a protection route because its only mutating reach is
+    `--autonomy-mode guarded-auto` → `apply_guarded_auto` → the apply path, so the
+    lineage refusals must hold there. The row used to point at the sensitivity pin,
+    which drives `qdrant_memory_consolidation_apply` on ordinary profile points and
+    never reaches a lineage guard: it pinned a refusal the row did not describe.
+    """
+    from qdrant_memory.consolidation import persist_consolidation_report
+    from qdrant_memory.guarded_auto import GuardedAutoPolicy, apply_guarded_auto
+    from qdrant_memory.lineage import LINEAGE_MANAGED_RETIREMENT_REFUSED
+
+    def _guarded_dup_report(protected_payload):
+        provider = _provider(tmp_path)
+        provider._qdrant = FakeQdrant({
+            "memory": [
+                _point("m1", "Always dry-run before live vault indexing",
+                       source_type="manual", **protected_payload),
+                _point("m2", "Always dry-run before live vault indexing",
+                       source_type="conversation"),
+            ],
+            "learnings": [],
+        })
+        report = persist_consolidation_report(
+            {
+                "dry_run": True,
+                "report_only": True,
+                "scope": "memory",
+                "profile_id": "architect",
+                "proposals": [
+                    {
+                        "proposal_id": "watcher-dup",
+                        "proposal_type": "duplicate_cluster",
+                        "collection_name": "memory",
+                        "affected_ids": ["m1", "m2"],
+                        "suggested_action": "merge_review_only",
+                        "risk": "low",
+                        "confidence": 0.99,
+                        "match_kind": "exact_normalized",
+                        "guarded_auto_eligible": True,
+                        "preauthorized_policy": "guarded-auto:exact-duplicate-merge",
+                    }
+                ],
+            },
+            hermes_home=str(tmp_path),
+        )
+        return provider, report
+
+    def _apply(provider, report):
+        return json.loads(provider.handle_tool_call(
+            "qdrant_memory_consolidation_apply",
+            {
+                "report_id": report["report_id"],
+                "proposal_id": "watcher-dup",
+                "action": "merge",
+                "dry_run": False,
+                "approve": True,
+                "_guarded_auto": True,
+            },
+        ))
+
+    # identity: the retirement refusal, and the guarded-auto summary reports it as a
+    # provider rejection rather than an apply.
+    provider, report = _guarded_dup_report({"file_version_id": "a" * 64})
+    result = _apply(provider, report)
+    assert result["error"] == LINEAGE_MANAGED_RETIREMENT_REFUSED
+    assert provider._qdrant.payload_updates == []
+    assert provider._qdrant.deleted_ids == []
+
+    summary = apply_guarded_auto(provider, report, GuardedAutoPolicy(mode="guarded-auto"))
+    assert summary["applied"] == []
+    assert [entry["code"] for entry in summary["errors"]] == ["provider_rejected"]
+    assert provider._qdrant.payload_updates == []
+    assert provider._qdrant.deleted_ids == []
+
+    # structural: the caller-agnostic structural refusal, same zero-write outcome.
+    provider, report = _guarded_dup_report({"lineage_record": True})
+    result = _apply(provider, report)
+    assert "refusing to touch structural lineage records" in result["error"]
+    assert provider._qdrant.payload_updates == []
+    assert provider._qdrant.deleted_ids == []
+
+    summary = apply_guarded_auto(provider, report, GuardedAutoPolicy(mode="guarded-auto"))
+    assert summary["applied"] == []
+    assert [entry["code"] for entry in summary["errors"]] == ["provider_rejected"]
+    assert provider._qdrant.payload_updates == []
+    assert provider._qdrant.deleted_ids == []
+
+
 def test_guarded_auto_rejects_tampered_report_identity(tmp_path):
     provider = _provider(tmp_path)
     provider._qdrant = FakeQdrant(
@@ -3263,6 +3353,41 @@ def test_store_refuses_to_overwrite_a_protected_point_in_every_mode(field, mode,
 
     assert result == {"error": _overwrite_refusal_text(field)}
     assert provider._qdrant.upserts == []
+    assert provider._qdrant.payload_updates == []
+
+
+@pytest.mark.parametrize("mode", ["off", "capture", "reconcile"])
+def test_the_sync_turn_hook_cannot_overwrite_a_protected_target(mode, tmp_path):
+    """`sync_turn` is a write route the runtime calls when `sync_turns` is on.
+
+    It reaches the same deterministic id as the store, so it inherits the guard — but
+    it is not reachable from the tool dispatch or the CLI parser, which is why the
+    route inventory derives provider hooks separately. The id is calibrated here rather
+    than computed: the first turn reveals the id the writer uses for its text.
+    """
+    provider = _store_provider(tmp_path, mode)
+    provider._config["sync_turns"] = True
+    provider._write_enabled = True
+    provider._executor = None
+    assert provider._active is True
+    assert provider._writer is not None
+
+    provider.sync_turn("a user turn", "an assistant turn")
+    assert len(provider._qdrant.upserts) == 1, "the fixture must write once before the protected retry"
+    _collection, points = provider._qdrant.upserts[0]
+    assert points, "the calibration write must carry points"
+    target_id = str(points[0]["id"])
+    provider._qdrant.by_collection["memory"] = [
+        _point(target_id, "a user turn", source_type="manual",
+               requires_review=True, fact_status="review_required",
+               lineage_review_event_ids=["40dfae4c-0000-4000-8000-000000000004"]),
+    ]
+    provider._qdrant.upserts.clear()
+
+    provider.sync_turn("a user turn", "an assistant turn")
+
+    assert provider._qdrant.upserts == []
+    assert provider._qdrant.deleted_ids == []
     assert provider._qdrant.payload_updates == []
 
 

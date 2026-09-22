@@ -1093,6 +1093,91 @@ def test_directory_off_mode_does_not_delete_removed_lineage_managed_chunks(tmp_p
     assert result["lineage_blocked_files"][0]["lineage_blocked_reason"] == "lineage_managed_requires_capture_or_retirement"
 
 
+def test_a_removed_file_whose_siblings_are_ordinary_is_blocked_as_a_file(tmp_path):
+    """The removed-file block is decided per file, not per chunk.
+
+    A transition demotes one chunk of a multi-chunk file. That chunk carries the review
+    state, its siblings carry nothing, and the file is gone from disk. Deciding per point
+    here — the decision the present-file site already made per file — marked the path
+    blocked, then deleted every sibling anyway and listed the path as deleted, so the
+    block held exactly the one id that was protected and leaked all the others.
+    """
+    path = tmp_path / "note.md"
+    path.write_text(
+        "# Note\n\n" + "\n\n".join(
+            f"## Section {index}\n" + " ".join(f"s{index}w{word}" for word in range(12))
+            for index in range(6)
+        ) + "\n",
+        encoding="utf-8",
+    )
+    qdrant, embeddings = FakeQdrant(), FakeEmbedding()
+    _indexer(qdrant, embeddings, mode="off").index([path], dry_run=False)
+    chunks = _points(qdrant, kind="source_chunk")
+    assert len(chunks) > 1, "the fixture must produce siblings for this pin to mean anything"
+    protected = chunks[0]
+    payload = protected["payload"]
+    payload.update({
+        "requires_review": True,
+        "fact_status": "review_required",
+        "lineage_review_event_ids": ["40dfae4c-0000-4000-8000-000000000002"],
+    })
+    v2_chunks = {str(point["id"]) for point in chunks}
+    path.unlink()
+    qdrant.call_log.clear()
+    qdrant.deleted.clear()
+    qdrant.upserts.clear()
+    embeddings.documents.clear()
+
+    result = _indexer(qdrant, embeddings, mode="off").index([tmp_path], dry_run=False)
+
+    assert result["lineage_blocked_files"][0]["lineage_blocked_reason"] == "lineage_managed_requires_capture_or_retirement"
+    assert result["refused"] is True
+    assert result["deleted_file_paths"] == []
+    assert result["deleted_file_ids"] == []
+    assert result["stale_ids"] == []
+    assert result["files_with_stale_chunks"] == 0
+    assert qdrant.deleted == []
+    assert qdrant.upserts == []
+    assert embeddings.documents == []
+    assert {str(point["id"]) for point in _points(qdrant, kind="source_chunk")} == v2_chunks
+
+
+@pytest.mark.parametrize("force", [False, True], ids=("plain", "force"))
+def test_a_removed_file_with_one_protected_sibling_survives_force_too(tmp_path, force):
+    path = tmp_path / "note.md"
+    path.write_text(
+        "# Note\n\n" + "\n\n".join(
+            f"## Section {index}\n" + " ".join(f"s{index}w{word}" for word in range(12))
+            for index in range(5)
+        ) + "\n",
+        encoding="utf-8",
+    )
+    qdrant, embeddings = FakeQdrant(), FakeEmbedding()
+    _indexer(qdrant, embeddings, mode="off").index([path], dry_run=False)
+    chunks = _points(qdrant, kind="source_chunk")
+    # The protected chunk is the last one, so a per-point decision deletes its sibling
+    # predecessors instead of its successors. Both orders are the same defect.
+    chunks[-1]["payload"].update({
+        "requires_review": True,
+        "fact_status": "review_required",
+        "lineage_review_event_ids": ["40dfae4c-0000-4000-8000-000000000003"],
+    })
+    v2_chunks = {str(point["id"]) for point in chunks}
+    path.unlink()
+    qdrant.call_log.clear()
+    qdrant.deleted.clear()
+
+    result = _indexer(qdrant, embeddings, mode="off").index(
+        [tmp_path], dry_run=False, force=force,
+    )
+
+    assert result["deleted_file_ids"] == []
+    assert result["stale_ids"] == []
+    assert qdrant.deleted == []
+    assert {str(point["id"]) for point in _points(qdrant, kind="source_chunk")} == v2_chunks
+    assert result["lineage_blocked_files"][0]["lineage_blocked_reason"] == "lineage_managed_requires_capture_or_retirement"
+
+
 def test_foreign_scope_only_force_has_dry_live_parity_without_deletion(tmp_path):
     path = tmp_path / "note.md"
     path.write_text("# Note\nalpha", encoding="utf-8")

@@ -502,12 +502,14 @@ caveat and the recorded support limitation.
 (`hermes_memory`, `hermes_learnings`) already do. The learning store writes without
 the lineage overwrite guard, so a shared collection would let a learning upsert
 replace a protected payload, and `load_config` refuses that configuration with a
-`ValueError` instead of relying on the names happening to differ. The refusal
-surfaces from provider construction, and from `is_available` for a collision that
-comes from `config.yaml` or the environment; `is_available` calls `load_config()`
-without a `hermes_home`, so a collision that exists only in
-`$HERMES_HOME/qdrant_memory.json` passes `is_available` and raises when the provider
-initializes. `hermes qdrant doctor` reports the refusal as a failed
+`ValueError` instead of relying on the names happening to differ. The refusal surfaces
+from provider construction: when the collision comes from `config.yaml`, the environment
+or the active `$HERMES_HOME/qdrant_memory.json`, the provider raises before
+`is_available` is reached, so `is_available` never sees that case. A collision that
+exists only in a `hermes_home` passed to `initialize` — a home other than the `HERMES_HOME`
+the process runs against — passes `is_available`, because `is_available` calls
+`load_config()` without a `hermes_home`, and raises when the provider initializes.
+`hermes qdrant doctor` reports the refusal as a failed
 `config_invariants` check instead of dying with the same traceback; that path returns
 early, so it reports `plugin_discovery` and `config_invariants` only — with no
 loadable config there is no URL to reach a collection with.

@@ -861,31 +861,44 @@ class FileIndexer:
                                 and any(is_path_within(path, root) for root in roots)):
                             foreign_ids_by_file.setdefault(path, set()).add(str(point_id))
                     deleted: dict[str, list[dict[str, Any]]] = {}
+                    removed_by_file: dict[str, list[dict[str, Any]]] = {}
                     for point in existing_chunks:
                         payload = point.get("payload") or {}
                         path, point_id = str(payload.get("file_path") or ""), point.get("id")
                         if not path or point_id is None or path in desired_ids_by_file or Path(path).exists():
                             continue
                         if any(is_path_within(path, root) for root in roots):
-                            if not capture and not reconcile and lineage_overwrite_protected_reasons(payload):
-                                if path not in off_blocked_files:
-                                    blocked = {
-                                        "file_path": path,
-                                        "lineage_baseline_basis": "indexed_file_sha256",
-                                        "lineage_missing_fields": [],
-                                        "lineage_blocked_reason": "lineage_managed_requires_capture_or_retirement",
-                                        "lineage_history_complete": False,
-                                    }
-                                    off_blocked_files.add(path)
-                                    summary["lineage_files"].append(blocked)
-                                    summary["lineage_blocked_files"].append(blocked)
-                                    summary["refused"] = True
-                                    summary["refusals"].append({
-                                        "file_path": path,
-                                        "reason": "lineage_managed_requires_capture_or_retirement",
-                                    })
-                                continue
-                            deleted.setdefault(path, []).append(point)
+                            removed_by_file.setdefault(path, []).append(point)
+                    for path, old_points in sorted(removed_by_file.items()):
+                        # Decided per file, like the present-file site above: a removed
+                        # file is lineage-managed when any of its chunks is, because the
+                        # chunks share the file's identity and the transition's review
+                        # state lands on whichever chunk it lands on. Deciding per point
+                        # here deleted the blocked chunk's siblings and still reported the
+                        # path as deleted, so the block leaked exactly the ids it exists
+                        # to keep.
+                        if not capture and not reconcile and any(
+                            lineage_overwrite_protected_reasons(point.get("payload") or {})
+                            for point in old_points
+                        ):
+                            if path not in off_blocked_files:
+                                blocked = {
+                                    "file_path": path,
+                                    "lineage_baseline_basis": "indexed_file_sha256",
+                                    "lineage_missing_fields": [],
+                                    "lineage_blocked_reason": "lineage_managed_requires_capture_or_retirement",
+                                    "lineage_history_complete": False,
+                                }
+                                off_blocked_files.add(path)
+                                summary["lineage_files"].append(blocked)
+                                summary["lineage_blocked_files"].append(blocked)
+                                summary["refused"] = True
+                                summary["refusals"].append({
+                                    "file_path": path,
+                                    "reason": "lineage_managed_requires_capture_or_retirement",
+                                })
+                            continue
+                        deleted.setdefault(path, []).extend(old_points)
                     if reconcile:
                         source_filter = {"must": [
                             {"key": "lineage_role", "match": {"value": "file_source"}},
