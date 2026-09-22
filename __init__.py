@@ -60,10 +60,13 @@ from qdrant_memory.embeddings import EmbeddingClient
 from qdrant_memory.indexer import FileIndexer
 from qdrant_memory.learning import LearningStore, build_learning_payload, classify_learning_type
 from qdrant_memory.lineage import (
+    LINEAGE_LOCK_UNAVAILABLE,
+    LineageLockUnavailable,
     build_lineage_impact_snapshot,
     collection_write_lock,
     find_direct_dependents,
     lineage_impact_proposal_digest,
+    redact_lock_refusals,
     validate_lineage_impact_snapshot,
 )
 from qdrant_memory.lesson_extractor import LearningCandidate, candidate_to_learning_args, contains_secret, extract_learning_candidates_from_messages
@@ -130,20 +133,13 @@ from qdrant_memory.writer import ConversationWriter
 
 logger = logging.getLogger(__name__)
 
-# One fixed operator-facing contract for every lineage collection lock refusal.
-# The consolidation fence, the forget path and the locked-upsert writers all
-# report this exact inner text; callers may add an operation prefix, but the
-# underlying lock error is never forwarded raw (a lock-directory OS error must
-# not reach a tool response).
-LINEAGE_LOCK_UNAVAILABLE = "lineage collection lock unavailable"
-
-
-class LineageLockUnavailable(RuntimeError):
-    """Fixed-text refusal raised when the lineage collection lock is unavailable.
-
-    Subclasses RuntimeError so every existing ``except (TimeoutError, RuntimeError)``
-    lock handler keeps working, while carrying only the single fixed contract text.
-    """
+# One fixed operator-facing contract for every lineage collection lock refusal; the
+# constant, the refusal exception and the tool-boundary redactor are defined next to
+# the lock helper itself (qdrant_memory/lineage.py) so there is a single source. The
+# consolidation fence, the forget path and the locked-upsert writers report the fixed
+# inner text, callers add an operation prefix, and `redact_lock_refusals` keeps the
+# raw OS detail out of every other tool response.
+_LOCK_REFUSAL_REDACTED = "lineage lock refusal redacted from a tool response"
 
 
 def _json_error(message: str) -> str:
@@ -1369,9 +1365,18 @@ class QdrantMemoryProvider(MemoryProvider):
         )
         try:
             summary = indexer.index([str(p) for p in paths if str(p).strip()], dry_run=dry_run, force=force, max_files=max_files)
-            return json.dumps(summary)
+            redacted = redact_lock_refusals(summary)
+            if redacted != summary:
+                logger.warning(
+                    "%s: %s", _LOCK_REFUSAL_REDACTED, json.dumps(summary, default=str)[:600],
+                )
+            return json.dumps(redacted)
         except Exception as exc:
-            return _json_error(f"Index failed: {exc}")
+            raw = f"Index failed: {exc}"
+            redacted = redact_lock_refusals(raw)
+            if redacted != raw:
+                logger.warning("%s: %s", _LOCK_REFUSAL_REDACTED, raw)
+            return _json_error(redacted)
 
     def _lineage_dependency_fence(
         self, collection_name: str, root_point_ids: list[str], *, mode: str,

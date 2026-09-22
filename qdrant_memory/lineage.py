@@ -1786,6 +1786,55 @@ def _collection_lock_digest(collection_name: str, user_id: int) -> str:
     return hashlib.sha256(f"{int(user_id)}\n{collection_name}".encode()).hexdigest()
 
 
+LINEAGE_LOCK_UNAVAILABLE = "lineage collection lock unavailable"
+
+
+class LineageLockUnavailable(RuntimeError):
+    """Fixed-text refusal raised when the lineage collection lock is unavailable.
+
+    Subclasses RuntimeError so every existing ``except (TimeoutError, RuntimeError)``
+    lock handler keeps working, while carrying only the single fixed contract text.
+    """
+
+
+# Raw refusal texts the lock helper and its callers emit. A tool response must not
+# forward them verbatim: they carry OS detail (errno, filesystem paths) and a second
+# wording for one condition. Direct callers keep the raw text, because frozen W1
+# tests pin those messages; the server log keeps it as well.
+LINEAGE_LOCK_REFUSAL_MARKERS = (
+    "lineage collection lock acquisition timed out",
+    "lineage lock directory unavailable",
+    "lineage lock directory must not be a symlink",
+    "lineage lock directory has unsafe ownership, type, or permissions",
+    "lineage lock file has unsafe ownership, type, or permissions",
+    "lineage locking is unsupported on this platform",
+    "lineage locking requires O_NOFOLLOW support",
+)
+
+
+def redact_lock_refusals(value: Any) -> Any:
+    """Collapse a raw lineage lock refusal to the single fixed contract text.
+
+    Every string that mentions a lock refusal is truncated at the refusal marker and
+    suffixed with ``LINEAGE_LOCK_UNAVAILABLE``, so the operation prefix survives and
+    the OS detail does not. Strings already carrying the fixed text and non-string
+    values pass through untouched, which makes the transform idempotent.
+    """
+    if isinstance(value, str):
+        positions = [
+            value.find(marker) for marker in LINEAGE_LOCK_REFUSAL_MARKERS
+            if marker in value
+        ]
+        if not positions:
+            return value
+        return value[: min(positions)] + LINEAGE_LOCK_UNAVAILABLE
+    if isinstance(value, dict):
+        return {key: redact_lock_refusals(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_lock_refusals(item) for item in value]
+    return value
+
+
 @contextmanager
 def collection_write_lock(
     *, collection_name: str, timeout: float = 5.0, lock_dir: str = "",

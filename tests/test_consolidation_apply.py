@@ -2472,3 +2472,131 @@ def test_dependency_scope_mismatch_errors_keep_their_category_without_ids(tmp_pa
     assert "owned inventory scope mismatch" in plan["errors"]
     assert not any("owned-foreign" in error for error in plan["errors"])
 
+
+# ===========================================================================
+# W2 closure review (delta 5) N1/N2: the lock-refusal contract at the tool
+# boundary, and the acquisition-only scope of the writer normalization.
+# ===========================================================================
+
+def test_index_tool_response_collapses_lineage_lock_refusals(monkeypatch, tmp_path):
+    """N1: the index tool must not forward raw lock text or the lock path.
+
+    `FileIndexer` is an internal component that reports precisely; the tool
+    response is the operator contract. Redaction therefore happens at the
+    boundary, and the raw text is kept in the server log.
+    """
+    provider = _provider(tmp_path)
+    provider._qdrant = FakeQdrant({"memory": [], "learnings": []})
+    provider._embeddings = FakeEmbedding()
+    raw_errors = [
+        "lineage capture failed: lineage lock directory unavailable: "
+        "[Errno 20] Not a directory: '/tmp/conf/locks'",
+        "lineage capture failed: lineage collection lock acquisition timed out",
+        "lineage reconciliation failed: lineage lock directory must not be a symlink",
+    ]
+    expected = [
+        "lineage capture failed: lineage collection lock unavailable",
+        "lineage capture failed: lineage collection lock unavailable",
+        "lineage reconciliation failed: lineage collection lock unavailable",
+    ]
+
+    def fake_index(self, paths, **kwargs):
+        return {
+            "dry_run": False,
+            "errors": [
+                {"file_path": "/notes/a.md", "error": raw} for raw in raw_errors
+            ],
+            "lineage_blocked_files": [],
+        }
+
+    monkeypatch.setattr("__init__.FileIndexer.index", fake_index)
+    text = provider.handle_tool_call(
+        "qdrant_memory_index", {"paths": ["/notes/a.md"], "dry_run": False, "force": True},
+    )
+    payload = json.loads(text)
+
+    assert [entry["error"] for entry in payload["errors"]] == expected
+    for forbidden in (
+        "Errno", "Not a directory", "symlink", "lock directory unavailable",
+        "timed out", "/tmp/conf/locks", "lineage collection lock acquisition",
+    ):
+        assert forbidden not in text
+
+
+def test_index_tool_response_redacts_a_lock_failure_raised_out_of_the_indexer(monkeypatch, tmp_path):
+    """N1: the `except` branch of the index tool is a second way to leak raw text."""
+    provider = _provider(tmp_path)
+    provider._qdrant = FakeQdrant({"memory": [], "learnings": []})
+    provider._embeddings = FakeEmbedding()
+
+    def failing_index(self, paths, **kwargs):
+        raise RuntimeError(
+            "lineage lock directory unavailable: [Errno 20] Not a directory: '/tmp/conf/locks'"
+        )
+
+    monkeypatch.setattr("__init__.FileIndexer.index", failing_index)
+    text = provider.handle_tool_call(
+        "qdrant_memory_index", {"paths": ["/notes/a.md"], "dry_run": False, "force": True},
+    )
+
+    assert json.loads(text) == {
+        "error": "Index failed: lineage collection lock unavailable",
+    }
+    assert "Errno" not in text
+    assert "/tmp/conf/locks" not in text
+
+
+def test_locked_writer_body_failure_is_not_reported_as_a_lock_refusal(tmp_path):
+    """N2: the normalization wraps the acquisition only, never the guarded body."""
+    from qdrant_memory.source_extraction import extract_source_candidates_from_text
+
+    class BodyFailsOnUpsert(FakeQdrant):
+        def upsert(self, name, points):
+            raise RuntimeError("store exploded inside the locked body")
+
+    provider = _provider(tmp_path)
+    provider._qdrant = BodyFailsOnUpsert({"memory": [], "learnings": []})
+    provider._embeddings = FakeEmbedding()
+    provider._config.update({
+        "source_extraction_enabled": True,
+        "source_extraction_mode": "preview",
+        "source_extraction_min_confidence": 0.65,
+        "source_extraction_max_candidates_per_session": 8,
+        "lineage_lock_dir": str(tmp_path / "locks"),
+    })
+    candidate = extract_source_candidates_from_text(
+        "Decision: keep extraction approvals behind the configured collection lock.",
+        source_uri="session://lineage-lock/extraction",
+    )[0]
+    provider._pending_extraction_candidates[candidate.candidate_id] = candidate
+    assert json.loads(provider.handle_tool_call(
+        "qdrant_memory_extraction_approve",
+        {"candidate_id": candidate.candidate_id},
+    ))["dry_run"] is True
+
+    text = provider.handle_tool_call(
+        "qdrant_memory_extraction_approve",
+        {"candidate_id": candidate.candidate_id, "dry_run": False, "approve": True},
+    )
+
+    assert json.loads(text) == {
+        "error": "Extraction approval failed: store exploded inside the locked body",
+    }
+    assert LINEAGE_LOCK_FIXED_TEXT not in text
+    assert candidate.candidate_id in provider._pending_extraction_candidates
+
+
+def test_lock_refusal_redactor_is_idempotent_and_leaves_other_text_alone():
+    """N1: the redactor is a boundary transform, not a blanket string rewrite."""
+    from qdrant_memory.lineage import redact_lock_refusals
+
+    fixed = "lineage capture failed: lineage collection lock unavailable"
+    assert redact_lock_refusals(fixed) == fixed
+    assert redact_lock_refusals("ordinary index summary text") == "ordinary index summary text"
+    assert redact_lock_refusals(7) == 7
+    assert redact_lock_refusals({"a": [{"b": fixed}]}) == {"a": [{"b": fixed}]}
+    assert redact_lock_refusals(
+        "lineage capture failed: lineage lock directory must not be a symlink"
+    ) == fixed
+
+

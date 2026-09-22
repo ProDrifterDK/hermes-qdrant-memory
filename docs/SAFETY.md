@@ -1049,3 +1049,31 @@ Operators sharing one collection across profiles must treat a cross-profile
 dependency as unenforced: the fence is a per-profile safety check, not a
 collection-wide referential-integrity guarantee.
 
+---
+
+## 23. Lineage W2 — one lock-refusal contract on every tool surface
+
+Failing to take the lineage collection lock is one condition, so it reads as one
+string: `lineage collection lock unavailable`. The constant, the refusal exception
+(`LineageLockUnavailable`) and the redactor live next to the lock helper in
+`qdrant_memory/lineage.py` as the single source.
+
+- The consolidation fence, `qdrant_memory_forget` and the locked-upsert writers
+  (extraction approval, improve apply, RAPTOR apply) return that text, with the
+  writers keeping only an operation prefix. Each normalizes the acquisition only,
+  so a failure raised inside the guarded body is still reported as itself.
+- The `qdrant_memory_index` response is redacted at the tool boundary:
+  `redact_lock_refusals` truncates any raw refusal at its marker and appends the
+  fixed text, preserving the operation prefix (`lineage capture failed: lineage
+  collection lock unavailable`) while dropping the errno and the lock-directory
+  path. The raw text stays in the server log, so a misconfigured
+  `lineage_lock_dir` is still diagnosable.
+- Direct callers keep the raw texts (`lineage collection lock acquisition timed
+  out`, `lineage lock directory unavailable: …`), because the frozen W1 tests pin
+  those messages on the helper itself. Redaction is a response-boundary concern,
+  not a change to the helper's contract.
+- Out of scope and unchanged: the `backup` restore path is reached from the CLI,
+  not from a tool response, and keeps its own raw text. Runtime activation,
+  migration and backfill remain out of scope (see the closing notes for this
+  delta).
+
