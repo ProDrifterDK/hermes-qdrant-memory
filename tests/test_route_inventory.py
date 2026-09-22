@@ -258,6 +258,11 @@ _declare(["backup create", "eval-capture"], "read_only",
 # are the contract: a row reclassified away from `protection`, or a pin list trimmed,
 # fails here even though every individual route still looks fine.
 
+# The derived surface — 25 tools, 50 CLI commands, 12 provider hooks. A route added or
+# removed changes this number, which forces someone to touch this file and classify it,
+# even if the completeness check in the test body is later weakened.
+FROZEN_SURFACE_SIZE = 87
+
 EXPECTED_PROTECTION_ROUTES = {
     "qdrant_memory_store": STORE_PINS,
     "store": STORE_PINS,
@@ -325,8 +330,20 @@ def _unresolved_pins(inventory=None, repo: Path | None = None) -> list[str]:
 
 
 def test_every_surface_entry_is_classified():
-    """A new tool, command or hook must be classified before it can ship."""
-    missing = _unclassified(_surface())
+    """A new tool, command or hook must be classified before it can ship.
+
+    The size pin below is deliberate: it makes a new route change a number that has to
+    be updated by hand, so the gate keeps working even if someone later guts the
+    ``missing`` computation in this body. The detector functions themselves are tested
+    separately, against deliberately unclassified input.
+    """
+    derived = _surface()
+    assert len(derived) == FROZEN_SURFACE_SIZE, (
+        f"the derived surface changed from {FROZEN_SURFACE_SIZE} to {len(derived)} entries. "
+        "If a route was added or removed on purpose, classify it in ROUTE_INVENTORY and "
+        "update this pin; if not, find out why the derivation sees something new."
+    )
+    missing = _unclassified(derived)
     assert missing == [], (
         "these entry points are not classified in ROUTE_INVENTORY: "
         f"{missing}. Decide what each one does to a protected payload: protection "
