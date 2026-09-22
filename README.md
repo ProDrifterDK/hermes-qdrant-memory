@@ -479,6 +479,18 @@ wins; as with every key, the environment variable outranks a `lineage_lock_dir`
 written in `config.yaml` or `qdrant_memory.json`). Isolated deployments and test
 harnesses use it to keep the lineage lock directory off the shared per-user path.
 
+`lineage_mode` accepts `off`, `capture`, and `reconcile`. Read the activation
+boundary before turning it on: retirement of an ordinary (non-file) memory point
+is **not supported** yet, so the destructive routes refuse instead of degrading
+to a legacy delete. Under `reconcile` every consolidation delete/merge/quarantine
+returns `lineage impact blocks ordinary-root transition:
+ordinary_root_transition_cause_unratified`, and a point that belongs to a
+captured file (it carries a file version or lineage identity) is refused by both
+`qdrant_memory_forget` and destructive consolidation with `lineage-managed points
+require the reviewed retirement path`. That refusal means *unsupported*, not
+*broken*; do not work around it by turning lineage off or editing payloads. See
+`docs/SAFETY.md` for the per-route table and the recorded support limitation.
+
 Example config:
 
 ```yaml

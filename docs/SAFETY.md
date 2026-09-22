@@ -1101,3 +1101,90 @@ string: `lineage collection lock unavailable`. The constant, the refusal excepti
   migration and backfill remain out of scope (see the closing notes for this
   delta).
 
+---
+
+## 27. Lineage W2 — refusal-only ordinary-root retirement (activation statement)
+
+W2 ships as a **refusal-only activation mode** for ordinary roots. The plan
+leaves two branches open: ratify the source-neutral ordinary-root transition
+contract and prove demotion before retirement, or refuse every unsupported
+destructive route permanently. This build takes the second branch. The refusal
+is the safety property, not a defect: it stops a destructive route from
+degrading into a legacy delete that would leave dependent memories citing
+removed evidence, and it is the reason a retired root can always be explained.
+
+### What is supported
+
+- **File-root transitions** (`reconcile`): a changed, deleted or re-chunked file
+  goes through the reviewed plan — typed file event, observed baseline,
+  immutable replacement chunk IDs, bounded dependent invalidation, read-back
+  before commit. Retirement of the replaced chunks happens inside that plan.
+- **Dependent blocking** (`off` and `capture`): a destructive consolidation or a
+  forget whose target has in-profile dependents is refused (`lineage dependents
+  block destructive consolidation`, `lineage dependents block forget`), and so
+  is an incomplete or failed dependency lookup.
+- **Reindex retirement**: under `capture` a reindex never retires; a file whose
+  content changed is reported with `retirement_requires_reconcile`. Under `off`,
+  files that are already lineage-managed are refused with
+  `lineage_managed_requires_capture_or_retirement` instead of being replaced.
+- **Restore**: a backup restore that would overwrite lineage-managed content is
+  refused (`restore would overwrite lineage-managed content; run explicit
+  reconciliation`).
+- **Ordinary points without dependents**: a plain memory point that carries no
+  lineage identity still retires normally in every mode, so the refusal is not a
+  blanket ban on deletion.
+
+### What is not supported
+
+Retirement of an **ordinary root** — a memory point that is not a file chunk —
+has no ratified transition or cause representation yet. Two consequences:
+
+- Under `reconcile`, every consolidation delete/merge/quarantine on an ordinary
+  root returns `lineage impact blocks ordinary-root transition:
+  ordinary_root_transition_cause_unratified`. There is no operator override, and
+  the refusal never falls back to the legacy delete path.
+- A point that belongs to a captured file carries a file version or lineage
+  identity while staying an ordinary content point. Both `qdrant_memory_forget`
+  and destructive consolidation refuse it with `lineage-managed points require
+  the reviewed retirement path`, in `off`, `capture` and `reconcile`. The `off`
+  refusal is deliberate: turning the mode off, or downgrading, must not turn an
+  unsupported retirement into a silent delete.
+
+Recorded support limitation, in the terms the plan asks for: **complete planning
+plus zero root retirement on every unsupported route, with the limitation
+reported rather than hidden.** No ordinary-root retirement proof is claimed,
+because none exists yet. To retire such a point today, change the file it belongs
+to and let the file transition run under `reconcile`, or wait for the
+ordinary-root transition contract. Stripping the lineage fields from a payload to
+make a delete succeed is not a supported path.
+
+### Route table
+
+Verdict every destructive route must give, pinned by
+`tests/test_consolidation_apply.py` (retirement route oracle) and
+`tests/test_lineage.py` (reindex rows):
+
+- `forget`, ordinary root without dependents — `off` delete, `capture` delete,
+  `reconcile` delete.
+- `forget`, ordinary root with dependents — refuse in all three modes.
+- `forget`, structural record (truthy `lineage_record` / `lineage_pending`) —
+  refuse in all three modes.
+- `forget`, lineage-managed point — refuse in all three modes.
+- `consolidation delete/merge/quarantine`, lineage-managed point — refuse in all
+  three modes.
+- `consolidation delete/merge/quarantine`, ordinary root with dependents —
+  refuse under `off` and `capture` (fence); under `reconcile` the impact
+  validation refuses first.
+- `consolidation delete/merge/quarantine`, ordinary root under `reconcile` —
+  refuse with the unratified-cause text.
+- reindex retirement — not reachable: `retirement_requires_reconcile` under
+  `capture`, planned through the reviewed path under `reconcile`.
+
+### Preview caveat
+
+`qdrant_memory_forget` with `dry_run: true` reports the ids and `deleted: 0`. It
+does not evaluate the dependency fence or the managed check, so a preview is not
+a promise that the live call would succeed. The live call is the one that
+refuses; the consolidation apply validates its fences before its own dry-run
+branch, so its preview does report them.
+
