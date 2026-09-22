@@ -61,12 +61,14 @@ from qdrant_memory.indexer import FileIndexer
 from qdrant_memory.learning import LearningStore, build_learning_payload, classify_learning_type
 from qdrant_memory.lineage import (
     LINEAGE_LOCK_UNAVAILABLE,
+    LINEAGE_MANAGED_RETIREMENT_REFUSED,
     LineageLockUnavailable,
     build_lineage_impact_snapshot,
     collect_lock_refusals,
     collection_write_lock,
     find_direct_dependents,
     lineage_impact_proposal_digest,
+    lineage_managed_reasons,
     redact_lock_refusals,
     validate_lineage_impact_snapshot,
 )
@@ -1471,7 +1473,7 @@ class QdrantMemoryProvider(MemoryProvider):
                 ))
             except (TimeoutError, RuntimeError):
                 return _json_error(LINEAGE_LOCK_UNAVAILABLE)
-            _, verdict = self._lineage_dependency_fence(
+            points, verdict = self._lineage_dependency_fence(
                 collection_name, ids, mode=str(self._config.get("lineage_mode") or "off"),
             )
             if verdict["status"] == "lookup_failed":
@@ -1480,6 +1482,15 @@ class QdrantMemoryProvider(MemoryProvider):
                 return _json_error("lineage dependency fence is incomplete")
             if verdict["blocked"]:
                 return _json_error("lineage dependents block forget")
+            # A managed point (file chunk or source carrying lineage identity) is
+            # bound to a version/entity record whose bookkeeping a bare exact-ID
+            # delete would orphan. Structural records are already refused inside
+            # _retrieve_consolidation_points; this closes the non-structural
+            # shape, which is the one ordinary content points have. Refuse in
+            # every mode, including `off` and after a downgrade: dropping the
+            # mode must not turn an unsupported retirement into a silent delete.
+            if any(lineage_managed_reasons(point.payload) for point in points):
+                return _json_error(LINEAGE_MANAGED_RETIREMENT_REFUSED)
             self._qdrant.delete_ids(collection_name, ids)
             return json.dumps({"dry_run": False, "ids": ids, "deleted": len(ids)})
         except StructuralLineageRefusal as exc:
@@ -1907,8 +1918,17 @@ class QdrantMemoryProvider(MemoryProvider):
             points = self._retrieve_consolidation_points(collection_name, affected_ids)
             if len(points) != len(set(affected_ids)):
                 return _json_error("affected point missing; rerun consolidation")
+            # A managed point (file chunk or source carrying lineage identity) is
+            # bound to a version/entity record whose bookkeeping a destructive
+            # apply would orphan. Decided from the payloads alone and checked
+            # before the mode branches, so every mode answers with the same
+            # actionable refusal instead of a mode-specific one.
             lineage_mode = str(self._config.get("lineage_mode") or "off")
             destructive_action = action in {"merge", "delete", "quarantine"}
+            if destructive_action and any(
+                lineage_managed_reasons(point.payload) for point in points
+            ):
+                return _json_error(LINEAGE_MANAGED_RETIREMENT_REFUSED)
             fence_verdict: dict[str, Any] | None = None
             if lineage_mode in {"off", "capture"} and destructive_action:
                 try:

@@ -1813,6 +1813,39 @@ LINEAGE_LOCK_REFUSAL_MARKERS = (
 )
 
 
+LINEAGE_MANAGED_RETIREMENT_REFUSED = "lineage-managed points require the reviewed retirement path"
+
+# Lineage identity fields an ordinary content point carries once it belongs to a
+# captured file. Value semantics: an explicit empty value is absence, exactly as
+# the W1 capture predicate reads them. Structural records (``lineage_record`` /
+# ``lineage_pending``) are a separate write class and are detected by
+# ``is_structural_lineage_payload``; a point can be managed without being
+# structural, and that is precisely the shape a bare exact-ID delete would
+# orphan.
+LINEAGE_MANAGED_FIELDS = (
+    "file_version_id",
+    "lineage_entity_id",
+    "lineage_schema_version",
+    "lineage_scope_key",
+    "lineage_source_key",
+    "lineage_role",
+    "lineage_review_event_ids",
+)
+
+
+def lineage_managed_reasons(payload: Any) -> list[str]:
+    """Reasons a payload participates in lineage bookkeeping without being structural.
+
+    Retirement of such a point has to go through the reviewed path: it is bound to
+    a file version or entity record whose bookkeeping the delete would leave
+    dangling, and no reviewed transition exists for it yet. Callers refuse the
+    destructive route rather than degrading to a legacy delete.
+    """
+    if not isinstance(payload, dict):
+        return []
+    return [key for key in LINEAGE_MANAGED_FIELDS if payload.get(key) not in (None, "", [], {})]
+
+
 def _refusal_offset(value: str) -> int | None:
     """Offset of the first marker that reads as a refusal clause, or ``None``.
 

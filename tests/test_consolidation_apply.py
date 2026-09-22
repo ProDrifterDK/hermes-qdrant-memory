@@ -3024,6 +3024,137 @@ def test_a_symlinked_lock_dir_keeps_its_dedicated_wording(tmp_path):
     assert json.loads(text) == {"error": LINEAGE_LOCK_FIXED_TEXT}
 
 
+# --- W2 retirement route oracle (R09 refusal branch) --------------------------
+#
+# R09 requires the refusal-only activation branch to prove "zero root
+# retirement/overwrite on EVERY unsupported route". The routes that can retire
+# an existing point, and the verdict each must give:
+#
+#   route                                            off     capture  reconcile
+#   forget, ordinary root, no dependents             delete  delete   delete
+#   forget, ordinary root, dependents                refuse  refuse   refuse
+#   forget, structural record                        refuse  refuse   refuse
+#   forget, managed root (lineage identity)          refuse  refuse   refuse
+#   consolidation delete/merge/quarantine, managed   refuse  refuse   refuse
+#   indexer reindex retirement                       not reachable: blocked with
+#                                                    retirement_requires_reconcile
+#                                                    under capture, and planned
+#                                                    through the reviewed path
+#                                                    under reconcile (test_lineage.py)
+#
+# The managed rows are this commit's closure. Before them, a bare exact-ID
+# delete retired a version-bound chunk in all three modes, orphaning the
+# version/entity bookkeeping the reviewed path maintains. The dependents and
+# structural rows are pinned elsewhere in this file; the indexer rows in
+# tests/test_lineage.py.
+
+LINEAGE_MANAGED_REFUSED_TEXT = "lineage-managed points require the reviewed retirement path"
+
+_RETIREMENT_MANAGED_FIELDS = (
+    "file_version_id",
+    "lineage_entity_id",
+    "lineage_schema_version",
+    "lineage_scope_key",
+    "lineage_source_key",
+    "lineage_role",
+    "lineage_review_event_ids",
+)
+
+
+def test_the_retirement_oracle_exercises_every_managed_field():
+    """A field dropped from the exercised shapes silently reopens a route."""
+    from qdrant_memory.lineage import LINEAGE_MANAGED_FIELDS
+
+    assert set(_RETIREMENT_MANAGED_FIELDS) <= set(LINEAGE_MANAGED_FIELDS)
+
+
+@pytest.mark.parametrize("mode", ["off", "capture", "reconcile"])
+@pytest.mark.parametrize("field", _RETIREMENT_MANAGED_FIELDS)
+def test_forget_refuses_a_managed_root_in_every_mode(field, mode, tmp_path):
+    provider = _provider(tmp_path)
+    provider._config["lineage_mode"] = mode
+    provider._config["lineage_lock_dir"] = str(tmp_path / "locks")
+    value = ["event-1"] if field == "lineage_review_event_ids" else "identity-1"
+    provider._qdrant = FakeQdrant({
+        "memory": [_point("chunk-1", "managed chunk", source_type="file", **{field: value})],
+        "learnings": [],
+    })
+    before = copy.deepcopy(provider._qdrant.by_collection)
+
+    result = json.loads(provider.handle_tool_call(
+        "qdrant_memory_forget", {"ids": ["chunk-1"], "dry_run": False},
+    ))
+
+    assert result == {"error": LINEAGE_MANAGED_REFUSED_TEXT}
+    assert provider._qdrant.by_collection == before
+    assert provider._qdrant.deleted_ids == []
+    assert provider._qdrant.deleted_filters == []
+    assert provider._qdrant.upserts == []
+    assert provider._qdrant.payload_updates == []
+
+
+@pytest.mark.parametrize("mode", ["off", "capture", "reconcile"])
+def test_forget_still_retires_an_unmanaged_root_without_dependents(mode, tmp_path):
+    """Negative control: the managed guard must not become a blanket ban."""
+    provider = _provider(tmp_path)
+    provider._config["lineage_mode"] = mode
+    provider._config["lineage_lock_dir"] = str(tmp_path / "locks")
+    provider._qdrant = FakeQdrant({
+        "memory": [_point("plain-1", "plain memory", source_type="manual")],
+        "learnings": [],
+    })
+
+    result = json.loads(provider.handle_tool_call(
+        "qdrant_memory_forget", {"ids": ["plain-1"], "dry_run": False},
+    ))
+
+    assert result == {"dry_run": False, "ids": ["plain-1"], "deleted": 1}
+    assert provider._qdrant.deleted_ids == [("memory", ["plain-1"])]
+
+
+@pytest.mark.parametrize("mode", ["off", "capture", "reconcile"])
+@pytest.mark.parametrize("action", ["merge", "delete", "quarantine"])
+def test_destructive_consolidation_refuses_a_managed_root(action, mode, tmp_path):
+    provider = _provider(tmp_path)
+    provider._config["lineage_mode"] = mode
+    provider._config["lineage_lock_dir"] = str(tmp_path / "locks")
+    if action == "merge":
+        provider._qdrant = FakeQdrant({
+            "memory": [
+                _point("m1", "same", source_type="manual", importance=5, confidence=0.8,
+                       file_version_id="identity-1"),
+                _point("m2", "same", source_type="conversation", importance=9, confidence=0.7),
+            ],
+            "learnings": [],
+        })
+        report, proposal = _persist_duplicate_report(provider)
+    else:
+        old = (datetime.now(timezone.utc) - timedelta(days=200)).isoformat()
+        provider._qdrant = FakeQdrant({
+            "memory": [
+                _point("m1", "old weak memory", source_type="conversation", importance=1,
+                       confidence=0.3, access_count=0, created_at=old, file_version_id="identity-1"),
+            ],
+            "learnings": [],
+        })
+        report, proposal = _persist_stale_report(provider)
+
+    before = copy.deepcopy(provider._qdrant.by_collection)
+    result = json.loads(provider.handle_tool_call(
+        "qdrant_memory_consolidation_apply",
+        {
+            "report_id": report["report_id"], "proposal_id": proposal["proposal_id"],
+            "action": action, "dry_run": False, "approve": True,
+        },
+    ))
+
+    assert result == {"error": LINEAGE_MANAGED_REFUSED_TEXT}
+    assert provider._qdrant.by_collection == before
+    assert provider._qdrant.deleted_ids == []
+    assert provider._qdrant.upserts == []
+    assert provider._qdrant.payload_updates == []
+
+
 
 
 
