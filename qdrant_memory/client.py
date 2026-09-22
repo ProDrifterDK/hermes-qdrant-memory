@@ -125,6 +125,29 @@ class QdrantClient:
         data = self._request("POST", f"/collections/{urllib.parse.quote(name)}/points", body)
         return data.get("result", []) or []
 
+    def scroll_page(
+        self,
+        name: str,
+        filter: dict[str, Any],
+        *,
+        limit: int = 256,
+        offset: Any = None,
+        with_payload: bool = True,
+        with_vector: bool = False,
+    ) -> tuple[list[dict[str, Any]], Any]:
+        """Return one bounded scroll page and its continuation token."""
+        body: dict[str, Any] = {
+            "filter": filter,
+            "limit": int(limit),
+            "with_payload": with_payload,
+            "with_vector": with_vector,
+        }
+        if offset is not None:
+            body["offset"] = offset
+        data = self._request("POST", f"/collections/{urllib.parse.quote(name)}/points/scroll", body)
+        result = data.get("result", {}) or {}
+        return list(result.get("points", []) or []), result.get("next_page_offset")
+
     def scroll_by_filter(
         self,
         name: str,
@@ -144,19 +167,15 @@ class QdrantClient:
                 if remaining <= 0:
                     break
                 page_limit = min(page_limit, remaining)
-            body: dict[str, Any] = {
-                "filter": filter,
-                "limit": page_limit,
-                "with_payload": with_payload,
-                "with_vector": with_vector,
-            }
-            if offset is not None:
-                body["offset"] = offset
-            data = self._request("POST", f"/collections/{urllib.parse.quote(name)}/points/scroll", body)
-            result = data.get("result", {}) or {}
-            batch = result.get("points", []) or []
+            batch, offset = self.scroll_page(
+                name,
+                filter,
+                limit=page_limit,
+                offset=offset,
+                with_payload=with_payload,
+                with_vector=with_vector,
+            )
             points.extend(batch)
-            offset = result.get("next_page_offset")
             if offset is None or not batch:
                 break
         return points

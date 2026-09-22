@@ -8,7 +8,7 @@ from typing import Any, Callable, Mapping, Protocol
 from urllib.parse import unquote, urlsplit
 
 from .graph_schema import LINEAGE_OBSERVATIONS, LINEAGE_OPERATIONS, LINEAGE_ROLES, is_uuid_string
-from .lineage import is_sha256_hex
+from .lineage import find_direct_dependents, is_sha256_hex
 from .schema import sanitize_point_id_links, valid_fact_status, valid_memory_kind, valid_relation_type
 
 
@@ -1474,11 +1474,41 @@ def trace_point(qdrant: Any, collection_name: str, point_id: str, *, collection:
     if direction in {"upstream", "both"}:
         upstream = payload.get("derived_from") if isinstance(payload.get("derived_from"), list) else []
         result["upstream"] = [_trace_edge(edge, registry) for edge in upstream]
-    if direction in {"downstream", "both"}:
+    if direction in {"downstream", "both"} and str((config or {}).get("lineage_mode") or "off") != "reconcile":
         result["downstream"] = {
             "supported": False,
             "status": "unsupported",
-            "reason": "downstream_trace_unsupported",
-            "message": "Downstream trace requires an indexed reverse derivation lookup and is not enabled in this phase.",
+            "reason": "downstream_trace_requires_reconcile_mode",
         }
+    elif direction in {"downstream", "both"}:
+        try:
+            cap = max(1, min(1000, int((config or {}).get("lineage_trace_downstream_max_results", 100))))
+            downstream = find_direct_dependents(
+                qdrant=qdrant,
+                collection_name=collection_name,
+                target_point_id=point_id,
+                profile_id=str(payload.get("profile_id") or "default"),
+                user_id_hash=str(payload.get("user_id_hash") or ""),
+                chat_id_hash=str(payload.get("chat_id_hash") or ""),
+                max_results=cap,
+            )
+            result["downstream"] = {
+                "supported": True,
+                "status": "complete" if downstream["complete"] else "incomplete",
+                "complete": downstream["complete"],
+                "limit": cap,
+                "point_ids": [str(item.get("id")) for item in downstream["points"]],
+                "edges": downstream["edge_keys"],
+                "errors": downstream["errors"],
+            }
+        except Exception as exc:
+            result["downstream"] = {
+                "supported": True,
+                "status": "incomplete",
+                "complete": False,
+                "limit": max(1, min(1000, int((config or {}).get("lineage_trace_downstream_max_results", 100)))),
+                "point_ids": [],
+                "edges": [],
+                "errors": [f"downstream lookup failed: {exc}"],
+            }
     return _compact_status_response(result)

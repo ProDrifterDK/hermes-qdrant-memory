@@ -1024,3 +1024,80 @@ retire or delete lineage state.
   particular, `_tool_forget` treats an empty-string `dry_run` value as false and
   can perform a live delete. Callers must omit the argument or send an actual
   boolean until a separate bounded fix closes that interface.
+
+---
+
+## 22. Lineage W2 — the dependency fence is profile-scoped
+
+The destructive-operation dependency fence (`find_direct_dependents`, used by the
+consolidation apply fence, `qdrant_memory_forget`, and the reconcile lineage-impact
+snapshot) matches dependents inside a single scope: `profile_id`, `user_id_hash`
+and `chat_id_hash` must equal the caller's. A dependency edge whose `profile_id`
+belongs to a **different profile** is therefore invisible to the fence.
+
+This boundary is a recorded decision, not an accident:
+
+- A dependent that lives in another profile does **not** block a forget or a
+  destructive consolidation. The named target is deleted and the out-of-profile
+  edge is left pointing at a missing target.
+- The boundary already applied to the consolidation fence, and
+  `qdrant_memory_forget` inherits it because it reuses the same lookup.
+- Widening the fence would mean reading and reasoning about records outside the
+  caller's profile, so no broadening is done.
+
+Operators sharing one collection across profiles must treat a cross-profile
+dependency as unenforced: the fence is a per-profile safety check, not a
+collection-wide referential-integrity guarantee.
+
+---
+
+## 23. Lineage W2 — one lock-refusal contract on every tool surface
+
+Failing to take the lineage collection lock is one condition, so it reads as one
+string: `lineage collection lock unavailable`. The constant, the refusal exception
+(`LineageLockUnavailable`) and the redactor live next to the lock helper in
+`qdrant_memory/lineage.py` as the single source.
+
+- The helper normalizes its own OS failures: the lock *directory* check (including
+  its symlink test, whose `lstat` re-raises `EACCES` on an unsearchable parent
+  component and `ENAMETOOLONG` for an over-long one) and the lock *file*
+  (`open`/`fdopen`/`fstat`/`flock`) both report a refusal marker instead of letting a
+  bare `OSError` or `ValueError` out (`lineage lock directory unavailable`,
+  `lineage lock file unavailable`). The `ValueError` half is load-bearing at the
+  directory block, where `mkdir`/`stat` raise it for a NUL byte or an unencodable
+  surrogate; at the lock-file sites it is carried for symmetry, since such a path
+  fails at the directory check first. This matters in both directions: neither an
+  `OSError` nor a `ValueError` is a `TimeoutError`/`RuntimeError`, so either would
+  bypass the callers' normalization *and* the response redaction at the same time.
+  Cleanup (unlock, close) is best-effort on purpose — the kernel releases the flock
+  when the file description closes, so a failed unlock must not mask the body's
+  exception nor turn a completed write into a refusal.
+- The consolidation fence, `qdrant_memory_forget` and the locked-upsert writers
+  (extraction approval, improve apply, RAPTOR apply) return that text, with the
+  writers keeping only an operation prefix. Each normalizes the acquisition only,
+  so a failure raised inside the guarded body is still reported as itself.
+- The `qdrant_memory_index` response is redacted at the tool boundary:
+  `redact_lock_refusals` truncates a refusal clause at its marker and appends the
+  fixed text, preserving the operation prefix (`lineage capture failed: lineage
+  collection lock unavailable`) while dropping the errno and the lock-directory
+  path. A marker glued to a non-space character is data (a path or a directory name
+  that happens to spell a marker), not a refusal clause, and is left untouched.
+- The raw clauses are logged — one `logger.warning` per clause, before the response
+  is redacted — so a misconfigured `lineage_lock_dir` stays diagnosable: the server
+  log carries the errno and the path even though the tool response does not. The
+  per-clause cap is derived from PATH_MAX plus the lock-file suffix plus the longest
+  operation prefix, so any path the OS accepts reaches the log whole; an over-long
+  *attempted* path (an `ENAMETOOLONG` message is not bounded by PATH_MAX) is cut,
+  prefix first.
+- `qdrant_memory_consolidation_apply` answers an unusable lock with its own generic
+  `consolidation_apply_failed`. It carries no lock detail at all: the same promise
+  with a different wording.
+- Direct callers keep the raw texts (`lineage collection lock acquisition timed
+  out`, `lineage lock directory unavailable: …`), because the frozen W1 tests pin
+  those messages on the helper itself. Redaction is a response-boundary concern,
+  not a change to the helper's contract.
+- Out of scope and unchanged: the `backup` restore path is reached from the CLI,
+  not from a tool response, and keeps its own raw text. Runtime activation,
+  migration and backfill remain out of scope (see the closing notes for this
+  delta).
+

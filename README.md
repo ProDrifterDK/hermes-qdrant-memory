@@ -471,6 +471,14 @@ The plugin reads config in this order:
 3. `qdrant_memory:` section in Hermes `config.yaml`.
 4. Environment variables named `HERMES_QDRANT_MEMORY_<KEY>`.
 
+`HERMES_QDRANT_MEMORY_LINEAGE_LOCK_DIR` is also honoured at the point of use by
+the lineage collection lock helper itself: when a caller passes no
+`lineage_lock_dir`, the environment value supplies the default directory instead
+of `/tmp/hermes-qdrant-lineage-<uid>` (an explicit `lock_dir` argument always
+wins; as with every key, the environment variable outranks a `lineage_lock_dir`
+written in `config.yaml` or `qdrant_memory.json`). Isolated deployments and test
+harnesses use it to keep the lineage lock directory off the shared per-user path.
+
 Example config:
 
 ```yaml

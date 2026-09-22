@@ -105,6 +105,10 @@ DEFAULTS: dict[str, Any] = {
     "lineage_mode": "off",
     "lineage_lock_dir": "",
     "lineage_lock_timeout_seconds": 5.0,
+    "lineage_invalidation_max_depth": 8,
+    "lineage_invalidation_max_points": 4096,
+    "lineage_invalidation_max_edges": 8192,
+    "lineage_trace_downstream_max_results": 100,
 }
 
 _BOOL_KEYS = {
@@ -151,6 +155,10 @@ _INT_KEYS = {
     "reconsolidation_max_candidates",
     "manual_store_duplicate_top_k",
     "auto_recall_shadow_max_per_session",
+    "lineage_invalidation_max_depth",
+    "lineage_invalidation_max_points",
+    "lineage_invalidation_max_edges",
+    "lineage_trace_downstream_max_results",
 }
 _FLOAT_KEYS = {"decay_rate", "min_raw_score", "min_final_score", "learning_auto_extract_min_confidence", "learning_auto_extract_semantic_dedupe_threshold", "source_extraction_min_confidence", "consolidation_duplicate_threshold", "guarded_auto_duplicate_min_confidence", "guarded_auto_learning_min_confidence", "reconsolidation_min_confidence", "manual_store_duplicate_threshold", "lineage_lock_timeout_seconds"}
 _LIST_KEYS = {"index_dirs", "index_extensions", "index_exclude_dirs"}

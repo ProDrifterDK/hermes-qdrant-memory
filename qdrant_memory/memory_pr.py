@@ -151,6 +151,22 @@ _REVIEW_SNAPSHOT_PAYLOAD_KEYS = (
     "file_version_id",
     "file_version_entity_id",
     "current_version_id",
+    "head_event_id",
+    "pending_event_id",
+    "previous_event_id",
+    "from_version_id",
+    "to_version_id",
+    "event_kind",
+    "event_state",
+    "desired_inventory_digest",
+    "created_point_ids",
+    "retired_point_ids",
+    "patched_point_ids",
+    "new_chunk_ids",
+    "lineage_baseline_basis",
+    "lineage_missing_fields",
+    "lineage_review_event_ids",
+    "lineage_review_causes_truncated",
     "source_deleted",
     "lineage_history_complete",
     "chunker_version",
@@ -251,6 +267,22 @@ _REVIEW_SAFE_SCHEMAS: dict[str, dict[str, str]] = {
         "file_version_id": "exact_id",
         "file_version_entity_id": "exact_id",
         "current_version_id": "exact_id",
+        "head_event_id": "exact_id",
+        "pending_event_id": "exact_id",
+        "previous_event_id": "exact_id",
+        "from_version_id": "exact_id",
+        "to_version_id": "exact_id",
+        "event_kind": "token",
+        "event_state": "token",
+        "desired_inventory_digest": "text",
+        "created_point_ids": "id_list",
+        "retired_point_ids": "id_list",
+        "patched_point_ids": "id_list",
+        "new_chunk_ids": "id_list",
+        "lineage_baseline_basis": "token",
+        "lineage_missing_fields": "string_list",
+        "lineage_review_event_ids": "id_list",
+        "lineage_review_causes_truncated": "bool",
         "source_deleted": "bool",
         "lineage_history_complete": "bool",
         "chunker_version": "token",
@@ -568,6 +600,21 @@ def _point_collection(point: Any) -> str:
     if isinstance(point, Mapping):
         return str(point.get("collection_name") or "")
     return str(getattr(point, "collection_name", "") or "")
+
+
+def _lineage_impact_projection(proposal: Mapping[str, Any]) -> dict[str, Any] | None:
+    impact = proposal.get("lineage_impact")
+    if not isinstance(impact, Mapping):
+        return None
+    projected = {
+        key: impact[key]
+        for key in (
+            "schema_version", "root_ids", "dependent_ids", "snapshot_digests",
+            "bounds", "complete", "errors", "proposed_review_changes",
+        )
+        if key in impact
+    }
+    return sanitize_for_review(projected, max_string_chars=MAX_SNAPSHOT_STRING_CHARS)
 
 
 def _snapshot_projection_descriptor() -> dict[str, Any]:
@@ -1034,6 +1081,7 @@ def build_memory_pr(
         "proposed_status_changes": _identity_safe_status_changes(
             proposal.get("proposed_status_changes"), all_identity_ids, set(affected_ids)
         ),
+        "lineage_impact": _lineage_impact_projection(proposal),
         "persisted_evidence_schema": {
             "name": PERSISTED_EVIDENCE_SCHEMA_NAME,
             "version": PERSISTED_EVIDENCE_SCHEMA_VERSION,

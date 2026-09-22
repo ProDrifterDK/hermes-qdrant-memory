@@ -53,6 +53,26 @@ class FakeQdrant:
             }
         )
         points = list(self.by_collection.get(name, []))
+        must = filter.get("must", []) if isinstance(filter, dict) else []
+
+        def matches(point):
+            payload = point.get("payload") or {}
+            for clause in must:
+                if "nested" in clause:
+                    return False
+                actual = payload.get(clause.get("key"))
+                match = clause.get("match") or {}
+                if "value" in match:
+                    expected = match["value"]
+                    if actual != expected and not (
+                        isinstance(actual, list) and expected in actual
+                    ):
+                        return False
+                if "any" in match and actual not in match["any"]:
+                    return False
+            return True
+
+        points = [point for point in points if matches(point)]
         return points[:max_total] if max_total is not None else points
 
     def retrieve(self, name, ids, *, with_payload=True, with_vector=False):
@@ -555,6 +575,86 @@ def test_restore_live_upserts_changed_and_missing_only_with_backup_first(monkeyp
     assert (backup_root / result["pre_restore_backup_id"] / "manifest.json").exists()
 
 
+def test_restore_lineage_fence_refuses_actual_scoped_dependent(monkeypatch, tmp_path, capsys):
+    from qdrant_memory.cli_core import execute_command
+
+    _write_config(monkeypatch, tmp_path)
+    scoped = {
+        "profile_id": "architect",
+        "user_id_hash": "user-scope",
+        "chat_id_hash": "chat-scope",
+    }
+    fake = _install_fake_qdrant(monkeypatch, FakeQdrant({
+        "memory": [_point("root", "backup", [0.1, 0.2], **scoped)],
+    }))
+    parser = _parser()
+    create_args = parser.parse_args(["qdrant", "backup", "create", "--scope", "memory", "--json"])
+    assert execute_command(create_args, provider_factory=lambda: pytest.fail("provider should not be constructed")) == 0
+    backup_id = json.loads(capsys.readouterr().out)["backup_id"]
+    fake.by_collection["memory"] = [
+        _point("root", "changed", [0.1, 0.2], **scoped),
+        _point("dependent", "dependent", [0.2, 0.3], **scoped),
+        _point(
+            "edge", "", {}, **scoped, memory_kind="graph_edge",
+            source_point_id="dependent", target_point_id="root",
+            relation_type="DERIVED_FROM",
+        ),
+    ]
+    restore_args = parser.parse_args([
+        "qdrant", "restore", "--backup", backup_id,
+        "--no-dry-run", "--approve", "--backup-first", "--json",
+    ])
+
+    assert execute_command(restore_args, provider_factory=lambda: pytest.fail("provider should not be constructed")) == 2
+    assert fake.upserts == []
+
+
+@pytest.mark.parametrize(
+    "impact",
+    [
+        {"complete": False, "errors": [], "dependent_ids": []},
+        {"complete": True, "errors": ["lookup failed"], "dependent_ids": []},
+        {"complete": True, "errors": [], "dependent_ids": ["dependent"]},
+    ],
+)
+def test_restore_lineage_fence_refuses_incomplete_errors_and_scoped_dependents(
+    monkeypatch, tmp_path, capsys, impact,
+):
+    from qdrant_memory.cli_core import execute_command
+    import qdrant_memory.backup as backup
+
+    _write_config(monkeypatch, tmp_path)
+    scoped = {
+        "profile_id": "architect",
+        "user_id_hash": "user-scope",
+        "chat_id_hash": "chat-scope",
+    }
+    backup_points = {"memory": [_point("m1", "backup", [0.1, 0.2], **scoped)]}
+    fake = _install_fake_qdrant(monkeypatch, FakeQdrant(backup_points))
+    parser = _parser()
+    create_args = parser.parse_args(["qdrant", "backup", "create", "--scope", "memory", "--json"])
+    assert execute_command(create_args, provider_factory=lambda: pytest.fail("provider should not be constructed")) == 0
+    backup_id = json.loads(capsys.readouterr().out)["backup_id"]
+    fake.by_collection["memory"] = [_point("m1", "changed", [0.1, 0.2], **scoped)]
+    calls = []
+
+    def impact_lookup(**kwargs):
+        calls.append(kwargs)
+        return {"schema_version": 1, "root_ids": ["m1"], "snapshot_digests": {}, **impact}
+
+    monkeypatch.setattr(backup, "build_lineage_impact_snapshot", impact_lookup)
+    restore_args = parser.parse_args([
+        "qdrant", "restore", "--backup", backup_id,
+        "--no-dry-run", "--approve", "--backup-first", "--json",
+    ])
+
+    assert execute_command(restore_args, provider_factory=lambda: pytest.fail("provider should not be constructed")) == 2
+    assert calls[0]["profile_id"] == "architect"
+    assert calls[0]["user_id_hash"] == "user-scope"
+    assert calls[0]["chat_id_hash"] == "chat-scope"
+    assert fake.upserts == []
+
+
 def test_backup_url_redaction_fails_closed_if_cli_redactor_breaks(monkeypatch):
     import qdrant_memory.backup as backup
     import qdrant_memory.cli_core as cli_core
@@ -750,6 +850,178 @@ def test_restore_live_creates_pre_restore_backup_by_default(monkeypatch, tmp_pat
     assert result["pre_restore_backup_id"] != original_backup_id
     assert (hermes_home / "qdrant_memory" / "backups" / result["pre_restore_backup_id"] / "manifest.json").exists()
     assert fake.upserts == [("memory", [backup_points["memory"][0]])]
+
+def test_restore_refuses_missing_chunk_retired_by_committed_event(tmp_path, monkeypatch):
+    from qdrant_memory import backup as backup_module
+
+    chunk = _point(
+        "chunk-retired", "retired chunk", [0.1, 0.2],
+        lineage_schema_version=1, file_version_id="version-retired",
+    )
+    version = _point(
+        "version-retired", "", {}, lineage_record=True,
+        lineage_role="file_version", fact_status="active",
+    )
+    source = FakeQdrant({"memory": [chunk, version], "learnings": []})
+    config = {
+        "collection_name": "memory", "learning_collection_name": "learnings",
+        "vector_size": 2, "distance": "Cosine",
+    }
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    backup_id = backup_module.create_backup(
+        source, config, hermes_home=hermes_home, scope="both",
+    )["backup_id"]
+    event = _point(
+        "event-retired", "", {}, lineage_record=True,
+        lineage_role="change_event", event_state="committed",
+        retired_point_ids=["chunk-retired"],
+    )
+    target = FakeQdrant({"memory": [event, version], "learnings": []})
+    monkeypatch.setattr(
+        backup_module, "create_backup", lambda *args, **kwargs: {"backup_id": "pre-restore"},
+    )
+
+    with pytest.raises(backup_module.BackupError, match="resurrect retired"):
+        backup_module.restore_backup(
+            target, config, hermes_home=hermes_home, backup_id=backup_id,
+            dry_run=False, backup_first=True,
+        )
+    assert target.upserts == []
+
+
+def test_restore_refuses_missing_lineage_point_with_retired_status(tmp_path, monkeypatch):
+    from qdrant_memory import backup as backup_module
+
+    chunk = _point(
+        "chunk-status-retired", "retired chunk", [0.1, 0.2],
+        lineage_schema_version=1, fact_status="superseded",
+    )
+    source = FakeQdrant({"memory": [chunk], "learnings": []})
+    config = {
+        "collection_name": "memory", "learning_collection_name": "learnings",
+        "vector_size": 2, "distance": "Cosine",
+    }
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    backup_id = backup_module.create_backup(
+        source, config, hermes_home=hermes_home, scope="both",
+    )["backup_id"]
+    target = FakeQdrant({"memory": [], "learnings": []})
+    monkeypatch.setattr(
+        backup_module, "create_backup", lambda *args, **kwargs: {"backup_id": "pre-restore"},
+    )
+
+    with pytest.raises(backup_module.BackupError, match="resurrect retired"):
+        backup_module.restore_backup(
+            target, config, hermes_home=hermes_home, backup_id=backup_id,
+            dry_run=False, backup_first=True,
+        )
+    assert target.upserts == []
+
+
+def test_restore_refuses_missing_chunk_whose_version_is_superseded(tmp_path, monkeypatch):
+    from qdrant_memory import backup as backup_module
+
+    chunk = _point(
+        "chunk-superseded", "superseded chunk", [0.1, 0.2],
+        lineage_schema_version=1, file_version_id="version-superseded",
+    )
+    version = _point(
+        "version-superseded", "", {}, lineage_record=True,
+        lineage_role="file_version", fact_status="superseded",
+    )
+    source = FakeQdrant({"memory": [chunk, version], "learnings": []})
+    config = {
+        "collection_name": "memory", "learning_collection_name": "learnings",
+        "vector_size": 2, "distance": "Cosine",
+    }
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    backup_id = backup_module.create_backup(
+        source, config, hermes_home=hermes_home, scope="both",
+    )["backup_id"]
+    target = FakeQdrant({"memory": [version], "learnings": []})
+    monkeypatch.setattr(
+        backup_module, "create_backup", lambda *args, **kwargs: {"backup_id": "pre-restore"},
+    )
+
+    with pytest.raises(backup_module.BackupError, match="resurrect retired"):
+        backup_module.restore_backup(
+            target, config, hermes_home=hermes_home, backup_id=backup_id,
+            dry_run=False, backup_first=True,
+        )
+    assert target.upserts == []
+
+
+def test_restore_allows_lineage_chunk_that_was_merely_lost(tmp_path, monkeypatch):
+    from qdrant_memory import backup as backup_module
+
+    chunk = _point(
+        "chunk-lost", "lost chunk", [0.1, 0.2],
+        lineage_schema_version=1, file_version_id="version-active",
+    )
+    version = _point(
+        "version-active", "", {}, lineage_record=True,
+        lineage_role="file_version", fact_status="active",
+    )
+    source = FakeQdrant({"memory": [chunk, version], "learnings": []})
+    config = {
+        "collection_name": "memory", "learning_collection_name": "learnings",
+        "vector_size": 2, "distance": "Cosine",
+    }
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    backup_id = backup_module.create_backup(
+        source, config, hermes_home=hermes_home, scope="both",
+    )["backup_id"]
+    target = FakeQdrant({"memory": [version], "learnings": []})
+    monkeypatch.setattr(
+        backup_module, "create_backup", lambda *args, **kwargs: {"backup_id": "pre-restore"},
+    )
+
+    result = backup_module.restore_backup(
+        target, config, hermes_home=hermes_home, backup_id=backup_id,
+        dry_run=False, backup_first=True,
+    )
+    assert result["collections"]["memory"]["upserted"] == 1
+    assert target.upserts == [("memory", [chunk])]
+
+
+def test_restore_preflights_every_collection_fence_before_first_write(tmp_path, monkeypatch):
+    from qdrant_memory import backup as backup_module
+
+    source = FakeQdrant({
+        "memory": [_point("memory-changed", "backup memory")],
+        "learnings": [_point("learning-missing", "restore me")],
+    })
+    config = {
+        "collection_name": "memory", "learning_collection_name": "learnings",
+        "vector_size": 2, "distance": "Cosine",
+    }
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    backup_id = backup_module.create_backup(
+        source, config, hermes_home=hermes_home, scope="both",
+    )["backup_id"]
+    target = FakeQdrant({
+        "memory": [_point(
+            "memory-changed", "live memory",
+            lineage_schema_version=1,
+        )],
+        "learnings": [],
+    })
+    monkeypatch.setattr(
+        backup_module, "create_backup", lambda *args, **kwargs: {"backup_id": "pre-restore"},
+    )
+
+    with pytest.raises(backup_module.BackupError, match="overwrite lineage-managed"):
+        backup_module.restore_backup(
+            target, config, hermes_home=hermes_home, backup_id=backup_id,
+            dry_run=False, backup_first=True,
+        )
+    assert target.upserts == []
+
 
 # ===========================================================================
 # W0: payload-only points (vector={}) round-trip exactly

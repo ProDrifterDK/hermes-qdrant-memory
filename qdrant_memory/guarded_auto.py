@@ -200,6 +200,23 @@ def _points_are_sensitive(points: list[Any]) -> bool:
     return False
 
 
+def _lineage_impact_allows_guarded_auto(proposal: dict[str, Any]) -> bool:
+    if str(proposal.get("proposal_type") or "") not in {
+        "heading_noise", "duplicate_cluster", "stale_low_value",
+    }:
+        return True
+    impact = proposal.get("lineage_impact")
+    if impact is None:
+        return True
+    return (
+        isinstance(impact, dict)
+        and impact.get("schema_version") == 1
+        and impact.get("complete") is True
+        and not impact.get("errors")
+        and not impact.get("dependent_ids")
+    )
+
+
 def validate_guarded_auto_current_points(
     proposal: dict[str, Any],
     points: list[Any],
@@ -211,6 +228,8 @@ def validate_guarded_auto_current_points(
     learning_min_confidence: float,
 ) -> tuple[bool, str]:
     """Re-derive guarded-auto eligibility from freshly retrieved exact points."""
+    if not _lineage_impact_allows_guarded_auto(proposal):
+        return False, "lineage impact requires manual review; generate a fresh report"
     expected_proposal_digest = str(proposal.get("guarded_auto_proposal_sha256") or "")
     if not expected_proposal_digest or expected_proposal_digest != _proposal_digest(proposal):
         return False, "report metadata changed; generate a fresh report"
@@ -321,6 +340,8 @@ def guarded_auto_action_for_proposal(proposal: dict[str, Any], policy: GuardedAu
         return None, "proposal has no explicit affected_ids"
     if _secret_or_manual_only(proposal):
         return None, "proposal requires manual review or may contain secrets"
+    if not _lineage_impact_allows_guarded_auto(proposal):
+        return None, "lineage impact requires manual review"
 
     confidence = _as_float(proposal.get("confidence"), 0.0)
     risk = str(proposal.get("risk") or "").lower()
