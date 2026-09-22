@@ -1063,13 +1063,15 @@ string: `lineage collection lock unavailable`. The constant, the refusal excepti
   component and `ENAMETOOLONG` for an over-long one) and the lock *file*
   (`open`/`fdopen`/`fstat`/`flock`) both report a refusal marker instead of letting a
   bare `OSError` or `ValueError` out (`lineage lock directory unavailable`,
-  `lineage lock file unavailable`). A NUL byte in the configured path is a refusal
-  for the same reason. This matters in both directions: neither an `OSError` nor a
-  `ValueError` is a `TimeoutError`/`RuntimeError`, so either would bypass the callers'
-  normalization *and* the response redaction at the same time. Cleanup (unlock,
-  close) is best-effort on purpose — the kernel releases the flock when the file
-  description closes, so a failed unlock must not mask the body's exception nor turn
-  a completed write into a refusal.
+  `lineage lock file unavailable`). The `ValueError` half is load-bearing at the
+  directory block, where `mkdir`/`stat` raise it for a NUL byte or an unencodable
+  surrogate; at the lock-file sites it is carried for symmetry, since such a path
+  fails at the directory check first. This matters in both directions: neither an
+  `OSError` nor a `ValueError` is a `TimeoutError`/`RuntimeError`, so either would
+  bypass the callers' normalization *and* the response redaction at the same time.
+  Cleanup (unlock, close) is best-effort on purpose — the kernel releases the flock
+  when the file description closes, so a failed unlock must not mask the body's
+  exception nor turn a completed write into a refusal.
 - The consolidation fence, `qdrant_memory_forget` and the locked-upsert writers
   (extraction approval, improve apply, RAPTOR apply) return that text, with the
   writers keeping only an operation prefix. Each normalizes the acquisition only,
@@ -1082,7 +1084,11 @@ string: `lineage collection lock unavailable`. The constant, the refusal excepti
   that happens to spell a marker), not a refusal clause, and is left untouched.
 - The raw clauses are logged — one `logger.warning` per clause, before the response
   is redacted — so a misconfigured `lineage_lock_dir` stays diagnosable: the server
-  log carries the errno and the path even though the tool response does not.
+  log carries the errno and the path even though the tool response does not. The
+  per-clause cap is derived from PATH_MAX plus the lock-file suffix plus the longest
+  operation prefix, so any path the OS accepts reaches the log whole; an over-long
+  *attempted* path (an `ENAMETOOLONG` message is not bounded by PATH_MAX) is cut,
+  prefix first.
 - `qdrant_memory_consolidation_apply` answers an unusable lock with its own generic
   `consolidation_apply_failed`. It carries no lock detail at all: the same promise
   with a different wording.

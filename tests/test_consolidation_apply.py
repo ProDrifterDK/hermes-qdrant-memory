@@ -2974,5 +2974,56 @@ def test_the_redactor_and_the_walker_agree_on_tuples():
     assert isinstance(redacted["a"], tuple)
 
 
+# ===========================================================================
+# W2 closure review (delta 8) J5/J2: the derived clause cap and the dedicated
+# symlink wording, so neither is a claim without a test behind it.
+# ===========================================================================
+
+def test_the_clause_log_cap_covers_any_os_accepted_lock_path():
+    """J5: the cap is derived, not guessed, so no OS-accepted path is cut."""
+    import __init__ as provider_module
+
+    from qdrant_memory.lineage import LINEAGE_LOCK_REFUSAL_MARKERS
+
+    cap = provider_module._LOCK_REFUSAL_LOG_CAP
+    longest_wording = max(LINEAGE_LOCK_REFUSAL_MARKERS, key=len)
+    # Worst clause the helper can produce: the longest operation prefix a caller adds,
+    # the longest wording, the errno text, and a PATH_MAX directory for a *file* clause
+    # (which carries the extra `/<64-hex>.lock` suffix).
+    worst_clause = (
+        "lineage reconciliation failed: "
+        f"{longest_wording}: [Errno 36] File name too long: "
+        f"'{'d' * (4096 + 70)}'"
+    )
+
+    assert cap >= len(worst_clause)
+    assert cap >= 4096 + 70 + 120  # floor: PATH_MAX + file suffix + prefix/wording/errno
+
+
+def test_a_symlinked_lock_dir_keeps_its_dedicated_wording(tmp_path):
+    """J2: the explicit symlink refusal is defence with its own wording and marker."""
+    from qdrant_memory.lineage import collection_write_lock
+
+    real = tmp_path / "real-locks"
+    real.mkdir(mode=0o700)
+    link = tmp_path / "locks-link"
+    os.symlink(str(real), str(link))
+
+    with pytest.raises(RuntimeError) as excinfo:
+        with collection_write_lock(collection_name="memory", timeout=0.2, lock_dir=str(link)):
+            raise AssertionError("the lock must not be acquired through a symlinked directory")
+    assert str(excinfo.value) == "lineage lock directory must not be a symlink"
+
+    provider, _ = _locked_provider(tmp_path)
+    provider._config["lineage_lock_dir"] = str(link)
+    text = provider.handle_tool_call(
+        "qdrant_memory_forget",
+        {"ids": ["00000000-0000-0000-0000-000000000001"], "dry_run": False},
+    )
+
+    assert json.loads(text) == {"error": LINEAGE_LOCK_FIXED_TEXT}
+
+
+
 
 

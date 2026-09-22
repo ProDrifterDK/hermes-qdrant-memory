@@ -141,6 +141,13 @@ logger = logging.getLogger(__name__)
 # inner text, callers add an operation prefix, and `redact_lock_refusals` keeps the
 # raw OS detail out of every other tool response.
 _LOCK_REFUSAL_REDACTED = "lineage lock refusal redacted from a tool response"
+# The refusal clause is logged whole. This cap exists only to bound a pathological
+# marker-bearing string, and it is derived rather than chosen: PATH_MAX (4096) plus the
+# 70-character `/<64-hex>.lock` suffix a lock-*file* clause carries, plus the longest
+# operation prefix a caller adds, the wording and the errno text. A path the OS accepts
+# therefore always reaches the log; an over-long *attempted* path (ENAMETOOLONG is not
+# bounded by PATH_MAX) is cut, prefix first.
+_LOCK_REFUSAL_LOG_CAP = 4300
 
 
 def _json_error(message: str) -> str:
@@ -1371,12 +1378,8 @@ class QdrantMemoryProvider(MemoryProvider):
                 # Log the refusal clauses, not a prefix of the whole payload: the
                 # errno and the lock path are the diagnosis, and a summary dump capped
                 # at 600 chars loses them as soon as the indexer reports real paths.
-                # The per-clause cap exists only to bound a pathological marker-bearing
-                # string; it sits far above PATH_MAX plus the longest wording, because
-                # the lock path is the LAST thing in the clause and a tighter cap would
-                # silently truncate the very detail this log exists to preserve.
                 for refusal in collect_lock_refusals(summary):
-                    logger.warning("%s: %s", _LOCK_REFUSAL_REDACTED, refusal[:4200])
+                    logger.warning("%s: %s", _LOCK_REFUSAL_REDACTED, refusal[:_LOCK_REFUSAL_LOG_CAP])
             return json.dumps(redacted)
         except Exception as exc:
             raw = f"Index failed: {exc}"

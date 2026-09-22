@@ -1910,11 +1910,13 @@ def collection_write_lock(
     )
     try:
         # The symlink check runs inside the guard on purpose. `Path.is_symlink`
-        # swallows only ENOENT/ENOTDIR/EBADF/ELOOP and re-raises everything else
-        # (EACCES on an unsearchable parent component, ENAMETOOLONG for an over-long
-        # one), which would leave this helper as a bare OSError and reach a tool
-        # response with the errno and the lock-directory path. A path containing a NUL
-        # byte raises ValueError for the same reason: it is a refusal, not a crash.
+        # swallows the ignored errnos *and* `ValueError` (a non-encodable path), but
+        # re-raises everything else, so EACCES on an unsearchable parent component and
+        # ENAMETOOLONG for an over-long one would leave this helper as a bare OSError
+        # and reach a tool response with the errno and the lock-directory path. The
+        # `ValueError` half of this guard is for `mkdir`/`stat`, which raise it for a
+        # path carrying a NUL byte or an unencodable surrogate: a path that cannot
+        # exist is a refusal, not a crash.
         if directory.is_symlink():
             raise RuntimeError("lineage lock directory must not be a symlink")
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
