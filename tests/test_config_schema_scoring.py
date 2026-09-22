@@ -24,6 +24,33 @@ def test_config_defaults_when_no_file(tmp_path):
     assert set(DEFAULTS).issubset(cfg)
 
 
+def test_config_rejects_one_collection_for_memories_and_learnings(tmp_path):
+    """The learning store upserts without the lineage overwrite guard.
+
+    Sharing a collection is therefore not a preference: it would let a learning
+    write land on a memory point, including a lineage-protected one. The invariant
+    is enforced at load so no route has to re-derive it.
+    """
+    import pytest
+
+    with pytest.raises(ValueError, match="must differ"):
+        load_config(
+            hermes_home=str(tmp_path),
+            hermes_config={
+                "qdrant_memory": {"collection_name": "one", "learning_collection_name": "one"}
+            },
+        )
+
+    cfg = load_config(
+        hermes_home=str(tmp_path),
+        hermes_config={
+            "qdrant_memory": {"collection_name": "memory", "learning_collection_name": "learnings"}
+        },
+    )
+    assert cfg["collection_name"] == "memory"
+    assert cfg["learning_collection_name"] == "learnings"
+
+
 def test_config_overrides_from_qdrant_memory_section(tmp_path):
     cfg = load_config(
         hermes_home=str(tmp_path),
