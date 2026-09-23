@@ -38,19 +38,90 @@ REPO = Path(__file__).resolve().parent.parent
 # --- the surface, derived from the code ------------------------------------
 
 
-def _tool_names() -> set[str]:
-    """Every ``qdrant_memory_*`` / ``qdrant_learning_*`` name the provider dispatches."""
+def _plugin_module():
+    """This plugin's ``__init__.py``, loaded by path.
+
+    ``import qdrant_memory`` would resolve to whatever is installed; the derivations must
+    read the tree under test.
+    """
+    spec = importlib.util.spec_from_file_location("_route_inventory_plugin", REPO / "__init__.py")
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _comparison_strings(node: ast.AST) -> set[str]:
+    """Every string constant any comparison inside ``node`` puts on either side.
+
+    The dispatch used to be read as ``if <x> == "<name>"``, taking
+    ``comparators[0]`` for the name. That saw only that one shape, so
+    ``if tool_name in ("qdrant_memory_wipe_all",):`` and
+    ``if "qdrant_memory_wipe_all" == tool_name:`` were invisible: a new destructive route
+    could ship unclassified with the size pin and the completeness detector both saying
+    fine. Read both sides of the comparison, expand container literals, and keep the
+    prefix filter only as a hint — the schema cross-check below is what makes an
+    unprefixed name a failure rather than a silent miss.
+    """
+    found: set[str] = set()
+
+    def collect(expr: ast.AST) -> None:
+        if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+            found.add(expr.value)
+        elif isinstance(expr, (ast.Tuple, ast.List, ast.Set)):
+            for element in expr.elts:
+                collect(element)
+        elif isinstance(expr, ast.BinOp):
+            collect(expr.left)
+            collect(expr.right)
+        elif isinstance(expr, ast.JoinedStr):
+            for value in expr.values:
+                collect(value)
+
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Compare):
+            collect(sub.left)
+            for comparator in sub.comparators:
+                collect(comparator)
+    return found
+
+
+def _dispatched_tool_names() -> set[str]:
+    """Every string constant ``handle_tool_call`` compares against.
+
+    No prefix filter: a name this dispatch answers to is part of the surface whether or
+    not it is spelled like one. Filtering by ``qdrant_memory_``/``qdrant_learning_`` left
+    a dispatch branch on an unprefixed name invisible to the derivation, the size pin, the
+    detector and the schema cross-check at once — the same "the check looks at the shape
+    it expects" defect as the comparison form itself. Every constant is now reported, and
+    a non-tool comparison here fails loudly instead of being silently skipped, which is a
+    decision a human makes in this file rather than one the parser makes for them.
+    """
     tree = ast.parse((REPO / "__init__.py").read_text(encoding="utf-8"))
     names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == "handle_tool_call":
-            for sub in ast.walk(node):
-                if isinstance(sub, ast.If) and isinstance(sub.test, ast.Compare):
-                    right = sub.test.comparators[0]
-                    if isinstance(right, ast.Constant) and isinstance(right.value, str):
-                        names.add(right.value)
+            names |= _comparison_strings(node)
     assert names, "handle_tool_call dispatch could not be parsed"
     return names
+
+
+def _tool_names() -> set[str]:
+    """Every tool name the provider dispatches, cross-checked against the schemas.
+
+    Two independent derivations of the same question. The dispatch read of the AST can
+    still miss a shape nobody thought of; ``TOOL_SCHEMAS`` is the declaration the runtime
+    actually registers. A route present in one and not the other is a failure here
+    instead of an unclassified route that both the size pin and the detector accept.
+    """
+    dispatched = _dispatched_tool_names()
+    declared = {str(schema["name"]) for schema in _plugin_module().TOOL_SCHEMAS}
+    assert dispatched == declared, (
+        "the tool dispatch and TOOL_SCHEMAS disagree — one of them names a route the "
+        f"other does not: dispatched_only={sorted(dispatched - declared)} "
+        f"declared_only={sorted(declared - dispatched)}"
+    )
+    return dispatched
 
 
 def _cli_commands() -> set[str]:
@@ -87,20 +158,30 @@ def _provider_hooks() -> set[str]:
 
     ``sync_turn`` reaches the same deterministic id as the store and is enabled by a
     config flag, so it is a write route; it is invisible to both the dispatch parser and
-    the CLI parser. Derived by comparing the provider class against its bases, so a new
-    hook override appears here without anyone remembering to add it.
+    the CLI parser.
+
+    Derived by identity against the host base class across the whole MRO, not by reading
+    ``vars(provider_cls)``: reading the class body saw only methods written in the
+    provider itself, so a hook implemented in a plugin-side mixin the provider inherits
+    from was invisible to the derivation, to the size pin and to the completeness
+    detector all at once.
     """
-    spec = importlib.util.spec_from_file_location("_route_inventory_plugin", REPO / "__init__.py")
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module = _plugin_module()
     provider_cls = module.QdrantMemoryProvider
-    own = {name for name, value in vars(provider_cls).items() if callable(value) and not name.startswith("_")}
-    inherited: set[str] = set()
-    for klass in provider_cls.__mro__[1:]:
-        inherited |= {name for name, value in vars(klass).items() if callable(value) and not name.startswith("_")}
-    hooks = {name for name in own if name in inherited}
-    assert hooks, "no provider hook overrides could be derived"
+    base = module.MemoryProvider
+    hooks: set[str] = set()
+    for name in dir(base):
+        if name.startswith("_"):
+            continue
+        base_attr = getattr(base, name)
+        if not callable(base_attr):
+            continue
+        if getattr(provider_cls, name, None) is not base_attr:
+            hooks.add(name)
+    assert hooks, (
+        "no provider hook overrides could be derived: the host MemoryProvider base is "
+        "not importable in this environment, so this pin cannot answer its question"
+    )
     return hooks
 
 
@@ -389,7 +470,13 @@ def _unresolved_pins(inventory=None, repo: Path | None = None) -> list[str]:
     for entry, row in sorted(inventory.items()):
         if row["kind"] != "protection":
             continue
-        for node in row["pins"]:  # type: ignore[union-attr]
+        pins = list(row["pins"])  # type: ignore[arg-type]
+        if not pins:
+            # A protection row with no pin is the claim-surface hole this file exists to
+            # close, and it resolves silently: there is no node id to fail to find.
+            unresolved.append(f"{entry} -> a protection row must name at least one pin")
+            continue
+        for node in pins:
             path, _, name = node.partition("::")
             name = name.split("[", 1)[0]
             target = repo / path
@@ -445,7 +532,16 @@ def test_no_inventory_row_is_stale():
     stale = sorted(
         key for key in ROUTE_INVENTORY
         if _base(key) not in derived
-        or (" [" in key and _base(key) not in _MODE_SCOPED)
+        or (
+            " [" in key
+            and (
+                _base(key) not in _MODE_SCOPED
+                # A mode label that is not a mode: `index [Off]` classified the base
+                # route before this check, because only the base half of the row was
+                # ever validated.
+                or key.rsplit(" [", 1)[1].rstrip("]") not in _MODES
+            )
+        )
     )
     assert stale == [], f"ROUTE_INVENTORY rows that no longer name a real entry point: {stale}"
 
@@ -477,9 +573,25 @@ def test_every_uncovered_route_declares_a_reason():
 
 
 def test_a_route_is_classified_once_with_one_kind():
+    """One route, one kind — and a mode-scoped route is not classified twice.
+
+    The docstring said "once" while the body only checked that the kind was known. A base
+    row `index` declared `read_only` beside the `index [off]` protection row passed: the
+    same route answering twice, with the answer a reader finds first being the reassuring
+    one, and the mode rows outside the reach of the frozen protection set.
+    """
     kinds = {"protection", "transition", "read_only", "dispatch", "uncovered"}
     bad = {entry: row["kind"] for entry, row in ROUTE_INVENTORY.items() if row["kind"] not in kinds}
     assert bad == {}, f"unknown kinds: {bad}"
+
+    doubled = sorted(
+        name for name in _MODE_SCOPED
+        if name in ROUTE_INVENTORY and any(key.startswith(f"{name} [") for key in ROUTE_INVENTORY)
+    )
+    assert doubled == [], (
+        f"these mode-scoped routes are classified twice, as a base row and per mode: {doubled}. "
+        "A base row here is a second answer to the question the mode rows answer."
+    )
 
 
 def test_the_protection_set_is_exactly_this():

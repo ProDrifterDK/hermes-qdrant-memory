@@ -1241,6 +1241,9 @@ Verdict every destructive route must give, pinned by
   `lineage_role`, `lineage_scope_key`, `lineage_source_key` or
   `lineage_review_event_ids`. That is an observation about the deployed collection at
   that moment, not part of the contract above; the contract is pinned by test either way.
+  A later read-only `count` on 2026-09-23 reported 15,395 points and zero on all eight
+  fields, which is the whole point of the sentence: the number moves with ordinary use
+  and none of the lineage fields move with it.
 - `consolidation delete/merge/quarantine`, lineage-managed point — refuse in all
   three modes.
 - `consolidation delete/merge/quarantine`, ordinary root with dependents —
@@ -1263,23 +1266,35 @@ Verdict every destructive route must give, pinned by
   modes, in **both** scopes, pinned over the whole predicate.
 - restore, resurrection of retired lineage-managed content — refuse in all three
   modes, pinned by `tests/test_backup_cli.py::test_restore_refuses_missing_chunk_retired_by_committed_event`.
-- reindex under `off`, a file whose owned chunk carries lineage identity **or** the
+- reindex under `off`, a file whose chunk carries lineage identity **or** the
   review state a transition wrote — the file is blocked
   (`lineage_managed_requires_capture_or_retirement`), so neither the payload rewrite
   nor the stale-id deletion runs, with or without `--force`. Decided **per file**, the
   same way the present-file site decides: a removed file whose chunks are gone from
   disk is blocked whole when any one of its chunks is protected, so a demoted sibling
   cannot be retired through the file it belongs to, and the path is not reported as
-  deleted. Pinned by `tests/test_lineage.py` (`test_off_mode_refuses_to_rewrite_a_chunk_carrying_only_review_state`,
+  deleted. Decided over **the same population** as the present-file site too: every
+  scope plus the points whose ownership the filter cannot attribute
+  (`profile_id=None`), not just the chunks this indexer owns. The two branches of this
+  block asking the same question over different populations was the last way they
+  disagreed: a removed path whose only protected chunk was foreign-scope was not
+  blocked, and its owned chunks were deleted live. The deletion set itself stays
+  owned-only, so the widening can only add refusals. Pinned by `tests/test_lineage.py` (`test_off_mode_refuses_to_rewrite_a_chunk_carrying_only_review_state`,
   `..._one_identity_field`, `..._destroy_or_duplicate_captured_file`,
   `test_directory_off_mode_does_not_delete_removed_lineage_managed_chunks`,
   `test_a_removed_file_whose_siblings_are_ordinary_is_blocked_as_a_file`,
   `test_a_removed_file_with_one_protected_sibling_survives_force_too`,
+  `test_a_removed_file_whose_only_protected_chunk_is_foreign_scope_is_blocked`,
+  `test_a_present_file_whose_only_protected_chunk_is_foreign_scope_is_blocked_too`,
   `test_off_mode_force_skips_lineage_managed_filter_delete_in_dry_and_live_runs`).
 - provider hook `sync_turn` (`sync_turns` on), target at the store's deterministic id
   is protected — the write is suppressed by the same guard the store uses, and the
   failure is logged at debug rather than surfaced, since the runtime calls it with no
-  caller to answer.
+  caller to answer. The pin asserts the refusal, not only the silence:
+  `tests/test_consolidation_apply.py::test_the_sync_turn_hook_cannot_overwrite_a_protected_target`
+  requires `ManagedOverwriteRefused` from the writer and requires the hook to have logged
+  that same exception, because "no write happened" is also what a hook that declined for
+  an unrelated reason looks like.
 - improve apply (not an exact replay) and RAPTOR apply (differing node metadata) —
   refuse by their own checks; read, not executed, in the W2 closure reviews, and
   declared `uncovered` in `tests/test_route_inventory.py`.

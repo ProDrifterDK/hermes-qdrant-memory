@@ -3357,7 +3357,7 @@ def test_store_refuses_to_overwrite_a_protected_point_in_every_mode(field, mode,
 
 
 @pytest.mark.parametrize("mode", ["off", "capture", "reconcile"])
-def test_the_sync_turn_hook_cannot_overwrite_a_protected_target(mode, tmp_path):
+def test_the_sync_turn_hook_cannot_overwrite_a_protected_target(mode, tmp_path, caplog):
     """`sync_turn` is a write route the runtime calls when `sync_turns` is on.
 
     It reaches the same deterministic id as the store, so it inherits the guard — but
@@ -3384,11 +3384,29 @@ def test_the_sync_turn_hook_cannot_overwrite_a_protected_target(mode, tmp_path):
     ]
     provider._qdrant.upserts.clear()
 
-    provider.sync_turn("a user turn", "an assistant turn")
+    with caplog.at_level(logging.DEBUG):
+        provider.sync_turn("a user turn", "an assistant turn")
 
     assert provider._qdrant.upserts == []
     assert provider._qdrant.deleted_ids == []
     assert provider._qdrant.payload_updates == []
+
+    # Zero writes does not say *why* there were zero writes. The hook swallows whatever
+    # the writer raises, so a hook that declined for any other reason (already synced this
+    # session, a retrieve path raising first) satisfies the three assertions above with the
+    # guard removed, and the pin quietly stops being about the guard. Ask the writer
+    # directly, and require that the refusal the hook swallowed is the guard's refusal.
+    from qdrant_memory.writer import ManagedOverwriteRefused
+
+    with pytest.raises(ManagedOverwriteRefused):
+        provider._writer.store_turn("a user turn", "an assistant turn")
+
+    swallowed = [record for record in caplog.records if "sync_turn failed" in record.getMessage()]
+    assert swallowed, "the hook must log the refusal it swallows, or an operator cannot see it"
+    assert any(
+        record.exc_info and isinstance(record.exc_info[1], ManagedOverwriteRefused)
+        for record in swallowed
+    ), f"the swallowed exception was not the guard's refusal: {[r.exc_info for r in swallowed]}"
 
 
 @pytest.mark.parametrize("mode", ["off", "capture", "reconcile"])

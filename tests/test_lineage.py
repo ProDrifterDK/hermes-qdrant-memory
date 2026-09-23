@@ -1178,6 +1178,85 @@ def test_a_removed_file_with_one_protected_sibling_survives_force_too(tmp_path, 
     assert result["lineage_blocked_files"][0]["lineage_blocked_reason"] == "lineage_managed_requires_capture_or_retirement"
 
 
+def _seed_foreign_protected_sibling(path, qdrant):
+    """A file path holding one owned ordinary chunk and one foreign protected chunk.
+
+    The protected point carries review state and an unclaimed profile, which is the shape
+    a transition can leave behind: the review state lands on whichever point the sweep
+    wrote, and `_owned_file_chunks` only claims the points whose profile, user and chat
+    hashes match the running indexer.
+    """
+    resolved = str(path.resolve())
+    owned_id = "22222222-2222-4222-8222-222222222222"
+    foreign_id = "11111111-1111-4111-8111-111111111111"
+    qdrant.points.extend([
+        {"id": owned_id, "vector": [0.1, 0.2], "payload": {
+            "file_path": resolved, "chunk_type": "file_chunk", "memory_kind": "source_chunk",
+            "profile_id": "default", "user_id_hash": "u1", "chat_id_hash": "c1",
+        }},
+        {"id": foreign_id, "vector": [0.1, 0.2], "payload": {
+            "file_path": resolved, "chunk_type": "file_chunk", "memory_kind": "source_chunk",
+            "profile_id": "other", "user_id_hash": "u1", "chat_id_hash": "c1",
+            "requires_review": True, "fact_status": "review_required",
+            "lineage_review_event_ids": ["40dfae4c-0000-4000-8000-000000000005"],
+        }},
+    ])
+    return owned_id, foreign_id
+
+
+def test_a_removed_file_whose_only_protected_chunk_is_foreign_scope_is_blocked(tmp_path):
+    """The removed-file and present-file sites answer the same question over one population.
+
+    The present-file site reads every scope (`profile_id=None`), because the transition's
+    review state can land on a point the ownership filter does not claim. The removed-file
+    site read owned chunks only, so a removed path whose only protected chunk was
+    foreign-scope was not blocked, and its owned chunks were deleted live while §27
+    promises `off` refuses managed files. Deciding both sites over the same population is
+    the difference between the two branches of one block agreeing and diverging.
+    """
+    path = tmp_path / "note.md"
+    path.write_text("# Note\nalpha", encoding="utf-8")
+    qdrant, embeddings = FakeQdrant(), FakeEmbedding()
+    owned_id, foreign_id = _seed_foreign_protected_sibling(path, qdrant)
+    indexer = _indexer(qdrant, embeddings, mode="off")
+    indexer.user_id_hash, indexer.chat_id_hash = "u1", "c1"
+    path.unlink()
+    qdrant.call_log.clear()
+    qdrant.deleted.clear()
+    qdrant.upserts.clear()
+
+    result = indexer.index([tmp_path], dry_run=False)
+
+    assert result["refused"] is True
+    assert result["lineage_blocked_files"][0]["lineage_blocked_reason"] == "lineage_managed_requires_capture_or_retirement"
+    assert result["lineage_blocked_files"][0]["file_path"] == str(path.resolve())
+    assert result["deleted_file_paths"] == []
+    assert result["deleted_file_ids"] == []
+    assert result["stale_ids"] == []
+    assert result["files_with_stale_chunks"] == 0
+    assert qdrant.deleted == []
+    assert qdrant.upserts == []
+    assert {str(point["id"]) for point in qdrant.points} == {owned_id, foreign_id}
+
+
+def test_a_present_file_whose_only_protected_chunk_is_foreign_scope_is_blocked_too(tmp_path):
+    """The present-file half of the same question, so the pair cannot drift apart again."""
+    path = tmp_path / "note.md"
+    path.write_text("# Note\nalpha", encoding="utf-8")
+    qdrant, embeddings = FakeQdrant(), FakeEmbedding()
+    owned_id, foreign_id = _seed_foreign_protected_sibling(path, qdrant)
+    indexer = _indexer(qdrant, embeddings, mode="off")
+    indexer.user_id_hash, indexer.chat_id_hash = "u1", "c1"
+
+    result = indexer.index([tmp_path], dry_run=False, force=True)
+
+    assert result["refused"] is True
+    assert result["lineage_blocked_files"][0]["lineage_blocked_reason"] == "lineage_managed_requires_capture_or_retirement"
+    assert qdrant.deleted == []
+    assert qdrant.upserts == []
+    assert {str(point["id"]) for point in qdrant.points} == {owned_id, foreign_id}
+
+
 def test_foreign_scope_only_force_has_dry_live_parity_without_deletion(tmp_path):
     path = tmp_path / "note.md"
     path.write_text("# Note\nalpha", encoding="utf-8")
