@@ -61,12 +61,15 @@ from qdrant_memory.indexer import FileIndexer
 from qdrant_memory.learning import LearningStore, build_learning_payload, classify_learning_type
 from qdrant_memory.lineage import (
     LINEAGE_LOCK_UNAVAILABLE,
+    LINEAGE_MANAGED_RETIREMENT_REFUSED,
     LineageLockUnavailable,
     build_lineage_impact_snapshot,
     collect_lock_refusals,
     collection_write_lock,
     find_direct_dependents,
     lineage_impact_proposal_digest,
+    lineage_managed_reasons,
+    lineage_overwrite_refusal,
     redact_lock_refusals,
     validate_lineage_impact_snapshot,
 )
@@ -130,7 +133,7 @@ HARD_CONTEXT_CHAR_BUDGET: int = 16000
 HARD_MAX_SOURCE_CHARS: int = 2400
 from qdrant_memory.write_gate import evaluate_raptor_summary_write, evaluate_write_candidate
 from qdrant_memory.tools import TOOL_SCHEMAS
-from qdrant_memory.writer import ConversationWriter
+from qdrant_memory.writer import ConversationWriter, ManagedOverwriteRefused
 
 logger = logging.getLogger(__name__)
 
@@ -1255,7 +1258,15 @@ class QdrantMemoryProvider(MemoryProvider):
                 return json.dumps({"dry_run": False, "saved": False, "would_store": False, **base})
             if write_decision.decision != "store":
                 return _json_error("write gate requires review before storing memory candidate")
-            point_id = self._writer.store_text(text, source_type=source_type, importance=importance, tags=tags)
+            try:
+                point_id = self._writer.store_text(text, source_type=source_type, importance=importance, tags=tags)
+            except ManagedOverwriteRefused as exc:
+                # The store id is derived from the content, so re-storing the same
+                # text targets the existing point. Replacing a payload that carries
+                # lineage identity retires the binding just as a delete would, and
+                # replacing one that carries W2 review state erases the gate the
+                # retriever reads. The exception carries which refusal applies.
+                return _json_error(str(exc))
             return json.dumps({"dry_run": False, "saved": bool(point_id), "id": point_id, "source_type": source_type, "collection_name": self._config["collection_name"], "write_decision": write_decision.to_dict()})
         except Exception as exc:
             return _json_error(f"Failed to store memory: {exc}")
@@ -1471,7 +1482,7 @@ class QdrantMemoryProvider(MemoryProvider):
                 ))
             except (TimeoutError, RuntimeError):
                 return _json_error(LINEAGE_LOCK_UNAVAILABLE)
-            _, verdict = self._lineage_dependency_fence(
+            points, verdict = self._lineage_dependency_fence(
                 collection_name, ids, mode=str(self._config.get("lineage_mode") or "off"),
             )
             if verdict["status"] == "lookup_failed":
@@ -1480,6 +1491,15 @@ class QdrantMemoryProvider(MemoryProvider):
                 return _json_error("lineage dependency fence is incomplete")
             if verdict["blocked"]:
                 return _json_error("lineage dependents block forget")
+            # A managed point (file chunk or source carrying lineage identity) is
+            # bound to a version/entity record whose bookkeeping a bare exact-ID
+            # delete would orphan. Structural records are already refused inside
+            # _retrieve_consolidation_points; this closes the non-structural
+            # shape, which is the one ordinary content points have. Refuse in
+            # every mode, including `off` and after a downgrade: dropping the
+            # mode must not turn an unsupported retirement into a silent delete.
+            if any(lineage_managed_reasons(point.payload) for point in points):
+                return _json_error(LINEAGE_MANAGED_RETIREMENT_REFUSED)
             self._qdrant.delete_ids(collection_name, ids)
             return json.dumps({"dry_run": False, "ids": ids, "deleted": len(ids)})
         except StructuralLineageRefusal as exc:
@@ -1907,8 +1927,17 @@ class QdrantMemoryProvider(MemoryProvider):
             points = self._retrieve_consolidation_points(collection_name, affected_ids)
             if len(points) != len(set(affected_ids)):
                 return _json_error("affected point missing; rerun consolidation")
+            # A managed point (file chunk or source carrying lineage identity) is
+            # bound to a version/entity record whose bookkeeping a destructive
+            # apply would orphan. Decided from the payloads alone and checked
+            # before the mode branches, so every mode answers with the same
+            # actionable refusal instead of a mode-specific one.
             lineage_mode = str(self._config.get("lineage_mode") or "off")
             destructive_action = action in {"merge", "delete", "quarantine"}
+            if destructive_action and any(
+                lineage_managed_reasons(point.payload) for point in points
+            ):
+                return _json_error(LINEAGE_MANAGED_RETIREMENT_REFUSED)
             fence_verdict: dict[str, Any] | None = None
             if lineage_mode in {"off", "capture"} and destructive_action:
                 try:
@@ -2416,6 +2445,33 @@ class QdrantMemoryProvider(MemoryProvider):
                 )
             if persisted_decision.decision != "store":
                 return _json_error("extraction candidate requires manual review before storing")
+            try:
+                existing_points = self._qdrant.retrieve(
+                    self._config["collection_name"], [candidate.candidate_id], with_payload=True
+                )
+            except Exception:
+                return _json_error(
+                    "Unable to verify target point identity; refusing to overwrite "
+                    "(Qdrant retrieval error)"
+                )
+            # The candidate id is deterministic, so approving a regenerated candidate
+            # can land on a point that already carries lineage identity or the review
+            # state a W2 transition wrote. Replacing either erases state this route
+            # does not own, so the refusal text names which one applies.
+            overwrite_refusal = next(
+                (
+                    refusal
+                    for refusal in (
+                        lineage_overwrite_refusal(item.get("payload") or {})
+                        for item in existing_points or []
+                        if isinstance(item, dict)
+                    )
+                    if refusal
+                ),
+                None,
+            )
+            if overwrite_refusal:
+                return _json_error(overwrite_refusal)
             text = str(payload.get("text") or payload.get("claim_text") or "")
             vector = self._embeddings.embed_document(text)
             self._lineage_locked_upsert(

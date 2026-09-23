@@ -10,7 +10,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from qdrant_memory.lineage import build_lineage_impact_snapshot, collection_write_lock
+from qdrant_memory.consolidation import is_structural_lineage_payload
+from qdrant_memory.lineage import (
+    build_lineage_impact_snapshot,
+    collection_write_lock,
+    lineage_overwrite_protected_reasons,
+)
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from qdrant_memory.client import QdrantClient
@@ -630,9 +635,19 @@ def plan_restore(qdrant: Any, config: dict[str, Any], manifest: dict[str, Any], 
 
 
 def _lineage_managed(payload: dict[str, Any]) -> bool:
-    return payload.get("lineage_record") is True or any(
-        payload.get(key) not in (None, "")
-        for key in ("file_version_id", "lineage_entity_id", "lineage_schema_version")
+    """Whether a restore may not replace this payload in place.
+
+    Restore is a third in-place overwrite route, and its predicate used to be local
+    and narrower than the rest: three identity fields plus the structural marker, so
+    it allowed overwriting a target whose only lineage state was the review marker a
+    transition wrote — the same shape the store and extraction routes refuse — and
+    targets carrying only ``lineage_role``, ``lineage_scope_key`` or
+    ``lineage_source_key``. It now reads the shared overwrite predicate (identity plus
+    review state) and the shared structural test (a separate write class this route
+    also owns), so no field list survives here to drift from the others.
+    """
+    return is_structural_lineage_payload(payload) or bool(
+        lineage_overwrite_protected_reasons(payload)
     )
 
 

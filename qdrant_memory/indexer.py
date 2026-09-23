@@ -14,6 +14,7 @@ from .lineage import (
     CHUNKER_VERSION,
     apply_capture_plan,
     apply_reconciliation_plan,
+    lineage_overwrite_protected_reasons,
     make_scope_key,
     make_source_key,
     make_version_identity_digest,
@@ -783,9 +784,14 @@ class FileIndexer:
                     desired = {chunk.id for chunk in chunks_by_file[file_path]}
                     desired_ids_by_file[file_path] = desired
                     if not capture and not reconcile:
+                        # A reindex replaces every chunk payload in place at its
+                        # content-derived id, so it is an overwrite route: it answers
+                        # from the shared overwrite predicate, never from a local
+                        # subset of the identity fields. A miss here rewrites the
+                        # transition's review state away (or deletes the chunk under
+                        # --force) while §27 promises `off` refuses managed files.
                         lineage_managed = any(
-                            any((point.get("payload") or {}).get(key) not in (None, "")
-                                for key in ("file_version_id", "lineage_entity_id", "lineage_schema_version"))
+                            lineage_overwrite_protected_reasons(point.get("payload") or {})
                             for point in existing
                         )
                         if lineage_managed:
@@ -855,33 +861,64 @@ class FileIndexer:
                                 and any(is_path_within(path, root) for root in roots)):
                             foreign_ids_by_file.setdefault(path, set()).add(str(point_id))
                     deleted: dict[str, list[dict[str, Any]]] = {}
+                    removed_by_file: dict[str, list[dict[str, Any]]] = {}
+                    # The present-file site decides over every scope (`profile_id=None`)
+                    # because the transition's review state can land on a point the
+                    # ownership filter does not claim. The removed-file site has to answer
+                    # the same question over the same population, or the two sites disagree
+                    # about what a managed file is: a removed path whose only protected
+                    # chunk was foreign-scope or unattributable was not blocked, and its
+                    # owned chunks were deleted live while §27 promises `off` refuses
+                    # managed files. The deletion set stays owned-only below; only the
+                    # protection decision widens, which can only add refusals.
+                    protected_by_file: dict[str, list[dict[str, Any]]] = {}
+                    for point in all_existing_chunks:
+                        payload = point.get("payload") or {}
+                        candidate = str(payload.get("file_path") or "")
+                        if candidate and any(is_path_within(candidate, root) for root in roots):
+                            protected_by_file.setdefault(candidate, []).append(point)
                     for point in existing_chunks:
                         payload = point.get("payload") or {}
                         path, point_id = str(payload.get("file_path") or ""), point.get("id")
                         if not path or point_id is None or path in desired_ids_by_file or Path(path).exists():
                             continue
                         if any(is_path_within(path, root) for root in roots):
-                            if not capture and not reconcile and any(payload.get(key) not in (None, "") for key in (
-                                "file_version_id", "lineage_entity_id", "lineage_schema_version"
-                            )):
-                                if path not in off_blocked_files:
-                                    blocked = {
-                                        "file_path": path,
-                                        "lineage_baseline_basis": "indexed_file_sha256",
-                                        "lineage_missing_fields": [],
-                                        "lineage_blocked_reason": "lineage_managed_requires_capture_or_retirement",
-                                        "lineage_history_complete": False,
-                                    }
-                                    off_blocked_files.add(path)
-                                    summary["lineage_files"].append(blocked)
-                                    summary["lineage_blocked_files"].append(blocked)
-                                    summary["refused"] = True
-                                    summary["refusals"].append({
-                                        "file_path": path,
-                                        "reason": "lineage_managed_requires_capture_or_retirement",
-                                    })
-                                continue
-                            deleted.setdefault(path, []).append(point)
+                            removed_by_file.setdefault(path, []).append(point)
+                    for path, old_points in sorted(removed_by_file.items()):
+                        # Decided per file, like the present-file site above: a removed
+                        # file is lineage-managed when any of its chunks is, because the
+                        # chunks share the file's identity and the transition's review
+                        # state lands on whichever chunk it lands on. Deciding per point
+                        # here deleted the blocked chunk's siblings and still reported the
+                        # path as deleted, so the block leaked exactly the ids it exists
+                        # to keep.
+                        #
+                        # And decided over every scope, also like the present-file site:
+                        # `protected_by_file` is the same population that site reads, so
+                        # the two answers agree about a file whose only protected chunk the
+                        # ownership filter does not claim.
+                        if not capture and not reconcile and any(
+                            lineage_overwrite_protected_reasons(point.get("payload") or {})
+                            for point in protected_by_file.get(path, old_points)
+                        ):
+                            if path not in off_blocked_files:
+                                blocked = {
+                                    "file_path": path,
+                                    "lineage_baseline_basis": "indexed_file_sha256",
+                                    "lineage_missing_fields": [],
+                                    "lineage_blocked_reason": "lineage_managed_requires_capture_or_retirement",
+                                    "lineage_history_complete": False,
+                                }
+                                off_blocked_files.add(path)
+                                summary["lineage_files"].append(blocked)
+                                summary["lineage_blocked_files"].append(blocked)
+                                summary["refused"] = True
+                                summary["refusals"].append({
+                                    "file_path": path,
+                                    "reason": "lineage_managed_requires_capture_or_retirement",
+                                })
+                            continue
+                        deleted.setdefault(path, []).extend(old_points)
                     if reconcile:
                         source_filter = {"must": [
                             {"key": "lineage_role", "match": {"value": "file_source"}},

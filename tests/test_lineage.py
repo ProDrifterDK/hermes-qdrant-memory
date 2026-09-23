@@ -874,6 +874,84 @@ def test_off_mode_refuses_to_destroy_or_duplicate_captured_file(tmp_path):
     assert embeddings.documents == []
 
 
+# The off-mode reindex is an overwrite route: it rewrites every chunk payload in
+# place at its content-derived id, and under --force it deletes the ids it is about
+# to rewrite. Its block decision therefore has to answer from the shared overwrite
+# predicate. The predecessor test only covers a captured file (identity fields); the
+# shapes below are what a transition writes onto an otherwise ordinary chunk, and a
+# local subset decision let an ordinary reindex — cron or operator, under `off` or
+# after a downgrade — re-serve a stale-pending-review fact as active.
+
+
+def _demote_chunk(qdrant, **fields):
+    """Apply the transition's demotion patch to the single indexed chunk."""
+    chunk = _points(qdrant, kind="source_chunk")[0]
+    payload = chunk["payload"]
+    patch = {"requires_review": True, "fact_status": "review_required",
+             "lineage_review_event_ids": ["40dfae4c-0000-4000-8000-000000000001"]}
+    patch.update(fields)
+    payload.update(patch)
+    return chunk, patch
+
+
+def _off_reindex(tmp_path, qdrant, embeddings, *, force):
+    qdrant.call_log.clear()
+    qdrant.deleted.clear()
+    qdrant.upserts.clear()
+    embeddings.documents.clear()
+    return _indexer(qdrant, embeddings, mode="off").index(
+        [tmp_path / "note.md"], dry_run=False, force=force,
+    )
+
+
+@pytest.mark.parametrize("force", [False, True], ids=("plain", "force"))
+def test_off_mode_refuses_to_rewrite_a_chunk_carrying_only_review_state(tmp_path, force):
+    path = tmp_path / "note.md"
+    path.write_text("# Note\nalpha", encoding="utf-8")
+    qdrant, embeddings = FakeQdrant(), FakeEmbedding()
+    _indexer(qdrant, embeddings, mode="off").index([path], dry_run=False)
+    chunk, patch = _demote_chunk(qdrant)
+    before = json.dumps(chunk["payload"], sort_keys=True, separators=(",", ":")).encode()
+
+    result = _off_reindex(tmp_path, qdrant, embeddings, force=force)
+
+    assert result["lineage_blocked_files"][0]["lineage_blocked_reason"] == "lineage_managed_requires_capture_or_retirement"
+    assert result["partial_failure"] is True
+    after = _points(qdrant, kind="source_chunk")[0]
+    assert json.dumps(after["payload"], sort_keys=True, separators=(",", ":")).encode() == before
+    assert after["payload"]["requires_review"] is True
+    assert after["payload"]["fact_status"] == "review_required"
+    assert qdrant.deleted == []
+    assert qdrant.upserts == []
+    assert embeddings.documents == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("lineage_role", "chunk"),
+        ("lineage_scope_key", "a" * 64),
+        ("lineage_source_key", "b" * 64),
+    ],
+    ids=("role", "scope-key", "source-key"),
+)
+def test_off_mode_refuses_to_rewrite_a_chunk_carrying_one_identity_field(tmp_path, field, value):
+    path = tmp_path / "note.md"
+    path.write_text("# Note\nalpha", encoding="utf-8")
+    qdrant, embeddings = FakeQdrant(), FakeEmbedding()
+    _indexer(qdrant, embeddings, mode="off").index([path], dry_run=False)
+    chunk, _ = _demote_chunk(qdrant, **{field: value})
+    before = json.dumps(chunk["payload"], sort_keys=True, separators=(",", ":")).encode()
+
+    result = _off_reindex(tmp_path, qdrant, embeddings, force=True)
+
+    assert result["lineage_blocked_files"][0]["lineage_blocked_reason"] == "lineage_managed_requires_capture_or_retirement"
+    after = _points(qdrant, kind="source_chunk")[0]
+    assert json.dumps(after["payload"], sort_keys=True, separators=(",", ":")).encode() == before
+    assert qdrant.deleted == []
+    assert qdrant.upserts == []
+
+
 @pytest.mark.parametrize(
     ("off_profile", "off_user", "off_chat"),
     [("default", "", ""), ("default", "u2", "c2"), ("other", "u1", "c1")],
@@ -985,11 +1063,22 @@ def test_off_mode_force_skips_lineage_managed_filter_delete_in_dry_and_live_runs
     assert embeddings.documents == []
 
 
-def test_directory_off_mode_does_not_delete_removed_lineage_managed_chunks(tmp_path):
+@pytest.mark.parametrize("shape", ["captured", "review_only"], ids=("captured", "review-only"))
+def test_directory_off_mode_does_not_delete_removed_lineage_managed_chunks(tmp_path, shape):
+    """A removed file's chunks are the second place the off-mode block decision runs.
+
+    It used to decide from three identity fields, so a chunk whose only lineage state
+    was the review marker a transition wrote was deleted as stale — the same payload
+    the store, extraction and restore routes refuse to replace.
+    """
     path = tmp_path / "note.md"
     path.write_text("# Note\nalpha", encoding="utf-8")
     qdrant, embeddings = FakeQdrant(), FakeEmbedding()
-    _indexer(qdrant, embeddings).index([path], dry_run=False)
+    if shape == "captured":
+        _indexer(qdrant, embeddings).index([path], dry_run=False)
+    else:
+        _indexer(qdrant, embeddings, mode="off").index([path], dry_run=False)
+        _demote_chunk(qdrant)
     v2_chunks = {str(point["id"]) for point in _points(qdrant, kind="source_chunk")}
     path.unlink()
     qdrant.call_log.clear()
@@ -1002,6 +1091,170 @@ def test_directory_off_mode_does_not_delete_removed_lineage_managed_chunks(tmp_p
     assert qdrant.deleted == []
     assert {str(point["id"]) for point in _points(qdrant, kind="source_chunk")} == v2_chunks
     assert result["lineage_blocked_files"][0]["lineage_blocked_reason"] == "lineage_managed_requires_capture_or_retirement"
+
+
+def test_a_removed_file_whose_siblings_are_ordinary_is_blocked_as_a_file(tmp_path):
+    """The removed-file block is decided per file, not per chunk.
+
+    A transition demotes one chunk of a multi-chunk file. That chunk carries the review
+    state, its siblings carry nothing, and the file is gone from disk. Deciding per point
+    here — the decision the present-file site already made per file — marked the path
+    blocked, then deleted every sibling anyway and listed the path as deleted, so the
+    block held exactly the one id that was protected and leaked all the others.
+    """
+    path = tmp_path / "note.md"
+    path.write_text(
+        "# Note\n\n" + "\n\n".join(
+            f"## Section {index}\n" + " ".join(f"s{index}w{word}" for word in range(12))
+            for index in range(6)
+        ) + "\n",
+        encoding="utf-8",
+    )
+    qdrant, embeddings = FakeQdrant(), FakeEmbedding()
+    _indexer(qdrant, embeddings, mode="off").index([path], dry_run=False)
+    chunks = _points(qdrant, kind="source_chunk")
+    assert len(chunks) > 1, "the fixture must produce siblings for this pin to mean anything"
+    protected = chunks[0]
+    payload = protected["payload"]
+    payload.update({
+        "requires_review": True,
+        "fact_status": "review_required",
+        "lineage_review_event_ids": ["40dfae4c-0000-4000-8000-000000000002"],
+    })
+    v2_chunks = {str(point["id"]) for point in chunks}
+    path.unlink()
+    qdrant.call_log.clear()
+    qdrant.deleted.clear()
+    qdrant.upserts.clear()
+    embeddings.documents.clear()
+
+    result = _indexer(qdrant, embeddings, mode="off").index([tmp_path], dry_run=False)
+
+    assert result["lineage_blocked_files"][0]["lineage_blocked_reason"] == "lineage_managed_requires_capture_or_retirement"
+    assert result["refused"] is True
+    assert result["deleted_file_paths"] == []
+    assert result["deleted_file_ids"] == []
+    assert result["stale_ids"] == []
+    assert result["files_with_stale_chunks"] == 0
+    assert qdrant.deleted == []
+    assert qdrant.upserts == []
+    assert embeddings.documents == []
+    assert {str(point["id"]) for point in _points(qdrant, kind="source_chunk")} == v2_chunks
+
+
+@pytest.mark.parametrize("force", [False, True], ids=("plain", "force"))
+def test_a_removed_file_with_one_protected_sibling_survives_force_too(tmp_path, force):
+    path = tmp_path / "note.md"
+    path.write_text(
+        "# Note\n\n" + "\n\n".join(
+            f"## Section {index}\n" + " ".join(f"s{index}w{word}" for word in range(12))
+            for index in range(5)
+        ) + "\n",
+        encoding="utf-8",
+    )
+    qdrant, embeddings = FakeQdrant(), FakeEmbedding()
+    _indexer(qdrant, embeddings, mode="off").index([path], dry_run=False)
+    chunks = _points(qdrant, kind="source_chunk")
+    # The protected chunk is the last one, so a per-point decision deletes its sibling
+    # predecessors instead of its successors. Both orders are the same defect.
+    chunks[-1]["payload"].update({
+        "requires_review": True,
+        "fact_status": "review_required",
+        "lineage_review_event_ids": ["40dfae4c-0000-4000-8000-000000000003"],
+    })
+    v2_chunks = {str(point["id"]) for point in chunks}
+    path.unlink()
+    qdrant.call_log.clear()
+    qdrant.deleted.clear()
+
+    result = _indexer(qdrant, embeddings, mode="off").index(
+        [tmp_path], dry_run=False, force=force,
+    )
+
+    assert result["deleted_file_ids"] == []
+    assert result["stale_ids"] == []
+    assert qdrant.deleted == []
+    assert {str(point["id"]) for point in _points(qdrant, kind="source_chunk")} == v2_chunks
+    assert result["lineage_blocked_files"][0]["lineage_blocked_reason"] == "lineage_managed_requires_capture_or_retirement"
+
+
+def _seed_foreign_protected_sibling(path, qdrant):
+    """A file path holding one owned ordinary chunk and one foreign protected chunk.
+
+    The protected point carries review state and an unclaimed profile, which is the shape
+    a transition can leave behind: the review state lands on whichever point the sweep
+    wrote, and `_owned_file_chunks` only claims the points whose profile, user and chat
+    hashes match the running indexer.
+    """
+    resolved = str(path.resolve())
+    owned_id = "22222222-2222-4222-8222-222222222222"
+    foreign_id = "11111111-1111-4111-8111-111111111111"
+    qdrant.points.extend([
+        {"id": owned_id, "vector": [0.1, 0.2], "payload": {
+            "file_path": resolved, "chunk_type": "file_chunk", "memory_kind": "source_chunk",
+            "profile_id": "default", "user_id_hash": "u1", "chat_id_hash": "c1",
+        }},
+        {"id": foreign_id, "vector": [0.1, 0.2], "payload": {
+            "file_path": resolved, "chunk_type": "file_chunk", "memory_kind": "source_chunk",
+            "profile_id": "other", "user_id_hash": "u1", "chat_id_hash": "c1",
+            "requires_review": True, "fact_status": "review_required",
+            "lineage_review_event_ids": ["40dfae4c-0000-4000-8000-000000000005"],
+        }},
+    ])
+    return owned_id, foreign_id
+
+
+def test_a_removed_file_whose_only_protected_chunk_is_foreign_scope_is_blocked(tmp_path):
+    """The removed-file and present-file sites answer the same question over one population.
+
+    The present-file site reads every scope (`profile_id=None`), because the transition's
+    review state can land on a point the ownership filter does not claim. The removed-file
+    site read owned chunks only, so a removed path whose only protected chunk was
+    foreign-scope was not blocked, and its owned chunks were deleted live while §27
+    promises `off` refuses managed files. Deciding both sites over the same population is
+    the difference between the two branches of one block agreeing and diverging.
+    """
+    path = tmp_path / "note.md"
+    path.write_text("# Note\nalpha", encoding="utf-8")
+    qdrant, embeddings = FakeQdrant(), FakeEmbedding()
+    owned_id, foreign_id = _seed_foreign_protected_sibling(path, qdrant)
+    indexer = _indexer(qdrant, embeddings, mode="off")
+    indexer.user_id_hash, indexer.chat_id_hash = "u1", "c1"
+    path.unlink()
+    qdrant.call_log.clear()
+    qdrant.deleted.clear()
+    qdrant.upserts.clear()
+
+    result = indexer.index([tmp_path], dry_run=False)
+
+    assert result["refused"] is True
+    assert result["lineage_blocked_files"][0]["lineage_blocked_reason"] == "lineage_managed_requires_capture_or_retirement"
+    assert result["lineage_blocked_files"][0]["file_path"] == str(path.resolve())
+    assert result["deleted_file_paths"] == []
+    assert result["deleted_file_ids"] == []
+    assert result["stale_ids"] == []
+    assert result["files_with_stale_chunks"] == 0
+    assert qdrant.deleted == []
+    assert qdrant.upserts == []
+    assert {str(point["id"]) for point in qdrant.points} == {owned_id, foreign_id}
+
+
+def test_a_present_file_whose_only_protected_chunk_is_foreign_scope_is_blocked_too(tmp_path):
+    """The present-file half of the same question, so the pair cannot drift apart again."""
+    path = tmp_path / "note.md"
+    path.write_text("# Note\nalpha", encoding="utf-8")
+    qdrant, embeddings = FakeQdrant(), FakeEmbedding()
+    owned_id, foreign_id = _seed_foreign_protected_sibling(path, qdrant)
+    indexer = _indexer(qdrant, embeddings, mode="off")
+    indexer.user_id_hash, indexer.chat_id_hash = "u1", "c1"
+
+    result = indexer.index([tmp_path], dry_run=False, force=True)
+
+    assert result["refused"] is True
+    assert result["lineage_blocked_files"][0]["lineage_blocked_reason"] == "lineage_managed_requires_capture_or_retirement"
+    assert qdrant.deleted == []
+    assert qdrant.upserts == []
+    assert {str(point["id"]) for point in qdrant.points} == {owned_id, foreign_id}
 
 
 def test_foreign_scope_only_force_has_dry_live_parity_without_deletion(tmp_path):

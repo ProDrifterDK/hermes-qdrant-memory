@@ -293,4 +293,16 @@ def load_config(*, hermes_home: str | None = None, hermes_config: Mapping[str, A
         env_key = f"HERMES_QDRANT_MEMORY_{key.upper()}"
         if env_key in os.environ:
             merged[key] = os.environ[env_key]
-    return {key: _coerce(key, merged.get(key)) for key in DEFAULTS}
+    resolved = {key: _coerce(key, merged.get(key)) for key in DEFAULTS}
+    # The learning store upserts without the lineage overwrite guard, so it is only
+    # safe while its collection cannot hold a memory point. Fail closed at load
+    # rather than depend on the two names happening to differ.
+    memory_collection = str(resolved.get("collection_name") or "").strip()
+    learning_collection = str(resolved.get("learning_collection_name") or "").strip()
+    if memory_collection and memory_collection == learning_collection:
+        raise ValueError(
+            "collection_name and learning_collection_name must differ: the learning "
+            "store writes without the lineage overwrite guard, so one shared "
+            "collection would let a learning upsert replace a protected payload"
+        )
+    return resolved

@@ -1023,6 +1023,128 @@ def test_restore_preflights_every_collection_fence_before_first_write(tmp_path, 
     assert target.upserts == []
 
 
+# --- restore is the third in-place overwrite route ---------------------------
+#
+# Its predicate used to be local (three identity fields plus the structural marker),
+# so it allowed the review-only target the store and extraction routes refuse, and
+# targets carrying only lineage_role / lineage_scope_key / lineage_source_key. The
+# rows below are the shared overwrite predicate, so a future narrowing of one route
+# cannot pass by testing one field.
+
+_RESTORE_PROTECTED_FIELDS = ("file_version_id", "lineage_entity_id", "lineage_schema_version",
+                             "lineage_scope_key", "lineage_source_key", "lineage_role",
+                             "lineage_review_event_ids", "lineage_record", "lineage_pending")
+
+# ``lineage_record`` / ``lineage_pending`` are truthy markers; every other row is an
+# identity string (``lineage_review_event_ids`` is a list).
+_RESTORE_MARKER_FIELDS = {"lineage_record", "lineage_pending"}
+
+
+def _restore_fixture(tmp_path, monkeypatch, live_payload, live_learning_payload=None):
+    """A backup whose memory point changed, against a target holding ``live_payload``.
+
+    ``live_learning_payload`` places a protected target in the **learnings** scope at
+    the id the backup restores into, so a preflight that evaluates its predicate
+    against ``collection_name`` for every scope is caught instead of being invisible.
+    """
+    from qdrant_memory import backup as backup_module
+
+    source = FakeQdrant({
+        "memory": [_point("memory-changed", "backup memory")],
+        "learnings": [_point("learning-missing", "restore me")],
+    })
+    config = {
+        "collection_name": "memory", "learning_collection_name": "learnings",
+        "vector_size": 2, "distance": "Cosine",
+    }
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    backup_id = backup_module.create_backup(
+        source, config, hermes_home=hermes_home, scope="both",
+    )["backup_id"]
+    learnings = []
+    if live_learning_payload is not None:
+        learnings.append(_point("learning-missing", "live learning", **live_learning_payload))
+    target = FakeQdrant({"memory": [_point("memory-changed", "live memory", **live_payload)],
+                         "learnings": learnings})
+    monkeypatch.setattr(
+        backup_module, "create_backup", lambda *args, **kwargs: {"backup_id": "pre-restore"},
+    )
+    return backup_module, target, config, hermes_home, backup_id
+
+
+@pytest.mark.parametrize("field", _RESTORE_PROTECTED_FIELDS)
+def test_restore_refuses_to_overwrite_every_protected_payload(field, tmp_path, monkeypatch):
+    value = True if field in _RESTORE_MARKER_FIELDS else (
+        ["event-1"] if field == "lineage_review_event_ids" else "identity-1"
+    )
+    backup_module, target, config, hermes_home, backup_id = _restore_fixture(
+        tmp_path, monkeypatch, {field: value},
+    )
+
+    with pytest.raises(backup_module.BackupError, match="overwrite lineage-managed"):
+        backup_module.restore_backup(
+            target, config, hermes_home=hermes_home, backup_id=backup_id,
+            dry_run=False, backup_first=True,
+        )
+    assert target.upserts == []
+
+
+@pytest.mark.parametrize("field", _RESTORE_PROTECTED_FIELDS)
+def test_restore_refuses_a_protected_target_in_the_learnings_scope(field, tmp_path, monkeypatch):
+    """The same predicate has to hold for the second scope restore writes into."""
+    value = True if field in _RESTORE_MARKER_FIELDS else (
+        ["event-1"] if field == "lineage_review_event_ids" else "identity-1"
+    )
+    backup_module, target, config, hermes_home, backup_id = _restore_fixture(
+        tmp_path, monkeypatch, {}, live_learning_payload={field: value},
+    )
+
+    with pytest.raises(backup_module.BackupError, match="overwrite lineage-managed"):
+        backup_module.restore_backup(
+            target, config, hermes_home=hermes_home, backup_id=backup_id,
+            dry_run=False, backup_first=True,
+        )
+    assert target.upserts == []
+
+
+def test_restore_refuses_the_review_only_shape(tmp_path, monkeypatch):
+    """The exact shape the second review reproduced on the other two routes: no
+    identity field, only the state a transition wrote. Replacing it erases
+    ``requires_review``, the gate the retriever reads."""
+    backup_module, target, config, hermes_home, backup_id = _restore_fixture(
+        tmp_path, monkeypatch,
+        {"requires_review": True, "fact_status": "review_required",
+         "lineage_review_event_ids": ["event-1"]},
+    )
+
+    with pytest.raises(backup_module.BackupError, match="overwrite lineage-managed"):
+        backup_module.restore_backup(
+            target, config, hermes_home=hermes_home, backup_id=backup_id,
+            dry_run=False, backup_first=True,
+        )
+    assert target.upserts == []
+
+
+def test_restore_still_overwrites_an_ordinary_payload(tmp_path, monkeypatch):
+    """Negative control: restore keeps restoring. The refusal is about the live
+    payload's lineage state, not about the route."""
+    backup_module, target, config, hermes_home, backup_id = _restore_fixture(
+        tmp_path, monkeypatch, {},
+    )
+
+    result = backup_module.restore_backup(
+        target, config, hermes_home=hermes_home, backup_id=backup_id,
+        dry_run=False, backup_first=True,
+    )
+
+    assert result["applied"] is True
+    assert result["upserted"] == 2
+    # Both scopes were written; the order restore walks them is not part of the
+    # contract, so the control asserts the set rather than the sequence.
+    assert sorted(name for name, _ in target.upserts) == ["learnings", "memory"]
+
+
 # ===========================================================================
 # W0: payload-only points (vector={}) round-trip exactly
 # ===========================================================================

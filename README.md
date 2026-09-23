@@ -479,6 +479,41 @@ wins; as with every key, the environment variable outranks a `lineage_lock_dir`
 written in `config.yaml` or `qdrant_memory.json`). Isolated deployments and test
 harnesses use it to keep the lineage lock directory off the shared per-user path.
 
+`lineage_mode` accepts `off`, `capture`, and `reconcile`. Read the activation
+boundary before turning it on: retirement of an ordinary (non-file) memory point
+is **not supported** yet, so the destructive routes refuse instead of degrading
+to a legacy delete. Under `reconcile` every consolidation delete/merge/quarantine
+returns `lineage impact blocks ordinary-root transition:
+ordinary_root_transition_cause_unratified`. A point that carries lineage identity
+(a file version or lineage binding) is refused in every mode by
+`qdrant_memory_forget`, by destructive consolidation, by the store upsert and by
+the extraction-approval upsert, all with `lineage-managed points require the
+reviewed retirement path`. What protects a point is decided per **effect class**,
+because a retirement removes it while an in-place overwrite keeps the id: the
+demotion marker `lineage_review_event_ids` is history rather than identity, so it
+does not stop an ordinary dependent from being retired, but it does stop the two
+overwrite routes, which refuse with `lineage review state requires the reviewed
+transition path` instead of erasing the review state the retriever reads. That
+refusal means *unsupported*, not *broken*; do not work around it by turning lineage
+off or editing payloads. See `docs/SAFETY.md` for the per-route table, the preview
+caveat and the recorded support limitation.
+
+`collection_name` and `learning_collection_name` must differ; the defaults
+(`hermes_memory`, `hermes_learnings`) already do. The learning store writes without
+the lineage overwrite guard, so a shared collection would let a learning upsert
+replace a protected payload, and `load_config` refuses that configuration with a
+`ValueError` instead of relying on the names happening to differ. The refusal surfaces
+from provider construction: when the collision comes from `config.yaml`, the environment
+or the active `$HERMES_HOME/qdrant_memory.json`, the provider raises before
+`is_available` is reached, so `is_available` never sees that case. A collision that
+exists only in a `hermes_home` passed to `initialize` — a home other than the `HERMES_HOME`
+the process runs against — passes `is_available`, because `is_available` calls
+`load_config()` without a `hermes_home`, and raises when the provider initializes.
+`hermes qdrant doctor` reports the refusal as a failed
+`config_invariants` check instead of dying with the same traceback; that path returns
+early, so it reports `plugin_discovery` and `config_invariants` only — with no
+loadable config there is no URL to reach a collection with.
+
 Example config:
 
 ```yaml

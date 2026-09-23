@@ -31,6 +31,13 @@ class FakeQdrant:
         self.points.extend(points)
         return {"status": "ok"}
 
+    def retrieve(self, name, ids, *, with_payload=True, with_vector=False):
+        # The store path reads the target id before writing so it can refuse to
+        # replace a lineage-managed payload; a double must answer the same
+        # interface the real client exposes.
+        wanted = {str(item) for item in ids}
+        return [point for point in self.points if str(point.get("id")) in wanted]
+
     def search(self, name, vector, limit, filter=None, with_payload=True, with_vector=False):
         self.searches.append((name, vector, limit, filter, with_payload, with_vector))
         return self.search_results

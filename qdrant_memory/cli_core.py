@@ -1151,7 +1151,31 @@ def _collection_vector_size_check(status: dict[str, Any]) -> dict[str, Any]:
 def build_doctor_report(provider_factory: Callable[[], Any]) -> dict[str, Any]:
     from qdrant_memory.config import load_config
 
-    config = load_config(hermes_home=str(_hermes_home()))
+    try:
+        config = load_config(hermes_home=str(_hermes_home()))
+    except ValueError as exc:
+        # The plugin refuses a configuration whose memory and learning collections
+        # coincide. Doctor is the tool an operator runs when the plugin will not
+        # start, so it has to be able to report that refusal instead of dying with
+        # the same traceback and telling them nothing.
+        checks = [
+            _plugin_discovery_check(),
+            _doctor_check(
+                "config_invariants",
+                False,
+                f"configuration refused: {exc}",
+                details={"error": type(exc).__name__},
+            ),
+        ]
+        return {
+            "ok": False,
+            "summary": {
+                "total_checks": len(checks),
+                "passed": len([check for check in checks if check.get("ok")]),
+                "failed_critical": len([check for check in checks if check.get("critical") and not check.get("ok")]),
+            },
+            "checks": checks,
+        }
     checks: list[dict[str, Any]] = [
         _plugin_discovery_check(),
         _metadata_version_check(),

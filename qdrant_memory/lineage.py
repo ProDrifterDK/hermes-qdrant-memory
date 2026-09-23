@@ -1813,6 +1813,91 @@ LINEAGE_LOCK_REFUSAL_MARKERS = (
 )
 
 
+LINEAGE_MANAGED_RETIREMENT_REFUSED = "lineage-managed points require the reviewed retirement path"
+LINEAGE_REVIEW_STATE_REFUSAL = "lineage review state requires the reviewed transition path"
+
+# Lineage identity fields an ordinary content point carries once it belongs to a
+# captured file. Value semantics: an explicit empty value is absence, exactly as
+# the W1 capture predicate reads them. Structural records (``lineage_record`` /
+# ``lineage_pending``) are a separate write class and are detected by
+# ``is_structural_lineage_payload``; a point can be managed without being
+# structural, and that is precisely the shape a bare exact-ID delete would
+# orphan.
+LINEAGE_MANAGED_FIELDS = (
+    "file_version_id",
+    "lineage_entity_id",
+    "lineage_schema_version",
+    "lineage_scope_key",
+    "lineage_source_key",
+    "lineage_role",
+)
+
+# ``lineage_review_event_ids`` is history, not identity: the demotion patch is its
+# only writer, and it marks ordinary dependents a transition *touched* (carrying
+# ``requires_review`` / ``fact_status=review_required``), not points bound to a
+# version record. Whether it counts as protection is decided per **effect**, not
+# per field:
+#
+#   - A retirement (forget, destructive consolidation) removes the point. Widening
+#     the retirement predicate with the marker would make a demoted ordinary point
+#     permanently unretirable in every mode with no reviewed path available to it,
+#     so retirement reads ``LINEAGE_MANAGED_FIELDS`` alone.
+#   - An overwrite (store at the content-derived id, extraction approval at the
+#     candidate id) replaces the payload while keeping the id. The unretirable
+#     argument does not apply, and the damage is worse than the retirement it
+#     resembles: the payload loses ``requires_review`` / ``fact_status`` and the
+#     recorded causes, and ``requires_review`` is the gate the retriever and
+#     auto-recall read — a fact W2 flagged as stale-pending-review would be
+#     re-served as active.
+#
+# Overwrite therefore reads ``LINEAGE_OVERWRITE_PROTECTED_FIELDS``, which is the
+# identity set plus exactly the review-state set.
+LINEAGE_REVIEW_STATE_FIELDS = ("lineage_review_event_ids",)
+
+LINEAGE_OVERWRITE_PROTECTED_FIELDS = LINEAGE_MANAGED_FIELDS + LINEAGE_REVIEW_STATE_FIELDS
+
+
+def lineage_managed_reasons(payload: Any) -> list[str]:
+    """Reasons a payload participates in lineage bookkeeping without being structural.
+
+    Retirement of such a point has to go through the reviewed path: it is bound to
+    a file version or entity record whose bookkeeping the delete would leave
+    dangling, and no reviewed transition exists for it yet. Callers refuse the
+    destructive route rather than degrading to a legacy delete.
+    """
+    if not isinstance(payload, dict):
+        return []
+    return [key for key in LINEAGE_MANAGED_FIELDS if payload.get(key) not in (None, "", [], {})]
+
+
+def lineage_overwrite_protected_reasons(payload: Any) -> list[str]:
+    """Reasons a payload may not be replaced in place at its own id.
+
+    Broader than the retirement predicate by exactly the transition-history marker,
+    for the reasons recorded above the constants: an overwrite keeps the id and
+    destroys the review state the retriever gates on. Value semantics match the
+    identity predicate, so an explicit empty value is absence.
+    """
+    if not isinstance(payload, dict):
+        return []
+    return [key for key in LINEAGE_OVERWRITE_PROTECTED_FIELDS if payload.get(key) not in (None, "", [], {})]
+
+
+def lineage_overwrite_refusal(payload: Any) -> str | None:
+    """Refusal text for replacing ``payload`` in place, or ``None`` when allowed.
+
+    Identity wins the text when a point carries both: the reviewed retirement path
+    is the one that can actually release such a point, while the review-state text
+    points at the transition that flagged it.
+    """
+    reasons = lineage_overwrite_protected_reasons(payload)
+    if not reasons:
+        return None
+    if any(key in LINEAGE_MANAGED_FIELDS for key in reasons):
+        return LINEAGE_MANAGED_RETIREMENT_REFUSED
+    return LINEAGE_REVIEW_STATE_REFUSAL
+
+
 def _refusal_offset(value: str) -> int | None:
     """Offset of the first marker that reads as a refusal clause, or ``None``.
 
