@@ -118,19 +118,44 @@ def _dispatched_tool_names() -> set[str]:
     return names
 
 
-_TOOL_NAME_SHAPE = re.compile(r"^(?:qdrant_memory_|qdrant_learning_)[a-z_]+$")
+# The shape a tool name has to match to be seen at all. Digits are in the character class
+# because a name the host can register with a digit in it (`qdrant_memory_retrieve_v2`) was
+# invisible to all four derivations: (1) reads comparisons inside one function, (3) and (4)
+# filter by this pattern, and (2) is the only one that would have caught it. Every declared
+# name is now asserted to match this pattern, so a name outside it fails loudly instead of
+# being skipped by three of the four reads.
+_TOOL_NAME_SHAPE = re.compile(r"^(?:qdrant_memory_|qdrant_learning_)[a-z0-9_]+$")
 
-# A ``_tool_*`` implementation the dispatch does not reach. Named here with its reason
-# instead of being invisible: the derivation exists so that a *new* unwired
-# implementation is loud, and an exception list checked in both directions still fails
-# when the exception is wired or when a new one appears.
-_UNDISPATCHED_TOOL_METHODS = {
-    "retrieve_learning": (
-        "no branch in handle_tool_call and no TOOL_SCHEMAS entry — a direct-Python-caller "
-        "route only, exercised by tests/test_learning_retrieve.py. Pre-existing on main "
-        "and out of this closure's scope; pinned so it cannot grow."
-    ),
+# A ``_tool_*`` implementation the dispatch does not reach from ``handle_tool_call``, in two
+# classes that are checked against the source rather than described in prose. A reason string
+# is a claim, and this file shipped one that was false: ``retrieve_learning`` was excused as
+# "a direct-Python-caller route only, no branch in handle_tool_call", but ``_tool_retrieve``
+# dispatches ``collection="learning"`` straight to it, so ``qdrant_memory_retrieve`` reaches
+# it (review 8, N1). Both classes now carry a testable form.
+#
+# - ``_HELPER_TOOL_METHODS``: reached from a *dispatched* handler instead of from
+#   ``handle_tool_call``. It is a real route — the host reaches it by calling the tool whose
+#   handler calls it. Each entry names the reaching route, the call site inside that route's
+#   handler, and the source evidence for its read-only claim; all three are asserted.
+# - ``_UNREACHED_TOOL_METHODS``: no dispatch name, no schema entry, and no call site in the
+#   module. Currently empty, and it cannot be parked in while a handler calls the method,
+#   because the call-site check runs for every entry.
+_HELPER_TOOL_METHODS = {
+    "retrieve_learning": {
+        "reached_from": "qdrant_memory_retrieve",
+        "call_site": "self._tool_retrieve_learning(args)",
+        "read_only_evidence": "update_access=False",
+        "reason": (
+            "reachable through a declared tool: the handler that name maps to "
+            "(``_tool_retrieve``) dispatches ``collection=\"learning\"`` to it. It has no "
+            "``TOOL_SCHEMAS`` entry and no dispatch name of its own, which is exactly what "
+            "makes it invisible to a name read. Read-only by contract — it passes "
+            "``update_access=False`` into ``LearningStore.search``, so it does not bump "
+            "``last_accessed``/``access_count`` either."
+        ),
+    },
 }
+_UNREACHED_TOOL_METHODS: dict[str, str] = {}
 
 
 def _literal_tool_names() -> set[str]:
@@ -153,17 +178,93 @@ def _literal_tool_names() -> set[str]:
     }
 
 
-def _tool_method_names() -> set[str]:
-    """Every ``self._tool_*`` implementation the provider class defines."""
-    tree = ast.parse((REPO / "__init__.py").read_text(encoding="utf-8"))
-    for node in tree.body:
-        if isinstance(node, ast.ClassDef) and node.name == "QdrantMemoryProvider":
-            return {
-                sub.name[len("_tool_"):]
-                for sub in node.body
-                if isinstance(sub, ast.FunctionDef) and sub.name.startswith("_tool_")
-            }
-    raise AssertionError("QdrantMemoryProvider is not defined in __init__.py")
+def _module_source() -> str:
+    return (REPO / "__init__.py").read_text(encoding="utf-8")
+
+
+def _module_tree() -> ast.Module:
+    return ast.parse(_module_source())
+
+
+def _module_classes(tree: ast.Module) -> dict[str, ast.ClassDef]:
+    return {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
+
+
+def _module_functions(tree: ast.Module) -> dict[str, ast.FunctionDef]:
+    return {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+
+
+def _class_names_in(node: ast.AST) -> set[str]:
+    """Names of classes the type is defined from, from its module-local bases.
+
+    ``vars()`` on one class is the read this whole file exists to replace: a mixin's method
+    is still called through the provider, and a base read that stops at one body cannot see
+    it.
+    """
+    names: set[str] = set()
+    for sub in ast.walk(node) if not isinstance(node, ast.ClassDef) else node.bases:
+        if isinstance(sub, ast.Name):
+            names.add(sub.id)
+    return names
+
+
+def _provider_mro_closure(tree: ast.Module) -> set[str]:
+    """Every module-local class the provider inherits from, transitively."""
+    classes = _module_classes(tree)
+    assert "QdrantMemoryProvider" in classes, "QdrantMemoryProvider is not defined in __init__.py"
+    seen: set[str] = set()
+    pending = ["QdrantMemoryProvider"]
+    while pending:
+        name = pending.pop()
+        if name in seen or name not in classes:
+            continue
+        seen.add(name)
+        pending.extend(sorted(_class_names_in(classes[name])))
+    return seen
+
+
+def _tool_methods_by_class(tree: ast.Module) -> dict[str, set[str]]:
+    """Class name -> every ``_tool_*`` method that class body defines."""
+    out: dict[str, set[str]] = {}
+    for name, cls in _module_classes(tree).items():
+        methods = {
+            sub.name[len("_tool_"):]
+            for sub in cls.body
+            if isinstance(sub, ast.FunctionDef) and sub.name.startswith("_tool_")
+        }
+        if methods:
+            out[name] = methods
+    return out
+
+
+def _tool_method_names(tree: ast.Module | None = None) -> set[str]:
+    """Every ``self._tool_*`` implementation the provider can call, over its whole MRO.
+
+    Reading only the provider's own ``ClassDef`` body is the same ``vars()``-style read the
+    hook derivation was fixed for in round 6 and review 8's N3 named here: a ``_tool_*``
+    defined on a mixin is called through the provider, so it is a route, but it was not in
+    the defined set. A ``_tool_*`` on a class *outside* that closure is loud, because either
+    it is inherited (and this read is wrong) or it is a method named like a route that
+    nothing calls.
+    """
+    tree = tree if tree is not None else _module_tree()
+    closure = _provider_mro_closure(tree)
+    by_class = _tool_methods_by_class(tree)
+    outside = {name: sorted(m) for name, m in by_class.items() if name not in closure}
+    assert not outside, (
+        "a _tool_* method is defined on a class outside the provider's module-local MRO: "
+        f"{outside} — either it is reached through inheritance this read cannot follow, or "
+        "it is dead code shaped like a route"
+    )
+    return {method for name in closure for method in by_class.get(name, set())}
+
+
+def _function_body(name: str) -> str:
+    """The unparsed source of one module-level or class-level function."""
+    for node in ast.walk(_module_tree()):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return ast.unparse(node)
+    raise AssertionError(f"{name} is not defined in __init__.py")
 
 
 def _dispatched_tool_methods() -> set[str]:
@@ -186,6 +287,82 @@ def _dispatched_tool_methods() -> set[str]:
     return reached
 
 
+def _registered_names_in(node: ast.AST) -> set[str]:
+    """Class names handed to ``register_memory_provider`` inside one body.
+
+    Every call site has to be readable. The previous version knew one shape,
+    ``register_memory_provider(Name())``, and skipped the others silently: a registration
+    written as ``register_memory_provider(registry.pop())`` produced no entry and no
+    failure, which is a check that answers "nothing to see" when it cannot read the page.
+    """
+    names: set[str] = set()
+    for sub in ast.walk(node):
+        if not (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)):
+            continue
+        if sub.func.attr != "register_memory_provider":
+            continue
+        assert sub.args, (
+            "register_memory_provider is called with no argument, so the class it registers "
+            f"cannot be read: {ast.unparse(sub)}"
+        )
+        arg = sub.args[0]
+        if isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name):
+            names.add(arg.func.id)
+        elif isinstance(arg, ast.Name):
+            names.add(arg.id)
+        else:
+            raise AssertionError(
+                "register_memory_provider is called with a shape this pin cannot read, so "
+                "the registered class is unknown: "
+                f"{ast.unparse(sub)}"
+            )
+    return names
+
+
+def _registered_from(
+    tree: ast.Module, class_names: set[str], function_names: set[str] | None = None
+) -> set[str]:
+    """Class names ``register()`` hands to the host, walking its direct callees once.
+
+    Two shapes the lexical read missed (review 8, N4): a second class registered from a
+    module-level function ``register()`` calls (nothing in ``register``'s body mentions it),
+    and a local rebinding of a module-level class name (which keeps the name the pin reads
+    while changing the class it resolves to). The first is walked one level; the second is
+    refused, because a pin that reads a shadowed name cannot say which class it saw.
+
+    Residual, stated: a registration two helpers deep, or reached through a method call
+    rather than a module-level function, or performed by the host on our behalf, is still
+    outside this read.
+    """
+    register = next(
+        (node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "register"),
+        None,
+    )
+    assert register is not None, "register() is not defined in __init__.py"
+    shadowed = sorted(
+        target.id
+        for node in ast.walk(register)
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+        for target in ([node.target] if isinstance(node, ast.AnnAssign) else node.targets)
+        if isinstance(target, ast.Name) and target.id in class_names
+    )
+    assert not shadowed, (
+        "register() rebinds a module-level class name, so the pin cannot tell which class is "
+        f"registered: {shadowed}"
+    )
+    registered = _registered_names_in(register)
+    if function_names is None:
+        function_names = set(_module_functions(tree))
+    for callee in sorted(
+        node.func.id
+        for node in ast.walk(register)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    ):
+        if callee in function_names:
+            registered |= _registered_names_in(_module_functions(tree)[callee])
+    return registered
+
+
 def _registered_provider_classes() -> set[str]:
     """Every class ``register()`` hands to the host.
 
@@ -194,21 +371,8 @@ def _registered_provider_classes() -> set[str]:
     class this file names. Pinning the registered set makes a second class loud here
     instead of silent there.
     """
-    tree = ast.parse((REPO / "__init__.py").read_text(encoding="utf-8"))
-    registered: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "register":
-            for sub in ast.walk(node):
-                if (
-                    isinstance(sub, ast.Call)
-                    and isinstance(sub.func, ast.Attribute)
-                    and sub.func.attr == "register_memory_provider"
-                    and sub.args
-                    and isinstance(sub.args[0], ast.Call)
-                    and isinstance(sub.args[0].func, ast.Name)
-                ):
-                    registered.add(sub.args[0].func.id)
-    return registered
+    tree = _module_tree()
+    return _registered_from(tree, set(_module_classes(tree)), set(_module_functions(tree)))
 
 
 def _tool_names() -> set[str]:
@@ -223,21 +387,35 @@ def _tool_names() -> set[str]:
     A route present in one and not the others is a failure here instead of an
     unclassified route that both the size pin and the detector accept.
 
-    Residual, stated rather than implied, and reproduced as two mutants that survive:
-    a branch that answers to a name nothing ever spells out. Two shapes do that — the
-    incoming name rewritten before the comparison (``tool_name.replace("wipe_all",
-    "forget")``), and the incoming name matched by pattern to an existing handler
-    (``tool_name.endswith("wipe_all")``) — and both are invisible to (1), (3) and (4).
-    Every such branch is unreachable through the host, which routes a tool call only when
+    Residual, stated rather than implied, and reproduced as mutants that survive: a branch
+    that answers to a name nothing ever spells out. Two shapes do that — the incoming name
+    rewritten before the comparison (``tool_name.replace("wipe_all", "forget")``), and the
+    incoming name matched by pattern to an existing handler
+    (``tool_name.endswith("wipe_all")``) — and both are invisible to (1), (3) and (4). A
+    third shape joins them, named by review 8's N2: a name the module *does* spell out but
+    which is reached through a lookup the reads do not model (``{"x": …}.get(name)``, an
+    alias) rather than through a comparison, a schema key or a shaped literal. Every such
+    branch is unreachable through the host, which routes a tool call only when
     ``memory_manager.has_tool(name)`` is true and builds that mapping from
     ``get_tool_schemas()``: a name absent from ``TOOL_SCHEMAS`` is a direct-Python-caller
     route. That is why (2) is the derivation that has to hold for anything that can ship,
     and why the other three are read as corroboration rather than as the guarantee. It is
     also why closing this residue would not be a test change: the only way to remove it is
     to stop dispatching on a name chain at all.
+
+    Two claims in this function are about *reachability* rather than about names, and both
+    are checked against the source instead of described: every entry in
+    ``_UNREACHED_TOOL_METHODS`` is asserted to have no call site anywhere in the module, and
+    every entry in ``_HELPER_TOOL_METHODS`` is asserted to be reached from the handler of a
+    declared route, at the call site it names.
     """
     dispatched = _dispatched_tool_names()
     declared = {str(schema["name"]) for schema in _plugin_module().TOOL_SCHEMAS}
+    unshaped = sorted(name for name in declared if not _TOOL_NAME_SHAPE.match(name))
+    assert not unshaped, (
+        "a declared tool name is outside the shape the literal read filters by, so three of "
+        f"the four derivations cannot see it: {unshaped}"
+    )
     assert dispatched == declared, (
         "the tool dispatch and TOOL_SCHEMAS disagree — one of them names a route the "
         f"other does not: dispatched_only={sorted(dispatched - declared)} "
@@ -251,12 +429,62 @@ def _tool_names() -> set[str]:
         f"declared_only={sorted(declared - literals)}"
     )
     unwired = _tool_method_names() - _dispatched_tool_methods()
-    assert unwired == set(_UNDISPATCHED_TOOL_METHODS), (
-        "a _tool_* implementation is not reached by handle_tool_call and is not in the "
-        f"pinned undispatched set: unexpected={sorted(unwired - set(_UNDISPATCHED_TOOL_METHODS))} "
-        f"pinned_but_now_wired={sorted(set(_UNDISPATCHED_TOOL_METHODS) - unwired)}"
+    pinned = set(_UNREACHED_TOOL_METHODS) | set(_HELPER_TOOL_METHODS)
+    assert unwired == pinned, (
+        "a _tool_* implementation is not reached by handle_tool_call and is not in the pinned "
+        f"sets: unexpected={sorted(unwired - pinned)} "
+        f"pinned_but_now_wired={sorted(pinned - unwired)}"
     )
+    _assert_no_unreached_claim_has_a_call_site()
+    _assert_every_helper_claim_holds(declared)
     return dispatched
+
+
+def _assert_no_unreached_claim_has_a_call_site() -> None:
+    """A method pinned as unreached must have no call site anywhere in the module.
+
+    This is the check the false claim could not survive. ``retrieve_learning`` was pinned as
+    a direct-Python-caller route while ``_tool_retrieve`` called it; the entry is now a
+    helper with its reaching route named, and this assertion is why that entry cannot come
+    back without its call site going away first.
+    """
+    source = _module_source()
+    for name, reason in _UNREACHED_TOOL_METHODS.items():
+        call = f"self._tool_{name}("
+        assert call not in source, (
+            f"{name} is pinned as unreached but {call} appears in the module, so the pinned "
+            f"reason is false ({reason!r}): move it to _HELPER_TOOL_METHODS with the route "
+            "that reaches it"
+        )
+
+
+def _assert_every_helper_claim_holds(declared: set[str]) -> None:
+    """A helper's reaching route, its call site, and its read-only evidence are all checked.
+
+    The route has to be a declared tool, the call site has to sit inside that route's
+    handler, and the source evidence for "read-only" has to be in the helper's own body.
+    Without the middle check, deleting the branch that reaches the helper would leave the
+    row claiming a route nothing calls; without the last, "read-only" is an adjective.
+    """
+    for name, spec in _HELPER_TOOL_METHODS.items():
+        route = str(spec["reached_from"])
+        assert route in declared, (
+            f"_tool_{name} is pinned as reached from {route}, which is not a declared tool"
+        )
+        prefix = "qdrant_memory_"
+        assert route.startswith(prefix), (
+            f"the handler of {route} is not derivable from its name; name the handler "
+            "explicitly in the entry instead of relying on the prefix rule"
+        )
+        handler = "_tool_" + route[len(prefix):]
+        assert str(spec["call_site"]) in _function_body(handler), (
+            f"_tool_{name} is pinned as reached from {route}, but {handler} does not contain "
+            f"the pinned call site {spec['call_site']!r}"
+        )
+        assert str(spec["read_only_evidence"]) in _function_body("_tool_" + name), (
+            f"_tool_{name} is pinned as read-only, but its body does not contain the pinned "
+            f"evidence {spec['read_only_evidence']!r}"
+        )
 
 
 def _cli_commands() -> set[str]:
@@ -780,6 +1008,130 @@ def test_every_mode_scoped_route_classifies_all_three_modes():
         if " [" in entry and _base(entry) in _MODE_SCOPED
     }
     assert rows == EXPECTED_MODE_ROWS
+
+
+def test_the_tool_name_shape_covers_names_the_host_can_register():
+    """The shape is a coverage claim about three of the four derivations.
+
+    A name with a digit in it was invisible to the comparison read, the literal read and the
+    method read at once; only ``TOOL_SCHEMAS`` would have caught it. Freezing the shape
+    against a synthetic name makes narrowing it back a failure here instead of a silence
+    there.
+    """
+    assert _TOOL_NAME_SHAPE.match("qdrant_memory_retrieve_v2")
+    assert _TOOL_NAME_SHAPE.match("qdrant_learning_search2")
+    assert not _TOOL_NAME_SHAPE.match("forget")
+    assert not _TOOL_NAME_SHAPE.match("qdrant_memory_")
+
+
+def test_a_helper_method_is_reached_through_the_route_it_names():
+    """The reachability claim, checked instead of asserted in a reason string.
+
+    ``_tool_retrieve_learning`` is invisible to a read that asks what ``handle_tool_call``
+    calls — it is called one level down, inside the handler the route maps to. The pinned
+    route, the pinned call site, the read-only evidence and that blindness are all checked
+    here, so the entry cannot survive its own call site being removed, and cannot be parked
+    back in the unreached set while something calls it.
+    """
+    assert _HELPER_TOOL_METHODS, "the helper set is empty: this test would pass vacuously"
+    _assert_every_helper_claim_holds({str(s["name"]) for s in _plugin_module().TOOL_SCHEMAS})
+    _assert_no_unreached_claim_has_a_call_site()
+    for name in _HELPER_TOOL_METHODS:
+        assert f"self._tool_{name}(" not in _function_body("handle_tool_call"), (
+            f"_tool_{name} is pinned as reached one level down, but handle_tool_call calls "
+            "it directly, so the entry describes a shape that no longer exists"
+        )
+
+
+def test_the_tool_method_set_is_read_over_the_whole_mro():
+    """Every ``_tool_*`` in the module lives on the provider or on a class it inherits.
+
+    The set used to be read from one ``ClassDef`` body. A method on a mixin is called
+    through the provider, so the closure is the set that has to be complete — and a
+    ``_tool_*`` outside it is loud rather than absent.
+    """
+    tree = _module_tree()
+    closure = _provider_mro_closure(tree)
+    assert "QdrantMemoryProvider" in closure
+    assert set(_tool_methods_by_class(tree)) <= closure
+    assert _tool_method_names() == {
+        method for name in closure for method in _tool_methods_by_class(tree).get(name, set())
+    }
+
+
+def test_the_tool_method_set_refuses_a_mixin_outside_the_mro():
+    """A ``_tool_*`` on a class the provider does not inherit from is a failure, not a gap."""
+    tree = ast.parse(
+        "class Lone:\n"
+        "    def _tool_orphan(self):\n"
+        "        pass\n"
+        "\n"
+        "class QdrantMemoryProvider:\n"
+        "    def _tool_keep(self):\n"
+        "        pass\n"
+    )
+    try:
+        _tool_method_names(tree)
+    except AssertionError as exc:
+        assert "Lone" in str(exc) and "orphan" in str(exc), str(exc)
+    else:
+        raise AssertionError("a _tool_* outside the provider MRO was accepted")
+
+
+def test_the_register_pin_walks_a_helper_called_by_register():
+    """A second class registered from a helper is read, not skipped.
+
+    ``register()`` calling ``_register_extra()`` which registers a second provider class left
+    the pinned set at one name while two classes were registered, and the hook derivation
+    reads one class. The walk is one level deep, which is the level this host uses.
+    """
+    tree = ast.parse(
+        "class QdrantMemoryProvider:\n    pass\n"
+        "class SecondProvider:\n    pass\n"
+        "def _register_extra():\n"
+        "    host.register_memory_provider(SecondProvider())\n"
+        "def register():\n"
+        "    host.register_memory_provider(QdrantMemoryProvider())\n"
+        "    _register_extra()\n"
+    )
+    assert _registered_from(tree, {"QdrantMemoryProvider", "SecondProvider"}) == {
+        "QdrantMemoryProvider",
+        "SecondProvider",
+    }
+
+
+def test_the_register_pin_refuses_a_shape_it_cannot_read():
+    """An unreadable registration call is a failure, not an empty set.
+
+    ``register_memory_provider(registry.pop())`` used to produce no entry and no error: the
+    check answered "nothing to see" about a page it could not read.
+    """
+    tree = ast.parse(
+        "def register():\n"
+        "    host.register_memory_provider(registry.pop())\n"
+    )
+    try:
+        _registered_from(tree, set())
+    except AssertionError as exc:
+        assert "cannot read" in str(exc), str(exc)
+    else:
+        raise AssertionError("an unreadable registration shape was accepted")
+
+
+def test_the_register_pin_refuses_a_local_rebinding():
+    """A rebinding of a module-level class name inside ``register()`` cannot be read."""
+    tree = ast.parse(
+        "class QdrantMemoryProvider:\n    pass\n"
+        "def register():\n"
+        "    QdrantMemoryProvider = Other\n"
+        "    host.register_memory_provider(QdrantMemoryProvider())\n"
+    )
+    try:
+        _registered_from(tree, {"QdrantMemoryProvider"})
+    except AssertionError as exc:
+        assert "rebinds" in str(exc), str(exc)
+    else:
+        raise AssertionError("a shadowed class name was accepted as a registration")
 
 
 def test_the_module_registers_exactly_the_modeled_provider():
