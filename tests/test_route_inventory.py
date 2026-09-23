@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import ast
 import importlib.util
+import sys
 import re
 from pathlib import Path
 
@@ -716,6 +717,14 @@ def _provider_hooks() -> set[str]:
     from was invisible to the derivation, to the size pin and to the completeness
     detector all at once.
 
+    Environment, stated rather than implied: the set is derived by identity against the
+    *host* base, and ``__init__.py`` falls back to its own stub when
+    ``agent.memory_provider`` is not importable — precisely so this repo's tests can run
+    without Hermes installed, which is what its CI does. A stub is not a base with no
+    overrides; it is the absence of the question, so this pin skips there instead of
+    returning an empty set that would silently drop every hook row from the inventory.
+    ``test_the_hook_derivation_declares_a_missing_host_base`` pins that branch.
+
     Residual, stated rather than implied: this reads the class, so a hook installed on
     the *instance* (an attribute assigned in ``__init__``), a hook served by
     ``__getattr__``, and a hook on a second registered provider class are all invisible
@@ -727,6 +736,14 @@ def _provider_hooks() -> set[str]:
     module = _plugin_module()
     provider_cls = module.QdrantMemoryProvider
     base = module.MemoryProvider
+    if not _host_provider_base_is_importable():
+        pytest.skip(
+            "the host's agent.memory_provider.MemoryProvider is not importable here, so this "
+            "pin cannot answer its question: the hook set is derived by identity against the "
+            "host base, and __init__.py's standalone fallback stub has no overridable public "
+            "API, so read as a surface it would drop every hook row out of the inventory. The "
+            "repo's CI runs the tests without Hermes installed; this pin runs where it is."
+        )
     hooks: set[str] = set()
     for name in dir(base):
         if name.startswith("_"):
@@ -737,10 +754,20 @@ def _provider_hooks() -> set[str]:
         if getattr(provider_cls, name, None) is not base_attr:
             hooks.add(name)
     assert hooks, (
-        "no provider hook overrides could be derived: the host MemoryProvider base is "
-        "not importable in this environment, so this pin cannot answer its question"
+        "the host base is importable but no public callable of it is overridden by the "
+        "provider, so the hook derivation matched nothing: either the provider stopped "
+        "overriding the host API or the identity comparison broke"
     )
     return hooks
+
+
+def _host_provider_base_is_importable() -> bool:
+    """Is ``__init__.MemoryProvider`` the host's real base, or the standalone fallback stub?"""
+    try:
+        from agent.memory_provider import MemoryProvider as host_base
+    except Exception:  # pragma: no cover - the branch CI takes
+        return False
+    return _plugin_module().MemoryProvider is host_base
 
 
 def _surface() -> set[str]:
@@ -1342,6 +1369,27 @@ def test_the_tool_method_set_refuses_a_mixin_outside_the_mro():
         assert "Lone" in str(exc) and "orphan" in str(exc), str(exc)
     else:
         raise AssertionError("a _tool_* outside the provider MRO was accepted")
+
+
+def test_the_hook_derivation_declares_a_missing_host_base(monkeypatch):
+    """A stub base is the absence of the question, not a base with no overrides.
+
+    Stands in for the environment the repo's CI runs in: no Hermes, so
+    ``agent.memory_provider`` is not importable and ``__init__.py`` supplies its own base.
+    The pin has to say the question cannot be asked there — not fail the suite, and not
+    return an empty hook set, which would quietly drop every hook row from the inventory.
+    """
+    module = _plugin_module()
+
+    class StandaloneStub:
+        """Stands in for __init__.py's fallback base class."""
+
+    monkeypatch.setattr(module, "MemoryProvider", StandaloneStub)
+    # ``_plugin_module`` re-executes __init__.py from disk on every call, so patching the
+    # module object it already returned would be invisible to the read under test.
+    monkeypatch.setattr(sys.modules[__name__], "_plugin_module", lambda: module)
+    with pytest.raises(pytest.skip.Exception):
+        _provider_hooks()
 
 
 def test_the_ast_tool_method_set_matches_the_class_the_host_loads():
