@@ -102,17 +102,139 @@ def _dispatched_tool_names() -> set[str]:
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == "handle_tool_call":
             names |= _comparison_strings(node)
+            unreadable = [
+                ast.unparse(sub)
+                for sub in ast.walk(node)
+                if isinstance(sub, ast.Compare)
+                and any(isinstance(part, ast.Name) and part.id == "tool_name" for part in ast.walk(sub))
+                and not _comparison_strings(sub)
+            ]
+            assert not unreadable, (
+                "handle_tool_call compares tool_name against something that is not a string "
+                "constant, so the name this route answers to cannot be read from the source: "
+                f"{unreadable}"
+            )
     assert names, "handle_tool_call dispatch could not be parsed"
     return names
 
 
-def _tool_names() -> set[str]:
-    """Every tool name the provider dispatches, cross-checked against the schemas.
+_TOOL_NAME_SHAPE = re.compile(r"^(?:qdrant_memory_|qdrant_learning_)[a-z_]+$")
 
-    Two independent derivations of the same question. The dispatch read of the AST can
-    still miss a shape nobody thought of; ``TOOL_SCHEMAS`` is the declaration the runtime
-    actually registers. A route present in one and not the other is a failure here
-    instead of an unclassified route that both the size pin and the detector accept.
+# A ``_tool_*`` implementation the dispatch does not reach. Named here with its reason
+# instead of being invisible: the derivation exists so that a *new* unwired
+# implementation is loud, and an exception list checked in both directions still fails
+# when the exception is wired or when a new one appears.
+_UNDISPATCHED_TOOL_METHODS = {
+    "retrieve_learning": (
+        "no branch in handle_tool_call and no TOOL_SCHEMAS entry — a direct-Python-caller "
+        "route only, exercised by tests/test_learning_retrieve.py. Pre-existing on main "
+        "and out of this closure's scope; pinned so it cannot grow."
+    ),
+}
+
+
+def _literal_tool_names() -> set[str]:
+    """Every tool-name-shaped string literal anywhere in the plugin module.
+
+    The dispatch read asks one question about one function and one syntax: which names
+    does ``handle_tool_call`` compare against. This reads the file instead. A name the
+    module spells out at all — a module-level constant, a dict key, a ``match``/``case``
+    pattern, a second dispatch function, a ``startswith`` prefix — is part of the surface
+    whether or not any single ``Compare`` mentions it. Five shapes that passed the
+    previous derivations are caught here, each duplicated as a harness mutant.
+    """
+    tree = ast.parse((REPO / "__init__.py").read_text(encoding="utf-8"))
+    return {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and _TOOL_NAME_SHAPE.match(node.value)
+    }
+
+
+def _tool_method_names() -> set[str]:
+    """Every ``self._tool_*`` implementation the provider class defines."""
+    tree = ast.parse((REPO / "__init__.py").read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == "QdrantMemoryProvider":
+            return {
+                sub.name[len("_tool_"):]
+                for sub in node.body
+                if isinstance(sub, ast.FunctionDef) and sub.name.startswith("_tool_")
+            }
+    raise AssertionError("QdrantMemoryProvider is not defined in __init__.py")
+
+
+def _dispatched_tool_methods() -> set[str]:
+    """Every ``self._tool_*`` implementation ``handle_tool_call`` reaches by attribute.
+
+    A branch that reaches its handler through a name the dispatch derivation cannot read
+    (``getattr(self, "_tool_" + name)``) still has to define that method, so comparing
+    implementations against reached implementations catches the shapes the string read
+    misses.
+    """
+    tree = ast.parse((REPO / "__init__.py").read_text(encoding="utf-8"))
+    reached: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "handle_tool_call":
+            reached |= {
+                sub.attr[len("_tool_"):]
+                for sub in ast.walk(node)
+                if isinstance(sub, ast.Attribute) and sub.attr.startswith("_tool_")
+            }
+    return reached
+
+
+def _registered_provider_classes() -> set[str]:
+    """Every class ``register()`` hands to the host.
+
+    ``register()`` is the seam the hook derivation cannot see: hooks on a *second*
+    registered provider class are invisible to ``_provider_hooks``, which reads the one
+    class this file names. Pinning the registered set makes a second class loud here
+    instead of silent there.
+    """
+    tree = ast.parse((REPO / "__init__.py").read_text(encoding="utf-8"))
+    registered: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "register":
+            for sub in ast.walk(node):
+                if (
+                    isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Attribute)
+                    and sub.func.attr == "register_memory_provider"
+                    and sub.args
+                    and isinstance(sub.args[0], ast.Call)
+                    and isinstance(sub.args[0].func, ast.Name)
+                ):
+                    registered.add(sub.args[0].func.id)
+    return registered
+
+
+def _tool_names() -> set[str]:
+    """Every tool name the provider dispatches, from four independent derivations.
+
+    1. the string constants ``handle_tool_call`` compares against;
+    2. ``TOOL_SCHEMAS``, the declaration the runtime registers and routes by;
+    3. every tool-name-shaped literal anywhere in the module;
+    4. every ``_tool_*`` implementation ``handle_tool_call`` reaches, less the pinned
+       undispatched set.
+
+    A route present in one and not the others is a failure here instead of an
+    unclassified route that both the size pin and the detector accept.
+
+    Residual, stated rather than implied, and reproduced as two mutants that survive:
+    a branch that answers to a name nothing ever spells out. Two shapes do that — the
+    incoming name rewritten before the comparison (``tool_name.replace("wipe_all",
+    "forget")``), and the incoming name matched by pattern to an existing handler
+    (``tool_name.endswith("wipe_all")``) — and both are invisible to (1), (3) and (4).
+    Every such branch is unreachable through the host, which routes a tool call only when
+    ``memory_manager.has_tool(name)`` is true and builds that mapping from
+    ``get_tool_schemas()``: a name absent from ``TOOL_SCHEMAS`` is a direct-Python-caller
+    route. That is why (2) is the derivation that has to hold for anything that can ship,
+    and why the other three are read as corroboration rather than as the guarantee. It is
+    also why closing this residue would not be a test change: the only way to remove it is
+    to stop dispatching on a name chain at all.
     """
     dispatched = _dispatched_tool_names()
     declared = {str(schema["name"]) for schema in _plugin_module().TOOL_SCHEMAS}
@@ -120,6 +242,19 @@ def _tool_names() -> set[str]:
         "the tool dispatch and TOOL_SCHEMAS disagree — one of them names a route the "
         f"other does not: dispatched_only={sorted(dispatched - declared)} "
         f"declared_only={sorted(declared - dispatched)}"
+    )
+    literals = _literal_tool_names()
+    assert literals == declared, (
+        "a tool-name-shaped string literal is not a declared tool, or a declared tool is "
+        "never spelled out in the module: "
+        f"literals_only={sorted(literals - declared)} "
+        f"declared_only={sorted(declared - literals)}"
+    )
+    unwired = _tool_method_names() - _dispatched_tool_methods()
+    assert unwired == set(_UNDISPATCHED_TOOL_METHODS), (
+        "a _tool_* implementation is not reached by handle_tool_call and is not in the "
+        f"pinned undispatched set: unexpected={sorted(unwired - set(_UNDISPATCHED_TOOL_METHODS))} "
+        f"pinned_but_now_wired={sorted(set(_UNDISPATCHED_TOOL_METHODS) - unwired)}"
     )
     return dispatched
 
@@ -165,6 +300,14 @@ def _provider_hooks() -> set[str]:
     provider itself, so a hook implemented in a plugin-side mixin the provider inherits
     from was invisible to the derivation, to the size pin and to the completeness
     detector all at once.
+
+    Residual, stated rather than implied: this reads the class, so a hook installed on
+    the *instance* (an attribute assigned in ``__init__``), a hook served by
+    ``__getattr__``, and a hook on a second registered provider class are all invisible
+    here. The second case is why ``test_the_module_registers_exactly_the_modeled_provider``
+    pins the registered set; the first two are direct-installation shapes no class-level
+    derivation can see, and ``test_no_inventory_row_is_stale`` fails loudly if a row
+    names a hook the derivation no longer produces.
     """
     module = _plugin_module()
     provider_cls = module.QdrantMemoryProvider
@@ -232,6 +375,8 @@ INDEX_OFF_PINS = [
     "tests/test_lineage.py::test_directory_off_mode_does_not_delete_removed_lineage_managed_chunks",
     "tests/test_lineage.py::test_a_removed_file_whose_siblings_are_ordinary_is_blocked_as_a_file",
     "tests/test_lineage.py::test_a_removed_file_with_one_protected_sibling_survives_force_too",
+    "tests/test_lineage.py::test_a_removed_file_whose_only_protected_chunk_is_foreign_scope_is_blocked",
+    "tests/test_lineage.py::test_a_present_file_whose_only_protected_chunk_is_foreign_scope_is_blocked_too",
     "tests/test_lineage.py::test_off_mode_force_skips_lineage_managed_filter_delete_in_dry_and_live_runs",
 ]
 CONSOLIDATION_PINS = [
@@ -351,6 +496,20 @@ _declare(["backup create", "eval-capture"], "read_only",
 # even if the completeness check in the test body is later weakened.
 FROZEN_SURFACE_SIZE = 87
 
+# Every `[mode]` row, frozen by name and by kind. Completeness used to ask only whether
+# *some* mode row existed for the route, so deleting both `[capture]` rows, deleting both
+# `[reconcile]` rows, or reclassifying `[capture]` as `read_only` left all ten tests green
+# while the route table said nothing about the mode. A mode row is a claim about a mode,
+# so the claim is what gets frozen.
+EXPECTED_MODE_ROWS = {
+    "qdrant_memory_index [off]": "protection",
+    "index [off]": "protection",
+    "qdrant_memory_index [capture]": "transition",
+    "index [capture]": "transition",
+    "qdrant_memory_index [reconcile]": "transition",
+    "index [reconcile]": "transition",
+}
+
 EXPECTED_PROTECTION_ROUTES = {
     "qdrant_memory_store": (
         "tests/test_consolidation_apply.py::test_store_refuses_to_overwrite_a_protected_point_in_every_mode",
@@ -400,6 +559,8 @@ EXPECTED_PROTECTION_ROUTES = {
         "tests/test_lineage.py::test_directory_off_mode_does_not_delete_removed_lineage_managed_chunks",
         "tests/test_lineage.py::test_a_removed_file_whose_siblings_are_ordinary_is_blocked_as_a_file",
         "tests/test_lineage.py::test_a_removed_file_with_one_protected_sibling_survives_force_too",
+        "tests/test_lineage.py::test_a_removed_file_whose_only_protected_chunk_is_foreign_scope_is_blocked",
+        "tests/test_lineage.py::test_a_present_file_whose_only_protected_chunk_is_foreign_scope_is_blocked_too",
         "tests/test_lineage.py::test_off_mode_force_skips_lineage_managed_filter_delete_in_dry_and_live_runs",
     ),
     "index [off]": (
@@ -409,6 +570,8 @@ EXPECTED_PROTECTION_ROUTES = {
         "tests/test_lineage.py::test_directory_off_mode_does_not_delete_removed_lineage_managed_chunks",
         "tests/test_lineage.py::test_a_removed_file_whose_siblings_are_ordinary_is_blocked_as_a_file",
         "tests/test_lineage.py::test_a_removed_file_with_one_protected_sibling_survives_force_too",
+        "tests/test_lineage.py::test_a_removed_file_whose_only_protected_chunk_is_foreign_scope_is_blocked",
+        "tests/test_lineage.py::test_a_present_file_whose_only_protected_chunk_is_foreign_scope_is_blocked_too",
         "tests/test_lineage.py::test_off_mode_force_skips_lineage_managed_filter_delete_in_dry_and_live_runs",
     ),
     "qdrant_memory_consolidation_apply": (
@@ -450,12 +613,22 @@ def _base(entry: str) -> str:
     return entry.split(" [", 1)[0]
 
 
+def _mode_rows(name: str, inventory) -> set[str]:
+    return {mode for mode in _MODES if f"{name} [{mode}]" in inventory}
+
+
 def _classified_by(name: str, inventory) -> bool:
+    """A mode-scoped route is classified only when **every** mode has a row.
+
+    ``any`` was the same hole in the detector that ``EXPECTED_MODE_ROWS`` closes in the
+    classification: one surviving mode row kept the route looking classified while the
+    other modes had been dropped.
+    """
     if name in inventory:
         return True
     if name not in _MODE_SCOPED:
         return False
-    return any(f"{name} [{mode}]" in inventory for mode in _MODES)
+    return _mode_rows(name, inventory) == set(_MODES)
 
 
 def _unclassified(derived: set[str], inventory=None) -> list[str]:
@@ -592,6 +765,31 @@ def test_a_route_is_classified_once_with_one_kind():
         f"these mode-scoped routes are classified twice, as a base row and per mode: {doubled}. "
         "A base row here is a second answer to the question the mode rows answer."
     )
+
+
+def test_every_mode_scoped_route_classifies_all_three_modes():
+    """Frozen: dropping both `[capture]` rows, or reclassifying one, fails here.
+
+    The two modes other than `off` carry the transition the closure depends on: `capture`
+    records and `reconcile` retires. A route table that names the mode in prose while the
+    inventory has no row for it is the claim surface this file exists to remove.
+    """
+    rows = {
+        entry: row["kind"]
+        for entry, row in ROUTE_INVENTORY.items()
+        if " [" in entry and _base(entry) in _MODE_SCOPED
+    }
+    assert rows == EXPECTED_MODE_ROWS
+
+
+def test_the_module_registers_exactly_the_modeled_provider():
+    """One provider class, so the hook derivation reads the class the runtime registers.
+
+    ``register()`` is the seam ``_provider_hooks`` cannot see: a hook on a second
+    registered class is invisible to a derivation that names one class. Pinning the
+    registered set makes that loud here.
+    """
+    assert _registered_provider_classes() == {"QdrantMemoryProvider"}
 
 
 def test_the_protection_set_is_exactly_this():
