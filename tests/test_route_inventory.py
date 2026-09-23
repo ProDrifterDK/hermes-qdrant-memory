@@ -137,9 +137,14 @@ _TOOL_NAME_SHAPE = re.compile(r"^(?:qdrant_memory_|qdrant_learning_)[a-z0-9_]+$"
 #   ``handle_tool_call``. It is a real route — the host reaches it by calling the tool whose
 #   handler calls it. Each entry names the reaching route, the call site inside that route's
 #   handler, and the code evidence for its read-only claim; all three are asserted, and the
-#   two claims about code are read from the AST — a docstring sentence cannot satisfy either
-#   (review 9: the first version of this entry could be satisfied by prose, and a mutation of
-#   the prose survived while the code was untouched).
+#   handler is read from the dispatch branch rather than derived from the route's name.
+#   Review 9 falsified the first version of this entry twice, both times by mutating what the
+#   check was *about* rather than what it read: the prose mutation survived because a docstring
+#   sentence and the statement it describes render to the same text, and then, with the read
+#   moved to the AST, two mutations of the real call survived because the keyword was collected
+#   from the whole function instead of from the call it is about. Every claim here is now read
+#   from the tree and bound to the exact node it describes: the branch for the handler, the
+#   call for the argument.
 # - ``_UNREACHED_TOOL_METHODS``: no dispatch name, no schema entry, and no call site in the
 #   module. Currently empty, and it cannot be parked in while a handler calls the method,
 #   because the call-site check runs for every entry.
@@ -147,14 +152,21 @@ _HELPER_TOOL_METHODS = {
     "retrieve_learning": {
         "reached_from": "qdrant_memory_retrieve",
         "call_site": "self._tool_retrieve_learning",
-        "read_only_evidence": {"kind": "keyword_false", "keyword": "update_access"},
+        "read_only_evidence": {
+            "kind": "keyword_false",
+            "keyword": "update_access",
+            "callee": "search",
+        },
         "reason": (
-            "reachable through a declared tool: the handler that name maps to "
-            "(``_tool_retrieve``) dispatches ``collection=\"learning\"`` to it. It has no "
-            "``TOOL_SCHEMAS`` entry and no dispatch name of its own, which is exactly what "
-            "makes it invisible to a name read. Read-only by contract — it passes "
-            "``update_access=False`` into ``LearningStore.search``, so it does not bump "
-            "``last_accessed``/``access_count`` either."
+            "reachable through a declared tool: the dispatch branch that tests "
+            "``qdrant_memory_retrieve`` calls ``_tool_retrieve``, which dispatches "
+            "``collection=\"learning\"`` to it. It has no ``TOOL_SCHEMAS`` entry and no "
+            "dispatch name of its own, which is exactly what makes it invisible to a name "
+            "read. Read-only by contract — every call to ``store.search`` in its code passes "
+            "``update_access=False``, so it does not bump ``last_accessed``/``access_count`` "
+            "either. The handler is read from the branch and the keyword from the call: "
+            "neither claim is satisfied by the route's name or by a literal elsewhere in the "
+            "body."
         ),
     },
 }
@@ -270,16 +282,6 @@ def _function_node(name: str) -> ast.FunctionDef:
     raise AssertionError(f"{name} is not defined in __init__.py")
 
 
-class _NotALiteral:
-    """Marker for a ``keyword=`` argument that is not a literal boolean."""
-
-    def __repr__(self) -> str:
-        return "<something that is not a literal boolean>"
-
-
-_NOT_A_LITERAL = _NotALiteral()
-
-
 def _self_attribute_calls(name: str) -> set[str]:
     """``self.<attr>`` calls made by one function's code, as ``self.<attr>`` strings.
 
@@ -300,24 +302,53 @@ def _self_attribute_calls(name: str) -> set[str]:
     return found
 
 
-def _keyword_literal_values(name: str, keyword: str) -> set[object]:
-    """Literal values passed as ``keyword=`` in calls inside one function's code.
+def _read_only_violations_in(node: ast.AST, keyword: str, callee: str, where: str) -> list[str]:
+    """``_read_only_call_violations`` over any node, so a synthetic function can be fed to it."""
+    violations: list[str] = []
+    calls = 0
+    for sub in ast.walk(node):
+        if not isinstance(sub, ast.Call) or not isinstance(sub.func, ast.Attribute):
+            continue
+        if sub.func.attr != callee:
+            continue
+        calls += 1
+        passed = [kw for kw in sub.keywords if kw.arg == keyword]
+        if not passed:
+            violations.append(
+                f"line {sub.lineno} calls .{callee}(...) without {keyword}= at all"
+            )
+            continue
+        for kw in passed:
+            value = kw.value
+            if isinstance(value, ast.Constant) and value.value is False:
+                continue
+            violations.append(f"line {sub.lineno} passes {keyword}={ast.unparse(value)}")
+    if not calls:
+        violations.append(
+            f"{where} makes no call to .{callee}(...) at all, so the claim names a call that "
+            "does not exist"
+        )
+    return violations
 
-    Only real call arguments are seen, so no string literal anywhere in the body — the
-    docstring included — can satisfy a claim checked this way. A non-literal argument is
-    reported as ``_NOT_A_LITERAL`` so the caller fails on it instead of reading it as a pass.
+
+def _read_only_call_violations(name: str, keyword: str, callee: str) -> list[str]:
+    """Every call to ``callee`` inside one function whose ``keyword=`` is not a literal ``False``.
+
+    The claim is about a call, so the read is bound to the call. Reading the keyword off every
+    ``ast.Call`` in the body — the first version of this check — let two shapes through, both
+    found by falsifying it rather than by reading it (review 9, N2):
+
+    - the argument dropped from the real call while ``dict(update_access=False)`` sits anywhere
+      else in the body: the read still saw a literal ``False`` and the route now writes access
+      metadata while the row calls it read-only;
+    - the real call kept and a *second* call to the same method added without the keyword. That
+      second call defaults to a write, and the read was satisfied by the first.
+
+    So every call to the named callee has to carry the literal, a call carrying nothing is
+    reported as such, and a non-literal argument is reported by its own source text instead of
+    by a marker, so the failure names the expression that was actually passed.
     """
-    values: set[object] = set()
-    for sub in ast.walk(_function_node(name)):
-        if isinstance(sub, ast.Call):
-            for kw in sub.keywords:
-                if kw.arg != keyword:
-                    continue
-                if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, bool):
-                    values.add(kw.value.value)
-                else:
-                    values.add(_NOT_A_LITERAL)
-    return values
+    return _read_only_violations_in(_function_node(name), keyword, callee, f"_tool_{name}")
 
 
 def _dispatched_tool_methods() -> set[str]:
@@ -464,11 +495,7 @@ def _tool_names() -> set[str]:
     """
     dispatched = _dispatched_tool_names()
     declared = {str(schema["name"]) for schema in _plugin_module().TOOL_SCHEMAS}
-    unshaped = sorted(name for name in declared if not _TOOL_NAME_SHAPE.match(name))
-    assert not unshaped, (
-        "a declared tool name is outside the shape the literal read filters by, so three of "
-        f"the four derivations cannot see it: {unshaped}"
-    )
+    _assert_declared_names_are_shaped(declared)
     assert dispatched == declared, (
         "the tool dispatch and TOOL_SCHEMAS disagree — one of them names a route the "
         f"other does not: dispatched_only={sorted(dispatched - declared)} "
@@ -493,6 +520,79 @@ def _tool_names() -> set[str]:
     return dispatched
 
 
+def _handlers_reaching(route: str) -> set[str]:
+    """``self._tool_*`` handlers called by the ``handle_tool_call`` branch that tests ``route``.
+
+    The handler used to be derived from the route's name — ``"_tool_" + route[len(prefix):]`` —
+    which is a naming convention asserted as a fact about dispatch. Swapping the two handlers
+    inside ``handle_tool_call`` left every assertion in this file green while the row's claim
+    "reached from ``qdrant_memory_retrieve``" became false, because the name still matched the
+    old function: the row was pinning the convention, not the branch (review 9, N1).
+
+    The branch is the authority, so this reads it: for each ``ast.If`` whose test puts the route
+    constant on one side, the handlers called in the branch that runs when the test holds.
+    ``orelse`` is read as well, because a dispatch may test the complement (``if name != route``)
+    with the handler on the other side. A route whose branch yields nothing, or more than one
+    handler, is not silently resolved from its name — the caller has to declare it and say why.
+    """
+    tree = _module_tree()
+    reached: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or node.name != "handle_tool_call":
+            continue
+        for sub in ast.walk(node):
+            if not isinstance(sub, ast.If) or route not in _comparison_strings(sub.test):
+                continue
+            negative = any(
+                isinstance(op, (ast.NotEq, ast.NotIn))
+                for cmp in ast.walk(sub.test)
+                if isinstance(cmp, ast.Compare)
+                for op in cmp.ops
+            )
+            branch = sub.orelse if negative else sub.body
+            for inner in ast.walk(ast.Module(body=list(branch), type_ignores=[])):
+                if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute):
+                    base = inner.func.value
+                    if isinstance(base, ast.Name) and base.id == "self":
+                        if inner.func.attr.startswith("_tool_"):
+                            reached.add(inner.func.attr)
+    return reached
+
+
+def _tool_method_references(tree: ast.Module, name: str) -> list[str]:
+    """Every reference to ``_tool_<name>`` in a tree, call or not, any receiver, any form.
+
+    The absence claim used to be a substring read of ``self._tool_{name}(`` in the source. Three
+    call sites slipped through it — a call through a local alias (``fn = self._tool_x; fn(args)``),
+    a ``getattr(self, "_tool_x")`` call and ``cls._tool_x(`` — while a comment that spelled the
+    call out would have failed the check falsely. Written as a function over a tree so the
+    shapes can be fed to it directly (review 9, N3).
+    """
+    hits: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr == f"_tool_{name}":
+            hits.append(f"line {node.lineno}: {ast.unparse(node)}")
+        elif isinstance(node, ast.Constant) and node.value == f"_tool_{name}":
+            hits.append(f"line {node.lineno}: the string {node.value!r}")
+    return hits
+
+
+def _assert_declared_names_are_shaped(declared: set[str]) -> None:
+    """Every declared tool name has to match the shape three of the four derivations filter by.
+
+    A declared name outside the shape is invisible to the comparison read, the literal read and
+    the method read at once, so it is the one hole the size pin and the completeness detector
+    would both accept. The assertion used to live inline in ``_tool_names``, where no test could
+    reach it: deleting it left every test in this file green. Factored out so it is called with
+    a synthetic name (review 9, N4).
+    """
+    unshaped = sorted(name for name in declared if not _TOOL_NAME_SHAPE.match(name))
+    assert not unshaped, (
+        "a declared tool name is outside the shape the literal read filters by, so three of "
+        f"the four derivations cannot see it: {unshaped}"
+    )
+
+
 def _assert_no_unreached_claim_has_a_call_site() -> None:
     """A method pinned as unreached must have no call site anywhere in the module.
 
@@ -500,14 +600,19 @@ def _assert_no_unreached_claim_has_a_call_site() -> None:
     a direct-Python-caller route while ``_tool_retrieve`` called it; the entry is now a
     helper with its reaching route named, and this assertion is why that entry cannot come
     back without its call site going away first.
+
+    Read from the tree, like the presence claims. A substring read of ``self._tool_x(`` missed
+    a call through a local alias (``fn = self._tool_x; fn(args)``), a ``getattr`` call and a
+    ``cls._tool_x(`` — all of which are call sites — and it would have failed on a comment that
+    spelled the call out. Any reference to the name anywhere in the module counts: call or not,
+    any receiver, attribute or string form.
     """
-    source = _module_source()
     for name, reason in _UNREACHED_TOOL_METHODS.items():
-        call = f"self._tool_{name}("
-        assert call not in source, (
-            f"{name} is pinned as unreached but {call} appears in the module, so the pinned "
-            f"reason is false ({reason!r}): move it to _HELPER_TOOL_METHODS with the route "
-            "that reaches it"
+        hits = _tool_method_references(_module_tree(), name)
+        assert not hits, (
+            f"{name} is pinned as unreached but the module refers to it "
+            f"({sorted(hits)}), so the pinned reason is false ({reason!r}): move it to "
+            "_HELPER_TOOL_METHODS with the route that reaches it"
         )
 
 
@@ -515,23 +620,35 @@ def _assert_every_helper_claim_holds(declared: set[str]) -> None:
     """A helper's reaching route, its call site, and its read-only evidence are all checked.
 
     The route has to be a declared tool, the handler of that route has to actually call the
-    helper, and the helper's own code has to pass the declared keyword as a literal ``False``.
-    Without the middle check, deleting the branch that reaches the helper would leave the row
-    claiming a route nothing calls; without the last, "read-only" is an adjective. Both are
-    read from the AST: the evidence is an ``ast.keyword``, not a substring, so the docstring
-    that describes the invariant cannot stand in for it.
+    helper, and the handler is read from the dispatch branch rather than derived from the
+    route's name — the name is a convention, the branch is the dispatch. If the branch cannot
+    be read the entry has to declare the handler and say why, so the convention never comes
+    back as a fallback. The helper's own code has to pass the declared keyword as a literal
+    ``False`` **to the callee the entry names**: a literal anywhere in the body, or a second
+    call to that callee without it, is reported as a violation rather than read as a pass.
+    All of it is read from the AST: no docstring sentence can stand in for any of the three.
     """
     for name, spec in _HELPER_TOOL_METHODS.items():
         route = str(spec["reached_from"])
         assert route in declared, (
             f"_tool_{name} is pinned as reached from {route}, which is not a declared tool"
         )
-        prefix = "qdrant_memory_"
-        assert route.startswith(prefix), (
-            f"the handler of {route} is not derivable from its name; name the handler "
-            "explicitly in the entry instead of relying on the prefix rule"
-        )
-        handler = "_tool_" + route[len(prefix):]
+        handlers_reaching = _handlers_reaching(route)
+        declared_handler = spec.get("handler")
+        if len(handlers_reaching) == 1:
+            handler = next(iter(handlers_reaching))
+            assert declared_handler in (None, handler), (
+                f"{route} is pinned with handler {declared_handler!r}, but the dispatch branch "
+                f"that tests it calls {handler!r}"
+            )
+        else:
+            assert declared_handler, (
+                f"the handler of {route} cannot be read from the dispatch branch "
+                f"({len(handlers_reaching)} candidates: {sorted(handlers_reaching)}); declare it "
+                "in the entry's 'handler' key and record why the branch cannot be read, "
+                "instead of deriving it from the route's name"
+            )
+            handler = str(declared_handler)
         assert str(spec["call_site"]) in _self_attribute_calls(handler), (
             f"_tool_{name} is pinned as reached from {route}, but {handler} makes no call to "
             f"{spec['call_site']!r} (calls it makes: {sorted(_self_attribute_calls(handler))})"
@@ -545,10 +662,15 @@ def _assert_every_helper_claim_holds(declared: set[str]) -> None:
                 "is prose with a dict around it"
             )
         keyword = str(evidence["keyword"])
-        values = _keyword_literal_values("_tool_" + name, keyword)
-        assert values == {False}, (
-            f"_tool_{name} is pinned as read-only because its code passes {keyword}=False, "
-            f"but the code passes {keyword}= {values or 'nothing'}"
+        callee = str(evidence["callee"]) if "callee" in evidence else ""
+        assert callee, (
+            f"_tool_{name} pins read-only evidence without naming the callee it is about: the "
+            "claim is about a call, so the entry has to say which call"
+        )
+        violations = _read_only_call_violations("_tool_" + name, keyword, callee)
+        assert not violations, (
+            f"_tool_{name} is pinned as read-only because every call to .{callee}(...) in its "
+            f"code passes {keyword}=False, but " + "; ".join(violations)
         )
 
 
@@ -1075,6 +1197,85 @@ def test_every_mode_scoped_route_classifies_all_three_modes():
     assert rows == EXPECTED_MODE_ROWS
 
 
+def test_an_unshaped_declared_name_fails_loudly():
+    """The shape assertion is called with a synthetic name instead of trusted to be in place.
+
+    It used to live inline in ``_tool_names``: deleting it left every test in this file green,
+    so the "unshaped names fail loudly" disposition proved the regex admits digits and nothing
+    about the derivation's behaviour on a name outside the shape (review 9, N4).
+    """
+    _assert_declared_names_are_shaped({"qdrant_memory_retrieve_v2", "qdrant_learning_search2"})
+    for unshaped in ("qdrant_memory_Wipe", "qdrant-memory-wipe", "forget", "qdrant_memory_"):
+        try:
+            _assert_declared_names_are_shaped({unshaped})
+        except AssertionError as exc:
+            assert unshaped in str(exc), str(exc)
+        else:
+            raise AssertionError(f"a declared name outside the shape was accepted: {unshaped!r}")
+    here = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    called = {
+        str(node.func.id)
+        for fn in ast.walk(here)
+        if isinstance(fn, ast.FunctionDef) and fn.name == "_tool_names"
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "_assert_declared_names_are_shaped" in called, (
+        "the shape guard is defined but no longer called by the derivation that needs it, so "
+        "an unshaped declared name would be invisible to three of the four reads"
+    )
+
+
+def test_the_read_only_claim_cannot_be_satisfied_by_the_docstring():
+    """The first version of this check was satisfied by a sentence. That has to stay a failure.
+
+    Both directions are fed to the read directly, because the shape that has to be excluded —
+    a docstring asserting the contract while the code omits it — is exactly the shape a
+    mutation of the *plugin* cannot express without also changing behaviour.
+    """
+    prose_only = ast.parse(
+        'def f(self):\n'
+        '    """Read-only: the code passes update_access=False to search."""\n'
+        '    return store.search(query, top_k=1)\n'
+    )
+    assert _read_only_violations_in(prose_only, "update_access", "search", "f"), (
+        "a docstring sentence satisfied a claim about the code"
+    )
+    code_only = ast.parse(
+        'def f(self):\n'
+        '    """The code passes update_access=True and writes access metadata."""\n'
+        '    return store.search(query, update_access=False)\n'
+    )
+    assert not _read_only_violations_in(code_only, "update_access", "search", "f"), (
+        "the literal argument was not read from the call"
+    )
+    absent = ast.parse("def f(self):\n    return store.other(query)\n")
+    assert _read_only_violations_in(absent, "update_access", "search", "f"), (
+        "a claim about a call that does not exist was read as satisfied"
+    )
+
+
+def test_the_unreached_claim_is_read_from_the_tree():
+    """The absence claim has to see an alias, a ``getattr`` and a ``cls.`` call site.
+
+    A substring read of ``self._tool_x(`` sees none of them, and it fails on the comment
+    spelling the call out — the two errors are the same error: it reads the rendering instead
+    of the tree (review 9, N3).
+    """
+    tree = ast.parse(
+        "def f(self):\n"
+        "    # self._tool_orphan(args) would be a call site, but this line is a comment\n"
+        "    fn = self._tool_orphan\n"
+        "    fn(args)\n"
+        "    getattr(self, \"_tool_orphan\")(args)\n"
+        "    cls._tool_orphan(args)\n"
+    )
+    hits = _tool_method_references(tree, "orphan")
+    assert len(hits) >= 3, hits
+    assert all("orphan" in hit for hit in hits), hits
+    assert _tool_method_references(ast.parse("def f(self):\n    return self._tool_keep()\n"), "orphan") == []
+
+
 def test_the_tool_name_shape_covers_names_the_host_can_register():
     """The shape is a coverage claim about three of the four derivations.
 
@@ -1141,6 +1342,29 @@ def test_the_tool_method_set_refuses_a_mixin_outside_the_mro():
         assert "Lone" in str(exc) and "orphan" in str(exc), str(exc)
     else:
         raise AssertionError("a _tool_* outside the provider MRO was accepted")
+
+
+def test_the_ast_tool_method_set_matches_the_class_the_host_loads():
+    """The AST closure is corroborated against the live class, not only against itself.
+
+    ``_provider_mro_closure`` follows ``ast.Name`` bases that resolve to a module-level
+    ``ClassDef``. A ``_tool_*`` on a base imported from another module is therefore not in the
+    module tree, not in the closure and not reported: silent rather than loud (review 9, N5).
+    ``MemoryProvider``, the host base, is exactly such a class. Comparing the AST set with the
+    live MRO turns that silence into a failure the moment it stops being hypothetical.
+    """
+    module = _plugin_module()
+    live = {
+        method
+        for klass in module.QdrantMemoryProvider.__mro__
+        for method in vars(klass)
+        if method.startswith("_tool_")
+    }
+    ast_set = {f"_tool_{name}" for name in _tool_method_names()}
+    assert live == ast_set, (
+        "the live class and the AST read disagree about which _tool_* methods exist: "
+        f"live_only={sorted(live - ast_set)} ast_only={sorted(ast_set - live)}"
+    )
 
 
 def test_the_register_pin_walks_a_helper_called_by_register():
