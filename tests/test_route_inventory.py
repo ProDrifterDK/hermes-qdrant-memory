@@ -136,15 +136,18 @@ _TOOL_NAME_SHAPE = re.compile(r"^(?:qdrant_memory_|qdrant_learning_)[a-z0-9_]+$"
 # - ``_HELPER_TOOL_METHODS``: reached from a *dispatched* handler instead of from
 #   ``handle_tool_call``. It is a real route — the host reaches it by calling the tool whose
 #   handler calls it. Each entry names the reaching route, the call site inside that route's
-#   handler, and the source evidence for its read-only claim; all three are asserted.
+#   handler, and the code evidence for its read-only claim; all three are asserted, and the
+#   two claims about code are read from the AST — a docstring sentence cannot satisfy either
+#   (review 9: the first version of this entry could be satisfied by prose, and a mutation of
+#   the prose survived while the code was untouched).
 # - ``_UNREACHED_TOOL_METHODS``: no dispatch name, no schema entry, and no call site in the
 #   module. Currently empty, and it cannot be parked in while a handler calls the method,
 #   because the call-site check runs for every entry.
 _HELPER_TOOL_METHODS = {
     "retrieve_learning": {
         "reached_from": "qdrant_memory_retrieve",
-        "call_site": "self._tool_retrieve_learning(args)",
-        "read_only_evidence": "update_access=False",
+        "call_site": "self._tool_retrieve_learning",
+        "read_only_evidence": {"kind": "keyword_false", "keyword": "update_access"},
         "reason": (
             "reachable through a declared tool: the handler that name maps to "
             "(``_tool_retrieve``) dispatches ``collection=\"learning\"`` to it. It has no "
@@ -259,12 +262,62 @@ def _tool_method_names(tree: ast.Module | None = None) -> set[str]:
     return {method for name in closure for method in by_class.get(name, set())}
 
 
-def _function_body(name: str) -> str:
-    """The unparsed source of one module-level or class-level function."""
+def _function_node(name: str) -> ast.FunctionDef:
+    """The one module-level or class-level function with this name."""
     for node in ast.walk(_module_tree()):
         if isinstance(node, ast.FunctionDef) and node.name == name:
-            return ast.unparse(node)
+            return node
     raise AssertionError(f"{name} is not defined in __init__.py")
+
+
+class _NotALiteral:
+    """Marker for a ``keyword=`` argument that is not a literal boolean."""
+
+    def __repr__(self) -> str:
+        return "<something that is not a literal boolean>"
+
+
+_NOT_A_LITERAL = _NotALiteral()
+
+
+def _self_attribute_calls(name: str) -> set[str]:
+    """``self.<attr>`` calls made by one function's code, as ``self.<attr>`` strings.
+
+    Read from ``ast.Call`` nodes rather than by searching unparsed source. That distinction is
+    this file's whole subject: unparsed source renders a docstring sentence and the statement
+    it describes to the same text, so a substring read cannot tell the mechanism from the
+    sentence about it. Review 9 found exactly that here — the claim "read-only, because the
+    code passes ``update_access=False``" was satisfiable by the docstring saying so, and a
+    mutation of the sentence survived untouched code. Presence and absence claims about code
+    are read from the tree, not from its rendering.
+    """
+    found: set[str] = set()
+    for sub in ast.walk(_function_node(name)):
+        if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute):
+            base = sub.func.value
+            if isinstance(base, ast.Name) and base.id == "self":
+                found.add(f"self.{sub.func.attr}")
+    return found
+
+
+def _keyword_literal_values(name: str, keyword: str) -> set[object]:
+    """Literal values passed as ``keyword=`` in calls inside one function's code.
+
+    Only real call arguments are seen, so no string literal anywhere in the body — the
+    docstring included — can satisfy a claim checked this way. A non-literal argument is
+    reported as ``_NOT_A_LITERAL`` so the caller fails on it instead of reading it as a pass.
+    """
+    values: set[object] = set()
+    for sub in ast.walk(_function_node(name)):
+        if isinstance(sub, ast.Call):
+            for kw in sub.keywords:
+                if kw.arg != keyword:
+                    continue
+                if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, bool):
+                    values.add(kw.value.value)
+                else:
+                    values.add(_NOT_A_LITERAL)
+    return values
 
 
 def _dispatched_tool_methods() -> set[str]:
@@ -461,10 +514,12 @@ def _assert_no_unreached_claim_has_a_call_site() -> None:
 def _assert_every_helper_claim_holds(declared: set[str]) -> None:
     """A helper's reaching route, its call site, and its read-only evidence are all checked.
 
-    The route has to be a declared tool, the call site has to sit inside that route's
-    handler, and the source evidence for "read-only" has to be in the helper's own body.
-    Without the middle check, deleting the branch that reaches the helper would leave the
-    row claiming a route nothing calls; without the last, "read-only" is an adjective.
+    The route has to be a declared tool, the handler of that route has to actually call the
+    helper, and the helper's own code has to pass the declared keyword as a literal ``False``.
+    Without the middle check, deleting the branch that reaches the helper would leave the row
+    claiming a route nothing calls; without the last, "read-only" is an adjective. Both are
+    read from the AST: the evidence is an ``ast.keyword``, not a substring, so the docstring
+    that describes the invariant cannot stand in for it.
     """
     for name, spec in _HELPER_TOOL_METHODS.items():
         route = str(spec["reached_from"])
@@ -477,13 +532,23 @@ def _assert_every_helper_claim_holds(declared: set[str]) -> None:
             "explicitly in the entry instead of relying on the prefix rule"
         )
         handler = "_tool_" + route[len(prefix):]
-        assert str(spec["call_site"]) in _function_body(handler), (
-            f"_tool_{name} is pinned as reached from {route}, but {handler} does not contain "
-            f"the pinned call site {spec['call_site']!r}"
+        assert str(spec["call_site"]) in _self_attribute_calls(handler), (
+            f"_tool_{name} is pinned as reached from {route}, but {handler} makes no call to "
+            f"{spec['call_site']!r} (calls it makes: {sorted(_self_attribute_calls(handler))})"
         )
-        assert str(spec["read_only_evidence"]) in _function_body("_tool_" + name), (
-            f"_tool_{name} is pinned as read-only, but its body does not contain the pinned "
-            f"evidence {spec['read_only_evidence']!r}"
+        evidence = spec["read_only_evidence"]
+        kind = evidence["kind"] if isinstance(evidence, dict) else "unknown"
+        if kind != "keyword_false":
+            raise AssertionError(
+                f"_tool_{name} pins read-only evidence of kind {kind!r}, which no reading in "
+                "this file interprets: add the reading before adding the claim, or the claim "
+                "is prose with a dict around it"
+            )
+        keyword = str(evidence["keyword"])
+        values = _keyword_literal_values("_tool_" + name, keyword)
+        assert values == {False}, (
+            f"_tool_{name} is pinned as read-only because its code passes {keyword}=False, "
+            f"but the code passes {keyword}= {values or 'nothing'}"
         )
 
 
@@ -1037,7 +1102,7 @@ def test_a_helper_method_is_reached_through_the_route_it_names():
     _assert_every_helper_claim_holds({str(s["name"]) for s in _plugin_module().TOOL_SCHEMAS})
     _assert_no_unreached_claim_has_a_call_site()
     for name in _HELPER_TOOL_METHODS:
-        assert f"self._tool_{name}(" not in _function_body("handle_tool_call"), (
+        assert f"self._tool_{name}" not in _self_attribute_calls("handle_tool_call"), (
             f"_tool_{name} is pinned as reached one level down, but handle_tool_call calls "
             "it directly, so the entry describes a shape that no longer exists"
         )
