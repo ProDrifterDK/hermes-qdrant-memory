@@ -155,6 +155,56 @@ def contains_secret(text: str) -> bool:
     return False
 
 
+SECRET_SPAN_REPLACEMENT = "[redacted: possible secret-bearing value]"
+
+# `_SECRET_PATTERNS` flags a PEM key by its header line only. Redacting just the
+# header would leave the key body in place, so the span runs to the END marker (or
+# to the end of the text when the block is cut off).
+_PRIVATE_KEY_BLOCK_PATTERN = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)"
+)
+
+
+def redact_secret_spans(text: str) -> str:
+    """Return ``text`` with every span ``contains_secret`` flags replaced by a marker.
+
+    Uses the same patterns and the same placeholder and shape filters as
+    ``contains_secret``, so it redacts exactly what that detector would refuse and
+    nothing it would accept. The result is checked with ``contains_secret`` again; if
+    anything is still flagged, the whole text is replaced (fail closed).
+    """
+    text = text or ""
+    if not contains_secret(text):
+        return text
+    spans: list[tuple[int, int]] = []
+    for pattern in _SECRET_PATTERNS:
+        spans.extend(match.span() for match in pattern.finditer(text))
+    spans.extend(match.span() for match in _PRIVATE_KEY_BLOCK_PATTERN.finditer(text))
+    for match in _CREDENTIAL_ASSIGNMENT_PATTERN.finditer(text):
+        if not _is_secret_placeholder(match.group("value")):
+            spans.append(match.span("value"))
+    for match in _TOKEN_CONTEXT_PATTERN.finditer(text):
+        if _looks_like_secret_value(match.group(1)):
+            spans.append(match.span(1))
+    for match in _CREDENTIAL_CONTEXT_PATTERN.finditer(text):
+        if _looks_like_secret_value(match.group(2)):
+            spans.append(match.span(2))
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in sorted(spans):
+        if end <= cursor:
+            continue
+        if start > cursor:
+            pieces.append(text[cursor:start])
+        pieces.append(SECRET_SPAN_REPLACEMENT)
+        cursor = max(cursor, end)
+    pieces.append(text[cursor:])
+    redacted = "".join(pieces)
+    if contains_secret(redacted):
+        return SECRET_SPAN_REPLACEMENT
+    return redacted
+
+
 def _stable_id(parts: Iterable[str]) -> str:
     raw = "|".join((part or "").strip() for part in parts)
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()

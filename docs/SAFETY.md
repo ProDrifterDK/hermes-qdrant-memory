@@ -1266,6 +1266,12 @@ Verdict every destructive route must give, pinned by
   modes, in **both** scopes, pinned over the whole predicate.
 - restore, resurrection of retired lineage-managed content — refuse in all three
   modes, pinned by `tests/test_backup_cli.py::test_restore_refuses_missing_chunk_retired_by_committed_event`.
+- session recall (`qdrant_memory_session_recall`, `session-recall index`, the
+  `sync_turn` background catch-up) — upserts session windows and range-deletes a
+  session's windows past its last one, only in `session_recall_collection`. There is
+  no payload predicate: `load_config` refuses a session collection equal to the memory
+  or learnings collection, pinned by
+  `tests/test_config_schema_scoring.py::test_config_rejects_session_recall_collection_shared_with_memory_or_learnings`.
 - reindex under `off`, a file whose chunk carries lineage identity **or** the
   review state a transition wrote — the file is blocked
   (`lineage_managed_requires_capture_or_retirement`), so neither the payload rewrite

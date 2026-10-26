@@ -161,6 +161,27 @@ class EmbeddingClient:
     def embed(self, text: str) -> list[float]:
         return self._embed_prefixed(text, "")
 
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """Embed several unprefixed texts with one ``/embeddings`` list-input call.
+
+        Falls back to one ``embed`` call per text (which splits oversize input) when
+        the server reports the batch as too large.
+        """
+        if not texts:
+            return []
+        body = {"model": self.model, "input": list(texts)}
+        try:
+            data = self._request("POST", "/embeddings", body)
+        except RuntimeError as exc:
+            if not self._is_too_large_error(exc):
+                raise
+            return [self.embed(text) for text in texts]
+        items = data.get("data", []) if isinstance(data, dict) else []
+        if len(items) != len(texts) or any("embedding" not in item for item in items):
+            raise RuntimeError("Embedding response did not include one embedding per input")
+        ordered = sorted(items, key=lambda item: int(item.get("index", 0)))
+        return [[float(x) for x in item["embedding"]] for item in ordered]
+
     def embed_query(self, text: str) -> list[float]:
         return self._embed_prefixed(text, self.query_prefix)
 

@@ -51,6 +51,33 @@ def test_config_rejects_one_collection_for_memories_and_learnings(tmp_path):
     assert cfg["learning_collection_name"] == "learnings"
 
 
+def test_config_rejects_session_recall_collection_shared_with_memory_or_learnings(tmp_path):
+    """Session recall upserts and range-deletes windows with no payload check.
+
+    Its safety is collection separation alone: if the session-window collection could
+    alias the memory or learnings collection, a catch-up pass (a tool call, a turn, or
+    the CLI indexer) would overwrite and delete protected memory points.
+    """
+    import pytest
+
+    for shared in ("memory", "learnings"):
+        with pytest.raises(ValueError, match="session_recall_collection must differ"):
+            load_config(
+                hermes_home=str(tmp_path),
+                hermes_config={
+                    "qdrant_memory": {
+                        "collection_name": "memory",
+                        "learning_collection_name": "learnings",
+                        "session_recall_collection": shared,
+                    }
+                },
+            )
+
+    cfg = load_config(hermes_home=str(tmp_path), hermes_config={})
+    assert cfg["session_recall_collection"] == "hermes_session_windows"
+    assert cfg["session_recall_collection"] not in {cfg["collection_name"], cfg["learning_collection_name"]}
+
+
 def test_config_overrides_from_qdrant_memory_section(tmp_path):
     cfg = load_config(
         hermes_home=str(tmp_path),

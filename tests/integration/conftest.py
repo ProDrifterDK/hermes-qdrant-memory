@@ -31,7 +31,13 @@ PLATFORM = "pytest"
 # Fixed prefix for lineage integration collections (approved plan, section 5).
 LINEAGE_TEST_PREFIX = "hermes_qdrant_lineage_itest"
 # Names that must never be touched by tests.
-_FORBIDDEN_COLLECTIONS = {"hermes_memory", "hermes_learnings"}
+_FORBIDDEN_COLLECTIONS = {
+    "hermes_memory",
+    "hermes_learnings",
+    "hermes_session_windows",
+    "picoclaw_memory",
+    "resystbot_learnings",
+}
 
 
 def integration_enabled() -> bool:
@@ -174,6 +180,74 @@ def live_context() -> Iterator[LiveContext]:
         )
     finally:
         _delete_and_verify(qdrant, created, prefix)
+
+
+@dataclass(frozen=True)
+class SessionRecallCollections:
+    qdrant: QdrantClient
+    qdrant_url: str
+    embedding_url: str
+    embedding_model: str
+    vector_size: int
+    distance: str
+    prefix: str
+    new_collection: Any  # Callable[[str], str]: a fresh, tracked, prefixed collection name
+
+
+@pytest.fixture(scope="module")
+def session_recall_collections() -> Iterator[SessionRecallCollections]:
+    """Disposable session-window collection names for one test module.
+
+    The session-recall indexer creates its collection itself, so this fixture hands
+    out names instead of collections: every name is prefixed, never a production
+    name, never one that already exists, and every name handed out is deleted and
+    verified absent at module teardown. Real bge-m3 only: these tests measure
+    retrieval, so the deterministic fake embedder is refused.
+    """
+    prefix = os.environ.get("QDRANT_TEST_COLLECTION_PREFIX", "hermes_qdrant_itest").strip()
+    if not prefix or prefix in _FORBIDDEN_COLLECTIONS:
+        pytest.fail(f"refusing collection prefix {prefix!r}")
+    settings = _qdrant_test_settings()
+    if not settings["qdrant_url"]:
+        pytest.skip("set QDRANT_TEST_URL to run live Qdrant integration tests")
+    if settings["fake_embeddings"]:
+        pytest.skip("session recall integration tests need the real embedding model")
+    qdrant = QdrantClient(settings["qdrant_url"], timeout=30.0, **{"api_key": settings["api_key"]})
+    existing: set[str] = set()
+    try:
+        existing = set(qdrant.get_collections())
+    except Exception as exc:  # pragma: no cover - depends on live service state
+        pytest.fail(f"Qdrant health check failed for {settings['qdrant_url']}: {exc}")
+    probe = _embedding_client(settings).embed_query("Hermes session recall integration health probe")
+    if len(probe) != settings["vector_size"]:
+        pytest.fail(f"Embedding vector size mismatch: expected {settings['vector_size']}, got {len(probe)}")
+    run_id = uuid.uuid4().hex[:12]
+    handed_out: list[str] = []
+
+    def new_collection(label: str) -> str:
+        name = f"{prefix}_{run_id}_srecall_{label}"
+        if not name.startswith(prefix) or name in _FORBIDDEN_COLLECTIONS or name in existing:
+            pytest.fail(f"refusing session recall test collection {name!r}")
+        handed_out.append(name)
+        return name
+
+    try:
+        yield SessionRecallCollections(
+            qdrant=qdrant,
+            qdrant_url=settings["qdrant_url"],
+            embedding_url=settings["embedding_url"],
+            embedding_model=settings["embedding_model"],
+            vector_size=settings["vector_size"],
+            distance=settings["distance"],
+            prefix=prefix,
+            new_collection=new_collection,
+        )
+    finally:
+        present = set(qdrant.get_collections())
+        _delete_and_verify(qdrant, [name for name in handed_out if name in present], prefix)
+        leftover = sorted(set(handed_out) & set(qdrant.get_collections()))
+        if leftover:
+            pytest.fail(f"session recall test collections still present: {leftover}")
 
 
 @dataclass(frozen=True)

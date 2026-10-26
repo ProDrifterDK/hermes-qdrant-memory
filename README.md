@@ -863,6 +863,68 @@ M7.1 keeps automatic extraction disabled by default with `learning_auto_extract_
 
 Approves one pending candidate by `candidate_id`. `dry_run` defaults to true; live approval with `dry_run: false` stores into `hermes_learnings` only.
 
+### `qdrant_memory_session_recall`
+
+Recalls the exact earlier text of Hermes conversations. See [Session recall](#session-recall).
+
+## Session recall
+
+Session recall indexes Hermes conversation history verbatim and searches it. It reads `state.db` (opened read-only), serializes each session's `user` and `assistant` messages in `id` order as `[YYYY-MM-DD HH:MM role] content` lines (local time), cuts that text into fixed windows of `session_recall_window_chars` characters overlapping by `session_recall_overlap_chars`, and stores each window in its own collection (`hermes_session_windows` by default). Tool output and `session_meta` rows are skipped, and no LLM rewrites anything. A query is embedded with the plugin's embedding model. The lane takes the dense top `session_recall_candidates` windows, optionally reranks them with a cross-encoder, and returns the top `top_k` windows, capped at `session_recall_max_chars`.
+
+Use it for two things:
+
+- `scope=current` gets back what was said earlier in the conversation you are in, including the parts that context compression removed. Compression splits a conversation into a chain of sessions through `parent_session_id`, and `current` means the caller's session plus that whole ancestor chain. Before a `current` or `all` search, the tool indexes that chain inline (bounded by `session_recall_inline_catchup_seconds`), so the conversation you are in has zero lag. If the budget runs out, it searches what exists and reports what is left.
+- `scope=past` searches every other conversation. `after`, `before` (ISO dates, local time) and `sources` narrow the search.
+
+Each result carries `session_id`, `session_source`, `first_msg_id`, `start_ts`/`start_time`, `dense_score`, `rerank_score` and the window `text`. Every response carries `context_not_instruction: true`, the authority marker, `rerank` (`applied`, or `unavailable: <reason>` when it fell back to dense order), and `index_lag`.
+
+**Why it is separate from `qdrant_memory_retrieve`.** On a 30-question A/B over real Hermes history, raw windows with dense search and rerank recovered 29/30 answers within a 16K-character budget. Full-text `session_search` recovered 22/30, and the hybrid retrieve recovered 7/30, mostly because conversations had not been captured into `hermes_memory`. The lane wins because it is simple, so it deliberately has no RRF, no recency decay, no importance boosts, and no graph or RAPTOR lanes. Mixing it into the hybrid packer would give that up. Windows are embedded without the `query_prefix`/`document_prefix` strings, as in the measured setup.
+
+**Indexing.** Indexing reads `state.db` only, never turn hooks, so the index can always be rebuilt from the source of truth. Each session has a cursor in a sidecar file, `$HERMES_HOME/qdrant_memory/session_recall/<collection>.state.json`. When new messages arrive, the session's last unfinished window is re-cut and the windows after it are added. Point ids are derived from the session, the window offset and the window size, so reindexing is idempotent: indexing in any number of steps produces the same points as one full rebuild. After each turn, a debounced background pass (at most one per minute, at most 20 s each, skipped if another writer holds the lock) catches up the rest (`session_recall_auto_index`). One file lock is shared by the background pass, the inline catch-up and the CLI indexer.
+
+**Secrets.** Each message is passed through the plugin's secret detector (`contains_secret`) before windowing, and matched spans become `[redacted: possible secret-bearing value]`. The stored text, the text that is embedded, and the tool output never contain the original value. A window is checked again after cutting, and returned text is checked a third time.
+
+**Backfill.** The first full index of a large history (tens of thousands of windows) can take hours on a CPU embedder. Point the indexer at a faster temporary server that serves the same model:
+
+```bash
+hermes qdrant session-recall index --embedding-url http://127.0.0.1:18100/v1 --batch 32
+hermes qdrant session-recall index --max-seconds 600     # bounded run; the cursor keeps what was written
+hermes qdrant session-recall status                      # windows, cursor, index_lag, rerank, collection health
+hermes qdrant session-recall search "what did we decide about the gateway" --scope past
+```
+
+`index --full` re-windows every session and ignores the cursors. `search` is read-only and does not catch up. `hermes qdrant doctor` warns (`session_recall_lag`) when `index_lag` exceeds `session_recall_lag_warn_messages` or when the newest indexed message is more than 24 h behind `state.db`, so a stalled index cannot go unnoticed.
+
+**Reranker (optional).** Any llama.cpp-compatible `POST /v1/rerank` endpoint works. For example, with `bge-reranker-v2-m3`:
+
+```bash
+llama-server -m bge-reranker-v2-m3-Q8_0.gguf --reranking --port 18111 --host 127.0.0.1 -c 8192 -b 2048 -ub 2048
+```
+
+Then set `session_recall_rerank_url: http://127.0.0.1:18111`. Without a reranker the tool returns dense order and says `rerank: unavailable: rerank_url is not configured`. Dense order alone was 28/30 in the A/B, and rerank mostly improves which window comes first.
+
+Configuration (under `qdrant_memory:`):
+
+| key | default | meaning |
+|---|---|---|
+| `session_recall_enabled` | `true` | Tool, catch-up and doctor check. |
+| `session_recall_collection` | `hermes_session_windows` | Window collection. Must differ from the memory and learnings collections (enforced at load). |
+| `session_recall_state_db` | `$HERMES_HOME/state.db` | History source, opened read-only. |
+| `session_recall_window_chars` | `1000` | Window size in characters. Changing it changes every point id, so use a fresh collection. |
+| `session_recall_overlap_chars` | `128` | Overlap between consecutive windows. |
+| `session_recall_candidates` | `128` | Dense candidates passed to the reranker. |
+| `session_recall_top_k` | `15` | Windows returned (the tool accepts 1 to 30). |
+| `session_recall_max_chars` | `16000` | Character cap over the returned windows, in returned order. |
+| `session_recall_rerank_url` | `""` | Reranker base URL. Empty means dense order only. |
+| `session_recall_rerank_timeout_s` | `30` | Rerank request timeout. |
+| `session_recall_embedding_url` | `""` | Embedding server for this lane. Empty means the plugin's `embedding_url`. It must serve the same model. |
+| `session_recall_auto_index` | `true` | Background catch-up after turns. |
+| `session_recall_exclude_sources` | `[]` | Session sources never indexed (e.g. `["cron"]`). |
+| `session_recall_lag_warn_messages` | `500` | Doctor warning threshold. |
+| `session_recall_inline_catchup_seconds` | `8` | Budget for the inline catch-up of the caller's session chain. |
+
+Session windows hold raw conversation text. Treat the collection like `state.db` itself. Exclude sources you do not want searchable, and delete the collection and its state file to remove the index.
+
 ## Indexing safety
 
 Before indexing a broad directory:
@@ -912,6 +974,9 @@ hermes qdrant backup create --scope both
 hermes qdrant backup list
 hermes qdrant backup inspect BACKUP_ID
 hermes qdrant restore --backup BACKUP_ID --dry-run
+hermes qdrant session-recall status
+hermes qdrant session-recall index --max-seconds 600
+hermes qdrant session-recall search "what did we decide about the gateway" --scope past
 ```
 
 Default output is human-readable text. Use `--json` for scripts and automation; JSON success output is one parseable object, and JSON errors are written to stderr with a non-zero exit code. Do not parse default human summaries in automation. See [docs/CLI_OUTPUT_CONTRACT.md](docs/CLI_OUTPUT_CONTRACT.md) for the stdout/stderr, redaction, and per-command contract.
@@ -982,7 +1047,11 @@ QDRANT_TEST_EMBEDDING_MODEL=bge-m3
 QDRANT_TEST_VECTOR_SIZE=1024
 QDRANT_TEST_DISTANCE=Cosine
 QDRANT_TEST_COLLECTION_PREFIX=hermes_qdrant_itest
+QDRANT_TEST_RERANK_URL=http://127.0.0.1:18111   # session recall rerank contract
+SESSION_RECALL_ARTIFACT=/path/to/session_recall_live.json   # optional copy of the ranks/latency artifact
 ```
+
+The session recall contracts (`tests/integration/test_live_session_recall.py`) need the real embedding model and a running reranker. They build their `state.db` fixture from `tests/fixtures/state_db_schema.sql` and never open a real one.
 
 When `RUN_QDRANT_INTEGRATION` is truthy (`1`, `true`, `yes`, or `on`), Qdrant/embedding health or vector-size mismatches fail the tests instead of skipping them.
 

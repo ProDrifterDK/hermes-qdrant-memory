@@ -109,6 +109,25 @@ DEFAULTS: dict[str, Any] = {
     "lineage_invalidation_max_points": 4096,
     "lineage_invalidation_max_edges": 8192,
     "lineage_trace_downstream_max_results": 100,
+    # Session recall: raw conversation windows from state.db in their own collection.
+    # See README "Session recall". `$HERMES_HOME` in the state.db path is replaced by
+    # the provider's Hermes home. An empty rerank_url means dense order only (the tool
+    # says so in its output); an empty embedding_url means the plugin's embedding_url.
+    "session_recall_enabled": True,
+    "session_recall_collection": "hermes_session_windows",
+    "session_recall_state_db": "$HERMES_HOME/state.db",
+    "session_recall_window_chars": 1000,
+    "session_recall_overlap_chars": 128,
+    "session_recall_candidates": 128,
+    "session_recall_top_k": 15,
+    "session_recall_max_chars": 16000,
+    "session_recall_rerank_url": "",
+    "session_recall_rerank_timeout_s": 30.0,
+    "session_recall_embedding_url": "",
+    "session_recall_auto_index": True,
+    "session_recall_exclude_sources": [],
+    "session_recall_lag_warn_messages": 500,
+    "session_recall_inline_catchup_seconds": 8.0,
 }
 
 _BOOL_KEYS = {
@@ -132,6 +151,8 @@ _BOOL_KEYS = {
     "index_dry_run_default",
     "provenance_ranking_enabled",
     "auto_recall_shadow_enabled",
+    "session_recall_enabled",
+    "session_recall_auto_index",
 }
 _INT_KEYS = {
     "vector_size",
@@ -159,9 +180,15 @@ _INT_KEYS = {
     "lineage_invalidation_max_points",
     "lineage_invalidation_max_edges",
     "lineage_trace_downstream_max_results",
+    "session_recall_window_chars",
+    "session_recall_overlap_chars",
+    "session_recall_candidates",
+    "session_recall_top_k",
+    "session_recall_max_chars",
+    "session_recall_lag_warn_messages",
 }
-_FLOAT_KEYS = {"decay_rate", "min_raw_score", "min_final_score", "learning_auto_extract_min_confidence", "learning_auto_extract_semantic_dedupe_threshold", "source_extraction_min_confidence", "consolidation_duplicate_threshold", "guarded_auto_duplicate_min_confidence", "guarded_auto_learning_min_confidence", "reconsolidation_min_confidence", "manual_store_duplicate_threshold", "lineage_lock_timeout_seconds"}
-_LIST_KEYS = {"index_dirs", "index_extensions", "index_exclude_dirs"}
+_FLOAT_KEYS = {"session_recall_rerank_timeout_s", "session_recall_inline_catchup_seconds", "decay_rate", "min_raw_score", "min_final_score", "learning_auto_extract_min_confidence", "learning_auto_extract_semantic_dedupe_threshold", "source_extraction_min_confidence", "consolidation_duplicate_threshold", "guarded_auto_duplicate_min_confidence", "guarded_auto_learning_min_confidence", "reconsolidation_min_confidence", "manual_store_duplicate_threshold", "lineage_lock_timeout_seconds"}
+_LIST_KEYS = {"index_dirs", "index_extensions", "index_exclude_dirs", "session_recall_exclude_sources"}
 
 
 # Phase 6I: allowed values for ``auto_recall_mode``.
@@ -304,5 +331,14 @@ def load_config(*, hermes_home: str | None = None, hermes_config: Mapping[str, A
             "collection_name and learning_collection_name must differ: the learning "
             "store writes without the lineage overwrite guard, so one shared "
             "collection would let a learning upsert replace a protected payload"
+        )
+    # Session recall upserts and range-deletes windows with no payload predicate at
+    # all, so its collection may never be one that holds memories or learnings.
+    session_collection = str(resolved.get("session_recall_collection") or "").strip()
+    if session_collection and session_collection in {memory_collection, learning_collection}:
+        raise ValueError(
+            "session_recall_collection must differ from collection_name and "
+            "learning_collection_name: the session recall indexer rewrites and deletes "
+            "windows in its collection without any payload check"
         )
     return resolved

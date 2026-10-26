@@ -81,6 +81,10 @@ class QdrantClient:
         result = self._request("PUT", f"/collections/{urllib.parse.quote(name)}", body)
         return {"created": True, "name": name, "result": result}
 
+    def create_payload_index(self, name: str, field_name: str, field_schema: str) -> Any:
+        body = {"field_name": field_name, "field_schema": field_schema}
+        return self._request("PUT", f"/collections/{urllib.parse.quote(name)}/index?wait=true", body)
+
     def count(self, name: str) -> int:
         data = self._request("POST", f"/collections/{urllib.parse.quote(name)}/points/count", {"exact": True})
         return int(data.get("result", {}).get("count", 0))

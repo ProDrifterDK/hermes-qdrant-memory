@@ -1148,6 +1148,32 @@ def _collection_vector_size_check(status: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _session_recall_check(config: dict[str, Any], hermes_home: Path) -> dict[str, Any]:
+    """Warn when the session-window index silently stops following state.db.
+
+    Non-critical: a stale recall index degrades recall, it does not break the plugin.
+    """
+    from qdrant_memory.session_recall import RecallSettings, build_session_recall, lag_warnings
+
+    name = "session_recall_lag"
+    if not config.get("session_recall_enabled", True):
+        return _doctor_check(name, True, "session recall is disabled", critical=False)
+    try:
+        settings = RecallSettings.from_config(config, str(hermes_home))
+        if not Path(settings.state_db).is_file():
+            return _doctor_check(name, False, "state.db not found; session recall has nothing to index", critical=False,
+                                 details={"state_db": settings.state_db})
+        lag = build_session_recall(config, str(hermes_home)).lag()
+    except Exception as exc:
+        return _doctor_check(name, False, f"session recall lag unavailable ({type(exc).__name__})", critical=False)
+    warnings = lag_warnings(lag, int(config.get("session_recall_lag_warn_messages", 500)))
+    summary = "; ".join(warnings) if warnings else (
+        f"session recall index follows state.db (lag {lag['messages']} messages, {lag['seconds']} s)"
+    )
+    return _doctor_check(name, not warnings, summary, critical=False,
+                         details={"collection": settings.collection, "index_lag": lag})
+
+
 def build_doctor_report(provider_factory: Callable[[], Any]) -> dict[str, Any]:
     from qdrant_memory.config import load_config
 
@@ -1181,6 +1207,7 @@ def build_doctor_report(provider_factory: Callable[[], Any]) -> dict[str, Any]:
         _metadata_version_check(),
         _watcher_artifacts_check(config),
         _config_redaction_check(config),
+        _session_recall_check(config, _hermes_home()),
     ]
     status: dict[str, Any] = {}
     try:
@@ -2177,7 +2204,102 @@ def _print_eval_capture_summary(
     stdout.write("\n".join(lines) + "\n")
 
 
+def _format_session_recall_payload(payload: dict[str, Any], subcommand: str) -> str:
+    raw_lag = payload.get("index_lag")
+    lag: dict[str, Any] = raw_lag if isinstance(raw_lag, dict) else {}
+    lag_line = f"index_lag: {lag.get('messages')} messages, {lag.get('seconds')} s"
+    if subcommand == "index":
+        lines = [
+            f"Session recall index: lock {payload.get('lock')}, {payload.get('windows_upserted', 0)} windows upserted, "
+            f"{payload.get('sessions_completed', 0)}/{payload.get('sessions_selected', 0)} sessions completed "
+            f"in {payload.get('elapsed_s')} s",
+        ]
+        if payload.get("stopped"):
+            lines.append(f"stopped: {payload['stopped']}")
+        if payload.get("state_reset"):
+            lines.append(f"cursor reset: {payload['state_reset']}")
+        lines.append(lag_line)
+        return "\n".join(lines)
+    if subcommand == "status":
+        health = payload.get("collection_health") or {}
+        cursor = payload.get("cursor") or {}
+        rerank = payload.get("rerank") or {}
+        lines = [
+            f"collection: {payload.get('collection')} (exists={health.get('exists')}, status={health.get('status')}, "
+            f"vector_size={health.get('vector_size')})",
+            f"windows: {payload.get('windows')}",
+            f"cursor: {cursor.get('sessions_complete')}/{cursor.get('sessions_tracked')} sessions complete, "
+            f"newest indexed {cursor.get('newest_indexed_time') or 'never'}"
+            + (f", reset: {cursor['reset_reason']}" if cursor.get("reset_reason") else ""),
+            lag_line,
+            f"rerank: {payload.get('rerank_url') or 'not configured'} (reachable={rerank.get('reachable')})"
+            + (f" {rerank['reason']}" if rerank.get("reason") else ""),
+        ]
+        lines.extend(f"[WARN] {warning}" for warning in payload.get("warnings") or [])
+        return "\n".join(lines)
+    lines = [f"{payload.get('count', 0)} windows (scope={payload.get('scope')}, rerank: {payload.get('rerank')})", lag_line]
+    for item in payload.get("results") or []:
+        lines.append(
+            f"\n#{item.get('rank')} {item.get('start_time')} {item.get('session_source')} "
+            f"session={item.get('session_id')} msg={item.get('first_msg_id')} "
+            f"dense={item.get('dense_score')} rerank={item.get('rerank_score')}"
+        )
+        lines.append(str(item.get("text") or ""))
+    return "\n".join(lines)
+
+
+def _execute_session_recall_command(args: Namespace, stdout) -> int:
+    """`session-recall index|search|status`. Only `index` writes, and only its own collection."""
+    import time
+
+    from qdrant_memory.session_recall import SessionRecallError, build_session_recall, lag_warnings
+
+    subcommand = getattr(args, "session_recall_subcommand", "")
+    try:
+        hermes_home, config = _local_config()
+        recall = build_session_recall(config, str(hermes_home), embedding_url=str(getattr(args, "embedding_url", "") or ""))
+        if subcommand == "index":
+            last = [time.monotonic()]
+
+            def progress(report: dict[str, Any]) -> None:
+                if time.monotonic() - last[0] >= 10.0:
+                    last[0] = time.monotonic()
+                    print(f"session-recall: {report['windows_upserted']} windows, "
+                          f"{report['sessions_completed']}/{report['sessions_selected']} sessions", file=sys.stderr)
+
+            payload = recall.run(
+                full=bool(args.full), max_seconds=args.max_seconds, lock_timeout=float(args.lock_timeout),
+                batch=int(args.batch), progress=progress,
+            )
+            payload["index_lag"] = recall.lag()
+        elif subcommand == "search":
+            chain = recall.chain(args.session_id) if args.session_id else []
+            payload = recall.search(
+                args.query, scope=args.scope, chain=chain, top_k=args.top_k,
+                after=args.after, before=args.before, sources=args.source,
+            )
+            payload["index_lag"] = recall.lag(chain=chain)
+        else:
+            payload = recall.status()
+            payload["rerank_url"] = _redact_credentialed_url(str(payload.get("rerank_url") or ""))
+            payload["warnings"] = lag_warnings(payload["index_lag"], int(config.get("session_recall_lag_warn_messages", 500)))
+    except (SessionRecallError, ValueError) as exc:
+        _print_cli_error(str(exc), args, sys.stderr)
+        return 2 if isinstance(exc, ValueError) and not isinstance(exc, SessionRecallError) else 1
+    except (RuntimeError, OSError) as exc:
+        _print_cli_error(f"session recall failed: {_local_service_error_message(exc) if isinstance(exc, RuntimeError) else type(exc).__name__}",
+                         args, sys.stderr)
+        return 1
+    if _json_flag(args):
+        print(json.dumps(payload, sort_keys=True), file=stdout)
+    else:
+        print(_format_session_recall_payload(payload, subcommand), file=stdout)
+    return 1 if subcommand == "index" and payload.get("lock") == "busy" else 0
+
+
 def _execute_local_command(args: Namespace, stdout, *, provider_factory: Callable[[], Any] | None = None) -> int | None:
+    if getattr(args, "qdrant_subcommand", None) == "session-recall":
+        return _execute_session_recall_command(args, stdout)
     inspection_exit = _execute_inspection_command(args, stdout)
     if inspection_exit is not None:
         return inspection_exit
