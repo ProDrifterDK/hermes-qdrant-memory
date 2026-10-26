@@ -1,3 +1,14 @@
+# Metadata-only [project] table. This plugin is not built or installed as a package,
+# but Hermes treats any plugin carrying a pyproject.toml as a uv workspace member, and
+# `uv lock` fails on a pyproject without [project]. On 2026-09-27 that failure silently
+# parked this plugin for a month. hermes-lcm fixed the same defect upstream (#632).
+# There is deliberately no [build-system]: the table exists only so uv can lock.
+[project]
+name = "hermes-qdrant-memory"
+version = "0.0.0"
+requires-python = ">=3.10"
+dependencies = []
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
