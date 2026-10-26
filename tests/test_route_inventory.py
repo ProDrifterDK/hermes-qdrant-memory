@@ -837,6 +837,14 @@ GUARDED_AUTO_PINS = [
 ]
 SYNC_TURN_PINS = [
     "tests/test_consolidation_apply.py::test_the_sync_turn_hook_cannot_overwrite_a_protected_target",
+    "tests/test_config_schema_scoring.py::test_config_rejects_session_recall_collection_shared_with_memory_or_learnings",
+]
+# Session recall writes only into its own session-window collection: catch-up upserts at
+# deterministic window ids and a range delete of a session's windows past its last one.
+# There is no payload predicate, so, like the learning store, its safety is the
+# collection-separation invariant that load_config enforces.
+SESSION_RECALL_PINS = [
+    "tests/test_config_schema_scoring.py::test_config_rejects_session_recall_collection_shared_with_memory_or_learnings",
 ]
 
 ROUTE_INVENTORY: dict[str, dict[str, object]] = {}
@@ -877,7 +885,13 @@ _declare(["qdrant_memory_index [reconcile]", "index [reconcile]"], "transition")
 # The runtime calls these directly, so none of them is reachable from the parsers above.
 
 _declare(["sync_turn"], "protection", pins=SYNC_TURN_PINS,
-         note="writes the turn through ConversationWriter at the store's deterministic id")
+         note="writes the turn through ConversationWriter at the store's deterministic id; also "
+              "starts the debounced session-recall catch-up, which writes only its own collection")
+_declare(["qdrant_memory_session_recall", "session-recall index"], "protection", pins=SESSION_RECALL_PINS,
+         note="reads are the point; the catch-up upserts and range-deletes session windows in the "
+              "session-recall collection only, which load_config refuses to alias")
+_declare(["session-recall", "session-recall search", "session-recall status"], "read_only",
+         note="session-window search and status; no catch-up, no Qdrant write")
 _declare(["handle_tool_call", "get_tool_schemas"], "dispatch",
          note="the router itself; every route it can reach is classified in this file")
 _declare(
@@ -933,10 +947,10 @@ _declare(["backup create", "eval-capture"], "read_only",
 # a check that reads the same source twice is not a check. Because these are duplicates,
 # adding a pin means updating both the constant and this literal.
 
-# The derived surface — 25 tools, 50 CLI commands, 12 provider hooks. A route added or
+# The derived surface — 26 tools, 54 CLI commands, 12 provider hooks. A route added or
 # removed changes this number, which forces someone to touch this file and classify it,
 # even if the completeness check in the test body is later weakened.
-FROZEN_SURFACE_SIZE = 87
+FROZEN_SURFACE_SIZE = 92
 
 # Every `[mode]` row, frozen by name and by kind. Completeness used to ask only whether
 # *some* mode row existed for the route, so deleting both `[capture]` rows, deleting both
@@ -1036,6 +1050,13 @@ EXPECTED_PROTECTION_ROUTES = {
     ),
     "sync_turn": (
         "tests/test_consolidation_apply.py::test_the_sync_turn_hook_cannot_overwrite_a_protected_target",
+        "tests/test_config_schema_scoring.py::test_config_rejects_session_recall_collection_shared_with_memory_or_learnings",
+    ),
+    "qdrant_memory_session_recall": (
+        "tests/test_config_schema_scoring.py::test_config_rejects_session_recall_collection_shared_with_memory_or_learnings",
+    ),
+    "session-recall index": (
+        "tests/test_config_schema_scoring.py::test_config_rejects_session_recall_collection_shared_with_memory_or_learnings",
     ),
 }
 

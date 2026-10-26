@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from datetime import datetime, timedelta
@@ -83,6 +84,14 @@ from qdrant_memory.memory_pr import (
 )
 from qdrant_memory.recipes import get_recipe
 from qdrant_memory.ranking import RankingPolicy
+from qdrant_memory.session_recall import (
+    AUTO_INDEX_DEBOUNCE_SECONDS,
+    AUTO_INDEX_MAX_SECONDS,
+    SCOPES as SESSION_RECALL_SCOPES,
+    SessionRecall,
+    SessionRecallError,
+    build_session_recall,
+)
 from qdrant_memory.retriever import MemoryRetriever, format_for_prompt, format_hybrid_for_prompt
 from qdrant_memory.sources import expand_point, inspect_point, source_status_for_point, trace_point
 from qdrant_memory.proposals import proposal_draft_metadata, write_proposal_draft
@@ -538,6 +547,11 @@ class QdrantMemoryProvider(MemoryProvider):
         self._graph_retriever: Any = None
         self._raptor_searcher: Optional[RaptorSearcher] = None
         self._shadow_recorder: Optional[ShadowRecorder] = None
+        self._session_recall: Optional[SessionRecall] = None
+        self._session_recall_guard = threading.Lock()
+        self._session_recall_thread: Optional[threading.Thread] = None
+        self._session_recall_last_start = float("-inf")
+        self._session_recall_stop = threading.Event()
 
     @property
     def name(self) -> str:
@@ -566,6 +580,7 @@ class QdrantMemoryProvider(MemoryProvider):
         if agent_context in {"cron", "flush"}:
             self._write_enabled = False
         self._active = bool(self._config.get("enabled", True))
+        self._session_recall = None
         if not self._active:
             return
         self._qdrant = QdrantClient(self._config["qdrant_url"], api_key=self._config.get("qdrant_api_key", ""))
@@ -659,6 +674,13 @@ class QdrantMemoryProvider(MemoryProvider):
             "qdrant_learning_search, qdrant_learning_store, qdrant_memory_status, "
             "qdrant_memory_graph_search, and qdrant_memory_retrieve "
             "for explicit memory operations."
+            + (
+                " Use qdrant_memory_session_recall to recover the exact earlier text of this "
+                "conversation (scope=current, including parts lost to context compression) "
+                "or of past conversations (scope=past)."
+                if self._config.get("session_recall_enabled", True)
+                else ""
+            )
         )
 
     def _run_hybrid_prefetch(self, query: str) -> str:
@@ -896,6 +918,8 @@ class QdrantMemoryProvider(MemoryProvider):
         self._executor.submit(_run)
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+        # Session recall reads state.db, not this turn's text; the turn only nudges it.
+        self._maybe_schedule_session_recall_index()
         if not self._active or not self._write_enabled or not self._config.get("sync_turns") or not self._writer:
             return
         if session_id:
@@ -911,6 +935,57 @@ class QdrantMemoryProvider(MemoryProvider):
             self._executor.submit(_run)
         else:
             _run()
+
+    def _ensure_session_recall(self) -> SessionRecall:
+        # The lane uses the clients this provider was initialized with, never ones of its
+        # own: a provider wired to other services (tests, a profile) must not reach the
+        # services named in the default config.
+        if self._session_recall is None:
+            if self._qdrant is None or self._embeddings is None:
+                raise SessionRecallError("Qdrant memory provider is not initialized")
+            self._session_recall = build_session_recall(
+                self._config, self._hermes_home, qdrant=self._qdrant, embeddings=self._embeddings
+            )
+        return self._session_recall
+
+    def _maybe_schedule_session_recall_index(self) -> None:
+        """Start a bounded background catch-up pass, at most once per debounce interval.
+
+        Never blocks the turn: the pass runs on its own daemon thread, skips when the
+        previous pass is still running, and inside it the shared lock is a try-lock.
+        """
+        try:
+            if not (
+                self._active
+                and self._write_enabled
+                and self._config.get("session_recall_enabled", True)
+                and self._config.get("session_recall_auto_index", True)
+            ):
+                return
+            now = time.monotonic()
+            with self._session_recall_guard:
+                running = self._session_recall_thread is not None and self._session_recall_thread.is_alive()
+                if running or now - self._session_recall_last_start < AUTO_INDEX_DEBOUNCE_SECONDS:
+                    return
+                self._session_recall_last_start = now
+                thread = threading.Thread(
+                    target=self._session_recall_background_pass, name="qdrant-session-recall", daemon=True
+                )
+                self._session_recall_thread = thread
+            thread.start()
+        except Exception:
+            logger.debug("Session recall scheduling failed", exc_info=True)
+
+    def _session_recall_background_pass(self) -> None:
+        try:
+            self._ensure_session_recall().run(
+                lock_timeout=0.0,
+                max_seconds=AUTO_INDEX_MAX_SECONDS,
+                batch=8,
+                stop_event=self._session_recall_stop,
+            )
+        except Exception:
+            logger.debug("Session recall background pass failed", exc_info=True)
 
     def on_session_switch(
         self,
@@ -3816,6 +3891,53 @@ class QdrantMemoryProvider(MemoryProvider):
             )
         return json.dumps(result.to_dict(include_metadata=include_metadata))
 
+    def _tool_session_recall(self, args: dict) -> str:
+        """Raw-history recall; its only write is the catch-up of its own collection."""
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return _json_error("query is required")
+        if not self._active:
+            return _json_error("Qdrant memory provider is not initialized")
+        if not self._config.get("session_recall_enabled", True):
+            return _json_error("session recall is disabled (session_recall_enabled=false)")
+        scope = str(args.get("scope") or "all").strip().lower()
+        if scope not in SESSION_RECALL_SCOPES:
+            return _json_error("scope must be one of: current, past, all")
+        sources = args.get("sources")
+        if isinstance(sources, str):
+            sources = [sources]
+        try:
+            recall = self._ensure_session_recall()
+            chain = recall.chain(self._session_id)
+            catchup: dict[str, Any] = {"skipped": "scope=past reads only other sessions"}
+            if scope != "past":
+                # The conversation the agent is in is small: bring it to zero lag inline,
+                # within the time budget, and report what is left if the budget runs out.
+                budget = recall.settings.inline_catchup_seconds
+                try:
+                    catchup = recall.run(session_ids=chain, max_seconds=budget, lock_timeout=budget)
+                except Exception as exc:
+                    logger.debug("Session recall inline catch-up failed", exc_info=True)
+                    catchup = {"error": f"inline catch-up failed ({type(exc).__name__}); searching what exists"}
+            result = recall.search(
+                query,
+                scope=scope,
+                chain=chain,
+                top_k=args.get("top_k"),
+                after=args.get("after"),
+                before=args.get("before"),
+                sources=sources if isinstance(sources, list) else None,
+            )
+            result["catchup"] = catchup
+            result["index_lag"] = recall.lag(chain=chain)
+            result["query_length"] = len(query)
+        except SessionRecallError as exc:
+            return _json_error(str(exc))
+        except Exception:
+            logger.debug("Session recall failed", exc_info=True)
+            return _json_error("Session recall failed (no raw exception leaked; see server logs)")
+        return json.dumps(result)
+
     def _tool_graph_search(self, args: dict) -> str:
         query = str(args.get("query") or "").strip()
         if not query:
@@ -3931,9 +4053,17 @@ class QdrantMemoryProvider(MemoryProvider):
             return self._tool_raptor_status(args)
         if tool_name == "qdrant_memory_retrieve":
             return self._tool_retrieve(args)
+        if tool_name == "qdrant_memory_session_recall":
+            return self._tool_session_recall(args)
         return _json_error(f"Unknown tool: {tool_name}")
 
     def shutdown(self) -> None:
+        # A background session-recall pass stops at its next batch boundary and saves
+        # its cursor; an interrupted pass is redone idempotently by the next one.
+        self._session_recall_stop.set()
+        thread = self._session_recall_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=10.0)
         if self._executor:
             self._executor.shutdown(wait=True, cancel_futures=False)
             self._executor = None

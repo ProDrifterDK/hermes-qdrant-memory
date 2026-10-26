@@ -546,6 +546,63 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     _add_dry_run_flags(improve_apply)
     improve_apply.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
 
+    _register_session_recall(subcommands)
+
+
+def _recall_top_k(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1 or parsed > 30:
+        raise argparse.ArgumentTypeError("must be between 1 and 30")
+    return parsed
+
+
+def _non_negative_float(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be zero or more")
+    return parsed
+
+
+def _register_session_recall(subcommands) -> None:
+    recall = subcommands.add_parser(
+        "session-recall",
+        help="Raw session-history recall: index state.db conversation windows, search them, report lag.",
+    )
+    recall_subcommands = recall.add_subparsers(dest="session_recall_subcommand", required=True)
+
+    index = recall_subcommands.add_parser(
+        "index",
+        help="Incrementally index state.db into the session-window collection (its only write target).",
+    )
+    index.set_defaults(qdrant_subcommand="session-recall")
+    index.add_argument("--full", action="store_true", help="Re-window every session, ignoring the cursors.")
+    index.add_argument("--max-seconds", type=_non_negative_float, default=None,
+                       help="Stop at the next batch boundary after this many seconds; the cursor keeps what was written.")
+    index.add_argument("--embedding-url", default="",
+                       help="Embedding server base URL (e.g. http://127.0.0.1:18100/v1) for a faster backfill. "
+                            "Must serve the same model as the collection.")
+    index.add_argument("--batch", type=_positive_int, default=16, help="Windows per /embeddings request. Default: 16.")
+    index.add_argument("--lock-timeout", type=_non_negative_float, default=60.0,
+                       help="Seconds to wait for the single-writer lock. Default: 60.")
+    index.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
+
+    search = recall_subcommands.add_parser("search", help="Search session windows. Read-only: no catch-up.")
+    search.set_defaults(qdrant_subcommand="session-recall")
+    search.add_argument("query", help="What to recall, in natural language.")
+    search.add_argument("--scope", choices=["current", "past", "all"], default="all", help="Default: all.")
+    search.add_argument("--session-id", default="", help="Caller session for --scope current/past.")
+    search.add_argument("--top-k", type=_recall_top_k, default=None, help="1 to 30. Default: configured top_k.")
+    search.add_argument("--after", default=None, help="ISO date/datetime lower bound (local time).")
+    search.add_argument("--before", default=None, help="ISO date/datetime upper bound (local time).")
+    search.add_argument("--source", action="append", default=[], help="Session source filter. Repeatable.")
+    search.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
+
+    status = recall_subcommands.add_parser(
+        "status", help="Window count, cursor, index_lag, rerank configuration and collection health. Read-only."
+    )
+    status.set_defaults(qdrant_subcommand="session-recall")
+    status.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
+
 
 def qdrant_command(args) -> None:
     raise SystemExit(execute_command(args))

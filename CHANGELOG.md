@@ -8,6 +8,7 @@ This project is currently public beta / experimental. The format follows Keep a 
 
 ### Added
 
+- Session recall: `qdrant_memory_session_recall` and `hermes qdrant session-recall index|search|status`. The lane indexes `state.db` conversation history verbatim into its own collection (`hermes_session_windows`) as overlapping fixed-size windows and answers with a dense top-K search plus an optional cross-encoder rerank. `scope=current` covers the caller's session and its compressed ancestors and catches them up inline. The incremental per-session cursor reproduces a full rebuild exactly. A debounced background catch-up runs behind a shared single-writer lock, and a `session_recall_lag` doctor warning flags a stalled index. Secret spans are redacted before embedding and storage.
 - Configurable embedding input chunking in `EmbeddingClient` via `qdrant_memory.embedding_max_input_chars` and `qdrant_memory.embedding_max_chunks`, covering conversation writes, learning writes, indexing, search queries, and CLI/script clients through one centralized guard.
 
 ### Changed
