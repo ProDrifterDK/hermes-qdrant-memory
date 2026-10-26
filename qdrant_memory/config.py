@@ -128,6 +128,7 @@ DEFAULTS: dict[str, Any] = {
     "session_recall_exclude_sources": [],
     "session_recall_lag_warn_messages": 500,
     "session_recall_inline_catchup_seconds": 8.0,
+    "session_recall_dedup": True,
 }
 
 _BOOL_KEYS = {
@@ -153,6 +154,7 @@ _BOOL_KEYS = {
     "auto_recall_shadow_enabled",
     "session_recall_enabled",
     "session_recall_auto_index",
+    "session_recall_dedup",
 }
 _INT_KEYS = {
     "vector_size",

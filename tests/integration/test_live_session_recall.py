@@ -19,6 +19,10 @@ Contracts and the failure each one names:
     vector is the embedding of the redacted text.
 (e) an unreachable reranker gives dense order and says so.
 (f) index_lag is exact after a partial (time-budgeted) run.
+(g) duplicates collapse before the reranker: byte-identical replays and
+    offset-shifted near-duplicates form one group with duplicate_count/also_in
+    provenance, the rerank pool keeps every distinct text, and scope=past never
+    names a chain session in results or also_in.
 
 Run with RUN_QDRANT_INTEGRATION=1 QDRANT_TEST_URL=http://127.0.0.1:6333 and a
 llama.cpp reranker at QDRANT_TEST_RERANK_URL (default http://127.0.0.1:18111).
@@ -142,6 +146,23 @@ PLANTED_ANCESTOR = (
 ANCESTOR_QUERY = "What percentage did we agree to hold the staging rollout flag at?"
 FRESH_FACT = "Heads up: the rollback drill moved to 22:40 UTC on the 14th, and Marta runs it this time."
 FRESH_QUERY = "When is the rollback drill now and who is running it?"
+
+# The dedup corpus: one lore message replayed byte-identically across 40 Discord
+# sessions (the bridge-replay shape), the same lore cut at three different offsets
+# (near-duplicates), and one replay inside the caller's own chain (the leak probe).
+REPLAY_LORE = (
+    "The lighthouse keeper's ledger rule FOGHORN-LEDGER-7741 says the foghorn maintenance "
+    "window opens at dawn on every third Tuesday, that the lamp oil reserve stays above "
+    "forty barrels before the winter storms, and that the harbour master signs every "
+    "delivery note twice, once at the dock and once at the tower door."
+)
+REPLAY_QUERY = "what does the keeper's ledger say about the foghorn maintenance window?"
+REPLAY_TS = T0 + 60 * DAY
+OFFSET_FILLERS = (
+    "quick note before the real message",
+    "a slightly longer preamble line here",
+    "and one more preamble of different length",
+)
 
 _SEED = hashlib.sha256(b"session-recall-secret-fixture").hexdigest()
 # Built from fragments so this file never holds a contiguous credential-shaped literal.
@@ -271,7 +292,12 @@ def corpus(session_recall_collections: SessionRecallCollections, tmp_path_factor
     db.say(leaky, "assistant", "Stored. I won't repeat the billing service key back in chat.", base + 120)
 
     ancestor, caller = "chain-ancestor", "chain-caller"
-    db.session(ancestor, "cli", T0 + 50 * DAY)
+    # The dedup leak probe: one session above `ancestor` in the chain, holding a
+    # byte-identical copy of the replayed lore. scope=past must never name it.
+    mid = "chain-mid-ancestor"
+    db.session(mid, "cli", T0 + 48 * DAY)
+    db.say(mid, "user", REPLAY_LORE, REPLAY_TS + 40)  # same minute as the replays below
+    db.session(ancestor, "cli", T0 + 50 * DAY, parent=mid)
     db.session(caller, "cli", T0 + 50 * DAY + 7200, parent=ancestor)
     for turn in range(10):
         ts = T0 + 50 * DAY + turn * 300
@@ -280,6 +306,20 @@ def corpus(session_recall_collections: SessionRecallCollections, tmp_path_factor
     db.say(ancestor, "session_meta", "compressed into chain-caller", T0 + 50 * DAY + 7100)
     for turn in range(4):
         db.say(caller, "user" if turn % 2 == 0 else "assistant", filler(rng, 4), T0 + 50 * DAY + 7200 + turn * 60)
+
+    # 40 byte-identical replays: one message, same content, same timestamp, so the
+    # serialized window (header included) is identical in every session.
+    for index in range(40):
+        sid = f"replay-{index:02d}"
+        db.session(sid, "discord", REPLAY_TS + index)
+        db.say(sid, "user", REPLAY_LORE, REPLAY_TS + index)
+    # The same lore preceded by different-length filler: windows that cut the lore
+    # at different offsets (near-duplicates, never byte-identical).
+    for index, preamble in enumerate(OFFSET_FILLERS):
+        sid = f"lore-offset-{index}"
+        db.session(sid, "telegram", REPLAY_TS + DAY + index * 60)
+        db.say(sid, "user", preamble, REPLAY_TS + DAY + index * 60)
+        db.say(sid, "assistant", REPLAY_LORE, REPLAY_TS + DAY + index * 60 + 30)
 
     collection = ctx.new_collection("corpus")
     config = recall_config(ctx, collection, db.path, home, RERANK_URL)
@@ -294,7 +334,7 @@ def corpus(session_recall_collections: SessionRecallCollections, tmp_path_factor
     }
     assert report["lock"] == "acquired" and not report["stopped"], report
     yield {"db": db, "home": home, "collection": collection, "config": config, "recall": recall,
-           "past": past, "leaky": leaky, "ancestor": ancestor, "caller": caller}
+           "past": past, "leaky": leaky, "ancestor": ancestor, "caller": caller, "mid": mid}
     db.conn.close()
 
 
@@ -348,7 +388,7 @@ def test_c_current_scope_reaches_the_compressed_ancestor_and_past_does_not(corpu
     fresh = recall_tool(provider, query=FRESH_QUERY, scope="current")
     current = recall_tool(provider, query=ANCESTOR_QUERY, scope="current")
     past = recall_tool(provider, query=ANCESTOR_QUERY, scope="past")
-    chain = {corpus["ancestor"], corpus["caller"]}
+    chain = {corpus["ancestor"], corpus["caller"], corpus["mid"]}
     ARTIFACT["latency"]["inline_catchup"] = fresh["catchup"]
     ARTIFACT["contracts"]["c"] = {
         "fresh_rank": _rank_of(fresh["results"], "22:40"),
@@ -410,6 +450,80 @@ def test_e_unreachable_reranker_falls_back_to_dense_order_and_says_so(corpus, mo
     assert result["rerank"].startswith("unavailable:"), result["rerank"]
     assert all(item["rerank_score"] is None for item in result["results"])
     assert [item["text"] for item in result["results"]] == [hit["payload"]["text"] for hit in dense]
+
+
+# --- the dedup contracts (g) --------------------------------------------------
+
+
+def test_g_duplicates_collapse_before_rerank_with_provenance_and_scope(corpus, session_recall_collections):
+    ctx = session_recall_collections
+    recall = corpus["recall"]
+    chain = [corpus["caller"], corpus["ancestor"], corpus["mid"]]
+
+    # Oracle part one: the index really holds the planted duplication. The counts
+    # come from scrolling the collection, not from the code under test.
+    points = all_payloads(ctx, corpus["collection"])
+    shas = [p["payload"]["text_sha256"] for p in points]
+    replay_text = f"[{datetime.fromtimestamp(REPLAY_TS):%Y-%m-%d %H:%M} user] {REPLAY_LORE}\n"
+    exact_replays = [p for p in points if p["payload"]["text"] == replay_text]
+    assert len(exact_replays) == 41, "40 replays plus the chain copy, byte-identical"
+    assert len(set(p["payload"]["text_sha256"] for p in exact_replays)) == 1
+    offset_windows = [
+        p for p in points
+        if str(p["payload"]["session_id"]).startswith("lore-offset-") and "FOGHORN-LEDGER-7741" in p["payload"]["text"]
+    ]
+    assert len(offset_windows) == 3
+    assert len({p["payload"]["text_sha256"] for p in offset_windows}) == 3, \
+        "the offset windows are near-duplicates, never byte-identical"
+    distinct_total = len(set(shas))
+
+    every = recall.search(REPLAY_QUERY, scope="all", chain=chain, top_k=15)
+    past = recall.search(REPLAY_QUERY, scope="past", chain=chain, top_k=15)
+
+    assert every["rerank"] == "applied", every["rerank"]
+    assert every["candidates_raw"] == min(128 * 3, len(points))
+    # Pool fullness: every distinct text available made it into the rerank pool.
+    assert every["candidates"] == min(128, distinct_total), every["candidates"]
+    assert every["duplicates_collapsed"] == every["candidates_raw"] - every["candidates"]
+    texts = [item["text"] for item in every["results"]]
+    assert len(texts) == len(set(texts)), "the top-k holds distinct texts only"
+
+    lore_all = next(item for item in every["results"] if "FOGHORN-LEDGER-7741" in item["text"])
+    # 41 identical copies minus the representative, plus the 3 offset-shifted
+    # near-duplicates: exact arithmetic from the planted fixture.
+    assert lore_all["duplicate_count"] == 43, lore_all["duplicate_count"]
+    assert len(lore_all["also_in"]) == 10 and lore_all["also_in_truncated"] is True
+    # Which member wins the dense score (and becomes the representative) is the
+    # live embedder's call, so assert the invariants: every named session is a
+    # planted copy, newest first by start_time.
+    planted = {f"replay-{i:02d}" for i in range(40)} | {corpus["mid"]} \
+        | {f"lore-offset-{i}" for i in range(len(OFFSET_FILLERS))}
+    named = {entry["session_id"] for entry in lore_all["also_in"]}
+    assert named <= planted
+    assert {lore_all["session_id"]} | named <= planted
+    times = [entry["start_time"] for entry in lore_all["also_in"]]
+    assert times == sorted(times, reverse=True), "also_in is newest first"
+    # The chain copy collapsed into the group: it is either the representative
+    # (score tie broken by its newer timestamp) or named in the provenance.
+    assert corpus["mid"] == lore_all["session_id"] or corpus["mid"] in named
+
+    # Scope: the chain copy is inside the group with scope=all and gone with past,
+    # and no chain session ever reaches past results or their provenance.
+    lore_past = next(item for item in past["results"] if "FOGHORN-LEDGER-7741" in item["text"])
+    assert lore_past["duplicate_count"] == 42, lore_past["duplicate_count"]
+    chain_ids = {corpus["caller"], corpus["ancestor"], corpus["mid"]}
+    assert not {item["session_id"] for item in past["results"]} & chain_ids
+    past_named = {entry["session_id"] for item in past["results"] for entry in item["also_in"]}
+    assert not past_named & chain_ids, "also_in never names a chain session under scope=past"
+
+    ARTIFACT["contracts"]["g"] = {
+        "candidates": every["candidates"],
+        "candidates_raw": every["candidates_raw"],
+        "duplicates_collapsed": every["duplicates_collapsed"],
+        "lore_duplicate_count_all": lore_all["duplicate_count"],
+        "lore_duplicate_count_past": lore_past["duplicate_count"],
+        "timings": every["timings"],
+    }
 
 
 # --- small databases for the indexing contracts (a, f) ----------------------

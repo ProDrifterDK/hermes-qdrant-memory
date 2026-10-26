@@ -13,6 +13,7 @@ This project is currently public beta / experimental. The format follows Keep a 
 
 ### Changed
 
+- Session recall search now collapses duplicate windows at search time before the reranker: it over-fetches the dense pool (3x `session_recall_candidates`, capped at 512), groups exact copies by `text_sha256` (or the sha of the whitespace-collapsed text) and offset-shifted near-duplicates by a 75% contiguous token-run rule measured on real candidate pairs, keeps up to `session_recall_candidates` distinct texts, and returns `duplicate_count`/`also_in`/`also_in_truncated` provenance plus `candidates_raw` and `duplicates_collapsed` counts (`candidates` is now the distinct-text count). Scope, date and source filters still run inside the dense search, so provenance never names an out-of-scope session. `session_recall_dedup: false` restores the raw pool; the index itself is never deduplicated.
 - Index refusals and partial failures now keep exit status 1 but write their human or JSON payload to stderr, matching the documented CLI output contract. Successful index output remains on stdout.
 
 ### Safety
