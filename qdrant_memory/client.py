@@ -7,16 +7,60 @@ import urllib.request
 from typing import Any
 
 
+# The only requests allowed against a read-only collection: collection info (GET) and
+# the point read endpoints (POST). Everything else - create, delete, index, upsert,
+# payload set/overwrite/delete, vector update, point delete - is refused. An allow-list,
+# so an endpoint added later is refused until it is classified as a read.
+_READ_ONLY_POST_SUFFIXES = frozenset({"/points", "/points/search", "/points/scroll", "/points/count"})
+
+
+class ReadOnlyCollectionError(RuntimeError):
+    """A mutating request targeted a collection configured as a read source."""
+
+
 class QdrantClient:
-    def __init__(self, base_url: str, *, timeout: float = 5.0, api_key: str = ""):
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        timeout: float = 5.0,
+        api_key: str = "",
+        read_only_collections: frozenset[str] | set[str] | None = None,
+    ):
         self.base_url = (base_url or "").rstrip("/")
         self.timeout = timeout
         self.api_key = api_key or ""
+        self.read_only_collections = frozenset(read_only_collections or ())
 
     def _url(self, path: str) -> str:
         return f"{self.base_url}{path if path.startswith('/') else '/' + path}"
 
+    def _check_writable(self, method: str, path: str) -> None:
+        """Refuse any non-read request against a read-only collection.
+
+        Every client method reaches the server through ``_request``, so this is the
+        single point that keeps a read source untouched whatever the call site.
+        """
+        if not self.read_only_collections:
+            return
+        route = urllib.parse.urlsplit(path if path.startswith("/") else "/" + path).path
+        parts = route.split("/", 3)
+        if len(parts) < 3 or parts[1] != "collections" or not parts[2]:
+            return
+        name = urllib.parse.unquote(parts[2])
+        if name not in self.read_only_collections:
+            return
+        rest = "/" + parts[3] if len(parts) > 3 else ""
+        verb = method.upper()
+        if verb == "GET" or (verb == "POST" and rest.rstrip("/") in _READ_ONLY_POST_SUFFIXES):
+            return
+        raise ReadOnlyCollectionError(f"refused {verb} {rest or '/'} on read-only collection {name!r}")
+
     def _request(self, method: str, path: str, body: Any = None) -> Any:
+        self._check_writable(method, path)
+        return self._send(method, path, body)
+
+    def _send(self, method: str, path: str, body: Any = None) -> Any:
         data = None if body is None else json.dumps(body).encode("utf-8")
         headers = {"Content-Type": "application/json"}
         if self.api_key:

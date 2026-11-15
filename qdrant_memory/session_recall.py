@@ -1025,11 +1025,17 @@ def build_session_recall(
     one during a backfill; the model and key stay the plugin's.
     """
     from qdrant_memory.client import QdrantClient
+    from qdrant_memory.config import read_source_collections
     from qdrant_memory.embeddings import EmbeddingClient
 
     settings = RecallSettings.from_config(config, hermes_home)
     if qdrant is None:
-        qdrant = QdrantClient(str(config["qdrant_url"]), timeout=30.0, api_key=str(config.get("qdrant_api_key") or ""))
+        qdrant = QdrantClient(
+            str(config["qdrant_url"]),
+            timeout=30.0,
+            api_key=str(config.get("qdrant_api_key") or ""),
+            read_only_collections=read_source_collections(config),
+        )
     override = embedding_url or str(config.get("session_recall_embedding_url") or "")
     if embeddings is not None and not override:
         return SessionRecall(settings, qdrant=qdrant, embeddings=embeddings)

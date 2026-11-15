@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # ruff: noqa: E402 - user plugins patch sys.path before importing Hermes/runtime modules.
 
+import dataclasses
 import hashlib
 import json
 import logging
@@ -41,7 +42,8 @@ from qdrant_memory.guarded_auto import (
 )
 from qdrant_memory.client import QdrantClient
 from qdrant_memory.backup import create_backup
-from qdrant_memory.config import load_config
+from qdrant_memory.config import load_config, read_source_collections
+from qdrant_memory.read_sources import MergedRecall
 from qdrant_memory.context import ContextTemplateError, build_context_packet, default_context_top_k
 from qdrant_memory.consolidation import (
     StructuralLineageRefusal,
@@ -93,7 +95,7 @@ from qdrant_memory.session_recall import (
     build_session_recall,
 )
 from qdrant_memory.retriever import MemoryRetriever, format_for_prompt, format_hybrid_for_prompt
-from qdrant_memory.sources import expand_point, inspect_point, source_status_for_point, trace_point
+from qdrant_memory.sources import expand_point, inspect_point, retrieve_point, source_status_for_point, trace_point
 from qdrant_memory.proposals import proposal_draft_metadata, write_proposal_draft
 from qdrant_memory.source_extraction import (
     build_source_extraction_proposal,
@@ -141,7 +143,7 @@ from qdrant_memory.shadow_runtime import ShadowRecorder, _safe_hybrid_counts
 HARD_CONTEXT_CHAR_BUDGET: int = 16000
 HARD_MAX_SOURCE_CHARS: int = 2400
 from qdrant_memory.write_gate import evaluate_raptor_summary_write, evaluate_write_candidate
-from qdrant_memory.tools import TOOL_SCHEMAS
+from qdrant_memory.tools import ALL_TOOL_NAMES, RECALL_TOOL_NAMES, RECALL_TOOL_SCHEMAS, TOOL_SCHEMAS
 from qdrant_memory.writer import ConversationWriter, ManagedOverwriteRefused
 
 logger = logging.getLogger(__name__)
@@ -583,7 +585,11 @@ class QdrantMemoryProvider(MemoryProvider):
         self._session_recall = None
         if not self._active:
             return
-        self._qdrant = QdrantClient(self._config["qdrant_url"], api_key=self._config.get("qdrant_api_key", ""))
+        self._qdrant = QdrantClient(
+            self._config["qdrant_url"],
+            api_key=self._config.get("qdrant_api_key", ""),
+            read_only_collections=read_source_collections(self._config),
+        )
         self._embeddings = EmbeddingClient(
             self._config["embedding_url"],
             self._config["embedding_model"],
@@ -663,9 +669,93 @@ class QdrantMemoryProvider(MemoryProvider):
             return {}
         return scope
 
+    def _recall_surface(self) -> bool:
+        return (getattr(self, "_config", None) or {}).get("tool_surface") == "recall"
+
+    def _tool_surface_refusal(self, tool_name: str) -> str:
+        """Tool error for a plugin tool the active surface hides; empty when it may run."""
+        if self._recall_surface() and tool_name in ALL_TOOL_NAMES and tool_name not in RECALL_TOOL_NAMES:
+            return _json_error(
+                f"{tool_name} is not available: qdrant_memory.tool_surface is 'recall' "
+                f"(available: {', '.join(sorted(RECALL_TOOL_NAMES))})"
+            )
+        return ""
+
+    def _read_sources(self, kind: str) -> list[dict[str, Any]]:
+        return [source for source in self._config.get("read_sources") or [] if source.get("kind") == kind]
+
+    def _memory_recall(self) -> Optional[MergedRecall]:
+        """Own memory retriever merged with the memory read sources; None when there are none."""
+        sources = self._read_sources("memory")
+        if not sources or not self._retriever or not self._qdrant or not self._embeddings:
+            return None
+        return MergedRecall(
+            self._retriever,
+            self._config["collection_name"],
+            [
+                (
+                    source["collection"],
+                    MemoryRetriever(
+                        qdrant=self._qdrant,
+                        embeddings=self._embeddings,
+                        collection_name=source["collection"],
+                        search_candidates=self._config["search_candidates"],
+                        decay_rate=self._config["decay_rate"],
+                        scope={"profile_id": source["profile_id"]} if source["profile_id"] else {},
+                        min_raw_score=self._config.get("min_raw_score", 0.0),
+                        min_final_score=self._config.get("min_final_score", 0.0),
+                        ranking_policy=self._retriever.ranking_policy,
+                    ),
+                )
+                for source in sources
+            ],
+        )
+
+    def _learning_recall(self, store: LearningStore) -> Optional[MergedRecall]:
+        """Own learning store merged with the learning read sources; None when there are none."""
+        sources = self._read_sources("learning")
+        if not sources or not self._qdrant or not self._embeddings:
+            return None
+        return MergedRecall(
+            store,
+            self._config["learning_collection_name"],
+            [
+                (
+                    source["collection"],
+                    LearningStore(
+                        qdrant=self._qdrant,
+                        embeddings=self._embeddings,
+                        collection_name=source["collection"],
+                        profile_id=source["profile_id"] or "",
+                        # An empty-valued scope adds no condition: profile_id null reads every profile.
+                        scope={"profile_id": source["profile_id"] or ""},
+                        search_candidates=self._config.get("search_candidates", 20),
+                        decay_rate=self._config.get("decay_rate", 0.001),
+                        min_raw_score=self._config.get("min_raw_score", 0.0),
+                        min_final_score=self._config.get("min_final_score", 0.0),
+                    ),
+                )
+                for source in sources
+            ],
+        )
+
     def system_prompt_block(self) -> str:
         if not self._active:
             return ""
+        if self._recall_surface():
+            return (
+                "# Qdrant Memory\n"
+                "Active local long-term semantic memory (recall only). Use qdrant_memory_context, "
+                "qdrant_memory_search, qdrant_memory_expand, qdrant_learning_search and "
+                "qdrant_memory_status to recall stored facts and lessons before exploring."
+                + (
+                    " Use qdrant_memory_session_recall to recover the exact earlier text of this "
+                    "conversation (scope=current, including parts lost to context compression) "
+                    "or of past conversations (scope=past)."
+                    if self._config.get("session_recall_enabled", True)
+                    else ""
+                )
+            )
         return (
             "# Qdrant Memory\n"
             "Active local long-term semantic memory. Use qdrant_memory_context, qdrant_memory_search, "
@@ -702,6 +792,12 @@ class QdrantMemoryProvider(MemoryProvider):
             router = self._ensure_hybrid_router(self._config["collection_name"])
             if router is None:
                 return ""
+            recall = self._memory_recall()
+            if recall is not None:
+                # Read sources join the dense lane only; graph and RAPTOR stay on the
+                # own collection. The formatter emits text bodies only, so the prompt
+                # reveals nothing more than it does without read sources.
+                router = dataclasses.replace(router, base_retriever=recall)
             result = router.retrieve(
                 query,
                 top_k=int(self._config["auto_recall_top_k"]),
@@ -840,7 +936,7 @@ class QdrantMemoryProvider(MemoryProvider):
             if not result:
                 # Hybrid fallback to legacy dense formatted result.
                 try:
-                    chunks = self._retriever.search(query, top_k=int(self._config["auto_recall_top_k"]), update_access=False)
+                    chunks = (self._memory_recall() or self._retriever).search(query, top_k=int(self._config["auto_recall_top_k"]), update_access=False)
                     result = format_for_prompt(chunks, int(self._config["display_tokens"]))
                 except Exception:
                     logger.debug("Qdrant prefetch legacy fallback failed", exc_info=True)
@@ -850,7 +946,7 @@ class QdrantMemoryProvider(MemoryProvider):
             # dense search + format path. This is the legacy behavior the
             # prompt-context contract relies on.
             try:
-                chunks = self._retriever.search(query, top_k=int(self._config["auto_recall_top_k"]), update_access=False)
+                chunks = (self._memory_recall() or self._retriever).search(query, top_k=int(self._config["auto_recall_top_k"]), update_access=False)
                 result = format_for_prompt(chunks, int(self._config["display_tokens"]))
             except Exception:
                 logger.debug("Qdrant prefetch failed", exc_info=True)
@@ -908,7 +1004,7 @@ class QdrantMemoryProvider(MemoryProvider):
                     formatted = self._run_hybrid_prefetch(query)
                 if not formatted:
                     # Legacy dense path (always the fallback).
-                    chunks = self._retriever.search(query, top_k=int(self._config["auto_recall_top_k"]), update_access=False)
+                    chunks = (self._memory_recall() or self._retriever).search(query, top_k=int(self._config["auto_recall_top_k"]), update_access=False)
                     formatted = format_for_prompt(chunks, int(self._config["display_tokens"]))
                 with self._prefetch_lock:
                     self._prefetch_cache[sid] = formatted
@@ -1162,6 +1258,8 @@ class QdrantMemoryProvider(MemoryProvider):
         self._collect_source_extraction_candidates(messages, source_hook="on_session_end")
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
+        if self._recall_surface():
+            return RECALL_TOOL_SCHEMAS
         return TOOL_SCHEMAS
 
     def _tool_status(self) -> str:
@@ -1346,6 +1444,15 @@ class QdrantMemoryProvider(MemoryProvider):
         except Exception as exc:
             return _json_error(f"Failed to store memory: {exc}")
 
+    @staticmethod
+    def _labelled_search(
+        recall: Optional[MergedRecall], own: Any, own_collection: str, query: str, **kwargs: Any
+    ) -> list[tuple[str, Any]]:
+        """``(collection, chunk)`` hits: merged with read sources when configured, else own only."""
+        if recall is not None:
+            return recall.search_labelled(query, **kwargs)
+        return [(own_collection, chunk) for chunk in own.search(query, **kwargs)]
+
     def _tool_context(self, args: dict[str, Any]) -> str:
         template = str(args.get("template") or "source_backed_answer").strip()
         topic = str(args.get("topic") or "").strip()
@@ -1365,6 +1472,7 @@ class QdrantMemoryProvider(MemoryProvider):
             return _json_error("Qdrant memory provider is not initialized")
         try:
             result_groups: list[list[Any]] = []
+            labelled_groups: list[tuple[str, Any]] = []
             for collection in collections:
                 search_kwargs = _context_search_kwargs(collection, recipe, top_k)
                 if collection == "learning":
@@ -1373,11 +1481,22 @@ class QdrantMemoryProvider(MemoryProvider):
                     store = self._ensure_learning_store()
                     if not store:
                         continue
-                    result_groups.append(list(store.search(topic, **search_kwargs)))
+                    hits = self._labelled_search(
+                        self._learning_recall(store), store, self._config["learning_collection_name"], topic, **search_kwargs
+                    )
+                elif self._retriever:
+                    hits = self._labelled_search(
+                        self._memory_recall(), self._retriever, self._config["collection_name"], topic, **search_kwargs
+                    )
+                else:
                     continue
-                if self._retriever:
-                    result_groups.append(list(self._retriever.search(topic, **search_kwargs)))
+                labelled_groups.extend(hits)
+                result_groups.append([chunk for _, chunk in hits])
             chunks = _merge_context_results(result_groups, top_k)
+            if self._config.get("read_sources"):
+                # Read sources are configured: label every result with its collection.
+                labels = {id(chunk): name for name, chunk in labelled_groups}
+                chunks = [{**dataclasses.asdict(chunk), "source_collection": labels[id(chunk)]} for chunk in chunks]
             packet = build_context_packet(template=template, topic=topic, results=chunks)
             return json.dumps(packet)
         except ContextTemplateError as exc:
@@ -1407,21 +1526,27 @@ class QdrantMemoryProvider(MemoryProvider):
         include_fact_history = parse_bool_arg(args.get("include_fact_history"), default=False)
         source_type = args.get("source_type") or None
         try:
-            chunks = self._retriever.search(
+            labelled = self._labelled_search(
+                self._memory_recall(),
+                self._retriever,
+                self._config["collection_name"],
                 query,
                 top_k=top_k,
                 source_type=source_type,
                 include_fact_history=include_fact_history,
                 **_tool_search_filters(args),
             )
+            label_sources = bool(self._config.get("read_sources"))
             results = []
-            for chunk in chunks:
+            for source_collection, chunk in labelled:
                 item: dict[str, Any] = {
                     "id": chunk.id,
                     "text": chunk.text,
                     "score": round(chunk.final_score, 6),
                     "vector_score": round(chunk.qdrant_score, 6),
                 }
+                if label_sources:
+                    item["source_collection"] = source_collection
                 if include_metadata:
                     item["metadata"] = chunk.payload
                     item["ranking"] = chunk.ranking_debug
@@ -1649,6 +1774,24 @@ class QdrantMemoryProvider(MemoryProvider):
             max_chars = 8000
         try:
             payload = expand_point(self._qdrant, collection_name, point_id, collection=collection, mode=mode, max_chars=max_chars, config=self._config)
+            if not payload.get("found", True):
+                # A recall result may come from a read source: look there next, honouring
+                # the source's profile filter. Reads only; collection_name labels the source.
+                for source in self._read_sources(collection):
+                    try:
+                        point = retrieve_point(self._qdrant, source["collection"], point_id)
+                    except Exception:
+                        logger.debug("Qdrant read source %s skipped: retrieve failed", source["collection"], exc_info=True)
+                        continue
+                    if point is None:
+                        continue
+                    point_payload = point.get("payload") if isinstance(point.get("payload"), dict) else {}
+                    if source["profile_id"] and point_payload.get("profile_id") != source["profile_id"]:
+                        continue
+                    payload = expand_point(
+                        self._qdrant, source["collection"], point_id, collection=collection, mode=mode, max_chars=max_chars, config=self._config
+                    )
+                    break
             if not payload.get("found", True):
                 return _json_error("Point not found")
             return json.dumps(payload)
@@ -2314,15 +2457,26 @@ class QdrantMemoryProvider(MemoryProvider):
         include_metadata = bool(args.get("include_metadata", False))
         learning_type = args.get("learning_type") or None
         try:
-            chunks = store.search(query, top_k=top_k, learning_type=learning_type, **_tool_search_filters(args))
+            labelled = self._labelled_search(
+                self._learning_recall(store),
+                store,
+                self._config["learning_collection_name"],
+                query,
+                top_k=top_k,
+                learning_type=learning_type,
+                **_tool_search_filters(args),
+            )
+            label_sources = bool(self._config.get("read_sources"))
             results = []
-            for chunk in chunks:
+            for source_collection, chunk in labelled:
                 item: dict[str, Any] = {
                     "id": chunk.id,
                     "text": chunk.text,
                     "score": round(chunk.final_score, 6),
                     "vector_score": round(chunk.qdrant_score, 6),
                 }
+                if label_sources:
+                    item["source_collection"] = source_collection
                 payload = chunk.payload or {}
                 if payload.get("learning_type"):
                     item["learning_type"] = payload.get("learning_type")
@@ -4003,6 +4157,9 @@ class QdrantMemoryProvider(MemoryProvider):
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         args = args or {}
+        refusal = self._tool_surface_refusal(tool_name)
+        if refusal:
+            return refusal
         if tool_name == "qdrant_memory_status":
             return self._tool_status()
         if tool_name == "qdrant_memory_store":
