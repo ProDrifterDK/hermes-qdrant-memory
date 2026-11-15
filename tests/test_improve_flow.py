@@ -162,13 +162,11 @@ def test_preview_graph_entity_candidates_have_deterministic_ids(tmp_path):
 # Preview from point_ids scope
 # ---------------------------------------------------------------------------
 
-def test_preview_from_point_ids_uses_bounded_qdrant_scroll(tmp_path):
+def test_preview_from_point_ids_reads_the_point_by_id(tmp_path):
     provider = _provider_for_improve(tmp_path)
-    # Set up fake scroll results
-    provider._qdrant.scroll_results = {
-        "point-aaa": [
-            {"id": "point-aaa", "payload": {"text": "Graph entity: concept: Emergence", "source_uri": "session://test/point"}},
-        ],
+    # The real client reads a point by id with retrieve (it has no scroll method).
+    provider._qdrant.retrieve_results = {
+        "point-aaa": {"id": "point-aaa", "payload": {"text": "Graph entity: concept: Emergence", "source_uri": "session://test/point"}},
     }
 
     result = json.loads(
