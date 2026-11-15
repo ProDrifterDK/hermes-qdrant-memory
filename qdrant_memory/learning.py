@@ -7,6 +7,7 @@ from typing import Any
 from .fact_metadata import derive_fact_metadata
 from .schema import build_payload, clean_text_for_memory, now_iso
 from .scoring import final_memory_score
+from .session_origin import merge_session_origin
 from .retriever import (
     CandidatePool,
     RetrievedMemory,
@@ -192,6 +193,7 @@ class LearningStore:
         confidence: float = 0.8,
         tags: list[str] | None = None,
         promote_to_skill_candidate: bool = False,
+        session_origin: dict[str, Any] | None = None,
     ) -> str:
         clean_lesson = clean_text_for_memory(lesson)
         if not clean_lesson:
@@ -219,6 +221,17 @@ class LearningStore:
             tags=tags or [],
             promote_to_skill_candidate=promote_to_skill_candidate,
         )
+        if session_origin is not None:
+            # session_origin (C'3): the id is content-derived, so a re-store lands on the same
+            # point. The new capture is merged into the mapping already there (C'2 rule: first
+            # capture kept, citations appended, validated against the bounds), never replaced.
+            # Without a capture (session_origin_mode off) the upsert is the plain one it was.
+            existing_origin = None
+            for item in self.qdrant.retrieve(self.collection_name, [point_id], with_payload=True) or []:
+                stored = item.get("payload") if isinstance(item, dict) else None
+                if isinstance(stored, dict) and "session_origin" in stored:
+                    existing_origin = stored["session_origin"]
+            payload["session_origin"] = merge_session_origin(existing_origin, session_origin)
         vector = self.embeddings.embed_document(payload["text"])
         self.qdrant.upsert(self.collection_name, [{"id": point_id, "vector": vector, "payload": payload}])
         return point_id

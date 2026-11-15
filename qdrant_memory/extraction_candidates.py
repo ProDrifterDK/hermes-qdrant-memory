@@ -40,6 +40,9 @@ class ExtractionCandidate:
     risk: str = "unknown"
     requires_review: bool = True
     created_at: str = field(default_factory=now_iso)
+    # Frozen by the provider at hook time: captured session, time, hook, the source line and
+    # its role. Session origin (C'3) resolves it at approval; never part of to_dict.
+    origin_capture: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {

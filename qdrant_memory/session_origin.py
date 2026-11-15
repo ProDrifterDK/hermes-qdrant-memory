@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, TypeVar
 
 from qdrant_memory.lesson_extractor import contains_secret, redact_secret_spans
-from qdrant_memory.session_recall import _ELIGIBLE, MAX_CHAIN_DEPTH
+from qdrant_memory.session_recall import _ELIGIBLE, MAX_CHAIN_DEPTH, session_chain
 
 STORE = "hermes-state.db"
 STATUSES = ("verified", "verified_via_uid", "drifted", "partially_missing", "expired", "unavailable")
@@ -233,6 +233,98 @@ def resolve_span(state_db: str, session_id: str, first_msg_id: int, last_msg_id:
         if window_hint:
             citation["window_hint"] = str(window_hint)
         return citation
+
+    try:
+        return _read(state_db, work)
+    except _Unavailable as exc:
+        return "unresolved:schema_unsupported" if exc.reason == "schema_unsupported" else "unresolved:no_state_db"
+    except Exception:  # never raise to the caller
+        return "unresolved:no_state_db"
+
+
+_CHAIN_QUERY_BATCH = 500
+
+
+def _text(value: Any) -> str:
+    return _b(value).decode("utf-8", "replace")
+
+
+def _captured_chain(conn: sqlite3.Connection, session_id: str) -> list[str]:
+    """``session_recall.session_chain`` on this connection (which reads text as bytes)."""
+    has_parent = any(_text(row[1]) == "parent_session_id" for row in conn.execute("PRAGMA table_info(sessions)"))
+    if not has_parent:
+        return [session_id]
+    factory = conn.text_factory
+    conn.text_factory = str
+    try:
+        return session_chain(conn, session_id)
+    finally:
+        conn.text_factory = factory
+
+
+def _holds_source_text(content: str, source_text: str) -> bool:
+    """The extractor read ``source_text`` from this message: one of its lines, or all of it."""
+    return source_text in content.splitlines() or content.strip() == source_text
+
+
+def resolve_source_line(state_db: str, captured_session_id: str, source_text: str, *,
+                        role: str | None = None) -> dict[str, Any] | str:
+    """Cite the message an extractor read ``source_text`` from (basis ``extractor_source_line``).
+
+    The search covers the eligible rows of ``captured_session_id`` and its whole
+    ``parent_session_id`` chain (``session_recall.session_chain``), restricted to ``role``
+    when it is ``user`` or ``assistant``. A row matches when ``source_text`` is one of its
+    lines exactly, or its whole stripped content. Rows that share a ``message_uid`` are one
+    logical message (the host copies a compaction's protected tail under new ids), cited
+    at its original, lowest id. Exactly one message gives a one-row span citation; none
+    gives ``unresolved:no_match``; more than one gives ``unresolved:ambiguous_match`` and is
+    never narrowed to a pick. Read-only; never raises.
+    """
+    if not isinstance(captured_session_id, str) or not captured_session_id:
+        return "unresolved:session_absent"
+    needle = source_text if isinstance(source_text, str) else ""
+    if not needle.strip():
+        return "unresolved:no_match"
+    role_clause, role_params = ("", [])
+    if role in ("user", "assistant"):
+        role_clause, role_params = " AND m.role = ?", [role]
+
+    def work(conn: sqlite3.Connection) -> dict[str, Any] | str:
+        if not _session_exists(conn, captured_session_id):
+            return "unresolved:session_absent"
+        chain = _captured_chain(conn, captured_session_id)
+        messages: dict[Any, tuple] = {}
+        for start in range(0, len(chain), _CHAIN_QUERY_BATCH):
+            batch = chain[start:start + _CHAIN_QUERY_BATCH]
+            marks = ", ".join("?" for _ in batch)
+            rows = conn.execute(
+                f"SELECT m.id, m.role, m.content, m.message_uid, m.timestamp, m.session_id FROM messages m "
+                f"WHERE m.session_id IN ({marks}) AND {_ELIGIBLE}{role_clause} AND instr(m.content, ?) > 0",
+                [*batch, *role_params, needle]).fetchall()
+            for row in rows:
+                if not _holds_source_text(_text(row[2]), needle):
+                    continue
+                key = ("uid", _b(row[3])) if row[3] else ("row", int(row[0]))
+                if key not in messages or int(row[0]) < int(messages[key][0]):
+                    messages[key] = row
+        if not messages:
+            return "unresolved:no_match"
+        if len(messages) > 1:
+            return "unresolved:ambiguous_match"
+        row = next(iter(messages.values()))
+        sid = _text(row[5])
+        return {
+            "store": STORE,
+            "session_id": sid,
+            "first_msg_id": int(row[0]),
+            "last_msg_id": int(row[0]),
+            "msg_count": 1,
+            "uids_sha256": uids_sha256([row[3]]),
+            "span_sha256": span_sha256(sid, [row]),
+            "content_sha256": content_sha256(sid, [row]),
+            "basis": "extractor_source_line",
+            "verified_at": _utc_now(),
+        }
 
     try:
         return _read(state_db, work)
@@ -692,7 +784,7 @@ def describe_session_origin(mapping: Any, *, state_db: str | None) -> dict[str, 
 
 __all__ = [
     "STATUSES", "UNRESOLVED_REASONS", "SPAN_BASES", "STORE", "MAX_SPAN_MESSAGES", "QUOTE_MAX_CHARS",
-    "resolve_span", "verify_citation", "make_quote", "span_sha256", "uids_sha256", "content_sha256",
+    "resolve_span", "resolve_source_line", "verify_citation", "make_quote", "span_sha256", "uids_sha256", "content_sha256",
     "ORIGIN_SCHEMA", "PRODUCERS", "ORIGIN_MODES", "MAX_CITATIONS", "MAX_QUOTED_CITATIONS", "MAX_ORIGIN_BYTES",
     "SessionOriginRefused", "origin_size", "validate_session_origin", "build_session_origin",
     "merge_session_origin", "describe_session_origin", "resolve_position", "verify_origin_citation", "span_quote",

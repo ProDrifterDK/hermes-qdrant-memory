@@ -104,6 +104,7 @@ from qdrant_memory.retriever import (
 from qdrant_memory.sources import expand_point, inspect_point, retrieve_point, source_status_for_point, trace_point
 from qdrant_memory.proposals import proposal_draft_metadata, write_proposal_draft
 from qdrant_memory.source_extraction import (
+    _message_text as source_message_text,
     build_source_extraction_proposal,
     evaluate_source_extraction_candidate,
     extract_source_candidates_from_messages,
@@ -162,8 +163,10 @@ from qdrant_memory.session_origin import (
     merge_session_origin,
     origin_size,
     resolve_position,
+    resolve_source_line,
     resolve_span,
     span_quote,
+    validate_session_origin,
     verify_citation,
 )
 from qdrant_memory.tools import (
@@ -1282,6 +1285,8 @@ class QdrantMemoryProvider(MemoryProvider):
                 continue
             if self._is_semantic_duplicate_learning_candidate(candidate):
                 continue
+            candidate.origin_capture = self._freeze_origin_capture(
+                source_hook, candidate.source_text, candidate.source_role)
             self._pending_learning_candidates[candidate.candidate_id] = candidate
             accepted.append(candidate)
         if mode == "store":
@@ -1330,6 +1335,8 @@ class QdrantMemoryProvider(MemoryProvider):
             decision = evaluate_source_extraction_candidate(candidate)
             if decision.decision == "reject":
                 continue
+            candidate = dataclasses.replace(candidate, origin_capture=self._freeze_origin_capture(
+                source_hook, *self._extraction_source_line(messages, candidate)))
             self._pending_extraction_candidates[candidate.candidate_id] = candidate
             accepted.append(candidate)
         if mode == "store":
@@ -1487,6 +1494,126 @@ class QdrantMemoryProvider(MemoryProvider):
             citation = resolve_position(state_db, self._session_id)
         return build_session_origin(producer="manual_store", captured_session_id=self._session_id,
                                     captured_at=now, citation=citation)
+
+    # --- session origin for hook candidates and learnings (C'3) ---------------------
+
+    def _freeze_origin_capture(self, source_hook: str, source_text: str, role: str) -> dict[str, Any]:
+        """The capture a hook candidate keeps until approval: never re-read from the approver.
+
+        Recorded in every mode (it lives only on the in-memory candidate, never in an output),
+        so a candidate captured while the mode was off still cites its own session later.
+        """
+        return {"session_id": self._session_id or "", "captured_at": self._utc_now_z(), "hook": source_hook,
+                "source_text": str(source_text or ""), "role": str(role or "")}
+
+    @staticmethod
+    def _extraction_source_line(messages: list[Any], candidate: Any) -> tuple[str, str]:
+        """The exact line the source extractor read for ``candidate`` (from its locator)."""
+        locator = candidate.locator if isinstance(candidate.locator, dict) else {}
+        index, line_no = locator.get("message_index"), locator.get("line_start")
+        if not isinstance(index, int) or not isinstance(line_no, int) or not 0 <= index < len(messages or []):
+            return "", ""
+        lines = source_message_text(messages[index]).splitlines()
+        if not 1 <= line_no <= len(lines):
+            return "", ""
+        return lines[line_no - 1], str(locator.get("role") or "")
+
+    def _candidate_session_origin(self, producer: str, capture: Mapping[str, Any]) -> dict[str, Any]:
+        """The ``session_origin`` an approval records: the candidate's captured session and
+        its source line resolved by exact match across that session's chain. The approving
+        session only appears as ``approved_session_id`` when it differs."""
+        capture = capture if isinstance(capture, Mapping) else {}
+        captured = str(capture.get("session_id") or "")
+        now = self._utc_now_z()
+        citation = resolve_source_line(self._state_db_path(), captured, str(capture.get("source_text") or ""),
+                                       role=str(capture.get("role") or "") or None)
+        origin = build_session_origin(producer=producer, captured_session_id=captured,
+                                      captured_at=str(capture.get("captured_at") or now), citation=citation)
+        if (self._session_id or "") != captured:
+            origin["approved_session_id"] = self._session_id or ""
+            origin["approved_at"] = now
+        validate_session_origin(origin)
+        return origin
+
+    def _learning_store_session_origin(self) -> dict[str, Any]:
+        """``qdrant_learning_store`` has no extractor line: call-time session, tool_position."""
+        return build_session_origin(producer="learning_store", captured_session_id=self._session_id or "",
+                                    captured_at=self._utc_now_z(),
+                                    citation=resolve_position(self._state_db_path(), self._session_id or ""))
+
+    def _origin_lock(self, collection_name: str) -> Any:
+        return collection_write_lock(
+            collection_name=collection_name,
+            timeout=float(self._config.get("lineage_lock_timeout_seconds", 5.0)),
+            lock_dir=str(self._config.get("lineage_lock_dir") or ""),
+        )
+
+    @staticmethod
+    def _origin_summary(origin: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "captured_session_id": origin["captured_session_id"],
+            "citation_status": origin["citation_status"],
+            "citation": origin["citations"][0] if origin["citations"] else None,
+        }
+
+    def _store_learning_with_origin(self, store: LearningStore, learning_args: dict[str, Any],
+                                    origin: dict[str, Any]) -> tuple[str, str]:
+        """Read-merge-upsert of a learning under the collection lock; ``(point_id, error)``.
+
+        The per-collection write lock (the manual store's, here on the learning collection)
+        keeps two re-stores from dropping each other's citation. Store failures other than a
+        refused mapping propagate.
+        """
+        lock_stack = ExitStack()
+        try:
+            lock_stack.enter_context(self._origin_lock(self._config["learning_collection_name"]))
+        except (TimeoutError, RuntimeError):
+            return "", LINEAGE_LOCK_UNAVAILABLE
+        with lock_stack:
+            try:
+                return store.store(**learning_args, session_origin=origin), ""
+            except SessionOriginRefused as exc:
+                return "", str(exc)
+
+    def _upsert_extraction_with_origin(self, point_id: str, vector: list[float], payload: dict[str, Any],
+                                       origin: dict[str, Any]) -> str:
+        """Read-merge-upsert of an approved extraction under the memory collection lock.
+
+        The point is re-read under the lock: the lineage overwrite refusal runs again and an
+        existing ``session_origin`` is merged (C'2 rule), never replaced. Returns an error
+        text, or ``""`` once written.
+        """
+        collection = self._config["collection_name"]
+        qdrant = self._qdrant
+        if qdrant is None:
+            return "Qdrant memory provider is not initialized"
+        lock_stack = ExitStack()
+        try:
+            lock_stack.enter_context(self._origin_lock(collection))
+        except (TimeoutError, RuntimeError):
+            return LINEAGE_LOCK_UNAVAILABLE
+        with lock_stack:
+            try:
+                existing = qdrant.retrieve(collection, [point_id], with_payload=True)
+            except Exception:
+                return "Unable to verify target point identity; refusing to overwrite (Qdrant retrieval error)"
+            existing_origin = None
+            for item in existing or []:
+                stored = item.get("payload") if isinstance(item, dict) else None
+                if not isinstance(stored, dict):
+                    continue
+                refusal = lineage_overwrite_refusal(stored)
+                if refusal:
+                    return refusal
+                if "session_origin" in stored:
+                    existing_origin = stored["session_origin"]
+            try:
+                merged = merge_session_origin(existing_origin, origin)
+            except SessionOriginRefused as exc:
+                return str(exc)
+            qdrant.upsert(collection, [{"id": point_id, "vector": vector,
+                                        "payload": {**payload, "session_origin": merged}}])
+        return ""
 
     def _tool_status(self) -> str:
         qdrant_ok = False
@@ -2695,21 +2822,28 @@ class QdrantMemoryProvider(MemoryProvider):
                 return json.dumps({"saved": False, "id": None, "collection_name": self._config["learning_collection_name"], "write_decision": write_decision.to_dict()})
             if write_decision.decision not in {"learning_candidate", "store", "skill_candidate"}:
                 return _json_error("learning candidate requires manual draft review before storing")
-            point_id = store.store(
-                lesson=lesson,
-                learning_type=str(args.get("learning_type") or ""),
-                trigger=str(args.get("trigger") or ""),
-                mistake=str(args.get("mistake") or ""),
-                correction=str(args.get("correction") or ""),
-                evidence=str(args.get("evidence") or ""),
-                tool_name=str(args.get("tool_name") or ""),
-                command=str(args.get("command") or ""),
-                importance=importance,
-                confidence=confidence,
-                tags=[str(t) for t in tags],
-                promote_to_skill_candidate=bool(args.get("promote_to_skill_candidate", False)),
-            )
-            return json.dumps({"saved": bool(point_id), "id": point_id, "collection_name": self._config["learning_collection_name"], "write_decision": write_decision.to_dict()})
+            learning_args: dict[str, Any] = {
+                "lesson": lesson,
+                "learning_type": str(args.get("learning_type") or ""),
+                "trigger": str(args.get("trigger") or ""),
+                "mistake": str(args.get("mistake") or ""),
+                "correction": str(args.get("correction") or ""),
+                "evidence": str(args.get("evidence") or ""),
+                "tool_name": str(args.get("tool_name") or ""),
+                "command": str(args.get("command") or ""),
+                "importance": importance,
+                "confidence": confidence,
+                "tags": [str(t) for t in tags],
+                "promote_to_skill_candidate": bool(args.get("promote_to_skill_candidate", False)),
+            }
+            if self._session_origin_mode() != "recorded":
+                point_id = store.store(**learning_args)
+                return json.dumps({"saved": bool(point_id), "id": point_id, "collection_name": self._config["learning_collection_name"], "write_decision": write_decision.to_dict()})
+            origin = self._learning_store_session_origin()
+            point_id, origin_error = self._store_learning_with_origin(store, learning_args, origin)
+            if origin_error:
+                return _json_error(origin_error)
+            return json.dumps({"saved": bool(point_id), "id": point_id, "collection_name": self._config["learning_collection_name"], "write_decision": write_decision.to_dict(), "session_origin": self._origin_summary(origin)})
         except Exception as exc:
             return _json_error(f"Failed to store learning: {exc}")
 
@@ -2812,8 +2946,14 @@ class QdrantMemoryProvider(MemoryProvider):
             promote_to_skill_candidate=bool(learning_args.get("promote_to_skill_candidate", False)),
             metadata=persisted_payload,
         )
+        # session_origin_mode recorded: the origin is the session frozen on the candidate at
+        # hook time, never the approver's (store.session_id follows session switches).
+        recorded = self._session_origin_mode() == "recorded"
         if dry_run:
-            return json.dumps({"dry_run": True, "saved": False, "candidate": candidate.to_dict(include_metadata=True), "learning_args": learning_args, "write_decision": write_decision.to_dict()})
+            previewed = {"dry_run": True, "saved": False, "candidate": candidate.to_dict(include_metadata=True), "learning_args": learning_args, "write_decision": write_decision.to_dict()}
+            if recorded:
+                previewed["session_origin"] = self._candidate_session_origin("learning_approval", candidate.origin_capture)
+            return json.dumps(previewed)
         if not store:
             return _json_error("Qdrant learning store is not initialized")
         try:
@@ -2821,9 +2961,16 @@ class QdrantMemoryProvider(MemoryProvider):
                 return _json_error("write gate rejected learning candidate")
             if write_decision.decision not in {"learning_candidate", "store", "skill_candidate"}:
                 return _json_error("learning candidate requires manual draft review before storing")
-            point_id = store.store(**learning_args)
+            if not recorded:
+                point_id = store.store(**learning_args)
+                self._pending_learning_candidates.pop(candidate_id, None)
+                return json.dumps({"dry_run": False, "saved": bool(point_id), "id": point_id, "collection_name": self._config["learning_collection_name"], "write_decision": write_decision.to_dict()})
+            origin = self._candidate_session_origin("learning_approval", candidate.origin_capture)
+            point_id, origin_error = self._store_learning_with_origin(store, learning_args, origin)
+            if origin_error:
+                return _json_error(origin_error)
             self._pending_learning_candidates.pop(candidate_id, None)
-            return json.dumps({"dry_run": False, "saved": bool(point_id), "id": point_id, "collection_name": self._config["learning_collection_name"], "write_decision": write_decision.to_dict()})
+            return json.dumps({"dry_run": False, "saved": bool(point_id), "id": point_id, "collection_name": self._config["learning_collection_name"], "write_decision": write_decision.to_dict(), "session_origin": self._origin_summary(origin)})
         except Exception as exc:
             return _json_error(f"Learning approval failed: {exc}")
 
@@ -2872,9 +3019,15 @@ class QdrantMemoryProvider(MemoryProvider):
             "collection_name": self._config["collection_name"],
             **proposal_payload,
         }
+        # session_origin_mode recorded: the origin is the session frozen on the candidate at
+        # hook time, never the approver's self._session_id (it follows session switches).
+        recorded = self._session_origin_mode() == "recorded"
         if dry_run:
             self._reviewed_extraction_candidate_ids.add(candidate_id)
-            return json.dumps({"dry_run": True, "saved": False, "proposal_created": False, **base})
+            previewed = {"dry_run": True, "saved": False, "proposal_created": False, **base}
+            if recorded:
+                previewed["session_origin"] = self._candidate_session_origin("source_extraction", candidate.origin_capture)
+            return json.dumps(previewed)
         if not approve:
             return _json_error("approve=true is required when dry_run=false")
         if candidate_id not in self._reviewed_extraction_candidate_ids:
@@ -2975,10 +3128,18 @@ class QdrantMemoryProvider(MemoryProvider):
                 return _json_error(overwrite_refusal)
             text = str(payload.get("text") or payload.get("claim_text") or "")
             vector = self._embeddings.embed_document(text)
-            self._lineage_locked_upsert(
-                self._config["collection_name"],
-                [{"id": candidate.candidate_id, "vector": vector, "payload": payload}],
-            )
+            origin_shown: dict[str, Any] = {}
+            if recorded:
+                origin = self._candidate_session_origin("source_extraction", candidate.origin_capture)
+                origin_error = self._upsert_extraction_with_origin(candidate.candidate_id, vector, payload, origin)
+                if origin_error:
+                    return _json_error(origin_error)
+                origin_shown = {"session_origin": self._origin_summary(origin)}
+            else:
+                self._lineage_locked_upsert(
+                    self._config["collection_name"],
+                    [{"id": candidate.candidate_id, "vector": vector, "payload": payload}],
+                )
             self._pending_extraction_candidates.pop(candidate_id, None)
             self._reviewed_extraction_candidate_ids.discard(candidate_id)
             return json.dumps(
@@ -2988,6 +3149,7 @@ class QdrantMemoryProvider(MemoryProvider):
                     "proposal_created": False,
                     "id": candidate.candidate_id,
                     **persisted_base,
+                    **origin_shown,
                 }
             )
         except Exception as exc:
