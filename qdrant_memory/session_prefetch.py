@@ -28,6 +28,7 @@ from datetime import datetime
 from typing import Any, Mapping
 
 from qdrant_memory.lesson_extractor import contains_secret, redact_secret_spans
+from qdrant_memory.retriever import prompt_char_cap
 from qdrant_memory.session_recall import (
     _ELIGIBLE,
     AUTHORITY,
@@ -72,9 +73,10 @@ class PrefetchSettings:
         max_chars = int(_clamp(config.get("session_prefetch_max_chars"), 1200, 0, HARD_LANE_CHARS))
         total = int(_clamp(config.get("session_prefetch_total_chars"), 0, 0, HARD_LANE_CHARS))
         if total <= 0:
-            # Auto: the legacy formatter's own cap (format_for_prompt) plus the lane's cap,
-            # so the lane is never starved by a full legacy block and the sum stays bounded.
-            legacy_cap = max(800, int(_clamp(config.get("display_tokens"), 300, 0, HARD_LANE_CHARS)) * 4)
+            # Auto: the legacy formatter's own cap (format_for_prompt, which never exceeds
+            # it) plus the lane's cap, so the lane is never starved by a full legacy block
+            # and the sum stays bounded.
+            legacy_cap = prompt_char_cap(int(_clamp(config.get("display_tokens"), 300, 0, HARD_LANE_CHARS)))
             total = min(HARD_LANE_CHARS, legacy_cap + max_chars + 2)
         return cls(
             scope=scope if scope in PREFETCH_SCOPES else "current",

@@ -53,13 +53,22 @@ scores, point ids, paths or session ids.
 with the legacy block (`session_prefetch_total_chars`; `0` means the legacy formatter's
 cap, `max(800, display_tokens * 4)`, plus the lane's cap). The lane gets whatever the
 legacy block leaves, never more than its own cap, and is skipped below 200 characters.
+The legacy and hybrid blocks never exceed that cap and are never a bare header: when the
+top-ranked memory is larger than what is left, it is cut to the remaining budget and
+ends with `… [truncated]`; with nothing to show they return an empty string.
 
-**Fail-open.** The lane runs on its own single worker with a timeout
-(`session_prefetch_timeout_s`). Any exception, a timeout, or a previous lane call still
-running returns the legacy prefetch byte for byte; the turn waits at most the timeout.
-The reranker call inside the lane is bounded by the same timeout. Keep the timeout well
-under the host's external-prefetch limit (8 s, `agent/memory_manager.py`), past which
-the host drops the plugin's whole prefetch.
+**Degrade and fail-open.** Two levels, ratified on 2026-11-15:
+
+- *Only the reranker fails* (connection refused, an HTTP error, a malformed response):
+  the lane keeps the dense order of the window search and still injects its block.
+- *The lane itself fails*: any exception, a timeout of the lane, or a previous lane call
+  still running returns the legacy prefetch byte for byte. The lane runs on its own
+  single worker with `session_prefetch_timeout_s`, so the turn waits at most that long.
+  The reranker's HTTP timeout is capped at the same value, so a reranker that hangs
+  until then ends as a lane timeout (legacy unchanged), not as dense order.
+
+Keep the timeout well under the host's external-prefetch limit (8 s,
+`agent/memory_manager.py`), past which the host drops the plugin's whole prefetch.
 
 **Read-only.** Window search and `state.db` reads only: no catch-up indexing, no access
 counter, no write of any kind. Compacted rows are normally already indexed by the
@@ -77,6 +86,13 @@ If the host pruned the session (`sessions.retention_days`), the tool returns the
 windows that contain the message instead, with `"source": "indexed_windows"`,
 `"pruned": true` and a note that the text is as of indexing, not a live read.
 
+**Message ids are capability handles** (ratified on 2026-11-15). Without `session_id`
+the tool resolves any `state.db` message id in any session, not only the caller's
+conversation or the ids the lane injected. `state.db` ids are sequential integers, so
+holding (or guessing) an id is enough to read the messages around it. Every message
+text is redacted (`redact_secret_spans`) before it is returned, as in the lane. Enable
+the tool only on profiles that may read the whole local conversation history.
+
 ## Configuration
 
 | Key | Default | Meaning |
@@ -86,7 +102,7 @@ windows that contain the message instead, with `"source": "indexed_windows"`,
 | `session_prefetch_top_k` | `5` | Excerpts injected at most (1-10). |
 | `session_prefetch_max_chars` | `1200` | Lane cap. |
 | `session_prefetch_total_chars` | `0` | Total shared with the legacy block; `0` = legacy cap + lane cap. |
-| `session_prefetch_rerank` | `true` | Rerank with `session_recall_rerank_url` when one is configured; dense order otherwise. |
+| `session_prefetch_rerank` | `true` | Rerank with `session_recall_rerank_url` when one is configured. Dense order when none is configured or when only the reranker call fails; a lane timeout returns legacy unchanged (see "Degrade and fail-open"). |
 | `session_prefetch_candidates` | `32` | Distinct windows sent to the reranker (1-128). Rerank time grows with it. |
 | `session_prefetch_timeout_s` | `2.0` | Hard limit for the lane; fail-open to legacy. |
 | `session_expand_enabled` | `false` | Register `qdrant_memory_session_expand`. |
@@ -105,9 +121,16 @@ Measured on one install (2026-11-15, idle GPU, 30 frozen questions plus 21 conti
 questions about the early part of really compacted sessions): at the ~1,200-character
 budget the legacy block scored 0/30 and 0/21, the lane with rerank 24/30 and 17-18/21,
 dense-only 18/30 and 9-11/21. The lane added about 0.8 s at p50 and 1.0 s at p95 with
-rerank (32 candidates), about 0.13 s / 0.25 s dense-only. Legacy's low score is mostly
-its formatter: when the top-ranked memory alone exceeds the cap (typically a long
-conversation-turn point) it emits the header and no memories.
+rerank (32 candidates), about 0.13 s / 0.25 s dense-only. Legacy's low score was mostly
+its formatter: when the top-ranked memory alone exceeded the cap (typically a long
+conversation-turn point) it emitted the header and no memories (42 of 51 questions).
+
+Re-measured after the formatter fix (same sets and budgets, idle GPU): no legacy block
+is header-only any more (0 of 51 at both 1,200 and 2,800 characters). Legacy scored
+4/51 at 1,200 characters and 7/51 at 2,800; legacy plus the lane scored 42/51 with
+rerank and 30/51 dense-only at 1,200 characters, and lost no question that legacy
+answered. Cutting the oversized top memory beat skipping it (4/51 against 1/51 at 1,200
+characters, where skipping left 26 of 51 blocks empty).
 
 ## Limits
 
