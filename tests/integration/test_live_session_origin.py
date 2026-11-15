@@ -374,7 +374,10 @@ def test_off_mode_is_byte_identical_to_base(live, state, tmp_path):
     db, ids = state
     base = tmp_path / "base"
     base.mkdir()
-    archive = subprocess.run(["git", "-C", str(REPO), "archive", C2_BASE], capture_output=True)
+    # A scratch copy made with `git archive` (the bite harness) is not a git checkout; it
+    # names the checkout that holds C2_BASE through SESSION_ORIGIN_BASE_REPO.
+    git_dir = os.environ.get("SESSION_ORIGIN_BASE_REPO", "").strip() or str(REPO)
+    archive = subprocess.run(["git", "-C", git_dir, "archive", C2_BASE], capture_output=True)
     if archive.returncode != 0:
         pytest.skip(f"base commit {C2_BASE} is not available here: {archive.stderr.decode()[:200]}")
     subprocess.run(["tar", "-x", "-C", str(base)], input=archive.stdout, check=True)
