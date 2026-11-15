@@ -859,7 +859,9 @@ _declare(
     [
         "qdrant_memory_store", "store",
     ], "protection", pins=STORE_PINS,
-    note="replaces the payload at a deterministic content-derived id",
+    note="replaces the payload at a deterministic content-derived id; session_origin (C'2) is merged, "
+         "never replaced, and carried forward when a call brings none. The `cite` argument exists only "
+         "with session_origin_mode=recorded and stays off the read-only recall surface (it is a write)",
 )
 _declare(["qdrant_memory_forget", "forget"], "protection", pins=FORGET_PINS)
 _declare(

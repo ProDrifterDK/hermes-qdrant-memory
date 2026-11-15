@@ -147,6 +147,12 @@ DEFAULTS: dict[str, Any] = {
     "session_prefetch_timeout_s": 2.0,
     # Opt-in read-only tool qdrant_memory_session_expand (messages around a msg id).
     "session_expand_enabled": False,
+    # C' session origin: ``off`` (default) keeps manual-store payloads, schemas and outputs
+    # as they were; ``recorded`` adds a digest-pinned state.db citation (``session_origin``)
+    # to manual stores and the optional ``cite`` store argument. ``recorded`` never blocks a
+    # store because state.db cannot resolve the citation: it records ``unresolved:<reason>``.
+    # Unknown values fall back to ``off``. See README "Session origin on manual stores".
+    "session_origin_mode": "off",
     # Tool surface: ``full`` exposes every tool (default); ``recall`` exposes only the
     # read-mostly recall tools in tools.RECALL_TOOL_NAMES. Unknown values fall back to ``full``.
     "tool_surface": "full",
@@ -235,6 +241,9 @@ _AUTO_RECALL_MODES: frozenset[str] = frozenset({"legacy", "hybrid"})
 # Lineage (W0): allowed values for ``lineage_mode``.
 # Invalid values fail closed to ``off``.
 _LINEAGE_MODES: frozenset[str] = frozenset({"off", "capture", "reconcile"})
+
+# C' (session_origin_mode): invalid values fail closed to ``off``.
+_SESSION_ORIGIN_MODES: frozenset[str] = frozenset({"off", "recorded"})
 
 
 def _as_lineage_mode(value: Any) -> str:
@@ -364,6 +373,9 @@ def _coerce(key: str, value: Any) -> Any:
         return _as_lineage_mode(value)
     if key == "tool_surface":
         return _as_tool_surface(value)
+    if key == "session_origin_mode":
+        candidate = value.strip().lower() if isinstance(value, str) else ""
+        return candidate if candidate in _SESSION_ORIGIN_MODES else "off"
     if key == "read_sources":
         return _as_read_sources(value)
     if isinstance(default, str):

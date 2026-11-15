@@ -1271,7 +1271,13 @@ def _assertion_metadata(payload: dict[str, Any]) -> dict[str, Any]:
     return metadata
 
 
-def inspect_point(qdrant: Any, collection_name: str, point_id: str, *, collection: str = "memory") -> dict[str, Any]:
+def inspect_point(qdrant: Any, collection_name: str, point_id: str, *, collection: str = "memory",
+                  state_db: str | None = None) -> dict[str, Any]:
+    """Compact metadata for one point.
+
+    A point carrying ``session_origin`` (C') also gets that origin disclosed, with each
+    citation's current status re-checked read-only against ``state_db``.
+    """
     point = retrieve_point(qdrant, collection_name, point_id, with_payload=True, with_vector=False)
     result: dict[str, Any] = {
         "found": point is not None,
@@ -1295,6 +1301,10 @@ def inspect_point(qdrant: Any, collection_name: str, point_id: str, *, collectio
     if text:
         snippet, _ = _bounded_text(" ".join(text.split()), 240)
         result["snippet"] = snippet
+    if "session_origin" in payload:
+        from qdrant_memory.session_origin import describe_session_origin
+
+        result["session_origin"] = describe_session_origin(payload["session_origin"], state_db=state_db)
     return _compact_status_response(result)
 
 
