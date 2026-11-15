@@ -94,7 +94,13 @@ from qdrant_memory.session_recall import (
     SessionRecallError,
     build_session_recall,
 )
-from qdrant_memory.retriever import MemoryRetriever, format_for_prompt, format_hybrid_for_prompt
+from qdrant_memory.retriever import (
+    MemoryRetriever,
+    above_auto_recall_floor,
+    format_for_prompt,
+    format_hybrid_for_prompt,
+    too_short_for_recall,
+)
 from qdrant_memory.sources import expand_point, inspect_point, retrieve_point, source_status_for_point, trace_point
 from qdrant_memory.proposals import proposal_draft_metadata, write_proposal_draft
 from qdrant_memory.source_extraction import (
@@ -948,6 +954,8 @@ class QdrantMemoryProvider(MemoryProvider):
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if not self._active or not self._config.get("auto_recall") or not query.strip() or not self._retriever:
             return ""
+        if too_short_for_recall(query, self._config.get("auto_recall_min_word_chars")):
+            return ""
         sid = session_id or self._session_id or "default"
         # Phase 6I: determine the active auto-recall mode.
         active_mode = str(self._config.get("auto_recall_mode") or "legacy").strip().lower()
@@ -978,8 +986,7 @@ class QdrantMemoryProvider(MemoryProvider):
             if not result:
                 # Hybrid fallback to legacy dense formatted result.
                 try:
-                    chunks = (self._memory_recall() or self._retriever).search(query, top_k=int(self._config["auto_recall_top_k"]), update_access=False)
-                    result = format_for_prompt(chunks, int(self._config["display_tokens"]))
+                    result = self._legacy_recall_block(query)
                 except Exception:
                     logger.debug("Qdrant prefetch legacy fallback failed", exc_info=True)
                     result = ""
@@ -988,8 +995,7 @@ class QdrantMemoryProvider(MemoryProvider):
             # dense search + format path. This is the legacy behavior the
             # prompt-context contract relies on.
             try:
-                chunks = (self._memory_recall() or self._retriever).search(query, top_k=int(self._config["auto_recall_top_k"]), update_access=False)
-                result = format_for_prompt(chunks, int(self._config["display_tokens"]))
+                result = self._legacy_recall_block(query)
             except Exception:
                 logger.debug("Qdrant prefetch failed", exc_info=True)
                 result = ""
@@ -1020,6 +1026,22 @@ class QdrantMemoryProvider(MemoryProvider):
         if self._config.get("session_prefetch_enabled"):
             return self._with_session_prefetch(query, session_id or self._session_id, result)
         return result
+
+    def _legacy_recall_block(self, query: str) -> str:
+        """The legacy auto-recall block: dense top-k, the relevance floor, the formatter.
+
+        Below ``auto_recall_min_final_score`` / ``auto_recall_min_raw_score`` a memory is
+        left out; with none left the block is ``""`` (no header).
+        """
+        chunks = (self._memory_recall() or self._retriever).search(
+            query, top_k=int(self._config["auto_recall_top_k"]), update_access=False
+        )
+        chunks = above_auto_recall_floor(
+            chunks,
+            float(self._config.get("auto_recall_min_final_score") or 0.0),
+            float(self._config.get("auto_recall_min_raw_score") or 0.0),
+        )
+        return format_for_prompt(chunks, int(self._config["display_tokens"]))
 
     def _with_session_prefetch(self, query: str, session_id: str, legacy: str) -> str:
         """Append the session-recall lane to ``legacy``; fail-open to ``legacy`` unchanged.
@@ -1076,6 +1098,8 @@ class QdrantMemoryProvider(MemoryProvider):
         # matches the prefetch fallback semantics.
         if not self._active or not self._executor or not self._retriever or not self._config.get("auto_recall") or not query.strip():
             return
+        if too_short_for_recall(query, self._config.get("auto_recall_min_word_chars")):
+            return
         sid = session_id or self._session_id or "default"
         active_mode = str(self._config.get("auto_recall_mode") or "legacy").strip().lower()
         if active_mode not in ("legacy", "hybrid"):
@@ -1088,8 +1112,7 @@ class QdrantMemoryProvider(MemoryProvider):
                     formatted = self._run_hybrid_prefetch(query)
                 if not formatted:
                     # Legacy dense path (always the fallback).
-                    chunks = (self._memory_recall() or self._retriever).search(query, top_k=int(self._config["auto_recall_top_k"]), update_access=False)
-                    formatted = format_for_prompt(chunks, int(self._config["display_tokens"]))
+                    formatted = self._legacy_recall_block(query)
                 with self._prefetch_lock:
                     self._prefetch_cache[sid] = formatted
             except Exception:

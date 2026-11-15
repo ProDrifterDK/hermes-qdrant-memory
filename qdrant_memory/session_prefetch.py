@@ -28,16 +28,21 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping
 
+from qdrant_memory.host_markers import is_host_injected
 from qdrant_memory.lesson_extractor import contains_secret, redact_secret_spans
 from qdrant_memory.retriever import prompt_char_cap
 from qdrant_memory.session_recall import (
     _ELIGIBLE,
     AUTHORITY,
+    HEADER_RE as _HEADER_RE,
     TOP_K_MAX,
     SessionRecall,
     SessionRecallError,
     connect_state_db,
+    conversation_text,
+    dangling_header as _dangling_header,
     session_chain,
+    window_segments as _segments,
 )
 
 PREFETCH_SCOPES = ("current", "all")
@@ -45,8 +50,6 @@ PREFETCH_SCOPES = ("current", "all")
 MIN_LANE_CHARS = 200
 # Hard ceiling shared with the plugin's other prompt-context budgets.
 HARD_LANE_CHARS = 16000
-# ``serialize_session`` line header: ``[YYYY-MM-DD HH:MM role] ``.
-_HEADER_RE = re.compile(r"(?m)^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} (?:user|assistant)\] ")
 EXPAND_TOOL = "qdrant_memory_session_expand"
 # Time kept back from the lane budget for the work after the rerank (state.db reads and
 # formatting, a few milliseconds) and the hand-off to the waiting turn, so a reranker
@@ -63,6 +66,16 @@ def _clamp(value: Any, default: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, number))
 
 
+def _floor(value: Any) -> float | None:
+    """A relevance floor from config: a number, or None (off) for null, "" or garbage."""
+    if value is None or isinstance(value, bool) or (isinstance(value, str) and not value.strip()):
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
 @dataclass(frozen=True)
 class PrefetchSettings:
     scope: str = "current"
@@ -72,6 +85,10 @@ class PrefetchSettings:
     rerank: bool = True
     candidates: int = 32
     timeout_s: float = 2.0
+    # Relevance floors (None = off). A reranked result is judged by its rerank score, a
+    # dense-ordered one (no reranker, or the reranker failed) by its cosine similarity.
+    min_rerank_score: float | None = None
+    min_dense_score: float | None = None
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "PrefetchSettings":
@@ -92,7 +109,15 @@ class PrefetchSettings:
             rerank=bool(config.get("session_prefetch_rerank", True)),
             candidates=int(_clamp(config.get("session_prefetch_candidates"), 32, 1, 128)),
             timeout_s=_clamp(config.get("session_prefetch_timeout_s"), 2.0, 0.1, 30.0),
+            min_rerank_score=_floor(config.get("session_prefetch_min_rerank_score")),
+            min_dense_score=_floor(config.get("session_prefetch_min_dense_score")),
         )
+
+    def admits(self, rerank_score: float | None, dense_score: float | None) -> bool:
+        """Whether a result clears the floor of the scale it was ordered by."""
+        if rerank_score is not None:
+            return self.min_rerank_score is None or float(rerank_score) >= self.min_rerank_score
+        return self.min_dense_score is None or float(dense_score or 0.0) >= self.min_dense_score
 
     def lane_budget(self, legacy_chars: int) -> int:
         """Characters left for the lane: its own cap, within the budget shared with legacy."""
@@ -147,27 +172,6 @@ def load_active_view(conn: sqlite3.Connection, session_id: str) -> ActiveView:
 _HEADER_TAIL_RE = re.compile(r"^[\d :-]*[a-z]{0,9}\] ")
 
 
-def _segments(text: str) -> list[str]:
-    """Split a window at its message headers; a leading partial message is its own segment."""
-    starts = [m.start() for m in _HEADER_RE.finditer(text)]
-    if not starts or starts[0] != 0:
-        starts.insert(0, 0)
-    return [text[a:b] for a, b in zip(starts, starts[1:] + [len(text)])]
-
-
-def _dangling_header(text: str) -> int:
-    """Start of a header the window's end cut through (``\\n[2026-10``), else -1.
-
-    That header belongs to the next message, which the window's ``last_msg_id`` counts
-    although none of its content is inside the window.
-    """
-    cut = text.rfind("\n") + 1
-    tail = text[cut:]
-    if cut and tail.startswith("[") and "] " not in tail and not _HEADER_RE.match(tail):
-        return cut
-    return -1
-
-
 def hidden_text(
     conn: sqlite3.Connection, view: ActiveView, result: Mapping[str, Any], emitted: str = ""
 ) -> tuple[str, int | None]:
@@ -183,16 +187,23 @@ def hidden_text(
     with fresh ids. When the mapping does not line up (a message that itself contains a
     header-shaped line, or rows changed since indexing), a window of the caller's own
     session is dropped whole; a window of another session keeps only text-checked segments.
+
+    ``result`` text comes from the window search, which already cut host scaffolding out
+    (``conversation_text``); its rows are left out of the mapping here the same way.
     """
     sid = str(result.get("session_id") or "")
     text = str(result.get("text") or "")
     first, last = int(result.get("first_msg_id") or 0), int(result.get("last_msg_id") or 0)
     flags = ", m.active, m.compacted" if view.has_flags else ""
-    rows = conn.execute(
-        f"SELECT m.id{flags} FROM messages m WHERE m.session_id = ? AND m.id BETWEEN ? AND ? "
-        f"AND {_ELIGIBLE} ORDER BY m.id",
-        (sid, first, last),
-    ).fetchall()
+    rows = [
+        row[:-1]
+        for row in conn.execute(
+            f"SELECT m.id{flags}, m.content FROM messages m WHERE m.session_id = ? AND m.id BETWEEN ? AND ? "
+            f"AND {_ELIGIBLE} ORDER BY m.id",
+            (sid, first, last),
+        ).fetchall()
+        if not is_host_injected(row[-1])
+    ]
     dangling = _dangling_header(text)
     if dangling >= 0:
         text = text[:dangling]
@@ -227,6 +238,8 @@ class _Entry:
     label: str
     msg_id: int | None
     text: str
+    dense_score: float | None = None
+    rerank_score: float | None = None
 
 
 def format_session_block(entries: list[_Entry], budget_chars: int, *, expand_hint: bool) -> str:
@@ -269,6 +282,7 @@ class SessionPrefetchLane:
         self.recall = recall
         self.settings = settings
         self.expand_hint = expand_hint
+        self.last_rerank = ""  # the window search's rerank status of the last collect
 
     def build(
         self, query: str, session_id: str, budget_chars: int, *, before: Any = None, deadline: float | None = None
@@ -278,14 +292,28 @@ class SessionPrefetchLane:
         ``deadline`` is the ``time.monotonic()`` instant the caller stops waiting (default:
         ``timeout_s`` from now). The rerank call must end ``FINISH_RESERVE_S`` before it,
         whatever time the embedding and the dense search took, so a slow or sleeping
-        reranker degrades to dense order that still reaches the turn.
+        reranker degrades to dense order that still reaches the turn. Results below the
+        relevance floor are left out; when none is left the block is ``""``, not a header.
+        """
+        if budget_chars < MIN_LANE_CHARS:
+            return ""
+        entries = self.collect(query, session_id, before=before, deadline=deadline)
+        return format_session_block(entries[: self.settings.top_k], budget_chars, expand_hint=self.expand_hint)
+
+    def collect(
+        self, query: str, session_id: str, *, before: Any = None, deadline: float | None = None, floors: bool = True
+    ) -> list[_Entry]:
+        """The lane's entries in rank order, each with its scores; ``build`` formats them.
+
+        With ``floors=False`` the relevance floors are not applied (measurement only: the
+        floors cut a suffix of the rank order, so applying them afterwards is equivalent).
         """
         if deadline is None:
             deadline = time.monotonic() + self.settings.timeout_s
         rerank_deadline = deadline - min(FINISH_RESERVE_S, self.settings.timeout_s / 4)
         query = str(query or "").strip()
-        if not query or budget_chars < MIN_LANE_CHARS:
-            return ""
+        if not query:
+            return []
         base = self.recall.settings
         conn = connect_state_db(base.state_db)
         try:
@@ -293,7 +321,7 @@ class SessionPrefetchLane:
             view = load_active_view(conn, session_id)
             if self.settings.scope == "current" and (not chain or (len(chain) == 1 and view.hidden_ceiling is None)):
                 # Nothing of this conversation has left the prompt: no search at all.
-                return ""
+                return []
             exclude: list[dict[str, Any]] = []
             if session_id:
                 own = {"key": "session_id", "match": {"value": session_id}}
@@ -320,10 +348,13 @@ class SessionPrefetchLane:
                 query, scope=self.settings.scope, chain=chain, top_k=fetch, before=before, exclude=exclude,
                 rerank_deadline=rerank_deadline,
             )
+            self.last_rerank = str(found.get("rerank") or "")
             chain_ids = set(chain)
             entries: list[_Entry] = []
             emitted = ""
             for result in found.get("results") or []:
+                if floors and not self.settings.admits(result.get("rerank_score"), result.get("dense_score")):
+                    continue
                 text, msg_id = hidden_text(conn, view, result, emitted)
                 text = redact_secret_spans(" ".join(text.split()))
                 if not text or contains_secret(text):
@@ -331,12 +362,13 @@ class SessionPrefetchLane:
                 emitted += "\n" + _norm(text)
                 where = "this conversation, compacted" if result.get("session_id") in chain_ids else "another session"
                 day = str(result.get("start_time") or "")[:10]
-                entries.append(_Entry(f"{where}, {day}" if day else where, msg_id, text))
-                if len(entries) >= self.settings.top_k:
+                entries.append(_Entry(f"{where}, {day}" if day else where, msg_id, text,
+                                      result.get("dense_score"), result.get("rerank_score")))
+                if floors and len(entries) >= self.settings.top_k:
                     break
         finally:
             conn.close()
-        return format_session_block(entries, budget_chars, expand_hint=self.expand_hint)
+        return entries
 
 
 # --- expand -------------------------------------------------------------------
@@ -392,28 +424,40 @@ def expand_messages(
     return _expand_from_windows(recall, int(msg_id), session_id, max_chars)
 
 
+# Extra rows read per side so that skipped scaffolding (runs of process notifications) still
+# leaves ``before``/``after`` real neighbours in most sessions.
+_EXPAND_SCAFFOLD_SLACK = 64
+
+
 def _expand_from_db(conn, sid, msg_id, current_session_id, before, after, max_chars) -> dict[str, Any]:
     has_flags = _has_flags(conn)
     flags = ", m.active, m.compacted" if has_flags else ""
-    # Undone / superseded rows are not part of the conversation's history; skip them as neighbours.
+    # Undone / superseded rows are not part of the conversation's history; skip them as neighbours,
+    # and host scaffolding (compaction summaries, notifications: see host_markers) too.
     kept = " AND NOT (m.active = 0 AND m.compacted = 0)" if has_flags else ""
     cols = f"m.id, m.role, m.content, m.timestamp{flags}"
-    earlier = conn.execute(
-        f"SELECT {cols} FROM messages m WHERE m.session_id = ? AND m.id < ? AND {_ELIGIBLE}{kept} "
-        "ORDER BY m.id DESC LIMIT ?",
-        (sid, msg_id, int(before)),
-    ).fetchall()
+
+    def neighbours(where: str, order: str, count: int) -> list[Any]:
+        rows = conn.execute(
+            f"SELECT {cols} FROM messages m WHERE m.session_id = ? AND m.id {where} ? AND {_ELIGIBLE}{kept} "
+            f"ORDER BY m.id {order} LIMIT ?",
+            (sid, msg_id, int(count) + _EXPAND_SCAFFOLD_SLACK),
+        ).fetchall()
+        return [r for r in rows if not is_host_injected(r[2])][: int(count)]
+
+    earlier = neighbours("<", "DESC", before)
     target = conn.execute(f"SELECT {cols} FROM messages m WHERE m.id = ?", (msg_id,)).fetchall()
-    later = conn.execute(
-        f"SELECT {cols} FROM messages m WHERE m.session_id = ? AND m.id > ? AND {_ELIGIBLE}{kept} "
-        "ORDER BY m.id LIMIT ?",
-        (sid, msg_id, int(after)),
-    ).fetchall()
+    later = neighbours(">", "", after)
     rows = list(reversed(earlier)) + target + later
-    texts, truncated = _fit([redact_secret_spans(str(r[2] or "").strip()) for r in rows], max_chars)
+    scaffolding = {int(r[0]) for r in target if is_host_injected(r[2])}
+    texts, truncated = _fit(
+        ["" if int(r[0]) in scaffolding else redact_secret_spans(str(r[2] or "").strip()) for r in rows], max_chars
+    )
     messages = []
     for r, text in zip(rows, texts):
         item = {"msg_id": int(r[0]), "role": r[1], "time": _iso(r[3]), "text": text}
+        if int(r[0]) in scaffolding:
+            item["host_scaffolding"] = True  # written by the host, not said by anyone: text withheld
         if has_flags:
             active, compacted = int(r[4]), int(r[5])
             item["state"] = "active" if active else ("compacted" if compacted else "retracted")
@@ -448,10 +492,16 @@ def _expand_from_windows(recall: SessionRecall, msg_id: int, session_id: str, ma
         raise SessionRecallError(
             f"message {msg_id} is not in state.db (pruned or never stored) and no indexed window contains it"
         )
+    # The rows are gone, so each window is judged by its own text (see conversation_text).
     payloads = sorted(
-        (p.get("payload") or {} for p in points),
+        ({**payload, "text": conversation_text(None, payload)} for payload in (p.get("payload") or {} for p in points)),
         key=lambda p: (str(p.get("session_id") or ""), int(p.get("char_start") or 0)),
     )
+    payloads = [p for p in payloads if str(p.get("text") or "").strip()]
+    if not payloads:
+        raise SessionRecallError(
+            f"message {msg_id} is not in state.db and the indexed windows that contain it hold only host scaffolding"
+        )
     texts, truncated = _fit([redact_secret_spans(str(p.get("text") or "")) for p in payloads], max_chars)
     return {
         "context_not_instruction": True,

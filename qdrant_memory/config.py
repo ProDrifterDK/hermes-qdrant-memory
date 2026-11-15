@@ -70,6 +70,14 @@ DEFAULTS: dict[str, Any] = {
     "scope_mode": "profile",
     "min_raw_score": 0.0,
     "min_final_score": 0.0,
+    # Automatic recall only (the legacy block): memories below these are not injected; with none
+    # left the block is empty. 0 disables. Tool searches use min_raw_score/min_final_score.
+    # Measured on one install (docs/session-recall-prefetch.md, "Relevance floor"): 0.1 cut the
+    # legacy block on short confirmations from 41 of 41 turns to 1 within one gate hit.
+    "auto_recall_min_final_score": 0.1,
+    "auto_recall_min_raw_score": 0.0,
+    # Messages with fewer letters/digits than this skip automatic recall (legacy and lane).
+    "auto_recall_min_word_chars": 12,
     "provenance_ranking_enabled": True,
     "qdrant_api_key": "",
     "embedding_api_key": "",
@@ -145,6 +153,11 @@ DEFAULTS: dict[str, Any] = {
     "session_prefetch_rerank": True,
     "session_prefetch_candidates": 32,
     "session_prefetch_timeout_s": 2.0,
+    # Lane relevance floors: a reranked excerpt needs at least min_rerank_score, a dense-ordered
+    # one (no reranker, or it failed) at least min_dense_score (cosine). "" or "off" disables.
+    # Calibrated for bge-reranker-v2-m3 logits and bge-m3 cosine; re-derive for other models.
+    "session_prefetch_min_rerank_score": -1.5,
+    "session_prefetch_min_dense_score": 0.55,
     # Opt-in read-only tool qdrant_memory_session_expand (messages around a msg id).
     "session_expand_enabled": False,
     # C' session origin: ``off`` (default) keeps manual-store payloads, schemas and outputs
@@ -198,6 +211,7 @@ _INT_KEYS = {
     "embedding_max_input_chars",
     "embedding_max_chunks",
     "auto_recall_top_k",
+    "auto_recall_min_word_chars",
     "search_candidates",
     "max_chunk_tokens",
     "display_tokens",
@@ -230,7 +244,7 @@ _INT_KEYS = {
     "session_prefetch_total_chars",
     "session_prefetch_candidates",
 }
-_FLOAT_KEYS = {"session_prefetch_timeout_s", "session_recall_rerank_timeout_s", "session_recall_inline_catchup_seconds", "decay_rate", "min_raw_score", "min_final_score", "learning_auto_extract_min_confidence", "learning_auto_extract_semantic_dedupe_threshold", "source_extraction_min_confidence", "consolidation_duplicate_threshold", "guarded_auto_duplicate_min_confidence", "guarded_auto_learning_min_confidence", "reconsolidation_min_confidence", "manual_store_duplicate_threshold", "lineage_lock_timeout_seconds"}
+_FLOAT_KEYS = {"session_prefetch_timeout_s", "session_recall_rerank_timeout_s", "session_recall_inline_catchup_seconds", "decay_rate", "min_raw_score", "min_final_score", "auto_recall_min_final_score", "auto_recall_min_raw_score", "learning_auto_extract_min_confidence", "learning_auto_extract_semantic_dedupe_threshold", "source_extraction_min_confidence", "consolidation_duplicate_threshold", "guarded_auto_duplicate_min_confidence", "guarded_auto_learning_min_confidence", "reconsolidation_min_confidence", "manual_store_duplicate_threshold", "lineage_lock_timeout_seconds"}
 _LIST_KEYS = {"index_dirs", "index_extensions", "index_exclude_dirs", "session_recall_exclude_sources"}
 
 

@@ -531,6 +531,11 @@ qdrant_memory:
   distance: Cosine
   auto_recall: true
   auto_recall_top_k: 5
+  # Relevance floor of automatic recall (legacy block) and the short-message skip;
+  # see docs/session-recall-prefetch.md "Relevance floor".
+  auto_recall_min_final_score: 0.1
+  auto_recall_min_raw_score: 0.0
+  auto_recall_min_word_chars: 12
   search_candidates: 20
   decay_rate: 0.001
   max_chunk_tokens: 256

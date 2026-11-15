@@ -35,6 +35,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
+from qdrant_memory.host_markers import is_host_injected
 from qdrant_memory.lesson_extractor import redact_secret_spans
 from qdrant_memory.lineage import collection_write_lock
 
@@ -239,6 +240,82 @@ def serialize_session(rows: Iterable[tuple[int, str, str, float]]) -> Serialized
         parts.append(line)
         pos += len(line)
     return SerializedSession("".join(parts), marks)
+
+
+# ``serialize_session`` line header: ``[YYYY-MM-DD HH:MM role] ``.
+HEADER_RE = re.compile(r"(?m)^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} (?:user|assistant)\] ")
+
+
+def window_segments(text: str) -> list[str]:
+    """Split a window at its message headers; a leading partial message is its own segment."""
+    starts = [m.start() for m in HEADER_RE.finditer(text)]
+    if not starts or starts[0] != 0:
+        starts.insert(0, 0)
+    return [text[a:b] for a, b in zip(starts, starts[1:] + [len(text)])]
+
+
+def dangling_header(text: str) -> int:
+    """Start of a header the window's end cut through (``\\n[2026-10``), else -1.
+
+    That header belongs to the next message, which the window's ``last_msg_id`` counts
+    although none of its content is inside the window.
+    """
+    cut = text.rfind("\n") + 1
+    tail = text[cut:]
+    if cut and tail.startswith("[") and "] " not in tail and not HEADER_RE.match(tail):
+        return cut
+    return -1
+
+
+def conversation_text(conn: sqlite3.Connection | None, payload: Mapping[str, Any]) -> str:
+    """A window's text without the messages the host wrote (see ``host_markers``).
+
+    Each segment is attributed to its ``state.db`` row (the window's eligible rows in id
+    order, as indexed) and dropped when that row is host scaffolding, so a window that
+    starts inside a compaction summary loses that part although no header names it.
+    Fail-closed when attribution is impossible:
+
+    * the rows are gone (the host pruned the session): only segments that start with a
+      header are kept, each judged by its own text, so a leading part of a message whose
+      start is not in the window is dropped;
+    * the segments do not line up with the rows and one of the rows is scaffolding: the
+      whole window is dropped.
+
+    ``conn=None`` (no readable ``state.db``, so provenance is unknown rather than gone)
+    judges every segment by its own text, the leading one included.
+
+    Returns the text unchanged when nothing in it is scaffolding, and ``""`` when nothing
+    else is left. A kept cut-off header at the end stays, so the result still maps onto
+    the window's non-scaffolding rows.
+    """
+    text = str(payload.get("text") or "")
+    cut = dangling_header(text)
+    body, tail = (text[:cut], text[cut:]) if cut >= 0 else (text, "")
+    segments = window_segments(body)
+    if conn is None:
+        kept = [s for s in segments if not is_host_injected(HEADER_RE.sub("", s, count=1))]
+        return text if len(kept) == len(segments) else "".join(kept)
+    rows = conn.execute(
+        f"SELECT m.id, m.content FROM messages m WHERE m.session_id = ? AND m.id BETWEEN ? AND ? "
+        f"AND {_ELIGIBLE} ORDER BY m.id",
+        (str(payload.get("session_id") or ""), int(payload.get("first_msg_id") or 0),
+         int(payload.get("last_msg_id") or 0)),
+    ).fetchall()
+    if not rows:
+        kept = [s for s in segments if HEADER_RE.match(s) and not is_host_injected(HEADER_RE.sub("", s, count=1))]
+        return text if len(kept) == len(segments) else "".join(kept)
+    host = [is_host_injected(row[1]) for row in rows]
+    if not any(host):
+        return text
+    tail_host = bool(host[-1]) if cut >= 0 else False
+    if cut >= 0:
+        host = host[:-1]
+    if len(host) != len(segments):
+        return ""
+    kept = [segment for segment, scaffolding in zip(segments, host) if not scaffolding]
+    if not kept:
+        return ""
+    return "".join(kept) + ("" if tail_host else tail)
 
 
 def window_starts(length: int, window_chars: int, overlap_chars: int) -> list[int]:
@@ -912,6 +989,9 @@ class SessionRecall:
         hits = self.qdrant.search(settings.collection, vector, fetch_limit, filter=query_filter or None)
         timings["dense_s"] = round(self.clock() - t0, 3)
         candidates_raw = len(hits)
+        t0 = self.clock()
+        hits, host_dropped = self._without_host_text(hits)
+        timings["host_filter_s"] = round(self.clock() - t0, 3)
         pool: list[CandidateGroup] = []
         if settings.dedup and hits:
             t0 = self.clock()
@@ -919,7 +999,7 @@ class SessionRecall:
             timings["dedup_s"] = round(self.clock() - t0, 3)
         else:
             pool = [CandidateGroup(hit, [hit]) for hit in hits]
-        duplicates_collapsed = candidates_raw - len(pool)
+        duplicates_collapsed = candidates_raw - host_dropped - len(pool)
         ordered: list[tuple[CandidateGroup, float | None]] = [(group, None) for group in pool]
         left = None if rerank_deadline is None else rerank_deadline - time.monotonic()
         if not settings.rerank_url:
@@ -979,12 +1059,42 @@ class SessionRecall:
             "candidates": len(pool),
             "candidates_raw": candidates_raw,
             "duplicates_collapsed": duplicates_collapsed,
+            "host_text_dropped": host_dropped,
             "count": len(results),
             "results": results,
             "context_used_chars": used,
             "truncated": truncated,
             "timings": timings,
         }
+
+    def _without_host_text(self, hits: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+        """Hits with host scaffolding cut out of their text (``conversation_text``), before
+        dedup and rerank see them; hits left with no conversation are dropped.
+
+        Returns the kept hits and how many were dropped whole. Without a readable
+        ``state.db`` every window is judged by its text alone."""
+        if not hits:
+            return hits, 0
+        try:
+            conn: sqlite3.Connection | None = connect_state_db(self.settings.state_db)
+        except Exception:
+            conn = None
+        kept: list[dict[str, Any]] = []
+        try:
+            for hit in hits:
+                payload = hit.get("payload") or {}
+                original = str(payload.get("text") or "")
+                text = conversation_text(conn, payload)
+                if not text.strip():
+                    continue
+                if text != original:
+                    payload = {**payload, "text": text, "text_sha256": _sha256(text)}
+                    hit = {**hit, "payload": payload}
+                kept.append(hit)
+        finally:
+            if conn is not None:
+                conn.close()
+        return kept, len(hits) - len(kept)
 
     def status(self) -> dict[str, Any]:
         settings = self.settings
