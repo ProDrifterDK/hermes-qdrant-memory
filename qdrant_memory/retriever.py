@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from .config import min_word_chars as _min_word_chars, relevance_floor
+from .host_markers import is_host_injected
 from .schema import now_iso, valid_fact_status, valid_memory_kind
 from .ranking import RankingContext, RankingPolicy, query_requests_review_history, rank_memory_candidate
 from .scoring import final_memory_score, normalize_minmax, recency_score
@@ -159,6 +162,64 @@ def _payload_allowed(
     if not _payload_bool_allowed(payload.get("requires_review"), requires_review):
         return False
     return _payload_bool_allowed(payload.get("canonical"), canonical)
+
+
+def _conversation_scaffolding(payload: dict[str, Any]) -> bool:
+    """A conversation-turn point whose user or assistant side is host scaffolding.
+
+    The turn writer stored whatever the host passed as the user message, including
+    background-process reports, compaction handoffs and steer frames (see host_markers).
+    Only conversation-sourced points are judged: documents and manual facts are text
+    someone chose to keep, even when it quotes the host.
+    """
+    if not (payload.get("source_type") == "conversation" or payload.get("memory_kind") == "conversation_turn"):
+        return False
+    text = str(payload.get("text") or "")
+    if text.startswith("User: ") and "\nAssistant: " in text:
+        user, assistant = text[len("User: "):].split("\nAssistant: ", 1)
+        return is_host_injected(user) or is_host_injected(assistant)
+    return is_host_injected(text)
+
+
+def above_auto_recall_floor(
+    chunks: list["RetrievedMemory"], min_final_score: Any = None, min_raw_score: Any = None
+) -> list["RetrievedMemory"]:
+    """Automatic recall's relevance floor: chunks below either threshold are left out.
+
+    ``final_score`` is the ranked score (min-max normalized similarity x importance x
+    recency x provenance); ``qdrant_score`` the raw cosine similarity. A sparse-only hit
+    has no raw score and is judged by its final score alone. Tool searches do not use it.
+    A floor that is off ("off", "", None or 0, see ``config.relevance_floor``) is not
+    applied, so with both off the chunks come back unchanged.
+    """
+    final_floor = relevance_floor(min_final_score, zero_is_off=True)
+    raw_floor = relevance_floor(min_raw_score, zero_is_off=True)
+    if final_floor is None and raw_floor is None:
+        return list(chunks)
+    out = []
+    for chunk in chunks:
+        if final_floor is not None and chunk.final_score < final_floor:
+            continue
+        if raw_floor is not None and chunk.qdrant_score and chunk.qdrant_score < raw_floor:
+            continue
+        out.append(chunk)
+    return out
+
+
+_WORD_CHAR_RE = re.compile(r"\w")
+
+
+def too_short_for_recall(query: str, min_word_chars: Any) -> bool:
+    """True when a message has fewer than ``min_word_chars`` letters/digits (any script).
+
+    Such messages are confirmations, choices and pings ("ok", "dale", "lanzalo", "1. a",
+    "estatus?"); they point at the live conversation, which is already in the prompt, and
+    a similarity search with them returns whatever shares a word. "off", "", None or 0
+    disables (the default). One CJK character carries about a word, so CJK-heavy profiles
+    want a lower value.
+    """
+    limit = _min_word_chars(min_word_chars)
+    return limit > 0 and len(_WORD_CHAR_RE.findall(str(query or ""))) < limit
 
 
 def _extend_search_filter_conditions(
@@ -704,6 +765,8 @@ class MemoryRetriever:
                 requires_review=requires_review,
                 canonical=canonical,
             ):
+                continue
+            if _conversation_scaffolding(payload):
                 continue
             raw_score = float(candidate.dense_score)
             if raw_score and raw_score < self.min_raw_score:

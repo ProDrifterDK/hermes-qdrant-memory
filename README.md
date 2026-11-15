@@ -531,6 +531,12 @@ qdrant_memory:
   distance: Cosine
   auto_recall: true
   auto_recall_top_k: 5
+  # Relevance floors of automatic recall and the short-message skip, off by default
+  # ("off", "" or null). Values measured for bge-m3 with bge-reranker-v2-m3 are in
+  # docs/session-recall-prefetch.md "Relevance floor"; re-derive them for other models.
+  auto_recall_min_final_score: off
+  auto_recall_min_raw_score: off
+  auto_recall_min_word_chars: off
   search_candidates: 20
   decay_rate: 0.001
   max_chunk_tokens: 256
