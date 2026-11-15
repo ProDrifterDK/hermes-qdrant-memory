@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any, Mapping
+
+logger = logging.getLogger(__name__)
 
 DEFAULTS: dict[str, Any] = {
     "enabled": True,
@@ -129,7 +132,17 @@ DEFAULTS: dict[str, Any] = {
     "session_recall_lag_warn_messages": 500,
     "session_recall_inline_catchup_seconds": 8.0,
     "session_recall_dedup": True,
+    # Tool surface: ``full`` exposes every tool (default); ``recall`` exposes only the
+    # read-mostly recall tools in tools.RECALL_TOOL_NAMES. Unknown values fall back to ``full``.
+    "tool_surface": "full",
+    # Extra read-only sources merged into recall: a list of
+    # {collection, profile_id (null = no profile filter), kind: memory|learning}.
+    # The client refuses every mutating request against these collections.
+    "read_sources": [],
 }
+
+TOOL_SURFACES: frozenset[str] = frozenset({"full", "recall"})
+READ_SOURCE_KINDS: frozenset[str] = frozenset({"memory", "learning"})
 
 _BOOL_KEYS = {
     "enabled",
@@ -215,6 +228,55 @@ def _as_lineage_mode(value: Any) -> str:
     return "off"
 
 
+def _as_tool_surface(value: Any) -> str:
+    """Coerce ``tool_surface``; anything unrecognized falls back to ``full``."""
+    if isinstance(value, str) and value.strip().lower() in TOOL_SURFACES:
+        return value.strip().lower()
+    logger.warning("qdrant_memory.tool_surface=%r is not one of %s; using 'full'", value, sorted(TOOL_SURFACES))
+    return "full"
+
+
+def _as_read_sources(value: Any) -> list[dict[str, Any]]:
+    """Normalize ``read_sources``; malformed entries are dropped with a warning."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value) if value.strip() else []
+        except Exception:
+            logger.warning("qdrant_memory.read_sources is not valid JSON; ignoring it")
+            return []
+    if not isinstance(value, (list, tuple)):
+        logger.warning("qdrant_memory.read_sources must be a list; ignoring it")
+        return []
+    sources: list[dict[str, Any]] = []
+    seen: set[tuple[str, Any, str]] = set()
+    for entry in value:
+        if not isinstance(entry, Mapping):
+            logger.warning("qdrant_memory.read_sources entry %r is not a mapping; skipping it", entry)
+            continue
+        collection = str(entry.get("collection") or "").strip()
+        kind = str(entry.get("kind") or "memory").strip().lower()
+        raw_profile = entry.get("profile_id")
+        profile_id = str(raw_profile).strip() if raw_profile is not None else ""
+        if not collection or kind not in READ_SOURCE_KINDS:
+            logger.warning("qdrant_memory.read_sources entry %r needs a collection and kind memory|learning; skipping it", dict(entry))
+            continue
+        source = {"collection": collection, "profile_id": profile_id or None, "kind": kind}
+        key = (collection, source["profile_id"], kind)
+        if key not in seen:
+            seen.add(key)
+            sources.append(source)
+    return sources
+
+
+def read_source_collections(config: Mapping[str, Any]) -> frozenset[str]:
+    """Collection names the Qdrant client must treat as read-only."""
+    return frozenset(
+        str(source.get("collection") or "")
+        for source in config.get("read_sources") or []
+        if isinstance(source, Mapping) and source.get("collection")
+    )
+
+
 def _as_auto_recall_mode(value: Any) -> str:
     """Coerce ``auto_recall_mode`` to ``legacy`` or ``hybrid``.
 
@@ -278,6 +340,10 @@ def _coerce(key: str, value: Any) -> Any:
         return _as_auto_recall_mode(value)
     if key == "lineage_mode":
         return _as_lineage_mode(value)
+    if key == "tool_surface":
+        return _as_tool_surface(value)
+    if key == "read_sources":
+        return _as_read_sources(value)
     if isinstance(default, str):
         return str(value)
     return value
@@ -342,5 +408,16 @@ def load_config(*, hermes_home: str | None = None, hermes_config: Mapping[str, A
             "session_recall_collection must differ from collection_name and "
             "learning_collection_name: the session recall indexer rewrites and deletes "
             "windows in its collection without any payload check"
+        )
+    # A read source is guarded read-only in the client, so it may never be one of the
+    # collections this provider writes: that would either block the provider's own
+    # writes or, worse, mean the "shared" source is really the provider's own.
+    own_collections = {memory_collection, learning_collection, session_collection} - {""}
+    clashing = sorted(read_source_collections(resolved) & own_collections)
+    if clashing:
+        raise ValueError(
+            f"read_sources must not name collections this provider writes ({', '.join(clashing)}); "
+            "set collection_name, learning_collection_name and session_recall_collection to "
+            "collections of this profile's own"
         )
     return resolved

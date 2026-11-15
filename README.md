@@ -928,6 +928,34 @@ Configuration (under `qdrant_memory:`):
 
 Session windows hold raw conversation text. Treat the collection like `state.db` itself. Exclude sources you do not want searchable, and delete the collection and its state file to remove the index.
 
+## Local or sovereign profile
+
+A slow local model (for example a 27B model on your own GPU) gains the most from recall: one recalled fact saves minutes of exploration. It pays the most for a large tool surface, because every tool schema is prefill on every cold load. Two opt-in settings cover this case. Profiles that set neither behave exactly as before.
+
+```yaml
+memory:
+  provider: qdrant
+qdrant_memory:
+  collection_name: hermes_memory_local27b
+  learning_collection_name: hermes_learnings_local27b
+  session_recall_collection: hermes_session_windows_local27b
+  tool_surface: recall
+  sync_turns: false
+  read_sources:
+    - {collection: hermes_memory, profile_id: default, kind: memory}
+    - {collection: hermes_learnings, profile_id: default, kind: learning}
+```
+
+**`tool_surface`** (`full` by default). `recall` exposes six tools instead of 26: `qdrant_memory_context`, `qdrant_memory_search`, `qdrant_memory_expand`, `qdrant_memory_session_recall`, `qdrant_learning_search` and `qdrant_memory_status`. That is about 1,500 schema tokens instead of about 6,100. The system prompt block names only those six. A call to any other plugin tool returns a tool error that names the active surface, and nothing runs. Any value other than `full` or `recall` falls back to `full` and logs a warning.
+
+**`read_sources`** (`[]` by default). Extra collections that recall reads but never writes. Each entry is `{collection, profile_id, kind}`. `kind` is `memory` or `learning`, and `profile_id: null` means no profile filter on that source. The read sources are searched by automatic recall (both `auto_recall_mode` values; in `hybrid` they join the dense lane, while graph and RAPTOR stay on the own collection), by `qdrant_memory_context`, by `qdrant_memory_search`, and, for `kind: learning`, by `qdrant_learning_search`. Their hits and the own collection's are scored together on one scale: the dense scores of all searched collections are min-max normalized as one pool before importance, recency, provenance ranking and `min_final_score` apply, so a closer match ranks higher whichever collection holds it. In tool output, each result carries `source_collection`. The injected prompt shows the same fields as before and no collection names. `qdrant_memory_expand` on an id that came from a read source finds it there and reports that `collection_name`. A read source that does not exist is skipped with a debug log and is never created.
+
+What is shared and what is not:
+
+- Shared, read-only: main's memories and learnings, filtered to `profile_id: default` in the example. The plugin never writes to a read source. The Qdrant client refuses every request against a read-source collection except collection info, search, scroll, retrieve and count. That refusal covers upserts, payload updates (including recall access counters), deletes, quarantine, consolidation, lineage writes, payload index creation and collection creation. It is enforced in the Qdrant client itself (the provider's client and the clients the CLI builds from the same config), which every request passes through, so a new code path cannot bypass it. A read source may not name this profile's own memory, learning or session collection; the provider refuses to load such a config.
+- Own, never read by other profiles: everything this profile writes goes to `collection_name` and `learning_collection_name`. `sync_turns: false` stops it from storing conversation turns at all. Its session history goes to its own `session_recall_collection`, indexed from its own `$HERMES_HOME/state.db` (the profile's home), with its own cursor file and lock. Session recall reads and writes only that collection. It never touches `hermes_session_windows`, and it does not read `read_sources`.
+- Not affected: main's profile has no `read_sources` and keeps reading only its own collections, so nothing the local profile writes reaches main's recall.
+
 ## Indexing safety
 
 Before indexing a broad directory:

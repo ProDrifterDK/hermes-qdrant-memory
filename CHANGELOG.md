@@ -9,6 +9,7 @@ This project is currently public beta / experimental. The format follows Keep a 
 ### Added
 
 - Session recall: `qdrant_memory_session_recall` and `hermes qdrant session-recall index|search|status`. The lane indexes `state.db` conversation history verbatim into its own collection (`hermes_session_windows`) as overlapping fixed-size windows and answers with a dense top-K search plus an optional cross-encoder rerank. `scope=current` covers the caller's session and its compressed ancestors and catches them up inline. The incremental per-session cursor reproduces a full rebuild exactly. A debounced background catch-up runs behind a shared single-writer lock, and a `session_recall_lag` doctor warning flags a stalled index. Secret spans are redacted before embedding and storage.
+- Local/sovereign profile lane (opt-in; defaults unchanged): `tool_surface: recall` exposes only the six recall tools (context, search, expand, session recall, learning search, status), names only those in the system prompt block, and refuses every other plugin tool with an error naming the surface. `read_sources` adds read-only collections (`{collection, profile_id, kind}`) that automatic recall (legacy and hybrid dense lane), `qdrant_memory_context`, `qdrant_memory_search`, `qdrant_learning_search` and `qdrant_memory_expand` read. Recall scores the own and read-source hits as one pool (one min-max normalization, then the usual importance/recency/provenance scoring and `min_final_score`), so scores from different collections are comparable. Tool output labels each hit with `source_collection`. See README "Local or sovereign profile".
 - Configurable embedding input chunking in `EmbeddingClient` via `qdrant_memory.embedding_max_input_chars` and `qdrant_memory.embedding_max_chunks`, covering conversation writes, learning writes, indexing, search queries, and CLI/script clients through one centralized guard.
 
 ### Changed
@@ -18,6 +19,7 @@ This project is currently public beta / experimental. The format follows Keep a 
 
 ### Safety
 
+- `QdrantClient` refuses every request against a `read_sources` collection except collection info, search, scroll, retrieve and count (an allow-list in `_request`, which every client method passes through), so no upsert, payload or access-counter update, delete, index or collection creation can reach a read source from any call site. Config load rejects a read source that names the provider's own memory, learning or session collection.
 - Embedding requests that exceed the local llama.cpp physical batch/context budget are split into bounded chunks and combined into one normalized vector instead of failing the memory write/search path. Oversize-server-error fallback remains in place for tokenizer/Unicode cases where char estimates are imperfect.
 
 ## [0.9.0]

@@ -192,6 +192,8 @@ def build_context_packet(*, template: str, topic: str, results: Iterable[Any]) -
         fact_status = metadata.get("fact_status")
         if fact_status:
             entry["fact_status"] = fact_status
+        if item.get("source_collection"):
+            entry["source_collection"] = str(item["source_collection"])
         sections[section_type].append(entry)
 
     warnings = [BASE_CONTEXT_WARNING]

@@ -664,3 +664,15 @@ TOOL_SCHEMAS = [
     RETRIEVE_SCHEMA,
     SESSION_RECALL_SCHEMA,
 ]  # noqa: E501
+
+# ``tool_surface: recall``: the read-mostly tools a slow local model needs to recall.
+RECALL_TOOL_NAMES = frozenset({
+    "qdrant_memory_context",
+    "qdrant_memory_search",
+    "qdrant_memory_expand",
+    "qdrant_memory_session_recall",
+    "qdrant_learning_search",
+    "qdrant_memory_status",
+})
+RECALL_TOOL_SCHEMAS = [schema for schema in TOOL_SCHEMAS if schema["name"] in RECALL_TOOL_NAMES]
+ALL_TOOL_NAMES = frozenset(schema["name"] for schema in TOOL_SCHEMAS)

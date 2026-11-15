@@ -6,8 +6,16 @@ from typing import Any
 
 from .fact_metadata import derive_fact_metadata
 from .schema import build_payload, clean_text_for_memory, now_iso
-from .scoring import final_memory_score, normalize_minmax
-from .retriever import RetrievedMemory, _append_bool_filter, _extend_search_filter_conditions, _match_condition, _match_values
+from .scoring import final_memory_score
+from .retriever import (
+    CandidatePool,
+    RetrievedMemory,
+    _append_bool_filter,
+    _extend_search_filter_conditions,
+    _match_condition,
+    _match_values,
+    normalize_pools,
+)
 
 LEARNING_TYPES = {
     "tool_failure_lesson",
@@ -317,6 +325,47 @@ class LearningStore:
         canonical: Any = None,
         update_access: bool = True,
     ) -> list[RetrievedMemory]:
+        pool = self.collect_candidates(
+            query,
+            top_k=top_k,
+            learning_type=learning_type,
+            scope=scope,
+            tags=tags,
+            source=source,
+            file_path=file_path,
+            project_path=project_path,
+            since=since,
+            until=until,
+            fact_status_exclude=fact_status_exclude,
+            stale=stale,
+            requires_review=requires_review,
+            canonical=canonical,
+        )
+        chunks = [chunk for _, chunk in self.rank_candidates([pool])]
+        selected = chunks[: max(1, min(20, int(top_k)))]
+        if update_access:
+            self.update_access_metadata(selected)
+        return selected
+
+    def collect_candidates(
+        self,
+        query: str,
+        *,
+        top_k: int = 5,
+        learning_type: Any = None,
+        scope: dict[str, str] | None = None,
+        tags: list[str] | None = None,
+        source: str | None = None,
+        file_path: str | None = None,
+        project_path: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        fact_status_exclude: Any = None,
+        stale: Any = None,
+        requires_review: Any = None,
+        canonical: Any = None,
+    ) -> CandidatePool:
+        """Search this collection and filter the hits; read-only, nothing is scored yet."""
         vector = self.embeddings.embed_query(query)
         raw = self.qdrant.search(
             self.collection_name,
@@ -341,10 +390,10 @@ class LearningStore:
         )
         allowed_learning_types = {_normalize_learning_type(str(item)) for item in _match_values(learning_type)}
         excluded_statuses = {str(item) for item in _match_values(fact_status_exclude)}
-        scores = normalize_minmax([float(item.get("score", 0.0)) for item in raw])
-        chunks: list[RetrievedMemory] = []
-        for item, norm_score in zip(raw, scores):
-            raw_score = float(item.get("score", 0.0))
+        dense_scores = [float(item.get("score", 0.0)) for item in raw]
+        candidates: list[tuple[int | None, Any]] = []
+        for index, item in enumerate(raw):
+            raw_score = dense_scores[index]
             if raw_score < self.min_raw_score:
                 continue
             payload = item.get("payload") or {}
@@ -359,16 +408,22 @@ class LearningStore:
                 continue
             if isinstance(canonical, bool) and bool(payload.get("canonical")) is not canonical:
                 continue
-            text = str(payload.get("text") or "")
-            final = final_memory_score(norm_score, payload.get("importance", 7), payload.get("created_at", ""), self.decay_rate)
-            if final < self.min_final_score:
-                continue
-            chunks.append(RetrievedMemory(str(item.get("id", "")), text, payload, raw_score, final))
-        chunks.sort(key=lambda c: c.final_score, reverse=True)
-        selected = chunks[: max(1, min(20, int(top_k)))]
-        if update_access:
-            self.update_access_metadata(selected)
-        return selected
+            candidates.append((index, item))
+        return CandidatePool(self.collection_name, dense_scores, candidates)
+
+    def rank_candidates(self, pools: list[CandidatePool]) -> list[tuple[str, RetrievedMemory]]:
+        """Score the pools' candidates together (one min-max range) and sort them, best first."""
+        chunks: list[tuple[str, RetrievedMemory]] = []
+        for pool, scores in zip(pools, normalize_pools(pools)):
+            for index, item in pool.candidates:
+                payload = item.get("payload") or {}
+                text = str(payload.get("text") or "")
+                final = final_memory_score(scores[index], payload.get("importance", 7), payload.get("created_at", ""), self.decay_rate)
+                if final < self.min_final_score:
+                    continue
+                chunks.append((pool.collection, RetrievedMemory(str(item.get("id", "")), text, payload, pool.dense_scores[index], final)))
+        chunks.sort(key=lambda item: item[1].final_score, reverse=True)
+        return chunks
 
     def update_access_metadata(self, chunks: list[RetrievedMemory]) -> None:
         for chunk in chunks:

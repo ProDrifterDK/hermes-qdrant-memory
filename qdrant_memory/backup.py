@@ -19,6 +19,7 @@ from qdrant_memory.lineage import (
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from qdrant_memory.client import QdrantClient
+from qdrant_memory.config import read_source_collections
 
 SCHEMA_VERSION = 1
 BACKUP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
@@ -72,7 +73,11 @@ def backup_dir_for_id(root: Path, backup_id: str) -> Path:
 
 
 def qdrant_client_from_config(config: dict[str, Any]) -> QdrantClient:
-    return QdrantClient(str(config.get("qdrant_url") or ""), api_key=str(config.get("qdrant_api_key") or ""))
+    return QdrantClient(
+        str(config.get("qdrant_url") or ""),
+        api_key=str(config.get("qdrant_api_key") or ""),
+        read_only_collections=read_source_collections(config),
+    )
 
 
 def collection_specs(config: dict[str, Any], scope: str = "both") -> list[dict[str, str]]:
