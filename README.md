@@ -930,7 +930,7 @@ Session windows hold raw conversation text. Treat the collection like `state.db`
 
 ## Session origin citations
 
-A fact learned in a conversation can record where it came from as a citation into Hermes' own `state.db`: the session id, the first and last message row ids, and digests of the cited rows. The resolver and verifier live in `qdrant_memory/session_origin.py`. They only read `state.db`, they do not depend on Qdrant, and neither function raises to its caller. Nothing writes citations yet; the store, extraction and learning paths that attach them come in later releases.
+A fact learned in a conversation can record where it came from as a citation into Hermes' own `state.db`: the session id, the first and last message row ids, and digests of the cited rows. The resolver and verifier live in `qdrant_memory/session_origin.py`. They only read `state.db`, they do not depend on Qdrant, and neither function raises to its caller. The manual store attaches citations when `session_origin_mode: recorded` is set (see "Session origin on manual stores" below); the extraction and learning paths come in later releases.
 
 - `resolve_span(state_db, session_id, first_msg_id, last_msg_id, basis=...)` returns a citation (`store`, `session_id`, `first_msg_id`, `last_msg_id`, `msg_count`, `uids_sha256`, `span_sha256`, `content_sha256`, `basis`, `verified_at` in UTC), or `unresolved:<reason>`. The reason is `no_state_db`, `schema_unsupported`, `session_absent`, `no_match`, `ambiguous_match` or `span_too_large`. Both ids must be eligible rows of the session. A span holds at most 200 messages.
 - `verify_citation(citation, state_db=...)` returns `{"status": ..., "reason": ...}`. The status is one of `verified`, `verified_via_uid`, `drifted`, `partially_missing`, `expired` or `unavailable`.
@@ -962,6 +962,38 @@ Recommended practice:
 - **Backups.** Qdrant snapshots of the memory collections do not contain the cited conversations. To keep citations checkable through a restore, back up `state.db` with them.
 
 The plugin never changes Hermes configuration and never pins, unpins or prunes sessions. These settings are yours to choose. See `hermes config` and `hermes sessions --help`.
+
+### Session origin on manual stores
+
+`session_origin_mode` (`off` by default) decides whether `qdrant_memory_store` records where a fact came from. With `off`, the store's schema, payloads and outputs are exactly what they were before this feature. With `recorded`:
+
+```yaml
+qdrant_memory:
+  session_origin_mode: recorded
+```
+
+- Every approved store adds a `session_origin` mapping to the fact's payload. Without a span it records a `tool_position` citation: the current session and its highest user/assistant message id at the time of the call, with no digest.
+- `qdrant_memory_store` accepts an optional `cite`: `{session_id?, first_msg_id, last_msg_id, quote?}`. `session_id` defaults to the current session. The ids are typically a `qdrant_memory_session_recall` result's `first_msg_id`/`last_msg_id`; both ends must be user or assistant messages of that session, at most 200 messages. The citation is labelled `basis: agent_proposed`.
+- **Preview first.** The dry-run preview resolves the span and shows the citation with its digests and status. The approve call (`dry_run: false, approve: true`, same text and `cite`) re-verifies exactly the previewed digests and refuses if the span changed in between (`cited span changed since preview: drifted ...`). An approve whose `cite` was never previewed is refused. A span that is not a span of the session (a wrong `last_msg_id`, a tool row, reversed ids) is refused at preview.
+- **Never blocked by `state.db`.** If `state.db` is missing, locked, has an unsupported schema, or does not contain the session, the store still succeeds and records `citation_status: unresolved:<reason>` with no citation.
+- **Re-store merges.** Storing the same text again (same content id) from another session appends that session's citation: `[A, B]`. The first capture's `captured_session_id`, `captured_at` and `producer` are kept. Identical citations are not repeated, and a session gets at most one `tool_position`. Any writer call that brings no new capture (the mode switched back to `off`, the CLI `store`, `sync_turn`) carries an existing `session_origin` forward unchanged instead of dropping it.
+- **Quotes (optional).** `cite.quote: true` keeps a quote of the cited messages that stays readable after `state.db` prunes the session. The text is read from the cited rows, never taken from the caller. It passes Hermes' egress redaction (`agent.redact.redact_for_egress`) and the plugin's `redact_secret_spans`, and it is cut to 1,000 characters. Where the Hermes egress redactor cannot be imported, no quote is stored and the preview says why (`quote_omitted`).
+- **Limits.** At most 8 citations, at most 2 quoted citations, and at most 4,096 bytes for the whole mapping (UTF-8 of its compact sorted JSON). A store that would exceed any of them is refused with an error that names the limit; nothing is written. Two quoted citations already take about 3 KB.
+- **Inspect.** `qdrant_memory_inspect` (and `hermes qdrant inspect`) shows a point's `session_origin`: the capture fields, each citation, and its current status re-checked read-only against `state.db` (`current_status`, `current_reason`, `current_status_counts`). A `tool_position` citation reads `verified` while its session and row exist.
+- **Forget still works.** `session_origin` is not lineage identity: `qdrant_memory_forget` deletes such a point like any other, and a re-store is not refused because of it.
+
+The payload mapping (`session-origin-v1`, closed: unknown keys are refused):
+
+| key | value |
+|---|---|
+| `schema` | `"session-origin-v1"` |
+| `producer` | `manual_store` (later also `source_extraction`, `improve`, `learning_approval`, `learning_store`) |
+| `captured_session_id`, `captured_at` | the first capture: the calling session and UTC time (`YYYY-MM-DDTHH:MM:SSZ`) |
+| `approved_session_id`, `approved_at` | optional, only when approval differs from capture (not used by the manual store) |
+| `citations` | span citations (`store`, `session_id`, `first_msg_id`, `last_msg_id`, `msg_count`, `uids_sha256`, `span_sha256`, `content_sha256`, `basis`, `verified_at`, optional `window_hint`, `quote` + `quote_sha256`) or `tool_position` citations (`store`, `session_id`, `after_msg_id`, `basis`, `verified_at`) |
+| `citation_status` | `verified`, or `unresolved:<reason>` once any capture could not be resolved |
+
+`cite` is not part of the `tool_surface: recall` lane: it is an argument of `qdrant_memory_store`, which is a write and is not on that surface.
 
 ## Local or sovereign profile
 
