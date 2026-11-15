@@ -3208,15 +3208,10 @@ class QdrantMemoryProvider(MemoryProvider):
                 if not pid_str:
                     continue
                 try:
-                    # Read-only retrieve
-                    results = self._qdrant.scroll(
-                        self._config["collection_name"],
-                        limit=1,
-                        with_payload=True,
-                        with_vectors=False,
-                        _filter={"must": [{"key": "id", "match": {"value": pid_str}}]},
-                    )
-                    points = results[0] if isinstance(results, (list, tuple)) and results else []
+                    # Read-only retrieve by id. This used to call ``scroll``, which the real
+                    # client does not have; the AttributeError was swallowed below, so this
+                    # scope never produced a candidate outside unit-test fakes.
+                    points = self._qdrant.retrieve(self._config["collection_name"], [pid_str], with_payload=True)
                     for point in (points if isinstance(points, list) else []):
                         cands = extract_improve_candidates_from_point(
                             point,
