@@ -391,9 +391,12 @@ def span_quote(state_db: str, citation: Mapping[str, Any]) -> dict[str, str] | s
     """A D1 quote of the cited rows, or a reason string when none can be made.
 
     The text comes from the cited rows themselves (``role: content`` per row), never from
-    the caller. It passes the host egress scrub and ``make_quote`` until neither changes
-    it, so the result is at most ``QUOTE_MAX_CHARS`` and stable under both. Fails closed:
-    no egress redactor, a redactor failure or text that never settles gives no quote.
+    the caller. It passes ``make_quote`` (``redact_secret_spans`` and the cut) and then the
+    host egress scrub until neither changes it, so the result is at most
+    ``QUOTE_MAX_CHARS`` and stable under both. The plugin redactor runs first because it
+    replaces a whole secret span, while the egress mask keeps a short prefix and suffix.
+    Fails closed: no egress redactor, a redactor failure or text that never settles gives
+    no quote.
     """
     redactor = _egress_redactor()
     if redactor is None:
@@ -409,17 +412,18 @@ def span_quote(state_db: str, citation: Mapping[str, Any]) -> dict[str, str] | s
     text = "\n".join(f"{_b(row[1]).decode('utf-8', 'replace')}: {_b(row[2]).decode('utf-8', 'replace').strip()}"
                      for row in rows)
     for _ in range(4):
-        scrubbed = egress(text)
+        scrubbed = egress(make_quote(text)["quote"])
         if scrubbed == unavailable:
             return "egress redactor failed"
-        settled = make_quote(scrubbed)["quote"]
-        if settled == text:
+        if scrubbed == text:
             break
-        text = settled
+        text = scrubbed
     else:
         return "quote did not settle under redaction"
     if not text:
         return "quote empty after redaction"
+    if len(text) > QUOTE_MAX_CHARS or contains_secret(text):
+        return "quote did not settle under redaction"
     return {"quote": text, "quote_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}
 
 
