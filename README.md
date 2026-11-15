@@ -928,6 +928,41 @@ Configuration (under `qdrant_memory:`):
 
 Session windows hold raw conversation text. Treat the collection like `state.db` itself. Exclude sources you do not want searchable, and delete the collection and its state file to remove the index.
 
+## Session origin citations
+
+A fact learned in a conversation can record where it came from as a citation into Hermes' own `state.db`: the session id, the first and last message row ids, and digests of the cited rows. The resolver and verifier live in `qdrant_memory/session_origin.py`. They only read `state.db`, they do not depend on Qdrant, and neither function raises to its caller. Nothing writes citations yet; the store, extraction and learning paths that attach them come in later releases.
+
+- `resolve_span(state_db, session_id, first_msg_id, last_msg_id, basis=...)` returns a citation (`store`, `session_id`, `first_msg_id`, `last_msg_id`, `msg_count`, `uids_sha256`, `span_sha256`, `content_sha256`, `basis`, `verified_at` in UTC), or `unresolved:<reason>`. The reason is `no_state_db`, `schema_unsupported`, `session_absent`, `no_match`, `ambiguous_match` or `span_too_large`. Both ids must be eligible rows of the session. A span holds at most 200 messages.
+- `verify_citation(citation, state_db=...)` returns `{"status": ..., "reason": ...}`. The status is one of `verified`, `verified_via_uid`, `drifted`, `partially_missing`, `expired` or `unavailable`.
+- `make_quote(text)` returns an optional quote (`quote`, `quote_sha256`), redacted with the plugin's secret detector and capped at 1,000 characters. Callers decide when to attach one.
+
+A span is the session's `user` and `assistant` rows with non-blank content whose `id` falls in `[first_msg_id, last_msg_id]`, in `id` order. This is the same rule session recall uses. The digests hash the stored bytes: no time rendering and no redaction. A citation therefore verifies the same way in every timezone and with every redactor version, and it stores no message text. `span_sha256` is salted by session and row id. `uids_sha256` covers the ordered `message_uid` list. `content_sha256` covers uid, role and content without row ids. It is what lets a span survive compaction: Hermes can re-sequence rows under new ids, and the clones keep their `message_uid` and bytes.
+
+| status | meaning |
+|---|---|
+| `verified` | The rows at the cited ids hash to `span_sha256`. |
+| `verified_via_uid` | Hermes re-sequenced the cited rows under new ids. They are found by `message_uid` in the session or one of its continuations, and their bytes still match. |
+| `drifted` | The rows are there, but their bytes changed: an in-place rewrite such as a prompt expansion or a redaction. |
+| `partially_missing` | Some cited rows are gone and no clones were found: a destructive `/retry`, `/undo` or `/compress`. |
+| `expired` | The session no longer exists in `state.db`. The result names Hermes' retired-session key when one exists. |
+| `unavailable` | `state.db` is missing, locked, unreadable or has an unsupported schema, or the citation is malformed. Try again later. |
+
+No status writes anything or demotes a fact. `drifted` and `partially_missing` are signals for review, and `expired` is the normal end of a citation.
+
+**Read-only access.** The verifier opens `state.db` with `mode=ro` and waits at most 2 s for a lock, then reports `unavailable`. While no Hermes process holds the database, its WAL files (`-wal`, `-shm`) are absent. SQLite creates them even for a read-only open, so in that case the verifier opens the file `immutable=1` instead. It discards the result if the file changed during the read. It never creates, writes or deletes anything next to `state.db`.
+
+### `state.db` retention and pinning
+
+Hermes deletes ended sessions once they have been inactive for `sessions.retention_days`, together with their messages. Deletion runs only when `sessions.auto_prune: true`, at most once a day at startup. Pruning skips pinned sessions. A citation into a pruned session reads `expired`. **This is expected and does not invalidate the fact.** The digests still identify exactly what was cited, but the cited text can no longer be read back. It does not mean the fact is wrong, and the plugin never acts on it. If a quote was stored with the citation, the quote is what stays readable.
+
+Recommended practice:
+
+- **`sessions.retention_days: 180`.** A conversation-born fact is usually reviewed or challenged within weeks to a few months of the conversation. At 180 days, a citation stays checkable for about two quarters after the session's last activity. The Hermes default of 90 days covers only one. With 30 days, most citations had already expired before anyone looked at them: in one measured install, 83% of stored conversation turns came from sessions that had already been pruned. The cost is a larger `state.db` and slower full-text inserts and session listings, which is why Hermes prunes at all. With `auto_prune: false` (the Hermes default), nothing is pruned and citations expire only through manual deletes or `hermes sessions prune`.
+- **Pin what must stay checkable.** `hermes sessions pin <session_id>` exempts a session and its compression lineage from pruning. Pin conversations whose decisions you expect to audit later, such as design reviews and incident notes.
+- **Backups.** Qdrant snapshots of the memory collections do not contain the cited conversations. To keep citations checkable through a restore, back up `state.db` with them.
+
+The plugin never changes Hermes configuration and never pins, unpins or prunes sessions. These settings are yours to choose. See `hermes config` and `hermes sessions --help`.
+
 ## Local or sovereign profile
 
 A slow local model (for example a 27B model on your own GPU) gains the most from recall: one recalled fact saves minutes of exploration. It pays the most for a large tool surface, because every tool schema is prefill on every cold load. Two opt-in settings cover this case. Profiles that set neither behave exactly as before.
