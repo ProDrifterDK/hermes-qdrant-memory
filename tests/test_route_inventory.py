@@ -910,7 +910,10 @@ _declare(["on_pre_compress", "on_session_end"], "read_only",
          note="collects extraction candidates into local artifacts; the store modes that would write are inert")
 
 _declare(["qdrant_memory_improve_apply", "improve apply"], "uncovered",
-         reason="predicate read on 567eeac; stricter than the shared one on the traced shapes, never executed")
+         reason="predicate read on 567eeac; stricter than the shared one on the traced shapes, never executed. "
+                "C'4: the insert re-reads the target under the collection lock and refuses any existing point, "
+                "so session_origin is never dropped; under session_origin_mode=recorded it records the "
+                "preview's captured session, and point_ids candidates record no citation")
 _declare(["qdrant_memory_raptor_apply"], "uncovered",
          reason="same as improve apply: read, not executed")
 
@@ -935,6 +938,14 @@ _declare([
     note="searches set access metadata on the points they return (set/merge, never delete or replace); "
          "watcher status/install and the report commands write local artifacts only")
 
+# Stricter than the read rows above: it scrolls (no search, so no access metadata), through a
+# client that refuses any write to the two collections it reads, and opens state.db read-only.
+# It stays off the `recall` tool surface: a recall-surface profile has no session_origin
+# producer, and read_sources are never scanned.
+_declare(["qdrant_memory_origin_check", "origin-check"], "read_only",
+         note="scans this provider's own memory/learning collection for session_origin and re-verifies each "
+              "citation; no payload, access-counter, index, collection or state.db write")
+
 # Writes outside Qdrant (files, reports, proposal state) with no payload to protect.
 _declare(["backup create", "eval-capture"], "read_only",
          note="writes files only; the restore route that consumes them is the protection row")
@@ -952,10 +963,10 @@ _declare(["backup create", "eval-capture"], "read_only",
 # a check that reads the same source twice is not a check. Because these are duplicates,
 # adding a pin means updating both the constant and this literal.
 
-# The derived surface — 27 tools, 54 CLI commands, 12 provider hooks. A route added or
+# The derived surface — 28 tools, 55 CLI commands, 12 provider hooks. A route added or
 # removed changes this number, which forces someone to touch this file and classify it,
 # even if the completeness check in the test body is later weakened.
-FROZEN_SURFACE_SIZE = 93
+FROZEN_SURFACE_SIZE = 95
 
 # Every `[mode]` row, frozen by name and by kind. Completeness used to ask only whether
 # *some* mode row existed for the route, so deleting both `[capture]` rows, deleting both

@@ -290,7 +290,7 @@ def test_recall_surface_exposes_six_tools_and_refuses_hidden_writes(monkeypatch,
     # The opt-in session expand tool is off by default: every surface is exactly what it was.
     default_schemas = [s for s in plugin.TOOL_SCHEMAS if s["name"] != EXPAND]
     full = _local_provider(monkeypatch, tmp_path, store, log, read_sources=[])
-    assert full.get_tool_schemas() == default_schemas and len(full.get_tool_schemas()) == 26
+    assert full.get_tool_schemas() == default_schemas and len(full.get_tool_schemas()) == 27
 
     with caplog.at_level(logging.WARNING, logger="qdrant_memory.config"):
         typo = _local_provider(monkeypatch, tmp_path, store, log, read_sources=[], tool_surface="recal")
@@ -304,7 +304,7 @@ def test_recall_surface_exposes_six_tools_and_refuses_hidden_writes(monkeypatch,
 
     # With session_expand_enabled the expand tool joins both surfaces and the prompt block.
     full_x = _local_provider(monkeypatch, tmp_path, store, log, read_sources=[], session_expand_enabled=True)
-    assert full_x.get_tool_schemas() == plugin.TOOL_SCHEMAS and len(full_x.get_tool_schemas()) == 27
+    assert full_x.get_tool_schemas() == plugin.TOOL_SCHEMAS and len(full_x.get_tool_schemas()) == 28
     recall_x = _local_provider(
         monkeypatch, tmp_path, store, log, read_sources=[], tool_surface="recall", session_expand_enabled=True
     )

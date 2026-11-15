@@ -156,6 +156,16 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     trace.add_argument("--collection", choices=["memory", "learning"], default="memory", help="Configured collection scope. Default: memory.")
     trace.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
 
+    origin_check = subcommands.add_parser(
+        "origin-check",
+        help="Re-verify session_origin citations against state.db and count them per status. Read-only.",
+    )
+    origin_check.add_argument("--collection", choices=["memory", "learning"], default="memory", help="Configured collection scope. Default: memory.")
+    origin_check.add_argument("--limit", type=_positive_int, default=100, help="Points with session_origin per page (at most 500). Default: 100.")
+    origin_check.add_argument("--offset", default=None, help="next_offset printed by the previous page.")
+    origin_check.add_argument("--max-ids", type=_positive_int, default=100, help="Point ids listed per status (at most 500). Default: 100.")
+    origin_check.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
+
     expand = subcommands.add_parser("expand", help="Expand one point's source context with bounded output. Read-only.")
     expand.add_argument("point_id", help="Explicit Qdrant point ID to expand.")
     expand.add_argument("--mode", choices=["excerpt", "source", "neighbors"], default="excerpt", help="Expansion mode. Default: excerpt.")

@@ -1434,6 +1434,51 @@ def _format_inspect_summary(payload: dict[str, Any]) -> str:
         lines.append(f"derived_from: {len(derived)}")
     if payload.get("snippet"):
         lines.append(f"snippet: {_one_line(payload.get('snippet'), max_chars=220)}")
+    lines.extend(_session_origin_lines(payload))
+    return "\n".join(lines)
+
+
+def _session_origin_lines(payload: dict[str, Any]) -> list[str]:
+    """Human lines for a disclosed ``session_origin`` (inspect, trace); none without one."""
+    origin = payload.get("session_origin")
+    if not isinstance(origin, dict):
+        return []
+    lines = [f"session_origin: {_safe_scalar(origin.get('producer'))} captured in "
+             f"{_safe_scalar(origin.get('captured_session_id'))} ({_safe_scalar(origin.get('citation_status'))})"]
+    if origin.get("valid") is False:
+        lines.append(f"  invalid: {_one_line(origin.get('invalid_reason'))}")
+    citations = origin.get("citations") if isinstance(origin.get("citations"), list) else []
+    for citation in citations[:8]:
+        if isinstance(citation, dict):
+            span = (f"{citation.get('first_msg_id')}..{citation.get('last_msg_id')}" if "first_msg_id" in citation
+                    else f"after {citation.get('after_msg_id')}")
+            lines.append(f"  - {_safe_scalar(citation.get('session_id'))} {span} {_safe_scalar(citation.get('basis'))} "
+                         f"now={_safe_scalar(citation.get('current_status'))}")
+    return lines
+
+
+def _format_origin_check_summary(payload: dict[str, Any]) -> str:
+    lines = [f"Origin check: {payload.get('collection')} ({payload.get('collection_name')}), read-only"]
+    if payload.get("collection_missing"):
+        lines.append("collection missing; nothing to check")
+        return "\n".join(lines)
+    lines.append(f"points: {payload.get('points_checked', 0)}  citations: {payload.get('citations_checked', 0)}")
+    counts = payload.get("counts") if isinstance(payload.get("counts"), dict) else {}
+    point_ids = payload.get("point_ids") if isinstance(payload.get("point_ids"), dict) else {}
+    if not counts:
+        lines.append("no citations on this page")
+    for status, count in counts.items():
+        ids = point_ids.get(status) if isinstance(point_ids.get(status), list) else []
+        shown = ", ".join(_safe_scalar(pid) for pid in ids[:5]) + (", ..." if len(ids) > 5 else "")
+        lines.append(f"{status}: {count}" + (f"  [{shown}]" if shown else ""))
+    uncited = payload.get("uncited_counts") if isinstance(payload.get("uncited_counts"), dict) else {}
+    for status, count in uncited.items():
+        lines.append(f"no citation ({status}): {count}")
+    if payload.get("invalid_count"):
+        lines.append(f"invalid session_origin: {payload.get('invalid_count')}")
+    if payload.get("next_offset"):
+        lines.append(f"more pages: --offset {payload.get('next_offset')}")
+    lines.append("expired is host retention, not a retraction; nothing was changed.")
     return "\n".join(lines)
 
 
@@ -1476,6 +1521,7 @@ def _format_trace_summary(payload: dict[str, Any]) -> str:
         lines.append(f"downstream: {downstream.get('status', 'unknown')}")
         if downstream.get("message"):
             lines.append(f"downstream_message: {_one_line(downstream.get('message'))}")
+    lines.extend(_session_origin_lines(payload))
     return "\n".join(lines)
 
 
@@ -1907,6 +1953,8 @@ def _format_human_payload(payload: Any, args: Namespace, tool_name: str) -> str:
         return _format_inspect_summary(payload)
     if tool_name == "qdrant_memory_trace":
         return _format_trace_summary(payload)
+    if tool_name == "qdrant_memory_origin_check":
+        return _format_origin_check_summary(payload)
     if tool_name == "qdrant_memory_expand":
         return _format_expand_summary(payload)
     if tool_name == "qdrant_memory_source_status":
@@ -2421,6 +2469,16 @@ def build_tool_call(args: Namespace) -> tuple[str, dict[str, Any]]:
             "direction": getattr(args, "direction", "upstream") or "upstream",
             "collection": getattr(args, "collection", "memory") or "memory",
         }
+
+    if subcommand == "origin-check":
+        tool_args = {
+            "collection": getattr(args, "collection", "memory") or "memory",
+            "limit": int(getattr(args, "limit", 100) or 100),
+            "max_ids": int(getattr(args, "max_ids", 100) or 100),
+        }
+        if getattr(args, "offset", None):
+            tool_args["offset"] = str(args.offset)
+        return "qdrant_memory_origin_check", tool_args
 
     if subcommand == "expand":
         return "qdrant_memory_expand", {

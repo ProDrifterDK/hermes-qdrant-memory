@@ -197,6 +197,27 @@ SOURCE_STATUS_SCHEMA = {
     },
 }
 
+ORIGIN_CHECK_SCHEMA = {
+    "name": "qdrant_memory_origin_check",
+    "description": (
+        "Read-only check of session_origin citations: scans the points that carry session_origin in one of this "
+        "provider's collections, re-verifies each citation against Hermes' state.db and reports counts and point ids "
+        "per current status (verified, verified_via_uid, drifted, partially_missing, expired, unavailable). One "
+        "bounded page per call; pass next_offset to continue. Never writes. expired is normal host retention, not a "
+        "retraction."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "collection": {"type": "string", "enum": ["memory", "learning"], "description": "Collection to check. Defaults to memory.", "default": "memory"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Points with session_origin per page (default 100)."},
+            "offset": {"type": "string", "description": "next_offset from the previous page; omit for the first page."},
+            "max_ids": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Point ids listed per status (default 100)."},
+        },
+        "additionalProperties": False,
+    },
+}
+
 LEARNING_STORE_SCHEMA = {
     "name": "qdrant_learning_store",
     "description": "Store an explicit procedural learning in the separate Qdrant learning collection. Manual/gated only; not automatic learning.",
@@ -708,6 +729,7 @@ TOOL_SCHEMAS = [
     TRACE_SCHEMA,
     EXPAND_SCHEMA,
     SOURCE_STATUS_SCHEMA,
+    ORIGIN_CHECK_SCHEMA,
     LEARNING_STORE_SCHEMA,
     LEARNING_SEARCH_SCHEMA,
     LEARNING_PREVIEW_SCHEMA,
