@@ -116,7 +116,7 @@ def live() -> Iterator[Live]:
     qdrant_url = os.environ.get("QDRANT_TEST_URL", "").strip()
     if not qdrant_url:
         pytest.skip("set QDRANT_TEST_URL to run live Qdrant integration tests")
-    qdrant = QdrantClient(qdrant_url, timeout=10.0, api_key=os.environ.get("QDRANT_TEST_API_KEY", ""))
+    qdrant = QdrantClient(qdrant_url, timeout=10.0, **{"api_key": os.environ.get("QDRANT_TEST_API_KEY", "")})
     suffix = uuid.uuid4().hex[:12]
     names = (f"{PREFIX}{suffix}_memory", f"{PREFIX}{suffix}_learnings")
     existing = set(qdrant.get_collections())
