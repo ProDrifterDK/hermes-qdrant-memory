@@ -1,9 +1,11 @@
 """Recall over the provider's own store plus read-only ``read_sources``.
 
 The read sources are other profiles' collections. This module only ever calls
-``search(..., update_access=False)`` on them; the Qdrant client additionally refuses
-every mutating request against them (``QdrantClient.read_only_collections``), so a
-read source stays untouched even if a call site here or elsewhere gets it wrong.
+``collect_candidates`` on them, which issues read requests only (search, plus the
+sparse lane's scroll) and never touches access counters; the Qdrant client
+additionally refuses every mutating request against them
+(``QdrantClient.read_only_collections``), so a read source stays untouched even if a
+call site here or elsewhere gets it wrong.
 """
 
 from __future__ import annotations
@@ -15,12 +17,16 @@ logger = logging.getLogger(__name__)
 
 
 class MergedRecall:
-    """Search the own store and each read source, then merge the hits by score.
+    """Search the own store and each read source, then score the union once.
 
-    ``own`` and every source expose ``search(query, *, top_k, update_access, **filters)``
-    and return chunks with ``id`` and ``final_score`` (``MemoryRetriever`` or
-    ``LearningStore``). A read source that cannot be searched (for example a collection
-    that does not exist) is skipped with a debug log; it is never created.
+    ``own`` and every source are ``MemoryRetriever`` or ``LearningStore`` objects
+    (``collect_candidates(query, *, top_k, **filters)``, ``rank_candidates(pools)``).
+    The candidates of all collections are scored together by ``own.rank_candidates``:
+    one min-max normalization over every collection's dense scores, then the same
+    final scoring and ``min_final_score`` cut the single-collection search applies, so
+    scores from different collections are comparable. A read source that cannot be
+    searched (for example a collection that does not exist) is skipped with a debug
+    log; it is never created.
     """
 
     def __init__(self, own: Any, own_collection: str, sources: list[tuple[str, Any]]):
@@ -30,24 +36,17 @@ class MergedRecall:
 
     def search_labelled(self, query: str, top_k: int = 5, update_access: bool = True, **kwargs: Any) -> list[tuple[str, Any]]:
         limit = max(1, min(20, int(top_k)))
-        labelled = [
-            (self.own_collection, chunk)
-            for chunk in self.own.search(query, top_k=limit, update_access=False, **kwargs)
-        ]
+        pools = [self.own.collect_candidates(query, top_k=limit, **kwargs)]
         for collection, source in self.sources:
             try:
-                hits = source.search(query, top_k=limit, update_access=False, **kwargs)
+                pools.append(source.collect_candidates(query, top_k=limit, **kwargs))
             except Exception:
                 logger.debug("Qdrant read source %s skipped: search failed", collection, exc_info=True)
-                continue
-            labelled.extend((collection, chunk) for chunk in hits)
-        # final_score is normalized per collection, so each collection's best hit tends to
-        # tie; the raw vector score (same embedding model everywhere) breaks those ties.
-        # Stable sort: on a full tie the own collection keeps precedence.
-        labelled.sort(key=lambda item: (float(item[1].final_score), float(item[1].qdrant_score)), reverse=True)
+        # Sorted best first; the sort is stable, so on a tie the own collection keeps
+        # precedence. A point id present in several collections keeps its best hit.
         selected: list[tuple[str, Any]] = []
         seen: set[str] = set()
-        for collection, chunk in labelled:
+        for collection, chunk in self.own.rank_candidates(pools):
             if chunk.id in seen:
                 continue
             seen.add(chunk.id)

@@ -141,6 +141,19 @@ def main() -> int:
         checks["search_merged_from_both"] = {names["own_memory"], names["shared_memory"]} <= labels
         checks["search_sorted_by_score"] = [r["score"] for r in search["results"]] == sorted((r["score"] for r in search["results"]), reverse=True)
         checks["search_hides_other_profile"] = all("/srv/elsewhere" not in r["text"] for r in search["results"])
+        # One scale across collections: the shared desk band note is the closer match
+        # (higher vector score) and must rank above the own note, with a lower score.
+        order = [(r.get("source_collection"), r["score"], r["vector_score"], r["text"][:50]) for r in search["results"]]
+        report["search_rank_order"] = order
+        shared_i = next((i for i, r in enumerate(search["results"]) if "~/.hermes/deskband" in r["text"]), None)
+        own_i = next((i for i, r in enumerate(search["results"]) if r.get("source_collection") == names["own_memory"]), None)
+        checks["search_ranks_closer_shared_note_above_own"] = (
+            shared_i is not None
+            and own_i is not None
+            and search["results"][shared_i]["vector_score"] > search["results"][own_i]["vector_score"]
+            and shared_i < own_i
+            and search["results"][shared_i]["score"] > search["results"][own_i]["score"]
+        )
 
         learning = json.loads(provider.handle_tool_call("qdrant_learning_search", {"query": "how do I restart the desk band", "top_k": 3}))
         report["learning_search"] = learning

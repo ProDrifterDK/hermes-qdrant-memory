@@ -235,6 +235,55 @@ def test_read_sources_are_never_mutated_by_recall_paths(monkeypatch, tmp_path):
     assert json.dumps({n: store[n] for n in (SHARED_MEMORY, SHARED_LEARNING)}, sort_keys=True) == shared_before
 
 
+def test_merged_recall_ranks_own_and_read_source_hits_on_one_scale(monkeypatch, tmp_path):
+    """A stronger hit outranks a weaker one whichever collection holds it.
+
+    Equal importance (10) and a future created_at (recency exactly 1.0) make each
+    score equal to the hit's similarity normalized over the merged pool. Per-collection
+    normalization gives every collection's best hit 1.0, so a weak own hit would tie
+    the strong shared one and beat the shared runner-up, and survive min_final_score.
+    """
+    query = "alpha beta gamma delta"
+    strong = {"best": "alpha beta gamma delta", "hit": "alpha beta gamma zeta", "filler": "kappa lambda"}  # raw 1.0 / 0.75 / 0
+    weak = {"hit": "alpha beta zeta eta", "filler": "omega psi"}  # raw 0.5 / 0
+    cases = {
+        "memory": (OWN_MEMORY, SHARED_MEMORY, "qdrant_memory_search", {"source_type": "manual"}),
+        "learning": (OWN_LEARNING, SHARED_LEARNING, "qdrant_learning_search", {"source_type": "learning"}),
+    }
+    for read_source_strong in (True, False):  # the reverse case: the own collection holds the strong hits
+        for kind, (own_name, shared_name, tool, extra) in cases.items():
+            store, log = {}, []
+            emb = TokenEmbeddings()
+            strong_name, weak_name = (shared_name, own_name) if read_source_strong else (own_name, shared_name)
+            for name, texts in ((strong_name, strong), (weak_name, weak)):
+                store[name] = {
+                    f"{name}-{key}": {
+                        "id": f"{name}-{key}",
+                        "vector": emb.embed_document(text),
+                        "payload": {
+                            "text": text,
+                            "importance": 10,
+                            "created_at": "2099-01-01T00:00:00+00:00",
+                            "profile_id": "default" if name == shared_name else "local27b",
+                            **extra,
+                        },
+                    }
+                    for key, text in texts.items()
+                }
+            provider = _local_provider(monkeypatch, tmp_path, store, log)
+            out = json.loads(provider.handle_tool_call(tool, {"query": query, "top_k": 3}))["results"]
+            assert [r["id"] for r in out] == [f"{strong_name}-best", f"{strong_name}-hit", f"{weak_name}-hit"], (kind, out)
+            assert [r["source_collection"] for r in out] == [strong_name, strong_name, weak_name]
+            assert out[0]["score"] == 1.0
+            # Runner-up and the other collection's best hit: below the pool's best, ordered by similarity.
+            assert out[1]["score"] == pytest.approx(0.75) and out[2]["score"] == pytest.approx(0.5)
+
+            # min_final_score cuts on the merged scale: the weak collection's best hit (0.5) is dropped.
+            cut = _local_provider(monkeypatch, tmp_path, store, log, min_final_score=0.6)
+            out = json.loads(cut.handle_tool_call(tool, {"query": query, "top_k": 3}))["results"]
+            assert [r["id"] for r in out] == [f"{strong_name}-best", f"{strong_name}-hit"], (kind, out)
+
+
 def test_recall_surface_exposes_six_tools_and_refuses_hidden_writes(monkeypatch, tmp_path, caplog):
     store, log = {}, []
     full = _local_provider(monkeypatch, tmp_path, store, log, read_sources=[])
