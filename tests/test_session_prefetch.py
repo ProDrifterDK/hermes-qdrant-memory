@@ -61,7 +61,8 @@ _READ_POST = {"points", "points/search", "points/scroll", "points/count"}
 MAIN_TOOL_NAMES = [
     "qdrant_memory_status", "qdrant_memory_store", "qdrant_memory_search", "qdrant_memory_context",
     "qdrant_memory_index", "qdrant_memory_forget", "qdrant_memory_inspect", "qdrant_memory_trace",
-    "qdrant_memory_expand", "qdrant_memory_source_status", "qdrant_learning_store", "qdrant_learning_search",
+    "qdrant_memory_expand", "qdrant_memory_source_status", "qdrant_memory_origin_check",
+    "qdrant_learning_store", "qdrant_learning_search",
     "qdrant_learning_preview", "qdrant_learning_approve", "qdrant_memory_extraction_preview",
     "qdrant_memory_extraction_approve", "qdrant_memory_consolidate", "qdrant_memory_memory_pr",
     "qdrant_memory_consolidation_apply", "qdrant_memory_graph_search", "qdrant_memory_improve_preview",

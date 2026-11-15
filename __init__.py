@@ -178,6 +178,9 @@ from qdrant_memory.tools import (
     TOOL_SCHEMAS,
 )
 from qdrant_memory.writer import ConversationWriter, ManagedOverwriteRefused
+from qdrant_memory.origin_check import check_origins
+# The real client class, kept apart from the module-level name tests may replace.
+from qdrant_memory.client import QdrantClient as _RealQdrantClient
 
 logger = logging.getLogger(__name__)
 
@@ -581,6 +584,10 @@ class QdrantMemoryProvider(MemoryProvider):
         # C'2: citations shown by a store preview, keyed by (point id, cite); the approve
         # call re-verifies exactly these digests. Bounded, oldest dropped first.
         self._session_origin_previews: dict[tuple, Any] = {}
+        # C'4: what an improve preview captured for each conversation-born candidate, keyed
+        # by (report id, candidate id): the session and the exact source line. In memory
+        # only (never persisted with the report), kept across session switches. Bounded.
+        self._improve_origin_captures: dict[tuple[str, str], dict[str, Any]] = {}
         self._hybrid_router: Optional[HybridRouter] = None
         self._graph_retriever: Any = None
         self._raptor_searcher: Optional[RaptorSearcher] = None
@@ -2147,12 +2154,44 @@ class QdrantMemoryProvider(MemoryProvider):
         if direction not in {"upstream", "downstream", "both"}:
             return _json_error("direction must be one of: upstream, downstream, both")
         try:
-            payload = trace_point(self._qdrant, collection_name, point_id, collection=collection, direction=direction, config=self._config)
+            payload = trace_point(self._qdrant, collection_name, point_id, collection=collection, direction=direction,
+                                  config=self._config, state_db=self._state_db_path())
             if not payload.get("found"):
                 return _json_error("Point not found")
             return json.dumps(payload)
         except Exception as exc:
             return _json_error(f"Trace failed: {exc}")
+
+    def _origin_check_client(self) -> Any:
+        """A client for the check that refuses every write to the collections it reads.
+
+        The check only scrolls; this makes that structural for the real client (an upsert,
+        payload update, index or collection creation against these names raises before it
+        is sent). Any other client object is used as given.
+        """
+        qdrant = self._qdrant
+        if isinstance(qdrant, _RealQdrantClient):
+            return _RealQdrantClient(
+                qdrant.base_url, timeout=qdrant.timeout, api_key=qdrant.api_key,
+                read_only_collections={self._config["collection_name"], self._config["learning_collection_name"]},
+            )
+        return qdrant
+
+    def _tool_origin_check(self, args: dict[str, Any]) -> str:
+        """Read-only: verify the session_origin citations of one collection page by page."""
+        if not self._qdrant:
+            return _json_error("Qdrant memory provider is not initialized")
+        collection_pair = self._collection_name_from_tool_args(args)
+        if not collection_pair:
+            return _json_error("collection must be one of: memory, learning")
+        collection, collection_name = collection_pair
+        try:
+            result = check_origins(self._origin_check_client(), collection_name, state_db=self._state_db_path(),
+                                   scope=self._scope_filter_values(), limit=args.get("limit", 100),
+                                   offset=args.get("offset"), max_ids=args.get("max_ids", 100))
+        except Exception as exc:
+            return _json_error(f"Origin check failed: {exc}")
+        return json.dumps({"collection": collection, **result})
 
     def _tool_expand(self, args: dict[str, Any]) -> str:
         point_id = str(args.get("point_id") or "").strip()
@@ -3251,6 +3290,8 @@ class QdrantMemoryProvider(MemoryProvider):
             include_metadata=include_metadata,
         )
 
+        self._remember_improve_captures(report["report_id"], source_scope, all_candidates, session_id, source_text)
+
         if persist:
             try:
                 persist_improve_report(report, hermes_home=self._hermes_home)
@@ -3261,6 +3302,83 @@ class QdrantMemoryProvider(MemoryProvider):
         self._pending_improve_reports[report["report_id"]] = report
 
         return json.dumps(report)
+
+    _IMPROVE_CAPTURE_LIMIT = 256
+
+    def _remember_improve_captures(self, report_id: str, source_scope: str, candidates: list[Any], session_id: str,
+                                   source_text: str) -> None:
+        """Freeze the origin capture of each conversation-born candidate of a preview (C'4).
+
+        ``source_text`` under a ``session://`` URI: the preview's session and the exact line
+        the extractor read (the candidate's ``line_start``). ``pending_session``: the hook
+        capture the candidate already carries (C'3). ``point_ids``: never anything. A Qdrant
+        point, a legacy conversation turn above all, is not evidence of a ``state.db`` span
+        (design 5.1), even when its session and its words are still in ``state.db``.
+        Recorded in every mode (in memory only), like the hook captures.
+        """
+        if source_scope not in ("source_text", "pending_session"):
+            return
+        lines = (source_text or "").splitlines()
+        now = self._utc_now_z()
+        captures = self._improve_origin_captures
+        for candidate in candidates:
+            key = (report_id, str(candidate.candidate_id))
+            if key in captures:  # the first preview's capture time stands
+                continue
+            if source_scope == "source_text":
+                if not str(candidate.source_uri or "").startswith("session://"):
+                    continue
+                line_no = (candidate.locator if isinstance(candidate.locator, dict) else {}).get("line_start")
+                line = lines[line_no - 1] if isinstance(line_no, int) and 1 <= line_no <= len(lines) else ""
+                captures[key] = {"session_id": session_id or "", "captured_at": now, "hook": "improve_preview",
+                                 "source_text": line, "role": ""}
+            else:
+                captures[key] = dict(getattr(candidate, "origin_capture", None) or {})
+        while len(captures) > self._IMPROVE_CAPTURE_LIMIT:
+            captures.pop(next(iter(captures)))
+
+    def _improve_session_origin(self, report: Mapping[str, Any], report_id: str, candidate: Any) -> Optional[dict[str, Any]]:
+        """The ``session_origin`` an improve apply records, or ``None`` when the candidate is not
+        conversation-born (``point_ids`` scope, a source URI that is not ``session://``).
+
+        The captured session comes from the preview, never from the approver, who appears
+        only as ``approved_session_id`` when different (C'3 rule). If the preview's capture is
+        gone (a process restart between preview and apply), the session is still known from
+        the report but the source line is not, so the citation is ``unresolved:no_match``.
+        """
+        scope = str(report.get("source_scope") or "")
+        if scope not in ("source_text", "pending_session"):
+            return None
+        capture = self._improve_origin_captures.get((report_id, str(candidate.candidate_id)))
+        if capture is None:
+            uri = str(candidate.source_uri or "")
+            if not uri.startswith("session://"):
+                return None
+            session = str(report.get("session_id") or "")
+            if scope == "pending_session":
+                session = uri[len("session://"):].split("/", 1)[0]
+            capture = {"session_id": "" if session == "current" else session, "source_text": "", "role": ""}
+        return self._candidate_session_origin("improve", capture)
+
+    def _improve_locked_insert(self, point_id: str, vector: list[float], payload: dict[str, Any]) -> str:
+        """Upsert a new improve point under the memory collection lock; ``""`` once written.
+
+        The target is read again under the lock and a point that appeared since the earlier
+        check is refused: improve never overwrites, so it can never drop an existing payload
+        or its ``session_origin``. Raises ``LineageLockUnavailable`` like the locked upsert.
+        """
+        collection = self._config["collection_name"]
+        lock_stack = ExitStack()
+        try:
+            lock_stack.enter_context(self._origin_lock(collection))
+        except (TimeoutError, RuntimeError) as exc:
+            raise LineageLockUnavailable(LINEAGE_LOCK_UNAVAILABLE) from exc
+        with lock_stack:
+            if self._qdrant.retrieve(collection, [point_id], with_payload=True):
+                return (f"Target point {point_id} already exists with different payload/provenance; "
+                        "refusing to overwrite (use manual review)")
+            self._qdrant.upsert(collection, [{"id": point_id, "vector": vector, "payload": payload}])
+        return ""
 
     def _tool_improve_apply(self, args: dict) -> str:
         """Preview or apply exactly one candidate from one report."""
@@ -3324,17 +3442,27 @@ class QdrantMemoryProvider(MemoryProvider):
             "write_decision": write_decision.to_dict(),
         }
 
+        # session_origin_mode recorded: a conversation-born candidate records the session the
+        # preview captured; a point_ids candidate records none (design 5.1).
+        recorded = self._session_origin_mode() == "recorded"
+
         # Dry-run path
         if dry_run:
             self._reviewed_improve_candidate_keys.add(review_key)
-            return json.dumps({
+            previewed = {
                 "dry_run": True,
                 "applied": False,
                 "saved": False,
                 "would_store": write_decision.decision == "store",
                 "would_create_proposal": write_decision.decision == "draft_review",
                 **base_result,
-            })
+            }
+            if recorded:
+                try:
+                    previewed["session_origin"] = self._improve_session_origin(report, report_id, candidate)
+                except SessionOriginRefused as exc:
+                    return _json_error(str(exc))
+            return json.dumps(previewed)
 
         # Live apply path
         if not approve:
@@ -3504,12 +3632,15 @@ class QdrantMemoryProvider(MemoryProvider):
                         f"payload/provenance; refusing to overwrite (use manual review)"
                     )
 
+            origin = self._improve_session_origin(report, report_id, candidate) if recorded else None
+            if origin is not None:
+                payload["session_origin"] = merge_session_origin(None, origin)
+
             text = str(payload.get("text") or payload.get("claim_text") or "")
             vector = self._embeddings.embed_document(text)
-            self._lineage_locked_upsert(
-                self._config["collection_name"],
-                [{"id": target_pid, "vector": vector, "payload": payload}],
-            )
+            refusal = self._improve_locked_insert(target_pid, vector, payload)
+            if refusal:
+                return _json_error(refusal)
 
             # Blocker 2: Persist application record for idempotent repeat
             record_candidate_applied(
@@ -3523,7 +3654,7 @@ class QdrantMemoryProvider(MemoryProvider):
             self._reviewed_improve_candidate_keys.discard(review_key)
             self._remove_candidate_from_report(report_id, candidate_id)
 
-            return json.dumps({
+            applied = {
                 "dry_run": False,
                 "applied": True,
                 "saved": True,
@@ -3531,7 +3662,10 @@ class QdrantMemoryProvider(MemoryProvider):
                 "id": target_pid,
                 "collection_name": self._config["collection_name"],
                 **base_result,
-            })
+            }
+            if recorded:
+                applied["session_origin"] = self._origin_summary(origin) if origin is not None else None
+            return json.dumps(applied)
         except Exception as exc:
             return _json_error(f"Improve apply failed: {exc}")
 
@@ -4636,6 +4770,8 @@ class QdrantMemoryProvider(MemoryProvider):
             return self._tool_inspect(args)
         if tool_name == "qdrant_memory_trace":
             return self._tool_trace(args)
+        if tool_name == "qdrant_memory_origin_check":
+            return self._tool_origin_check(args)
         if tool_name == "qdrant_memory_expand":
             return self._tool_expand(args)
         if tool_name == "qdrant_memory_source_status":

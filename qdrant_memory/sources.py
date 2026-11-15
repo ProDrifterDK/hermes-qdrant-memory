@@ -1455,7 +1455,13 @@ def _supersession_trace(qdrant: Any, collection_name: str, payload: dict[str, An
     return history
 
 
-def trace_point(qdrant: Any, collection_name: str, point_id: str, *, collection: str = "memory", direction: str = "upstream", config: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def trace_point(qdrant: Any, collection_name: str, point_id: str, *, collection: str = "memory", direction: str = "upstream", config: Mapping[str, Any] | None = None,
+                state_db: str | None = None) -> dict[str, Any]:
+    """Provenance trace for one point.
+
+    A point carrying ``session_origin`` (C') also gets that origin disclosed, with each
+    citation's current status re-checked read-only against ``state_db`` (as in inspect).
+    """
     direction = str(direction or "upstream").strip().lower()
     if direction not in {"upstream", "downstream", "both"}:
         direction = "upstream"
@@ -1481,6 +1487,10 @@ def trace_point(qdrant: Any, collection_name: str, point_id: str, *, collection:
     supersession = _supersession_trace(qdrant, collection_name, payload)
     if supersession:
         result["supersession"] = supersession
+    if "session_origin" in payload:
+        from qdrant_memory.session_origin import describe_session_origin
+
+        result["session_origin"] = describe_session_origin(payload["session_origin"], state_db=state_db)
     if direction in {"upstream", "both"}:
         upstream = payload.get("derived_from") if isinstance(payload.get("derived_from"), list) else []
         result["upstream"] = [_trace_edge(edge, registry) for edge in upstream]
