@@ -245,7 +245,7 @@ def test_merged_recall_ranks_own_and_read_source_hits_on_one_scale(monkeypatch, 
     """
     query = "alpha beta gamma delta"
     strong = {"best": "alpha beta gamma delta", "hit": "alpha beta gamma zeta", "filler": "kappa lambda"}  # raw 1.0 / 0.75 / 0
-    weak = {"hit": "alpha beta zeta eta", "filler": "omega psi"}  # raw 0.5 / 0
+    weak = {"hit": "alpha beta zeta eta", "filler": "sigma tau"}  # raw 0.5 / 0
     cases = {
         "memory": (OWN_MEMORY, SHARED_MEMORY, "qdrant_memory_search", {"source_type": "manual"}),
         "learning": (OWN_LEARNING, SHARED_LEARNING, "qdrant_learning_search", {"source_type": "learning"}),
