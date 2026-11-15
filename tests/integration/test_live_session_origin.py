@@ -401,9 +401,14 @@ def test_off_mode_is_byte_identical_to_base(live, state, tmp_path):
     assert not differing, {key: (outputs["base"][key], outputs["head"][key]) for key in differing}
     assert "session_origin" not in outputs["head"]["payload_b"]
     assert '"cite":' not in outputs["head"]["schemas"]
+    # The receipt hashes each observable with the per-run collection names masked, so two
+    # runs produce the same receipt; the comparison above is on the raw bytes.
     RECEIPT["cases"]["off_mode_byte_identical"] = {
         "base": C2_BASE,
-        "observables": {key: hashlib.sha256(value.encode("utf-8")).hexdigest() for key, value in
-                        sorted(outputs["head"].items())},
+        "observables": {
+            key: hashlib.sha256(value.replace(live.memory, "<memory>").replace(live.learnings, "<learnings>")
+                                .encode("utf-8")).hexdigest()
+            for key, value in sorted(outputs["head"].items())
+        },
         "differing": differing, "pass": True,
     }
