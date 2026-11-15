@@ -15,6 +15,9 @@ Failure modes, written before the code:
    from what the plugin produced before the lane existed.
 7. Expanding a message whose session the host pruned errors out or returns nothing,
    or returns stale indexed text without saying it is not a live read.
+8. A reranker waking from idle sleep (slower than the lane budget) uses the whole
+   budget, so the dense fallback arrives after the turn gave up and the lane block is
+   lost; its still-running worker then makes the next turn skip the lane too.
 
 Only the network boundaries are fake (the Qdrant transport and the embedder). The
 state.db is a real SQLite file built from the production schema; windows are written by
@@ -306,6 +309,97 @@ def test_lane_failure_or_timeout_returns_the_legacy_prefetch_unchanged(monkeypat
     finally:
         release.set()
         provider.shutdown()
+
+
+class SleepyReranker:
+    """A llama.cpp-style ``/v1/rerank`` server that sleeps when idle.
+
+    Like ``llama-server --sleep-idle-seconds``: the first request starts a wake that takes
+    ``wake_s``, and every request that arrives before the wake is over is answered only
+    when it is. Scores reverse the dense order, so a reranked block differs from a dense one.
+    """
+
+    def __init__(self, wake_s: float):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        self.wake_s, self.requests, self.warm_requests = wake_s, 0, 0
+        self.wake_at: float | None = None
+        lock, stub = threading.Lock(), self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                docs = json.loads(self.rfile.read(int(self.headers["Content-Length"])))["documents"]
+                with lock:
+                    stub.requests += 1
+                    if stub.wake_at is None:
+                        stub.wake_at = time.monotonic() + stub.wake_s
+                    wait = float(stub.wake_at) - time.monotonic()
+                    stub.warm_requests += wait <= 0
+                time.sleep(max(0.0, wait))
+                body = json.dumps({"results": [{"index": i, "relevance_score": float(i)} for i in range(len(docs))]})
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body.encode())
+                except OSError:
+                    pass  # the client gave up first
+
+            def log_message(self, format, *args):  # noqa: A002 - the base class's name
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def test_cold_reranker_degrades_to_dense_order_within_the_budget_and_the_next_turn_keeps_the_lane(
+    monkeypatch, tmp_path
+):
+    budget = 1.0
+    reranker = SleepyReranker(wake_s=2.5)  # waking takes longer than the whole lane budget
+    store, log = {}, []
+    provider = _provider(
+        monkeypatch, tmp_path, store, log,
+        session_prefetch_enabled=True, session_prefetch_max_chars=6000, session_prefetch_total_chars=8000,
+        session_prefetch_timeout_s=budget, session_recall_rerank_url=reranker.url,
+    )
+    try:
+        _seed_memory(store)
+        _index_windows(provider)
+        provider._config["session_prefetch_enabled"] = False
+        legacy = provider.prefetch(QUERY, session_id="tip")
+        provider._config.update(session_prefetch_enabled=True, session_prefetch_rerank=False)
+        dense = provider.prefetch(QUERY, session_id="tip")
+        provider._config["session_prefetch_rerank"] = True
+        # Preconditions: the lane is live here and the reranker is still asleep.
+        assert "relay-gateway.md" in legacy and dense.startswith(legacy + "\n\n# Recalled Earlier Conversation")
+        assert dense.count("\n   ") >= 2 and reranker.requests == 0
+
+        turns = []
+        for _ in range(2):  # the cold turn, then the immediately following one
+            started = time.monotonic()
+            out = provider.prefetch(QUERY, session_id="tip")
+            turns.append((round(time.monotonic() - started, 3), out))
+
+        assert reranker.requests >= 1 and reranker.warm_requests == 0  # asked, but still waking
+        seen = [(elapsed, "lane" if "# Recalled Earlier" in out else "no lane", out == dense) for elapsed, out in turns]
+        assert [same for _, _, same in seen] == [True, True], seen  # (seconds, lane block?, dense block?)
+        assert all(elapsed < budget + 0.3 for elapsed, _, _ in seen), seen
+
+        time.sleep(max(0.0, float(reranker.wake_at or 0.0) + 0.1 - time.monotonic()))
+        warm = provider.prefetch(QUERY, session_id="tip")
+        assert reranker.warm_requests >= 1
+        assert warm.startswith(legacy + "\n\n# Recalled Earlier Conversation") and warm != dense
+    finally:
+        provider.shutdown()
+        reranker.close()
 
 
 def test_defaults_keep_prefetch_and_tool_schemas_identical_to_before(monkeypatch, tmp_path):

@@ -23,6 +23,7 @@ from __future__ import annotations
 import dataclasses
 import re
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping
@@ -47,6 +48,11 @@ HARD_LANE_CHARS = 16000
 # ``serialize_session`` line header: ``[YYYY-MM-DD HH:MM role] ``.
 _HEADER_RE = re.compile(r"(?m)^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} (?:user|assistant)\] ")
 EXPAND_TOOL = "qdrant_memory_session_expand"
+# Time kept back from the lane budget for the work after the rerank (state.db reads and
+# formatting, a few milliseconds) and the hand-off to the waiting turn, so a reranker
+# that never answers still ends in dense order inside the budget. At most a quarter of
+# the budget, so short budgets still leave the reranker most of their time.
+FINISH_RESERVE_S = 0.3
 
 
 def _clamp(value: Any, default: float, lo: float, hi: float) -> float:
@@ -264,8 +270,19 @@ class SessionPrefetchLane:
         self.settings = settings
         self.expand_hint = expand_hint
 
-    def build(self, query: str, session_id: str, budget_chars: int, *, before: Any = None) -> str:
-        """Search session windows with ``query`` and format what the prompt no longer holds."""
+    def build(
+        self, query: str, session_id: str, budget_chars: int, *, before: Any = None, deadline: float | None = None
+    ) -> str:
+        """Search session windows with ``query`` and format what the prompt no longer holds.
+
+        ``deadline`` is the ``time.monotonic()`` instant the caller stops waiting (default:
+        ``timeout_s`` from now). The rerank call must end ``FINISH_RESERVE_S`` before it,
+        whatever time the embedding and the dense search took, so a slow or sleeping
+        reranker degrades to dense order that still reaches the turn.
+        """
+        if deadline is None:
+            deadline = time.monotonic() + self.settings.timeout_s
+        rerank_deadline = deadline - min(FINISH_RESERVE_S, self.settings.timeout_s / 4)
         query = str(query or "").strip()
         if not query or budget_chars < MIN_LANE_CHARS:
             return ""
@@ -294,13 +311,15 @@ class SessionPrefetchLane:
                     top_k=fetch,
                     max_chars=fetch * base.window_chars,
                     rerank_url=base.rerank_url if self.settings.rerank else "",
-                    rerank_timeout_s=min(base.rerank_timeout_s, self.settings.timeout_s),
                 ),
                 qdrant=self.recall.qdrant,
                 embeddings=self.recall.embeddings,
                 clock=self.recall.clock,
             )
-            found = lane.search(query, scope=self.settings.scope, chain=chain, top_k=fetch, before=before, exclude=exclude)
+            found = lane.search(
+                query, scope=self.settings.scope, chain=chain, top_k=fetch, before=before, exclude=exclude,
+                rerank_deadline=rerank_deadline,
+            )
             chain_ids = set(chain)
             entries: list[_Entry] = []
             emitted = ""
