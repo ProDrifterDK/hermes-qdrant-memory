@@ -150,11 +150,22 @@ from qdrant_memory.session_prefetch import (
     compose_prefetch,
     expand_messages,
 )
+from qdrant_memory.session_origin import (
+    SessionOriginRefused,
+    build_session_origin,
+    merge_session_origin,
+    origin_size,
+    resolve_position,
+    resolve_span,
+    span_quote,
+    verify_citation,
+)
 from qdrant_memory.tools import (
     ALL_TOOL_NAMES,
     OPT_IN_TOOL_NAMES,
     RECALL_TOOL_NAMES,
     RECALL_TOOL_SCHEMAS,
+    STORE_SCHEMA_WITH_CITE,
     TOOL_SCHEMAS,
 )
 from qdrant_memory.writer import ConversationWriter, ManagedOverwriteRefused
@@ -558,6 +569,9 @@ class QdrantMemoryProvider(MemoryProvider):
         self._reviewed_improve_candidate_keys: set[str] = set()
         self._reviewed_raptor_keys: set[str] = set()
         self._pending_raptor_manifests: dict[str, dict[str, Any]] = {}
+        # C'2: citations shown by a store preview, keyed by (point id, cite); the approve
+        # call re-verifies exactly these digests. Bounded, oldest dropped first.
+        self._session_origin_previews: dict[tuple, Any] = {}
         self._hybrid_router: Optional[HybridRouter] = None
         self._graph_retriever: Any = None
         self._raptor_searcher: Optional[RaptorSearcher] = None
@@ -1324,9 +1338,127 @@ class QdrantMemoryProvider(MemoryProvider):
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         schemas = RECALL_TOOL_SCHEMAS if self._recall_surface() else TOOL_SCHEMAS
+        if self._session_origin_mode() == "recorded":
+            # The store gains `cite` only in recorded mode; with the mode off the list is
+            # the one it was before session origin existed.
+            schemas = [STORE_SCHEMA_WITH_CITE if schema["name"] == "qdrant_memory_store" else schema
+                       for schema in schemas]
         if self._session_expand_enabled():
             return schemas
         return [schema for schema in schemas if schema["name"] not in OPT_IN_TOOL_NAMES]
+
+    def _session_origin_mode(self) -> str:
+        return "recorded" if (getattr(self, "_config", None) or {}).get("session_origin_mode") == "recorded" else "off"
+
+    def _state_db_path(self) -> str:
+        """The state.db session recall reads (same `$HERMES_HOME` rule as RecallSettings)."""
+        home = str(self._hermes_home or Path.home() / ".hermes")
+        raw = str(self._config.get("session_recall_state_db") or "$HERMES_HOME/state.db")
+        return str(Path(raw.replace("$HERMES_HOME", home)).expanduser())
+
+    _SESSION_ORIGIN_PREVIEW_LIMIT = 64
+    # A caller-named span that is not a span of the session is a caller error to fix while
+    # the rows exist, so it is refused. Reasons the caller cannot fix (no state.db, schema
+    # drift, unknown session) are recorded as unresolved and never block the store (5.8).
+    _REFUSED_CITE_RESULTS = ("unresolved:no_match", "unresolved:span_too_large")
+
+    @staticmethod
+    def _utc_now_z() -> str:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    def _parse_session_cite(self, raw: Any) -> tuple[Optional[dict[str, Any]], str]:
+        if not isinstance(raw, dict):
+            return None, "cite must be an object with first_msg_id and last_msg_id"
+        unknown = sorted(str(key) for key in raw if key not in {"session_id", "first_msg_id", "last_msg_id", "quote"})
+        if unknown:
+            return None, f"cite has unknown keys: {', '.join(unknown)}"
+        ids = [raw.get("first_msg_id"), raw.get("last_msg_id")]
+        if not all(isinstance(value, int) and not isinstance(value, bool) and value > 0 for value in ids):
+            return None, "cite.first_msg_id and cite.last_msg_id must be positive integers"
+        session_id = raw.get("session_id") if raw.get("session_id") is not None else self._session_id
+        if not isinstance(session_id, str) or not session_id.strip():
+            return None, "cite.session_id is required when the current session is unknown"
+        return {
+            "session_id": session_id.strip(),
+            "first_msg_id": ids[0],
+            "last_msg_id": ids[1],
+            "quote": parse_bool_arg(raw.get("quote"), default=False),
+        }, ""
+
+    @staticmethod
+    def _cite_key(point_id: str, cite: dict[str, Any]) -> tuple:
+        return (point_id, cite["session_id"], cite["first_msg_id"], cite["last_msg_id"], cite["quote"])
+
+    def _existing_session_origin(self, point_id: str) -> Any:
+        existing = self._qdrant.retrieve(self._config["collection_name"], [point_id], with_payload=True) if self._qdrant else []
+        for item in existing or []:
+            payload = item.get("payload") if isinstance(item, dict) else None
+            if isinstance(payload, dict) and "session_origin" in payload:
+                return payload["session_origin"]
+        return None
+
+    def _session_origin_preview(self, point_id: str, cite: Optional[dict[str, Any]]) -> dict[str, Any]:
+        """Resolve what an approve would record and show it; raises SessionOriginRefused."""
+        state_db = self._state_db_path()
+        quote_note = ""
+        if cite is not None:
+            citation: Any = resolve_span(state_db, cite["session_id"], cite["first_msg_id"], cite["last_msg_id"],
+                                         basis="agent_proposed")
+            if citation in self._REFUSED_CITE_RESULTS:
+                raise SessionOriginRefused(
+                    f"cite refused ({citation}): messages {cite['first_msg_id']}..{cite['last_msg_id']} are not a "
+                    f"span of user/assistant messages of session {cite['session_id']} (both ends must be such "
+                    "messages, at most 200 of them)")
+            if isinstance(citation, dict) and cite["quote"]:
+                quote = span_quote(state_db, citation)
+                if isinstance(quote, dict):
+                    citation = {**citation, **quote}
+                else:
+                    quote_note = quote
+        else:
+            citation = resolve_position(state_db, self._session_id)
+        capture = build_session_origin(producer="manual_store", captured_session_id=self._session_id,
+                                       captured_at=self._utc_now_z(), citation=citation)
+        merged = merge_session_origin(self._existing_session_origin(point_id), capture)
+        if cite is not None:
+            previews = self._session_origin_previews
+            previews.pop(self._cite_key(point_id, cite), None)
+            previews[self._cite_key(point_id, cite)] = citation
+            while len(previews) > self._SESSION_ORIGIN_PREVIEW_LIMIT:
+                previews.pop(next(iter(previews)))
+        shown: dict[str, Any] = {
+            "citation_status": capture["citation_status"],
+            "citation": citation if isinstance(citation, dict) else None,
+            "merged_citation_count": len(merged["citations"]),
+            "bytes": origin_size(merged),
+        }
+        if quote_note:
+            shown["quote_omitted"] = quote_note
+        return shown
+
+    def _session_origin_capture(self, point_id: str, cite: Optional[dict[str, Any]]) -> dict[str, Any]:
+        """The capture an approve records; a cite must match its preview. Raises SessionOriginRefused."""
+        state_db = self._state_db_path()
+        now = self._utc_now_z()
+        if cite is not None:
+            previewed = self._session_origin_previews.get(self._cite_key(point_id, cite))
+            if previewed is None:
+                raise SessionOriginRefused(
+                    "cite needs a preview first: call qdrant_memory_store with the same text and cite and "
+                    "dry_run=true, check the citation, then approve")
+            if isinstance(previewed, dict):
+                check = verify_citation(previewed, state_db=state_db)
+                if check["status"] != "verified":
+                    raise SessionOriginRefused(
+                        f"cited span changed since preview: {check['status']} ({check.get('reason', '')}); "
+                        "preview again to see the current messages")
+                citation: Any = {**previewed, "verified_at": now}
+            else:
+                citation = previewed
+        else:
+            citation = resolve_position(state_db, self._session_id)
+        return build_session_origin(producer="manual_store", captured_session_id=self._session_id,
+                                    captured_at=now, citation=citation)
 
     def _tool_status(self) -> str:
         qdrant_ok = False
@@ -1457,6 +1589,14 @@ class QdrantMemoryProvider(MemoryProvider):
             duplicate_top_k = max(1, min(20, int(raw_top_k)))
         except Exception:
             duplicate_top_k = 3
+        # session_origin_mode off: `cite` is not in the schema and is ignored here, so the
+        # store behaves exactly as it did before session origin existed.
+        recorded = self._session_origin_mode() == "recorded"
+        cite = None
+        if recorded and args.get("cite") is not None:
+            cite, cite_error = self._parse_session_cite(args.get("cite"))
+            if cite_error:
+                return _json_error(cite_error)
         try:
             preview = self._writer.preview_text(text, source_type=source_type, importance=importance, tags=tags)
             if not preview.get("id"):
@@ -1488,7 +1628,13 @@ class QdrantMemoryProvider(MemoryProvider):
             )
             base["write_decision"] = write_decision.to_dict()
             if dry_run:
-                return json.dumps({"dry_run": True, "saved": False, "would_store": write_decision.decision == "store", **base})
+                previewed = {"dry_run": True, "saved": False, "would_store": write_decision.decision == "store", **base}
+                if recorded:
+                    try:
+                        previewed["session_origin"] = self._session_origin_preview(str(preview["id"]), cite)
+                    except SessionOriginRefused as exc:
+                        return _json_error(str(exc))
+                return json.dumps(previewed)
             if not approve:
                 return _json_error("approve=true is required when dry_run=false")
             if write_decision.decision == "reject":
@@ -1497,8 +1643,27 @@ class QdrantMemoryProvider(MemoryProvider):
                 return json.dumps({"dry_run": False, "saved": False, "would_store": False, **base})
             if write_decision.decision != "store":
                 return _json_error("write gate requires review before storing memory candidate")
+            capture = None
+            lock_stack = ExitStack()
             try:
-                point_id = self._writer.store_text(text, source_type=source_type, importance=importance, tags=tags)
+                if recorded:
+                    capture = self._session_origin_capture(str(preview["id"]), cite)
+                    # Read-merge-upsert of session_origin under the collection lock forget
+                    # also takes, so two re-stores cannot drop each other's citation.
+                    try:
+                        lock_stack.enter_context(collection_write_lock(
+                            collection_name=self._config["collection_name"],
+                            timeout=float(self._config.get("lineage_lock_timeout_seconds", 5.0)),
+                            lock_dir=str(self._config.get("lineage_lock_dir") or ""),
+                        ))
+                    except (TimeoutError, RuntimeError):
+                        return _json_error(LINEAGE_LOCK_UNAVAILABLE)
+                if recorded:
+                    point_id = self._writer.store_text(
+                        text, source_type=source_type, importance=importance, tags=tags, session_origin=capture,
+                    )
+                else:
+                    point_id = self._writer.store_text(text, source_type=source_type, importance=importance, tags=tags)
             except ManagedOverwriteRefused as exc:
                 # The store id is derived from the content, so re-storing the same
                 # text targets the existing point. Replacing a payload that carries
@@ -1506,7 +1671,19 @@ class QdrantMemoryProvider(MemoryProvider):
                 # replacing one that carries W2 review state erases the gate the
                 # retriever reads. The exception carries which refusal applies.
                 return _json_error(str(exc))
-            return json.dumps({"dry_run": False, "saved": bool(point_id), "id": point_id, "source_type": source_type, "collection_name": self._config["collection_name"], "write_decision": write_decision.to_dict()})
+            except SessionOriginRefused as exc:
+                return _json_error(str(exc))
+            finally:
+                lock_stack.close()
+            stored = {"dry_run": False, "saved": bool(point_id), "id": point_id, "source_type": source_type, "collection_name": self._config["collection_name"], "write_decision": write_decision.to_dict()}
+            if recorded and capture is not None:
+                if cite is not None:
+                    self._session_origin_previews.pop(self._cite_key(str(preview["id"]), cite), None)
+                stored["session_origin"] = {
+                    "citation_status": capture["citation_status"],
+                    "citation": capture["citations"][0] if capture["citations"] else None,
+                }
+            return json.dumps(stored)
         except Exception as exc:
             return _json_error(f"Failed to store memory: {exc}")
 
@@ -1793,7 +1970,8 @@ class QdrantMemoryProvider(MemoryProvider):
             return _json_error("collection must be one of: memory, learning")
         collection, collection_name = collection_pair
         try:
-            payload = inspect_point(self._qdrant, collection_name, point_id, collection=collection)
+            payload = inspect_point(self._qdrant, collection_name, point_id, collection=collection,
+                                    state_db=self._state_db_path())
             if not payload.get("found"):
                 return _json_error("Point not found")
             return json.dumps(payload)

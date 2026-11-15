@@ -30,6 +30,37 @@ STORE_SCHEMA = {
     },
 }
 
+# ``session_origin_mode: recorded`` only (C'2). With the mode off the store schema is exactly
+# STORE_SCHEMA; the provider swaps in STORE_SCHEMA_WITH_CITE when the mode is recorded.
+CITE_PROPERTY = {
+    "type": "object",
+    "description": (
+        "Optional origin span in Hermes' state.db: the first and last message id (for example a "
+        "qdrant_memory_session_recall result's first_msg_id/last_msg_id). Both must be user or "
+        "assistant messages of the session. The preview resolves and shows the citation; the "
+        "approve call re-verifies it and refuses if the span changed. Preview first."
+    ),
+    "properties": {
+        "session_id": {"type": "string", "description": "Session of the span. Defaults to the current session."},
+        "first_msg_id": {"type": "integer", "minimum": 1},
+        "last_msg_id": {"type": "integer", "minimum": 1},
+        "quote": {
+            "type": "boolean",
+            "description": "Also keep a redacted quote of the cited messages (at most 1,000 characters) "
+                           "that stays readable after state.db prunes the session. Defaults to false.",
+        },
+    },
+    "required": ["first_msg_id", "last_msg_id"],
+    "additionalProperties": False,
+}
+STORE_SCHEMA_WITH_CITE = {
+    **STORE_SCHEMA,
+    "parameters": {
+        **STORE_SCHEMA["parameters"],
+        "properties": {**STORE_SCHEMA["parameters"]["properties"], "cite": CITE_PROPERTY},
+    },
+}
+
 SEARCH_SCHEMA = {
     "name": "qdrant_memory_search",
     "description": "Search local Qdrant long-term memory by semantic similarity.",

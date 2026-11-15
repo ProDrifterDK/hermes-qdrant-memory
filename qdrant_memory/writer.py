@@ -5,6 +5,7 @@ from typing import Any
 from .fact_metadata import derive_fact_metadata
 from .lineage import lineage_overwrite_refusal
 from .schema import build_payload, clean_text_for_memory, make_point_id, score_importance
+from .session_origin import merge_session_origin, validate_session_origin
 
 
 class ManagedOverwriteRefused(RuntimeError):
@@ -139,7 +140,7 @@ class ConversationWriter:
             }
         return None
 
-    def store_text(self, text: str, *, source_type: str = "manual", chunk_type: str = "fact", importance: int | None = None, tags: list[str] | None = None, source: str = "hermes_tool") -> str:
+    def store_text(self, text: str, *, source_type: str = "manual", chunk_type: str = "fact", importance: int | None = None, tags: list[str] | None = None, source: str = "hermes_tool", session_origin: dict[str, Any] | None = None) -> str:
         preview = self.preview_text(text, source_type=source_type, chunk_type=chunk_type, importance=importance, tags=tags, source=source)
         clean = preview["text"]
         if not clean:
@@ -151,14 +152,31 @@ class ConversationWriter:
         # of the two applies. A retrieval error propagates; the caller's handler
         # reports the store as failed rather than writing blind.
         existing = self.qdrant.retrieve(self.collection_name, [point_id], with_payload=True)
+        existing_origin = None
         for item in existing or []:
             payload = item.get("payload") if isinstance(item, dict) else None
             if isinstance(payload, dict):
                 refusal = lineage_overwrite_refusal(payload)
                 if refusal:
                     raise ManagedOverwriteRefused(refusal)
+                if "session_origin" in payload:
+                    existing_origin = payload["session_origin"]
+        # session_origin (C'2) is merged, never replaced: a re-store from another session
+        # adds its citation and keeps the first capture. A writer call without a new capture
+        # (session_origin_mode off, the CLI, sync_turn) carries an existing mapping forward
+        # unchanged. Either way the validator runs here, so an invalid or oversized mapping
+        # is refused before anything is written. A point without one is written as before.
+        payload = preview["payload"]
+        if session_origin is not None:
+            origin = merge_session_origin(existing_origin, session_origin)
+        else:
+            origin = existing_origin
+            if origin is not None:
+                validate_session_origin(origin)
+        if origin is not None:
+            payload = {**payload, "session_origin": origin}
         vector = self.embeddings.embed_document(clean)
-        self.qdrant.upsert(self.collection_name, [{"id": point_id, "vector": vector, "payload": preview["payload"]}])
+        self.qdrant.upsert(self.collection_name, [{"id": point_id, "vector": vector, "payload": payload}])
         return point_id
 
     def store_turn(self, user_content: str, assistant_content: str) -> str:
