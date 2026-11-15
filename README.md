@@ -930,7 +930,7 @@ Session windows hold raw conversation text. Treat the collection like `state.db`
 
 ## Session origin citations
 
-A fact learned in a conversation can record where it came from as a citation into Hermes' own `state.db`: the session id, the first and last message row ids, and digests of the cited rows. The resolver and verifier live in `qdrant_memory/session_origin.py`. They only read `state.db`, they do not depend on Qdrant, and neither function raises to its caller. The manual store attaches citations when `session_origin_mode: recorded` is set (see "Session origin on manual stores" below); the extraction and learning paths come in later releases.
+A fact learned in a conversation can record where it came from as a citation into Hermes' own `state.db`: the session id, the first and last message row ids, and digests of the cited rows. The resolver and verifier live in `qdrant_memory/session_origin.py`. They only read `state.db`, they do not depend on Qdrant, and neither function raises to its caller. The manual store, source-extraction approval, learning approval and the learning store attach citations when `session_origin_mode: recorded` is set (see "Session origin on manual stores" and "Session origin on extraction and learning approval" below); improve comes in a later release.
 
 - `resolve_span(state_db, session_id, first_msg_id, last_msg_id, basis=...)` returns a citation (`store`, `session_id`, `first_msg_id`, `last_msg_id`, `msg_count`, `uids_sha256`, `span_sha256`, `content_sha256`, `basis`, `verified_at` in UTC), or `unresolved:<reason>`. The reason is `no_state_db`, `schema_unsupported`, `session_absent`, `no_match`, `ambiguous_match` or `span_too_large`. Both ids must be eligible rows of the session. A span holds at most 200 messages.
 - `verify_citation(citation, state_db=...)` returns `{"status": ..., "reason": ...}`. The status is one of `verified`, `verified_via_uid`, `drifted`, `partially_missing`, `expired` or `unavailable`.
@@ -987,13 +987,23 @@ The payload mapping (`session-origin-v1`, closed: unknown keys are refused):
 | key | value |
 |---|---|
 | `schema` | `"session-origin-v1"` |
-| `producer` | `manual_store` (later also `source_extraction`, `improve`, `learning_approval`, `learning_store`) |
-| `captured_session_id`, `captured_at` | the first capture: the calling session and UTC time (`YYYY-MM-DDTHH:MM:SSZ`) |
-| `approved_session_id`, `approved_at` | optional, only when approval differs from capture (not used by the manual store) |
+| `producer` | `manual_store`, `source_extraction`, `learning_approval` or `learning_store` (later also `improve`) |
+| `captured_session_id`, `captured_at` | the first capture: the session and UTC time (`YYYY-MM-DDTHH:MM:SSZ`) of the store call, or of the hook that produced a candidate |
+| `approved_session_id`, `approved_at` | optional, only when approval happened in another session than the capture (not used by the manual store) |
 | `citations` | span citations (`store`, `session_id`, `first_msg_id`, `last_msg_id`, `msg_count`, `uids_sha256`, `span_sha256`, `content_sha256`, `basis`, `verified_at`, optional `window_hint`, `quote` + `quote_sha256`) or `tool_position` citations (`store`, `session_id`, `after_msg_id`, `basis`, `verified_at`) |
 | `citation_status` | `verified`, or `unresolved:<reason>` once any capture could not be resolved |
 
 `cite` is not part of the `tool_surface: recall` lane: it is an argument of `qdrant_memory_store`, which is a write and is not on that surface.
+
+### Session origin on extraction and learning approval
+
+With `session_origin_mode: recorded`, three more writes record a `session_origin` mapping (same contract, limits and merge rule as above). With `off`, their schemas, payloads and outputs are unchanged.
+
+- **Hook candidates keep their own session.** When `on_pre_compress` or `on_session_end` produces a learning candidate (`learning_auto_extract_enabled`) or a source-extraction candidate (`source_extraction_enabled`), the candidate keeps the session the hook ran in, the hook time, and the exact text the extractor read: the source line for extraction, the user correction or the assistant reply that resolved a tool failure for learnings. This capture lives only on the in-memory pending candidate and never appears in tool output.
+- **Approval cites the captured session, not the approver's.** `qdrant_memory_extraction_approve` (producer `source_extraction`) and `qdrant_learning_approve` (producer `learning_approval`) record `captured_session_id` as the hook's session even when the approval happens after a compression switched the conversation to a continuation session; the approving session is recorded as `approved_session_id`/`approved_at` only when it differs. The dry-run preview of either tool shows the mapping the approval would record.
+- **Exact-text match across the session chain.** At approval the captured text is looked up in the user and assistant messages of the captured session and its whole `parent_session_id` chain, as one of a message's lines or its whole content, with the role it had. Copies of one message that share a `message_uid` (Hermes carries a compaction's tail into the next generation) count once and are cited at the original row. One message gives a one-message span citation with `basis: extractor_source_line`. No message gives `unresolved:no_match`. Two or more messages give `unresolved:ambiguous_match`, with no citation: the plugin never picks one. Either way the approval still stores. Hook transcripts are redacted for egress, so a line the host masked usually reads `no_match`.
+- **Learning store.** `qdrant_learning_store` (and `hermes qdrant learning store`) has no extractor line; it records producer `learning_store` with a `tool_position` citation for the calling session, like a manual store without `cite`.
+- **Learning re-store merges.** A learning's id is derived from its content, so storing or approving the same learning again lands on the same point. The new citation is merged into the existing `session_origin` (first capture kept, identical citations not repeated, at most 8, refused past the limits) under the learning collection's write lock, instead of the upsert replacing it. With the mode `off` the learning upsert is the plain one it always was and writes no mapping.
 
 ## Local or sovereign profile
 

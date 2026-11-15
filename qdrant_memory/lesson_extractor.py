@@ -227,6 +227,12 @@ class LearningCandidate:
     source_hook: str = "unknown"
     gated: bool = True
     reason: str = "heuristic candidate"
+    # The message text the lesson was read from, verbatim from the hook transcript, and its
+    # role. Session origin (C'3) cites the state.db row holding it; never part of to_dict.
+    source_text: str = field(default="", compare=False, repr=False)
+    source_role: str = field(default="", compare=False, repr=False)
+    # Frozen by the provider when it accepts the candidate (session, time, hook).
+    origin_capture: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
     @property
     def candidate_id(self) -> str:
@@ -349,6 +355,8 @@ def _extract_user_correction(user_content: str, assistant_content: str, *, sourc
         tags=["auto_candidate", "gated", "user_correction"],
         source_hook=source_hook,
         reason="explicit user correction signal",
+        source_text=text,
+        source_role="user",
     )
 
 
@@ -402,6 +410,10 @@ def _extract_tool_failure_candidates(messages: list[Any], *, source_hook: str) -
                 tags=["auto_candidate", "gated", "tool_failure"],
                 source_hook=source_hook,
                 reason="tool failure with explicit follow-up correction",
+                # The tool row is not an eligible state.db row; the assistant reply that
+                # carries the correction is.
+                source_text=next_text,
+                source_role="assistant",
             )
         )
     return candidates
