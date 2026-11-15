@@ -7,7 +7,7 @@ from typing import Any
 from .fact_metadata import derive_fact_metadata
 from .schema import build_payload, clean_text_for_memory, now_iso
 from .scoring import final_memory_score
-from .session_origin import merge_session_origin
+from .session_origin import merge_session_origin, origin_session_id, validate_session_origin
 from .retriever import (
     CandidatePool,
     RetrievedMemory,
@@ -221,17 +221,22 @@ class LearningStore:
             tags=tags or [],
             promote_to_skill_candidate=promote_to_skill_candidate,
         )
+        # session_origin (C'3, C'6): the id is content-derived, so a re-store lands on the same
+        # point. A new capture is merged into the mapping already there (C'2 rule: first capture
+        # kept, citations appended, validated against the bounds), never replaced. Without a
+        # capture (session_origin_mode off, or switched back to off) an existing mapping is
+        # carried forward unchanged, so turning the mode off never destroys recorded provenance.
+        existing_origin = None
+        for item in self.qdrant.retrieve(self.collection_name, [point_id], with_payload=True) or []:
+            stored = item.get("payload") if isinstance(item, dict) else None
+            if isinstance(stored, dict) and "session_origin" in stored:
+                existing_origin = stored["session_origin"]
         if session_origin is not None:
-            # session_origin (C'3): the id is content-derived, so a re-store lands on the same
-            # point. The new capture is merged into the mapping already there (C'2 rule: first
-            # capture kept, citations appended, validated against the bounds), never replaced.
-            # Without a capture (session_origin_mode off) the upsert is the plain one it was.
-            existing_origin = None
-            for item in self.qdrant.retrieve(self.collection_name, [point_id], with_payload=True) or []:
-                stored = item.get("payload") if isinstance(item, dict) else None
-                if isinstance(stored, dict) and "session_origin" in stored:
-                    existing_origin = stored["session_origin"]
             payload["session_origin"] = merge_session_origin(existing_origin, session_origin)
+            payload["session_id"] = origin_session_id(payload["session_origin"], payload.get("session_id"))
+        elif existing_origin is not None:
+            validate_session_origin(existing_origin)
+            payload["session_origin"] = existing_origin
         vector = self.embeddings.embed_document(payload["text"])
         self.qdrant.upsert(self.collection_name, [{"id": point_id, "vector": vector, "payload": payload}])
         return point_id

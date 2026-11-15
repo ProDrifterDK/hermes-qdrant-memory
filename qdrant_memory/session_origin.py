@@ -30,6 +30,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import time
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
@@ -167,6 +168,26 @@ def _read(state_db: str, work: Callable[[sqlite3.Connection], T]) -> T:
     return result
 
 
+_TRANSIENT_REASONS = ("locked", "state_db_changed_during_read", "wal_sidecars_incomplete")
+TRANSIENT_RETRY_SECONDS = 0.25
+
+
+def _read_retrying(state_db: str, work: Callable[[sqlite3.Connection], T]) -> T:
+    """``_read`` with one retry when the failure is transient (a writer held the database).
+
+    A resolver turns a read failure into a sticky ``unresolved:no_state_db`` on the stored
+    mapping, and an approve turns it into a refusal, so a momentary lock or a checkpoint
+    racing the read is retried once before it counts.
+    """
+    try:
+        return _read(state_db, work)
+    except _Unavailable as exc:
+        if not exc.reason.startswith(_TRANSIENT_REASONS):
+            raise
+    time.sleep(TRANSIENT_RETRY_SECONDS)
+    return _read(state_db, work)
+
+
 def _session_exists(conn: sqlite3.Connection, session_id: str) -> bool:
     return conn.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone() is not None
 
@@ -235,7 +256,7 @@ def resolve_span(state_db: str, session_id: str, first_msg_id: int, last_msg_id:
         return citation
 
     try:
-        return _read(state_db, work)
+        return _read_retrying(state_db, work)
     except _Unavailable as exc:
         return "unresolved:schema_unsupported" if exc.reason == "schema_unsupported" else "unresolved:no_state_db"
     except Exception:  # never raise to the caller
@@ -327,7 +348,7 @@ def resolve_source_line(state_db: str, captured_session_id: str, source_text: st
         }
 
     try:
-        return _read(state_db, work)
+        return _read_retrying(state_db, work)
     except _Unavailable as exc:
         return "unresolved:schema_unsupported" if exc.reason == "schema_unsupported" else "unresolved:no_state_db"
     except Exception:  # never raise to the caller
@@ -439,7 +460,7 @@ def verify_citation(citation: Mapping[str, Any], *, state_db: str) -> dict[str, 
         problem = _malformed(citation)
         if problem:
             return {"status": "unavailable", "reason": f"citation_malformed: {problem}"}
-        return _read(state_db, lambda conn: _verify(conn, citation))
+        return _read_retrying(state_db, lambda conn: _verify(conn, citation))
     except _Unavailable as exc:
         return {"status": "unavailable", "reason": exc.reason}
     except Exception as exc:  # never raise to the caller
@@ -540,7 +561,7 @@ def resolve_position(state_db: str, session_id: str) -> dict[str, Any] | str:
                 "basis": "tool_position", "verified_at": _utc_now()}
 
     try:
-        return _read(state_db, work)
+        return _read_retrying(state_db, work)
     except _Unavailable as exc:
         return "unresolved:schema_unsupported" if exc.reason == "schema_unsupported" else "unresolved:no_state_db"
     except Exception:  # never raise to the caller
@@ -563,7 +584,7 @@ def verify_origin_citation(citation: Mapping[str, Any], *, state_db: str) -> dic
             problem = _citation_problem(citation)
             if problem:
                 return {"status": "unavailable", "reason": f"citation_malformed: {problem}"}
-            return _read(state_db, lambda conn: _verify_position(conn, citation))
+            return _read_retrying(state_db, lambda conn: _verify_position(conn, citation))
         except _Unavailable as exc:
             return {"status": "unavailable", "reason": exc.reason}
         except Exception as exc:  # never raise to the caller
@@ -743,6 +764,96 @@ def merge_session_origin(existing: Any, new: Mapping[str, Any]) -> dict[str, Any
     return merged
 
 
+def origin_session_id(origin: Mapping[str, Any] | None, fallback: Any) -> Any:
+    """The legacy payload ``session_id`` of a point written with a ``session_origin``.
+
+    Under ``session_origin_mode: recorded`` the legacy field follows the first capture
+    (``captured_session_id``), so the payload never names two different sessions as the
+    fact's session; the approver stays in ``approved_session_id``. An empty capture (a
+    candidate injected outside the hooks, a CLI store) keeps ``fallback``.
+    """
+    captured = origin.get("captured_session_id") if isinstance(origin, Mapping) else None
+    return captured if isinstance(captured, str) and captured else fallback
+
+
+def _strip_quote(citation: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in citation.items() if key not in ("quote", "quote_sha256")}
+
+
+def bound_session_origin(mapping: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, int]]:
+    """Fit a merged mapping into the bounds without refusing (system merges only).
+
+    Deterministic rule, in order:
+
+    1. Quotes: the oldest ``MAX_QUOTED_CITATIONS`` quoted citations keep their quote; later
+       ones lose it (the citation stays). An old quote is the likelier only residue of a
+       session that host retention has pruned; a recent session can still be read.
+    2. Count and size: while the mapping has more than ``MAX_CITATIONS`` citations or is
+       over ``MAX_ORIGIN_BYTES``, drop the oldest citation after the first one, preferring
+       one without a quote. The first citation (the first capture) always stays, and the
+       most recent ones survive.
+
+    Returns the bounded mapping and ``{"citations_dropped", "quotes_dropped"}``.
+    """
+    citations: list[dict[str, Any]] = []
+    quoted = quotes_dropped = 0
+    for citation in mapping.get("citations") or []:
+        citation = dict(citation)
+        if "quote" in citation:
+            quoted += 1
+            if quoted > MAX_QUOTED_CITATIONS:
+                citation = _strip_quote(citation)
+                quotes_dropped += 1
+        citations.append(citation)
+    bounded = {**mapping, "citations": citations}
+    dropped = 0
+    while len(citations) > 1 and (len(citations) > MAX_CITATIONS or origin_size(bounded) > MAX_ORIGIN_BYTES):
+        index = next((i for i in range(1, len(citations)) if "quote" not in citations[i]), 1)
+        citations.pop(index)
+        dropped += 1
+        bounded = {**mapping, "citations": citations}
+    return bounded, {"citations_dropped": dropped, "quotes_dropped": quotes_dropped}
+
+
+def merge_session_origins(mappings: list[Any]) -> tuple[dict[str, Any] | None, dict[str, int]]:
+    """Merge the ``session_origin`` mappings of several copies of one fact (consolidation
+    merge, backup restore) into one, never refusing because of the bounds.
+
+    The earliest capture (``captured_at``, then list order) is the first capture: it keeps
+    ``producer``, ``captured_session_id``, ``captured_at`` and any approval fields. The
+    citations of every mapping follow in capture order, deduplicated like
+    ``merge_session_origin``; an unresolved status sticks. The result is then fitted by
+    ``bound_session_origin``. ``None`` entries are skipped; all ``None`` gives ``None``.
+    An invalid mapping raises ``SessionOriginRefused`` (nothing is merged or written), so a
+    corrupt mapping is reported instead of silently dropped.
+    """
+    present: list[tuple[int, Mapping[str, Any]]] = []
+    for index, mapping in enumerate(mappings):
+        if mapping is None:
+            continue
+        try:
+            validate_session_origin(mapping)
+        except SessionOriginRefused as exc:
+            raise SessionOriginRefused(f"session_origin {index} is invalid: {exc}") from exc
+        present.append((index, mapping))
+    if not present:
+        return None, {"citations_dropped": 0, "quotes_dropped": 0}
+    present.sort(key=lambda item: (str(item[1]["captured_at"]), item[0]))
+    base = present[0][1]
+    merged = {key: (list(value) if key == "citations" else value) for key, value in base.items()}
+    seen = {_citation_key(citation) for citation in merged["citations"]}
+    for _, mapping in present[1:]:
+        for citation in mapping["citations"]:
+            if _citation_key(citation) not in seen:
+                merged["citations"].append(dict(citation))
+                seen.add(_citation_key(citation))
+        if merged["citation_status"] == "verified" and mapping["citation_status"] != "verified":
+            merged["citation_status"] = mapping["citation_status"]
+    bounded, trimmed = bound_session_origin(merged)
+    validate_session_origin(bounded)
+    return bounded, trimmed
+
+
 def describe_session_origin(mapping: Any, *, state_db: str | None) -> dict[str, Any]:
     """Inspect disclosure: the recorded origin plus each citation's current status. Read-only."""
     try:
@@ -787,5 +898,6 @@ __all__ = [
     "resolve_span", "resolve_source_line", "verify_citation", "make_quote", "span_sha256", "uids_sha256", "content_sha256",
     "ORIGIN_SCHEMA", "PRODUCERS", "ORIGIN_MODES", "MAX_CITATIONS", "MAX_QUOTED_CITATIONS", "MAX_ORIGIN_BYTES",
     "SessionOriginRefused", "origin_size", "validate_session_origin", "build_session_origin",
-    "merge_session_origin", "describe_session_origin", "resolve_position", "verify_origin_citation", "span_quote",
+    "merge_session_origin", "merge_session_origins", "bound_session_origin", "describe_session_origin",
+    "origin_session_id", "resolve_position", "verify_origin_citation", "span_quote",
 ]

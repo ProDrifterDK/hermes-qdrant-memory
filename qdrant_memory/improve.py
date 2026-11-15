@@ -738,6 +738,53 @@ def load_improve_report(
     return loaded
 
 
+def _origin_captures_path(report_id: str, hermes_home: str) -> Any:
+    from pathlib import Path
+    return Path(hermes_home) / "qdrant_memory" / "improve_reports" / f"{report_id}.origin.json"
+
+
+def persist_improve_origin_captures(report_id: str, captures: Mapping[str, Mapping[str, Any]], *,
+                                    hermes_home: str) -> None:
+    """Persist the session_origin captures of one improve preview (C'6).
+
+    A sidecar next to the report, ``<report_id>.origin.json``, private (0600), written
+    atomically. It holds per candidate the capture an apply turns into a citation (the
+    preview's session, the capture time and the exact source line), so a process restart
+    between preview and apply still cites the line. Captures already on disk win (the first
+    preview's capture stands).
+    """
+    import os
+
+    if not REPORT_ID_RE.match(report_id) or not captures or not hermes_home:
+        return
+    path = _origin_captures_path(report_id, hermes_home)
+    merged = {**{str(key): dict(value) for key, value in captures.items()},
+              **load_improve_origin_captures(report_id, hermes_home=hermes_home)}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps({"report_id": report_id, "captures": merged}, sort_keys=True, ensure_ascii=False))
+    os.replace(tmp, path)
+
+
+def load_improve_origin_captures(report_id: str, *, hermes_home: str) -> dict[str, dict[str, Any]]:
+    """The persisted captures of ``report_id`` by candidate id; ``{}`` when absent or unreadable."""
+    if not REPORT_ID_RE.match(report_id) or not hermes_home:
+        return {}
+    path = _origin_captures_path(report_id, hermes_home)
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(loaded, dict) or loaded.get("report_id") != report_id:
+        return {}
+    captures = loaded.get("captures")
+    if not isinstance(captures, dict):
+        return {}
+    return {str(key): dict(value) for key, value in captures.items() if isinstance(value, dict)}
+
+
 # ---------------------------------------------------------------------------
 # Application record (idempotency)
 # ---------------------------------------------------------------------------

@@ -127,6 +127,10 @@ def _point_requires_manual_review(point: ConsolidationPoint) -> bool:
     payload = point.payload or {}
     if identity_bearing_payload(payload):
         return True
+    # A conversation-born fact with a recorded session origin (C'6) is never retired, merged
+    # or quarantined by guarded-auto maintenance without a human: its citations are evidence.
+    if payload.get("session_origin") is not None:
+        return True
     return any(str(payload.get(key) or "").strip() for key in _FACT_METADATA_KEYS)
 
 

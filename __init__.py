@@ -122,7 +122,9 @@ from qdrant_memory.improve import (
     is_candidate_applied,
     is_identity_bearing_graph_candidate,
     is_identity_bearing_value,
+    load_improve_origin_captures,
     load_improve_report,
+    persist_improve_origin_captures,
     make_candidate_digest,
     persist_improve_report,
     record_candidate_applied,
@@ -161,6 +163,8 @@ from qdrant_memory.session_origin import (
     SessionOriginRefused,
     build_session_origin,
     merge_session_origin,
+    merge_session_origins,
+    origin_session_id,
     origin_size,
     resolve_position,
     resolve_source_line,
@@ -1468,6 +1472,7 @@ class QdrantMemoryProvider(MemoryProvider):
             previews[self._cite_key(point_id, cite)] = citation
             while len(previews) > self._SESSION_ORIGIN_PREVIEW_LIMIT:
                 previews.pop(next(iter(previews)))
+            self._persist_cite_preview(self._cite_key(point_id, cite), citation)
         shown: dict[str, Any] = {
             "citation_status": capture["citation_status"],
             "citation": citation if isinstance(citation, dict) else None,
@@ -1478,12 +1483,56 @@ class QdrantMemoryProvider(MemoryProvider):
             shown["quote_omitted"] = quote_note
         return shown
 
+    # Cite previews also live in a private file under $HERMES_HOME (C'6), so a preview survives
+    # a process restart and the CLI (one process per command) can preview and then approve.
+    # The approve still re-verifies the previewed digests against state.db, so a stale or
+    # edited record can never store a span that is not in state.db now.
+    def _cite_previews_path(self) -> Optional[Path]:
+        if not self._hermes_home:
+            return None
+        return Path(str(self._hermes_home)) / "qdrant_memory" / "session_origin_previews.json"
+
+    def _load_cite_previews(self) -> dict[tuple, Any]:
+        path = self._cite_previews_path()
+        if path is None:
+            return {}
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            entries = loaded.get("previews") if isinstance(loaded, dict) else None
+            return {tuple(key): value for key, value in entries or []
+                    if isinstance(key, list) and len(key) == 5 and isinstance(value, (dict, str))}
+        except Exception:
+            return {}
+
+    def _persist_cite_preview(self, key: tuple, citation: Any) -> None:
+        """Record (or with ``None`` forget) one cite preview on disk; best effort."""
+        path = self._cite_previews_path()
+        if path is None:
+            return
+        try:
+            previews = self._load_cite_previews()
+            previews.pop(key, None)
+            if citation is not None:
+                previews[key] = citation
+            entries = [[list(item_key), value] for item_key, value in previews.items()]
+            entries = entries[-self._SESSION_ORIGIN_PREVIEW_LIMIT:]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps({"previews": entries}, sort_keys=True))
+            os.replace(tmp, path)
+        except Exception as exc:  # the in-memory preview still serves this process
+            logger.warning("Failed to persist session_origin cite preview: %s", exc)
+
     def _session_origin_capture(self, point_id: str, cite: Optional[dict[str, Any]]) -> dict[str, Any]:
         """The capture an approve records; a cite must match its preview. Raises SessionOriginRefused."""
         state_db = self._state_db_path()
         now = self._utc_now_z()
         if cite is not None:
             previewed = self._session_origin_previews.get(self._cite_key(point_id, cite))
+            if previewed is None:
+                previewed = self._load_cite_previews().get(self._cite_key(point_id, cite))
             if previewed is None:
                 raise SessionOriginRefused(
                     "cite needs a preview first: call qdrant_memory_store with the same text and cite and "
@@ -1618,8 +1667,10 @@ class QdrantMemoryProvider(MemoryProvider):
                 merged = merge_session_origin(existing_origin, origin)
             except SessionOriginRefused as exc:
                 return str(exc)
+            # The legacy session_id follows the first capture (C'6), never the approver.
             qdrant.upsert(collection, [{"id": point_id, "vector": vector,
-                                        "payload": {**payload, "session_origin": merged}}])
+                                        "payload": {**payload, "session_origin": merged,
+                                                    "session_id": origin_session_id(merged, payload.get("session_id"))}}])
         return ""
 
     def _tool_status(self) -> str:
@@ -1841,6 +1892,7 @@ class QdrantMemoryProvider(MemoryProvider):
             if recorded and capture is not None:
                 if cite is not None:
                     self._session_origin_previews.pop(self._cite_key(str(preview["id"]), cite), None)
+                    self._persist_cite_preview(self._cite_key(str(preview["id"]), cite), None)
                 stored["session_origin"] = {
                     "citation_status": capture["citation_status"],
                     "citation": capture["citations"][0] if capture["citations"] else None,
@@ -2510,6 +2562,11 @@ class QdrantMemoryProvider(MemoryProvider):
         if action == "merge" and points:
             canonical = self._select_canonical_point(points)
             plan.update({"canonical_id": canonical.id, "delete_ids": [p.id for p in points if p.id != canonical.id]})
+            if any(self._point_session_origin(p) is not None for p in points):
+                try:
+                    plan["session_origin_merge"] = self._consolidation_session_origin(points)[1]
+                except SessionOriginRefused as exc:
+                    plan["session_origin_merge"] = {"refused": str(exc)}
         elif action == "delete":
             plan.update({"delete_ids": affected_ids})
         elif action == "quarantine":
@@ -2523,6 +2580,29 @@ class QdrantMemoryProvider(MemoryProvider):
             draft = proposal_draft_metadata(report=report, proposal=proposal, points=points, hermes_home=self._hermes_home, config=self._config, write_decision=write_decision)
             plan.update({"proposal_draft_path": draft["path"], "reconsolidation_draft_path": draft["path"], "write_decision": write_decision.to_dict() if write_decision else None})
         return plan
+
+    @staticmethod
+    def _point_session_origin(point: Any) -> Any:
+        payload = point.payload if isinstance(getattr(point, "payload", None), dict) else {}
+        return payload.get("session_origin")
+
+    def _consolidation_session_origin(self, points: list[Any]) -> tuple[Optional[dict[str, Any]], dict[str, Any]]:
+        """The merged ``session_origin`` of a duplicate cluster and a summary of the merge.
+
+        Raises ``SessionOriginRefused`` when a mapping in the cluster is invalid: the merge is
+        refused rather than dropping it.
+        """
+        mappings = [self._point_session_origin(point) for point in points]
+        merged, trimmed = merge_session_origins(mappings)
+        if merged is None:
+            return None, {}
+        return merged, {
+            "from_ids": [point.id for point, mapping in zip(points, mappings) if mapping is not None],
+            "captured_session_id": merged["captured_session_id"],
+            "citation_status": merged["citation_status"],
+            "citation_count": len(merged["citations"]),
+            **trimmed,
+        }
 
     def _select_canonical_point(self, points: list[Any]) -> Any:
         def key(point: Any) -> tuple[float, float, str, str]:
@@ -2723,6 +2803,18 @@ class QdrantMemoryProvider(MemoryProvider):
                     return _json_error("merge requires at least two affected points")
                 if any(contains_secret(p.text) for p in points):
                     return _json_error("secret-bearing duplicate cluster requires manual review")
+                origin_extra: dict[str, Any] = {}
+                if any(self._point_session_origin(p) is not None for p in points) and fence_verdict is None:
+                    # Merging session_origin is a read-merge-write of the canonical payload: hold
+                    # the collection lock the stores take (reconcile mode reaches here without
+                    # it) and decide from a fresh read.
+                    try:
+                        lock_stack.enter_context(self._origin_lock(collection_name))
+                    except (TimeoutError, RuntimeError):
+                        return _json_error(LINEAGE_LOCK_UNAVAILABLE)
+                    points = self._retrieve_consolidation_points(collection_name, affected_ids)
+                    if len(points) != len(set(affected_ids)):
+                        return _json_error("affected point missing; rerun consolidation")
                 canonical = self._select_canonical_point(points)
                 delete_ids = [p.id for p in points if p.id != canonical.id]
                 payload_update = {
@@ -2732,11 +2824,24 @@ class QdrantMemoryProvider(MemoryProvider):
                     "consolidated_at": datetime.utcnow().isoformat() + "Z",
                     "duplicate_count": len(points),
                 }
+                # The duplicates' citations move onto the canonical point before they are deleted
+                # (C'6): the merged fact keeps every origin, within the bounds (first capture and
+                # the most recent citations kept, see bound_session_origin). In every mode.
+                try:
+                    merged_origin, origin_summary = self._consolidation_session_origin(points)
+                except SessionOriginRefused as exc:
+                    return _json_error(f"consolidation merge refused: {exc}")
+                if merged_origin is not None:
+                    payload_update["session_origin"] = merged_origin
+                    if self._session_origin_mode() == "recorded":
+                        payload_update["session_id"] = origin_session_id(
+                            merged_origin, (canonical.payload or {}).get("session_id"))
+                    origin_extra = {"session_origin_merge": origin_summary}
                 self._qdrant.update_payload(collection_name, canonical.id, payload_update)
                 if delete_ids:
                     self._qdrant.delete_ids(collection_name, delete_ids)
-                record = persist_application_record({"applied": True, **plan, **pre_apply, "canonical_id": canonical.id, "deleted_ids": delete_ids}, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))
-                return json.dumps({"dry_run": False, "applied": True, **plan, **pre_apply, "canonical_id": canonical.id, "deleted_ids": delete_ids, "application_id": record.get("application_id"), "application_artifact": record.get("artifact_path")})
+                record = persist_application_record({"applied": True, **plan, **pre_apply, "canonical_id": canonical.id, "deleted_ids": delete_ids, **origin_extra}, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))
+                return json.dumps({"dry_run": False, "applied": True, **plan, **pre_apply, "canonical_id": canonical.id, "deleted_ids": delete_ids, **origin_extra, "application_id": record.get("application_id"), "application_artifact": record.get("artifact_path")})
             if action == "promote_to_skill":
                 if collection_name != self._config["learning_collection_name"]:
                     return _json_error("promote_to_skill requires a learning collection proposal")
@@ -3175,9 +3280,10 @@ class QdrantMemoryProvider(MemoryProvider):
                     return _json_error(origin_error)
                 origin_shown = {"session_origin": self._origin_summary(origin)}
             else:
-                self._lineage_locked_upsert(
-                    self._config["collection_name"],
-                    [{"id": candidate.candidate_id, "vector": vector, "payload": payload}],
+                # Mode off: an existing session_origin at the candidate id is carried forward,
+                # so switching the mode back to off never destroys recorded provenance.
+                self._locked_upsert_carrying_origin(
+                    self._config["collection_name"], candidate.candidate_id, vector, payload,
                 )
             self._pending_extraction_candidates.pop(candidate_id, None)
             self._reviewed_extraction_candidate_ids.discard(candidate_id)
@@ -3290,7 +3396,8 @@ class QdrantMemoryProvider(MemoryProvider):
             include_metadata=include_metadata,
         )
 
-        self._remember_improve_captures(report["report_id"], source_scope, all_candidates, session_id, source_text)
+        self._remember_improve_captures(report["report_id"], source_scope, all_candidates, session_id, source_text,
+                                        persist=persist)
 
         if persist:
             try:
@@ -3306,7 +3413,7 @@ class QdrantMemoryProvider(MemoryProvider):
     _IMPROVE_CAPTURE_LIMIT = 256
 
     def _remember_improve_captures(self, report_id: str, source_scope: str, candidates: list[Any], session_id: str,
-                                   source_text: str) -> None:
+                                   source_text: str, *, persist: bool = False) -> None:
         """Freeze the origin capture of each conversation-born candidate of a preview (C'4).
 
         ``source_text`` under a ``session://`` URI: the preview's session and the exact line
@@ -3314,10 +3421,14 @@ class QdrantMemoryProvider(MemoryProvider):
         capture the candidate already carries (C'3). ``point_ids``: never anything. A Qdrant
         point, a legacy conversation turn above all, is not evidence of a ``state.db`` span
         (design 5.1), even when its session and its words are still in ``state.db``.
-        Recorded in every mode (in memory only), like the hook captures.
+        Recorded in every mode in memory, like the hook captures. In recorded mode a
+        persisted preview also writes them to a private sidecar next to the report (C'6), so
+        a restart between preview and apply still cites the line.
         """
         if source_scope not in ("source_text", "pending_session"):
             return
+        if session_id == "current":  # the caller's spelling of "this session"
+            session_id = self._session_id or ""
         lines = (source_text or "").splitlines()
         now = self._utc_now_z()
         captures = self._improve_origin_captures
@@ -3334,6 +3445,12 @@ class QdrantMemoryProvider(MemoryProvider):
                                  "source_text": line, "role": ""}
             else:
                 captures[key] = dict(getattr(candidate, "origin_capture", None) or {})
+        if persist and self._session_origin_mode() == "recorded":
+            mine = {cid: capture for (rid, cid), capture in captures.items() if rid == report_id}
+            try:
+                persist_improve_origin_captures(report_id, mine, hermes_home=self._hermes_home)
+            except Exception as exc:  # the in-memory capture still serves this process
+                logger.warning("Failed to persist improve origin captures: %s", exc)
         while len(captures) > self._IMPROVE_CAPTURE_LIMIT:
             captures.pop(next(iter(captures)))
 
@@ -3351,6 +3468,9 @@ class QdrantMemoryProvider(MemoryProvider):
             return None
         capture = self._improve_origin_captures.get((report_id, str(candidate.candidate_id)))
         if capture is None:
+            capture = load_improve_origin_captures(report_id, hermes_home=self._hermes_home).get(
+                str(candidate.candidate_id))
+        if capture is None:
             uri = str(candidate.source_uri or "")
             if not uri.startswith("session://"):
                 return None
@@ -3359,6 +3479,28 @@ class QdrantMemoryProvider(MemoryProvider):
                 session = uri[len("session://"):].split("/", 1)[0]
             capture = {"session_id": "" if session == "current" else session, "source_text": "", "role": ""}
         return self._candidate_session_origin("improve", capture)
+
+    def _locked_upsert_carrying_origin(self, collection_name: str, point_id: str, vector: Any,
+                                       payload: dict[str, Any]) -> None:
+        """``_lineage_locked_upsert`` of one point that keeps an existing ``session_origin``.
+
+        For writes that bring no new capture (session_origin_mode off): the point is re-read
+        under the collection lock and a mapping already on it is carried forward unchanged
+        (validated), so a replace never drops recorded provenance. Raises
+        ``LineageLockUnavailable`` like the locked upsert.
+        """
+        lock_stack = ExitStack()
+        try:
+            lock_stack.enter_context(self._origin_lock(collection_name))
+        except (TimeoutError, RuntimeError) as exc:
+            raise LineageLockUnavailable(LINEAGE_LOCK_UNAVAILABLE) from exc
+        with lock_stack:
+            for item in self._qdrant.retrieve(collection_name, [point_id], with_payload=True) or []:
+                stored = item.get("payload") if isinstance(item, dict) else None
+                if isinstance(stored, dict) and "session_origin" in stored:
+                    validate_session_origin(stored["session_origin"])
+                    payload = {**payload, "session_origin": stored["session_origin"]}
+            self._qdrant.upsert(collection_name, [{"id": point_id, "vector": vector, "payload": payload}])
 
     def _improve_locked_insert(self, point_id: str, vector: list[float], payload: dict[str, Any]) -> str:
         """Upsert a new improve point under the memory collection lock; ``""`` once written.
@@ -3635,6 +3777,7 @@ class QdrantMemoryProvider(MemoryProvider):
             origin = self._improve_session_origin(report, report_id, candidate) if recorded else None
             if origin is not None:
                 payload["session_origin"] = merge_session_origin(None, origin)
+                payload["session_id"] = origin_session_id(origin, payload.get("session_id"))
 
             text = str(payload.get("text") or payload.get("claim_text") or "")
             vector = self._embeddings.embed_document(text)

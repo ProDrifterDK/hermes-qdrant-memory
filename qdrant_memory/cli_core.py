@@ -1751,6 +1751,27 @@ def _format_result_list(payload: dict[str, Any], *, label: str, plural_label: st
     return "\n".join(lines)
 
 
+def _store_cite_arg(args: Namespace) -> dict[str, Any] | None:
+    """``store --cite FIRST:LAST --session-id SID [--cite-quote]`` as the tool's ``cite``."""
+    raw = getattr(args, "cite", None)
+    session_id = getattr(args, "session_id", None)
+    quote = bool(getattr(args, "cite_quote", False))
+    if raw is None:
+        if session_id is not None or quote:
+            raise CliUsageError("--session-id and --cite-quote need --cite FIRST:LAST")
+        return None
+    match = re.fullmatch(r"\s*(\d+)\s*:\s*(\d+)\s*", str(raw))
+    if not match or int(match.group(1)) < 1 or int(match.group(1)) > int(match.group(2)):
+        raise CliUsageError("--cite must be FIRST:LAST with message ids 1 <= FIRST <= LAST")
+    if not str(session_id or "").strip():
+        raise CliUsageError("--cite needs --session-id (the CLI has no current session)")
+    cite: dict[str, Any] = {"session_id": str(session_id).strip(), "first_msg_id": int(match.group(1)),
+                            "last_msg_id": int(match.group(2))}
+    if quote:
+        cite["quote"] = True
+    return cite
+
+
 def _format_store_summary(payload: dict[str, Any], *, learning: bool = False) -> str:
     label = "learning" if learning else "memory"
     item_id = payload.get("id") or "<unknown>"
@@ -1780,6 +1801,17 @@ def _format_store_summary(payload: dict[str, Any], *, learning: bool = False) ->
             lines.append(f"duplicate_score: {float(duplicate.get('score', 0.0)):.3f}")
         except Exception:
             pass
+    origin = payload.get("session_origin") if isinstance(payload.get("session_origin"), dict) else None
+    if origin:
+        lines.append(f"session_origin.citation_status: {_safe_scalar(origin.get('citation_status'))}")
+        citation = origin.get("citation") if isinstance(origin.get("citation"), dict) else None
+        if citation:
+            span = (f"{citation.get('first_msg_id')}..{citation.get('last_msg_id')}" if "first_msg_id" in citation
+                    else f"after {citation.get('after_msg_id')}")
+            lines.append(f"session_origin.citation: {_safe_scalar(citation.get('session_id'))} {span} "
+                         f"{_safe_scalar(citation.get('basis'))}")
+            if citation.get("span_sha256"):
+                lines.append(f"session_origin.span_sha256: {_safe_scalar(citation.get('span_sha256'))}")
     return "\n".join(lines)
 
 
@@ -2435,6 +2467,9 @@ def build_tool_call(args: Namespace) -> tuple[str, dict[str, Any]]:
         }
         if getattr(args, "approve", False):
             tool_args["approve"] = True
+        cite = _store_cite_arg(args)
+        if cite is not None:
+            tool_args["cite"] = cite
         return "qdrant_memory_store", tool_args
 
     if subcommand == "search":
@@ -2724,6 +2759,11 @@ def execute_command(
         return 2
 
     provider = provider_factory()
+    if tool_name == "qdrant_memory_store" and "cite" in tool_args:
+        mode_of = getattr(provider, "_session_origin_mode", None)
+        if not callable(mode_of) or mode_of() != "recorded":
+            _print_cli_error("--cite needs qdrant_memory.session_origin_mode: recorded", args, stderr)
+            return 2
     result = provider.handle_tool_call(tool_name, tool_args)
     try:
         parsed = json.loads(result)
