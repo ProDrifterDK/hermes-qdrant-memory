@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping
 
+from qdrant_memory.config import relevance_floor
 from qdrant_memory.host_markers import is_host_injected
 from qdrant_memory.lesson_extractor import contains_secret, redact_secret_spans
 from qdrant_memory.retriever import prompt_char_cap
@@ -67,13 +68,11 @@ def _clamp(value: Any, default: float, lo: float, hi: float) -> float:
 
 
 def _floor(value: Any) -> float | None:
-    """A relevance floor from config: a number, or None (off) for null, "" or garbage."""
-    if value is None or isinstance(value, bool) or (isinstance(value, str) and not value.strip()):
-        return None
-    try:
-        return float(value)
-    except Exception:
-        return None
+    """A lane relevance floor from config: a number, or None (off) for "off", "", null or garbage.
+
+    0 is a real threshold here: rerank logits and cosine similarity can be negative.
+    """
+    return relevance_floor(value)
 
 
 @dataclass(frozen=True)

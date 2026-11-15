@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from .config import min_word_chars as _min_word_chars, relevance_floor
 from .host_markers import is_host_injected
 from .schema import now_iso, valid_fact_status, valid_memory_kind
 from .ranking import RankingContext, RankingPolicy, query_requests_review_history, rank_memory_candidate
@@ -181,19 +182,25 @@ def _conversation_scaffolding(payload: dict[str, Any]) -> bool:
 
 
 def above_auto_recall_floor(
-    chunks: list["RetrievedMemory"], min_final_score: float = 0.0, min_raw_score: float = 0.0
+    chunks: list["RetrievedMemory"], min_final_score: Any = None, min_raw_score: Any = None
 ) -> list["RetrievedMemory"]:
     """Automatic recall's relevance floor: chunks below either threshold are left out.
 
     ``final_score`` is the ranked score (min-max normalized similarity x importance x
     recency x provenance); ``qdrant_score`` the raw cosine similarity. A sparse-only hit
     has no raw score and is judged by its final score alone. Tool searches do not use it.
+    A floor that is off ("off", "", None or 0, see ``config.relevance_floor``) is not
+    applied, so with both off the chunks come back unchanged.
     """
+    final_floor = relevance_floor(min_final_score, zero_is_off=True)
+    raw_floor = relevance_floor(min_raw_score, zero_is_off=True)
+    if final_floor is None and raw_floor is None:
+        return list(chunks)
     out = []
     for chunk in chunks:
-        if chunk.final_score < float(min_final_score or 0.0):
+        if final_floor is not None and chunk.final_score < final_floor:
             continue
-        if chunk.qdrant_score and chunk.qdrant_score < float(min_raw_score or 0.0):
+        if raw_floor is not None and chunk.qdrant_score and chunk.qdrant_score < raw_floor:
             continue
         out.append(chunk)
     return out
@@ -207,13 +214,11 @@ def too_short_for_recall(query: str, min_word_chars: Any) -> bool:
 
     Such messages are confirmations, choices and pings ("ok", "dale", "lanzalo", "1. a",
     "estatus?"); they point at the live conversation, which is already in the prompt, and
-    a similarity search with them returns whatever shares a word. 0 disables. One CJK
-    character carries about a word, so CJK-heavy profiles want a lower value.
+    a similarity search with them returns whatever shares a word. "off", "", None or 0
+    disables (the default). One CJK character carries about a word, so CJK-heavy profiles
+    want a lower value.
     """
-    try:
-        limit = int(min_word_chars or 0)
-    except Exception:
-        return False
+    limit = _min_word_chars(min_word_chars)
     return limit > 0 and len(_WORD_CHAR_RE.findall(str(query or ""))) < limit
 
 

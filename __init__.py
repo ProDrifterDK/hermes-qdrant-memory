@@ -1041,8 +1041,8 @@ class QdrantMemoryProvider(MemoryProvider):
         )
         chunks = above_auto_recall_floor(
             chunks,
-            float(self._config.get("auto_recall_min_final_score") or 0.0),
-            float(self._config.get("auto_recall_min_raw_score") or 0.0),
+            self._config.get("auto_recall_min_final_score"),
+            self._config.get("auto_recall_min_raw_score"),
         )
         return format_for_prompt(chunks, int(self._config["display_tokens"]))
 

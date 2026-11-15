@@ -25,6 +25,9 @@ Failure modes, written before the code:
    pruned (no row to check).
 10. A relevance floor leaves a bare block header when nothing clears it, or judges a
    reranked result by the dense floor (they are on different scales).
+11. An install that sets none of the floor keys loses recall it had before: a short
+   confirmation is skipped or a memory is cut by a floor tuned for another model, or the
+   host-scaffolding filter (a correctness fix, not a tuning knob) is off with the floors.
 
 Only the network boundaries are fake (the Qdrant transport and the embedder). The
 state.db is a real SQLite file built from the production schema; windows are written by
@@ -218,10 +221,8 @@ def _provider(monkeypatch, tmp_path, store, log, **overrides):
         "session_recall_auto_index": False,
         "sync_turns": False,
         "vector_size": 64,
-        # The shipped lane floors are calibrated for bge-m3 cosine and bge-reranker logits;
-        # the token-hash embedder here is on another scale, so tests opt in explicitly.
-        "session_prefetch_min_dense_score": "off",
-        "session_prefetch_min_rerank_score": "off",
+        # The relevance floors and the short-message skip are left at their defaults (off);
+        # tests that exercise them opt in explicitly.
         **overrides,
     }
     monkeypatch.setattr("qdrant_memory.config._load_hermes_config", lambda: {"qdrant_memory": section})
@@ -573,3 +574,45 @@ def test_below_floor_recall_injects_nothing_not_a_header(monkeypatch, tmp_path):
     finally:
         provider.shutdown()
         reranker.close()
+
+
+def test_default_config_keeps_short_message_recall_and_still_filters_host_text(monkeypatch, tmp_path):
+    _state_db_with_other_session(tmp_path / "state.db")
+    store, log = {}, []
+    provider = _provider(
+        monkeypatch, tmp_path, store, log, session_prefetch_enabled=True, session_prefetch_scope="all",
+        session_prefetch_top_k=10, session_prefetch_max_chars=6000, session_prefetch_total_chars=8000,
+    )
+    for key in ("auto_recall_min_final_score", "auto_recall_min_raw_score", "auto_recall_min_word_chars",
+                "session_prefetch_min_rerank_score", "session_prefetch_min_dense_score"):
+        assert provider._config[key] == "off", key
+    _seed_memory(store)
+    emb = TokenEmbeddings()
+    for pid, user in (("turn-host", HOST_NOTIFICATION), ("turn-real", "relay ok? CONTROLTURN")):
+        text = f"User: {user}\nAssistant: noted, the relay stays up"
+        store[MEMORY][pid] = {"id": pid, "vector": emb.embed_document(text), "payload": {
+            "text": text, "profile_id": "default", "source_type": "conversation", "memory_kind": "conversation_turn",
+            "importance": 5, "created_at": "2099-01-01T00:00:00+00:00"}}
+    _index_windows(provider)
+    short = "relay ok?"  # 7 word characters: a confirmation the short-message skip would drop
+    # Precondition: dense search ranks host-scaffolding windows among the lane's candidates.
+    qv = emb.embed_query(short)
+    ranked = sorted(store[WINDOWS].values(), key=lambda p: -sum(a * b for a, b in zip(p["vector"], qv)))
+    assert any("HOSTLEAK" in p["payload"]["text"] for p in ranked[:10])
+    log.clear()
+
+    out = provider.prefetch(short, session_id="tip")
+
+    # The legacy block is exactly what the plain legacy path returns (no skip, no floor).
+    legacy = format_for_prompt(
+        (provider._memory_recall() or provider._retriever).search(
+            short, top_k=int(provider._config["auto_recall_top_k"]), update_access=False),
+        int(provider._config["display_tokens"]),
+    )
+    assert legacy.startswith("# Relevant Long-Term Memory")
+    assert "relay-gateway.md" in legacy and "CONTROLTURN" in legacy
+    assert out.startswith(legacy)
+    assert "# Recalled Earlier Conversation" in out[len(legacy):]
+    for text in HOST_TEXT:  # neither the legacy turn point nor any window brings host text
+        assert text not in out, text
+    assert _mutations(log) == []

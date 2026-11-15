@@ -385,8 +385,8 @@ def run(args) -> dict[str, Any]:
     parity = []
     for q in frozen[:3]:
         chunks = [chunk_record(c) for c in legacy_chunks(provider, q["q"], None)]
-        mine = sim.legacy(chunks, float(provider._config.get("auto_recall_min_final_score") or 0.0),
-                          float(provider._config.get("auto_recall_min_raw_score") or 0.0))
+        mine = sim.legacy(chunks, provider._config.get("auto_recall_min_final_score"),
+                          provider._config.get("auto_recall_min_raw_score"))
         parity.append(mine == provider.prefetch(q["q"], session_id=""))
 
     lane_kw = dict(candidates=args.candidates, top_k=5, max_chars=1200, total_chars=legacy_cap + 1200 + 2)

@@ -71,13 +71,14 @@ DEFAULTS: dict[str, Any] = {
     "min_raw_score": 0.0,
     "min_final_score": 0.0,
     # Automatic recall only (the legacy block): memories below these are not injected; with none
-    # left the block is empty. 0 disables. Tool searches use min_raw_score/min_final_score.
-    # Measured on one install (docs/session-recall-prefetch.md, "Relevance floor"): 0.1 cut the
-    # legacy block on short confirmations from 41 of 41 turns to 1 within one gate hit.
-    "auto_recall_min_final_score": 0.1,
-    "auto_recall_min_raw_score": 0.0,
-    # Messages with fewer letters/digits than this skip automatic recall (legacy and lane).
-    "auto_recall_min_word_chars": 12,
+    # left the block is empty. Tool searches use min_raw_score/min_final_score. Off by default
+    # ("off", "", null or 0 disables); docs/session-recall-prefetch.md "Relevance floor" gives
+    # values measured for one embedding/reranker pair, to be re-derived for other models.
+    "auto_recall_min_final_score": "off",
+    "auto_recall_min_raw_score": "off",
+    # Messages with fewer letters/digits than this skip automatic recall (legacy, hybrid and
+    # lane). Off by default ("off", "", null or 0).
+    "auto_recall_min_word_chars": "off",
     "provenance_ranking_enabled": True,
     "qdrant_api_key": "",
     "embedding_api_key": "",
@@ -154,10 +155,11 @@ DEFAULTS: dict[str, Any] = {
     "session_prefetch_candidates": 32,
     "session_prefetch_timeout_s": 2.0,
     # Lane relevance floors: a reranked excerpt needs at least min_rerank_score, a dense-ordered
-    # one (no reranker, or it failed) at least min_dense_score (cosine). "" or "off" disables.
-    # Calibrated for bge-reranker-v2-m3 logits and bge-m3 cosine; re-derive for other models.
-    "session_prefetch_min_rerank_score": -1.5,
-    "session_prefetch_min_dense_score": 0.55,
+    # one (no reranker, or it failed) at least min_dense_score (cosine). Off by default ("off",
+    # "" or null; 0 is a real threshold on these scales). Values are model-specific: see
+    # docs/session-recall-prefetch.md "Relevance floor".
+    "session_prefetch_min_rerank_score": "off",
+    "session_prefetch_min_dense_score": "off",
     # Opt-in read-only tool qdrant_memory_session_expand (messages around a msg id).
     "session_expand_enabled": False,
     # C' session origin: ``off`` (default) keeps manual-store payloads, schemas and outputs
@@ -211,7 +213,6 @@ _INT_KEYS = {
     "embedding_max_input_chars",
     "embedding_max_chunks",
     "auto_recall_top_k",
-    "auto_recall_min_word_chars",
     "search_candidates",
     "max_chunk_tokens",
     "display_tokens",
@@ -244,8 +245,55 @@ _INT_KEYS = {
     "session_prefetch_total_chars",
     "session_prefetch_candidates",
 }
-_FLOAT_KEYS = {"session_prefetch_timeout_s", "session_recall_rerank_timeout_s", "session_recall_inline_catchup_seconds", "decay_rate", "min_raw_score", "min_final_score", "auto_recall_min_final_score", "auto_recall_min_raw_score", "learning_auto_extract_min_confidence", "learning_auto_extract_semantic_dedupe_threshold", "source_extraction_min_confidence", "consolidation_duplicate_threshold", "guarded_auto_duplicate_min_confidence", "guarded_auto_learning_min_confidence", "reconsolidation_min_confidence", "manual_store_duplicate_threshold", "lineage_lock_timeout_seconds"}
+_FLOAT_KEYS = {"session_prefetch_timeout_s", "session_recall_rerank_timeout_s", "session_recall_inline_catchup_seconds", "decay_rate", "min_raw_score", "min_final_score", "learning_auto_extract_min_confidence", "learning_auto_extract_semantic_dedupe_threshold", "source_extraction_min_confidence", "consolidation_duplicate_threshold", "guarded_auto_duplicate_min_confidence", "guarded_auto_learning_min_confidence", "reconsolidation_min_confidence", "manual_store_duplicate_threshold", "lineage_lock_timeout_seconds"}
 _LIST_KEYS = {"index_dirs", "index_extensions", "index_exclude_dirs", "session_recall_exclude_sources"}
+# Automatic-recall relevance floors. "off" (also "", null, false) disables every one of them.
+# On the legacy floors 0 disables too (their scores are never negative); on the lane floors 0
+# is a real threshold (rerank logits and cosine can be negative).
+_LEGACY_FLOOR_KEYS = {"auto_recall_min_final_score", "auto_recall_min_raw_score"}
+_LANE_FLOOR_KEYS = {"session_prefetch_min_rerank_score", "session_prefetch_min_dense_score"}
+_OFF_WORDS = {"", "off", "none", "null", "false", "no", "disabled"}
+
+
+def relevance_floor(value: Any, *, zero_is_off: bool = False) -> float | None:
+    """A relevance floor from config: a number, or None when it is off.
+
+    "off", "", null, a boolean or an unparseable value are off (no floor, the behaviour
+    without the key). With ``zero_is_off`` a 0 is off too.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str) and value.strip().lower() in _OFF_WORDS:
+        return None
+    try:
+        number = float(value)
+    except Exception:
+        logger.warning("qdrant_memory: unreadable relevance floor %r, treated as off", value)
+        return None
+    if number != number or (zero_is_off and number == 0.0):  # NaN, or 0 on a legacy floor
+        return None
+    return number
+
+
+def min_word_chars(value: Any) -> int:
+    """``auto_recall_min_word_chars`` as a count; 0 when off ("off", "", null, 0 or garbage)."""
+    if value is None or isinstance(value, bool):
+        return 0
+    if isinstance(value, str) and value.strip().lower() in _OFF_WORDS:
+        return 0
+    try:
+        return max(0, int(float(value)))
+    except Exception:
+        logger.warning("qdrant_memory: unreadable auto_recall_min_word_chars %r, treated as off", value)
+        return 0
+
+
+def _canonical_floor(key: str, value: Any) -> Any:
+    """Resolved config form of a floor key: a number, or the string "off"."""
+    if key == "auto_recall_min_word_chars":
+        return min_word_chars(value) or "off"
+    floor = relevance_floor(value, zero_is_off=key in _LEGACY_FLOOR_KEYS)
+    return "off" if floor is None else floor
 
 
 # Phase 6I: allowed values for ``auto_recall_mode``.
@@ -354,6 +402,8 @@ def _coerce(key: str, value: Any) -> Any:
         return default
     if key in _BOOL_KEYS:
         return _as_bool(value, bool(default))
+    if key in _LEGACY_FLOOR_KEYS or key in _LANE_FLOOR_KEYS or key == "auto_recall_min_word_chars":
+        return _canonical_floor(key, value)
     if key in _INT_KEYS:
         try:
             return int(value)

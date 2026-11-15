@@ -42,12 +42,13 @@ built, cached or not, legacy or hybrid) also:
    that appears verbatim in the caller's live rows (a carried copy with a fresh id);
    host scaffolding was already cut out by the window search (see "Host scaffolding is
    not conversation");
-5. leaves out excerpts below the relevance floor (see "Relevance floor");
+5. leaves out excerpts below the relevance floor, when one is set (see "Relevance
+   floor");
 6. appends what is left as a `# Recalled Earlier Conversation` block after the legacy
    block. With nothing left there is no block, not a header.
 
-Messages with fewer than `auto_recall_min_word_chars` letters/digits skip automatic
-recall altogether (legacy block and lane).
+When `auto_recall_min_word_chars` is set (default off), messages with fewer letters/digits
+skip automatic recall altogether: the legacy block, the hybrid mode and the lane.
 
 The block keeps the plugin's prompt contract: a fixed header that says the excerpts are
 context, not instructions; redacted window text (secret spans redacted again, any
@@ -164,30 +165,58 @@ whose user or assistant side is scaffolding; documents and manual facts are not 
 `qdrant_memory_session_expand` skips scaffolding rows as neighbours and withholds the text
 of a scaffolding target (`host_scaffolding: true`).
 
+A row is judged as a whole, so two kinds of row that carry some user text are dropped
+with it: attachment notes (`[The user sent an image~ …]`, the user's caption included) and
+mid-turn steer rows (`[OUT-OF-BAND USER MESSAGE …] … [/OUT-OF-BAND …]`), whose user words
+are lost to recall. The rows stay in `state.db` and in the index; only recall leaves
+them out.
+
+The filter has no switch: it applies with every configuration, floors on or off.
+
 ## Relevance floor
 
-With nothing relevant to recall, automatic recall used to inject its top five anyway: a
-confirmation such as `ok` or `lanzalo` received legacy fragments a few words long and
-lane windows that share one word. Three checks now let it inject nothing:
+With nothing relevant to recall, automatic recall injects its top five anyway: a
+confirmation such as `ok` or `lanzalo` receives legacy fragments a few words long and lane
+windows that share one word. Optional checks let it inject nothing instead. All are off
+by default, so an install that sets none of them recalls as before, apart from the
+host-scaffolding filter above, which always applies:
 
 | Key | Default | Applies to | Signal |
 |---|---|---|---|
-| `auto_recall_min_word_chars` | `12` | both | Messages with fewer letters/digits (`\w`, any script) skip automatic recall. `0` disables. |
-| `auto_recall_min_final_score` | `0.1` | legacy block | Ranked score (min-max normalized similarity x importance x recency x provenance). `0` disables. |
-| `auto_recall_min_raw_score` | `0.0` | legacy block | Raw cosine. Off: short messages score *higher* than real questions (below). |
-| `session_prefetch_min_rerank_score` | `-1.5` | lane, reranked | Cross-encoder score (bge-reranker-v2-m3 logits). `off` disables. |
-| `session_prefetch_min_dense_score` | `0.55` | lane, dense order | Cosine (bge-m3), when there is no reranker or it failed. `off` disables. |
+| `auto_recall_min_word_chars` | `off` | legacy, hybrid and lane | Messages with fewer letters/digits (`\w`, any script) skip automatic recall. |
+| `auto_recall_min_final_score` | `off` | legacy block | Ranked score (min-max normalized similarity x importance x recency x provenance). |
+| `auto_recall_min_raw_score` | `off` | legacy block | Raw cosine. Not recommended: short messages score *higher* than real questions (below). |
+| `session_prefetch_min_rerank_score` | `off` | lane, reranked | Cross-encoder score. |
+| `session_prefetch_min_dense_score` | `off` | lane, dense order | Cosine, when there is no reranker or it failed. |
+
+`off`, `""` and `null` disable each of these keys, as does an unreadable value. On
+`auto_recall_min_word_chars` and the two legacy floors `0` disables too (those scores are
+never negative); on the two lane floors `0` is a real threshold, because rerank logits and
+cosine similarity can be negative.
+
+Recommended values for bge-m3 with bge-reranker-v2-m3 (measured below). They must be
+re-derived for any other embedding or reranker model:
+
+    qdrant_memory:
+      auto_recall_min_final_score: 0.05   # 0.1 was the measured pick; see the decay note
+      auto_recall_min_word_chars: 12
+      session_prefetch_min_rerank_score: -1.5
+      session_prefetch_min_dense_score: 0.55
 
 A reranked excerpt is judged only by the rerank floor and a dense-ordered one only by the
 dense floor: they are on different scales. The floors cut a suffix of the rank order, and a
 block with nothing left is `""`. Tool searches are not affected (`min_raw_score` and
 `min_final_score` remain the tool-search filters).
 
-The lane floors are calibrated for bge-m3 and bge-reranker-v2-m3. A reranker that returns
-probabilities never scores below -1.5, so that floor is inert there; another embedding
-model can sit on a different cosine range, so re-derive `session_prefetch_min_dense_score`
-with the harness (below) or set it to `off`. One CJK character carries about a word, so
-CJK-heavy profiles want a lower `auto_recall_min_word_chars`.
+The lane values belong to bge-m3 cosine and bge-reranker-v2-m3 logits. A reranker that
+returns probabilities never scores below -1.5, so that floor would be inert there; another
+embedding model can sit on a different cosine range, where 0.55 can empty the lane.
+Re-derive them with the harness (below). The legacy final score includes recency
+(`decay_rate` 0.001/h halves it in about 29 days), so with a floor of 0.1 an old memory of
+ordinary importance (5) never reaches automatic recall after about 67 days, even as a
+perfect match; at 0.05 that limit moves to about 96 days, and 0.05 kept one more gate hit
+(table below). One CJK character carries about a word, so CJK-heavy profiles want a lower
+`auto_recall_min_word_chars`.
 
 **Measured** (one install, 2026-11-15, live budget `display_tokens: 700`, rerank on; the
 gate sets of C'5 plus a frozen noise set of 41 real short confirmations and status pings
@@ -208,9 +237,11 @@ in Spanish and English, each searched with its own session and timestamp):
 | host filter only | 8 / 43 / 33 | 41 | 103,773 |
 | + final floor 0.1 | 6 / 43 / 32 | 41 | 49,370 |
 | + skip under 12 word chars | 6 / 43 / 32 | 12 | 14,305 |
-| + lane floors -1.5 / 0.55 (defaults) | 6 / 43 / 31 | 9 | 9,619 |
+| + lane floors -1.5 / 0.55 | 6 / 43 / 31 | 9 | 9,619 |
+| final floor 0.05, skip under 12, lane floors -1.0 / 0.55 | 7 / 42 / 31 | 9 | 12,228 |
 
-Every arm stays within one hit of the previous baseline; injected host scaffolding goes
+With the skip on and the final floor at 0.1, every rerank floor from -1.5 to 0.0 gave the
+same noise. Every arm stays within one hit of the previous baseline; injected host scaffolding goes
 from 26 entries to 0. `scripts/c5_gate_harness.py --noise … --grid …` reproduces the
 trade-off and recomputes it offline from a recorded run (`--analyze-only`), with the
 plugin's own floor and formatting functions; on the noise set that simulation matched the
@@ -250,11 +281,11 @@ the tool only on profiles that may read the whole local conversation history.
 | `session_prefetch_rerank` | `true` | Rerank with `session_recall_rerank_url` when one is configured. Dense order when none is configured or when only the reranker call fails or does not answer before the rerank deadline; a lane timeout returns legacy unchanged (see "Degrade and fail-open"). |
 | `session_prefetch_candidates` | `32` | Distinct windows sent to the reranker (1-128). Rerank time grows with it. |
 | `session_prefetch_timeout_s` | `2.0` | Hard limit for the lane; fail-open to legacy. |
-| `session_prefetch_min_rerank_score` | `-1.5` | Lane floor for reranked excerpts (see "Relevance floor"). |
-| `session_prefetch_min_dense_score` | `0.55` | Lane floor for dense-ordered excerpts. |
-| `auto_recall_min_final_score` | `0.1` | Legacy block floor on the ranked score. |
-| `auto_recall_min_raw_score` | `0.0` | Legacy block floor on raw cosine (off). |
-| `auto_recall_min_word_chars` | `12` | Shorter messages skip automatic recall (both blocks). |
+| `session_prefetch_min_rerank_score` | `off` | Lane floor for reranked excerpts (see "Relevance floor"; model-specific). |
+| `session_prefetch_min_dense_score` | `off` | Lane floor for dense-ordered excerpts (model-specific). |
+| `auto_recall_min_final_score` | `off` | Legacy block floor on the ranked score. |
+| `auto_recall_min_raw_score` | `off` | Legacy block floor on raw cosine. |
+| `auto_recall_min_word_chars` | `off` | Shorter messages skip automatic recall (legacy, hybrid and lane). |
 | `session_expand_enabled` | `false` | Register `qdrant_memory_session_expand`. |
 
 ## Measurement (gate C'5)
