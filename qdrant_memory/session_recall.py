@@ -64,6 +64,8 @@ DEDUP_FETCH_CAP = 512
 NEAR_DUP_TOKEN_RUN = 0.75
 # Provenance cap for `also_in` per result.
 ALSO_IN_MAX = 10
+# A rerank call with less time than this left before its deadline is not started.
+MIN_RERANK_S = 0.05
 
 
 # Eligibility is decided in SQL only, so windowing and lag count the same rows.
@@ -853,9 +855,13 @@ class SessionRecall:
         before: Any = None,
         sources: Iterable[str] | None = None,
         exclude: Iterable[Mapping[str, Any]] | None = None,
+        rerank_deadline: float | None = None,
     ) -> dict[str, Any]:
         """Dense (+ optional rerank) window search. ``exclude`` adds raw Qdrant
-        ``must_not`` conditions, applied inside the dense search like the scope filter."""
+        ``must_not`` conditions, applied inside the dense search like the scope filter.
+
+        ``rerank_deadline`` (a ``time.monotonic()`` instant) caps the rerank call at the
+        time left when it starts, so a slow reranker ends in dense order by then."""
         settings = self.settings
         query = str(query or "").strip()
         if not query:
@@ -915,17 +921,21 @@ class SessionRecall:
             pool = [CandidateGroup(hit, [hit]) for hit in hits]
         duplicates_collapsed = candidates_raw - len(pool)
         ordered: list[tuple[CandidateGroup, float | None]] = [(group, None) for group in pool]
+        left = None if rerank_deadline is None else rerank_deadline - time.monotonic()
         if not settings.rerank_url:
             rerank_status = "unavailable: rerank_url is not configured"
         elif not pool:
             rerank_status = "skipped: no candidates"
+        elif left is not None and left < MIN_RERANK_S:
+            rerank_status = "skipped: no time left before the deadline"
         else:
             t0 = self.clock()
+            timeout = settings.rerank_timeout_s if left is None else min(settings.rerank_timeout_s, left)
             try:
                 docs = [
                     str((group.representative.get("payload") or {}).get("text") or "") for group in pool
                 ]
-                ranking = rerank(settings.rerank_url, query, docs, settings.rerank_timeout_s)
+                ranking = rerank(settings.rerank_url, query, docs, timeout)
                 ordered = [(pool[index], score) for index, score in ranking]
                 rerank_status = "applied"
             except Exception as exc:

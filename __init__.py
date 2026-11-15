@@ -1027,7 +1027,9 @@ class QdrantMemoryProvider(MemoryProvider):
         Any error, a timeout, or a previous lane call still running returns ``legacy``
         byte for byte. The lane runs on its own single worker, so a slow reranker or
         embedder can delay this turn by at most ``session_prefetch_timeout_s`` and can
-        never pile up work across turns. It is read-only (see ``session_prefetch``).
+        never pile up work across turns. The worker gets the same deadline the turn waits
+        for and ends its rerank call before it, so a slow reranker yields dense order in
+        time and leaves no running worker behind. It is read-only (see ``session_prefetch``).
         """
         try:
             if not self._config.get("session_recall_enabled", True):
@@ -1048,9 +1050,12 @@ class QdrantMemoryProvider(MemoryProvider):
                     self._session_prefetch_executor = ThreadPoolExecutor(
                         max_workers=1, thread_name_prefix="qdrant-session-prefetch"
                     )
-                future = self._session_prefetch_executor.submit(lane.build, query, session_id, budget)
+                deadline = time.monotonic() + settings.timeout_s
+                future = self._session_prefetch_executor.submit(
+                    lane.build, query, session_id, budget, deadline=deadline
+                )
                 self._session_prefetch_future = future
-            block = future.result(timeout=settings.timeout_s)
+            block = future.result(timeout=max(0.0, deadline - time.monotonic()))
         except Exception:
             logger.debug("Session prefetch failed or timed out; legacy prefetch unchanged", exc_info=True)
             return legacy

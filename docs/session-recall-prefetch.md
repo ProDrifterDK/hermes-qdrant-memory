@@ -59,13 +59,29 @@ ends with `… [truncated]`; with nothing to show they return an empty string.
 
 **Degrade and fail-open.** Two levels, ratified on 2026-11-15:
 
-- *Only the reranker fails* (connection refused, an HTTP error, a malformed response):
-  the lane keeps the dense order of the window search and still injects its block.
+- *Only the reranker fails* (connection refused, an HTTP error, a malformed response,
+  or no answer in time): the lane keeps the dense order of the window search and still
+  injects its block.
 - *The lane itself fails*: any exception, a timeout of the lane, or a previous lane call
   still running returns the legacy prefetch byte for byte. The lane runs on its own
   single worker with `session_prefetch_timeout_s`, so the turn waits at most that long.
-  The reranker's HTTP timeout is capped at the same value, so a reranker that hangs
-  until then ends as a lane timeout (legacy unchanged), not as dense order.
+
+**Rerank deadline.** The turn and the lane's worker share one deadline,
+`session_prefetch_timeout_s` after the lane starts. The rerank call gets whatever is left
+of it when it starts, minus a reserve of 0.3 s (at most a quarter of the timeout) for
+the `state.db` reads, the formatting and the hand-off, and is not started at all with
+less than 0.05 s left. `session_recall_rerank_timeout_s` stays an upper bound. So a
+reranker that is slow or asleep ends in dense order that reaches the turn, and the worker
+is done before the turn stops waiting, so the next turn does not skip the lane. A
+reranker started with `--sleep-idle-seconds` takes a few seconds to answer the first
+request after a sleep: that turn and any turn during the wake get dense order, later
+turns are reranked again. When the reranker answers in time nothing changes.
+
+The deadline is derived instead of being a separate setting because the time the
+embedding and the dense search take varies (a cold embedder too): a fixed rerank timeout
+would either waste budget or overrun it. The reranker's HTTP timeout is a socket timeout
+(connect, then each read), which bounds a llama.cpp server that sends its answer in one
+piece; a server that trickled bytes could keep the worker longer.
 
 Keep the timeout well under the host's external-prefetch limit (8 s,
 `agent/memory_manager.py`), past which the host drops the plugin's whole prefetch.
@@ -102,7 +118,7 @@ the tool only on profiles that may read the whole local conversation history.
 | `session_prefetch_top_k` | `5` | Excerpts injected at most (1-10). |
 | `session_prefetch_max_chars` | `1200` | Lane cap. |
 | `session_prefetch_total_chars` | `0` | Total shared with the legacy block; `0` = legacy cap + lane cap. |
-| `session_prefetch_rerank` | `true` | Rerank with `session_recall_rerank_url` when one is configured. Dense order when none is configured or when only the reranker call fails; a lane timeout returns legacy unchanged (see "Degrade and fail-open"). |
+| `session_prefetch_rerank` | `true` | Rerank with `session_recall_rerank_url` when one is configured. Dense order when none is configured or when only the reranker call fails or does not answer before the rerank deadline; a lane timeout returns legacy unchanged (see "Degrade and fail-open"). |
 | `session_prefetch_candidates` | `32` | Distinct windows sent to the reranker (1-128). Rerank time grows with it. |
 | `session_prefetch_timeout_s` | `2.0` | Hard limit for the lane; fail-open to legacy. |
 | `session_expand_enabled` | `false` | Register `qdrant_memory_session_expand`. |
