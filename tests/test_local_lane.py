@@ -38,6 +38,7 @@ RECALL_SIX = {
     "qdrant_learning_search",
     "qdrant_memory_status",
 }
+EXPAND = "qdrant_memory_session_expand"
 _READ_POST = {"points", "points/search", "points/scroll", "points/count"}
 
 
@@ -286,18 +287,29 @@ def test_merged_recall_ranks_own_and_read_source_hits_on_one_scale(monkeypatch, 
 
 def test_recall_surface_exposes_six_tools_and_refuses_hidden_writes(monkeypatch, tmp_path, caplog):
     store, log = {}, []
+    # The opt-in session expand tool is off by default: every surface is exactly what it was.
+    default_schemas = [s for s in plugin.TOOL_SCHEMAS if s["name"] != EXPAND]
     full = _local_provider(monkeypatch, tmp_path, store, log, read_sources=[])
-    assert full.get_tool_schemas() == plugin.TOOL_SCHEMAS and len(full.get_tool_schemas()) == 26
+    assert full.get_tool_schemas() == default_schemas and len(full.get_tool_schemas()) == 26
 
     with caplog.at_level(logging.WARNING, logger="qdrant_memory.config"):
         typo = _local_provider(monkeypatch, tmp_path, store, log, read_sources=[], tool_surface="recal")
-    assert typo.get_tool_schemas() == plugin.TOOL_SCHEMAS
+    assert typo.get_tool_schemas() == default_schemas
     assert "tool_surface" in caplog.text
 
     recall = _local_provider(monkeypatch, tmp_path, store, log, read_sources=[], tool_surface="recall")
     names = [schema["name"] for schema in recall.get_tool_schemas()]
     assert sorted(names) == sorted(RECALL_SIX)
     assert set(re.findall(r"qdrant_[a-z_]+", recall.system_prompt_block())) <= RECALL_SIX
+
+    # With session_expand_enabled the expand tool joins both surfaces and the prompt block.
+    full_x = _local_provider(monkeypatch, tmp_path, store, log, read_sources=[], session_expand_enabled=True)
+    assert full_x.get_tool_schemas() == plugin.TOOL_SCHEMAS and len(full_x.get_tool_schemas()) == 27
+    recall_x = _local_provider(
+        monkeypatch, tmp_path, store, log, read_sources=[], tool_surface="recall", session_expand_enabled=True
+    )
+    assert sorted(s["name"] for s in recall_x.get_tool_schemas()) == sorted(RECALL_SIX | {EXPAND})
+    assert set(re.findall(r"qdrant_[a-z_]+", recall_x.system_prompt_block())) == RECALL_SIX | {EXPAND}
 
     store_args = {"text": "Local profile decided to cache the desk band path", "dry_run": False, "approve": True}
     log.clear()

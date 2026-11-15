@@ -852,7 +852,10 @@ class SessionRecall:
         after: Any = None,
         before: Any = None,
         sources: Iterable[str] | None = None,
+        exclude: Iterable[Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        """Dense (+ optional rerank) window search. ``exclude`` adds raw Qdrant
+        ``must_not`` conditions, applied inside the dense search like the scope filter."""
         settings = self.settings
         query = str(query or "").strip()
         if not query:
@@ -878,6 +881,7 @@ class SessionRecall:
         source_list = [str(s) for s in (sources or []) if str(s).strip()]
         if source_list:
             must.append({"key": "session_source", "match": {"any": source_list}})
+        must_not.extend(dict(condition) for condition in (exclude or ()))
         query_filter: dict[str, Any] = {}
         if must:
             query_filter["must"] = must

@@ -143,7 +143,20 @@ from qdrant_memory.shadow_runtime import ShadowRecorder, _safe_hybrid_counts
 HARD_CONTEXT_CHAR_BUDGET: int = 16000
 HARD_MAX_SOURCE_CHARS: int = 2400
 from qdrant_memory.write_gate import evaluate_raptor_summary_write, evaluate_write_candidate
-from qdrant_memory.tools import ALL_TOOL_NAMES, RECALL_TOOL_NAMES, RECALL_TOOL_SCHEMAS, TOOL_SCHEMAS
+from qdrant_memory.session_prefetch import (
+    MIN_LANE_CHARS as SESSION_PREFETCH_MIN_CHARS,
+    PrefetchSettings,
+    SessionPrefetchLane,
+    compose_prefetch,
+    expand_messages,
+)
+from qdrant_memory.tools import (
+    ALL_TOOL_NAMES,
+    OPT_IN_TOOL_NAMES,
+    RECALL_TOOL_NAMES,
+    RECALL_TOOL_SCHEMAS,
+    TOOL_SCHEMAS,
+)
 from qdrant_memory.writer import ConversationWriter, ManagedOverwriteRefused
 
 logger = logging.getLogger(__name__)
@@ -554,6 +567,9 @@ class QdrantMemoryProvider(MemoryProvider):
         self._session_recall_thread: Optional[threading.Thread] = None
         self._session_recall_last_start = float("-inf")
         self._session_recall_stop = threading.Event()
+        self._session_prefetch_executor: Optional[ThreadPoolExecutor] = None
+        self._session_prefetch_future: Any = None
+        self._session_prefetch_guard = threading.Lock()
 
     @property
     def name(self) -> str:
@@ -675,11 +691,15 @@ class QdrantMemoryProvider(MemoryProvider):
     def _tool_surface_refusal(self, tool_name: str) -> str:
         """Tool error for a plugin tool the active surface hides; empty when it may run."""
         if self._recall_surface() and tool_name in ALL_TOOL_NAMES and tool_name not in RECALL_TOOL_NAMES:
+            available = {schema["name"] for schema in self.get_tool_schemas()}
             return _json_error(
                 f"{tool_name} is not available: qdrant_memory.tool_surface is 'recall' "
-                f"(available: {', '.join(sorted(RECALL_TOOL_NAMES))})"
+                f"(available: {', '.join(sorted(available))})"
             )
         return ""
+
+    def _session_expand_enabled(self) -> bool:
+        return bool((getattr(self, "_config", None) or {}).get("session_expand_enabled"))
 
     def _read_sources(self, kind: str) -> list[dict[str, Any]]:
         return [source for source in self._config.get("read_sources") or [] if source.get("kind") == kind]
@@ -742,6 +762,14 @@ class QdrantMemoryProvider(MemoryProvider):
     def system_prompt_block(self) -> str:
         if not self._active:
             return ""
+        expand = (
+            " Use qdrant_memory_session_expand with a message id to read the messages around it."
+            if self._session_expand_enabled() and self._config.get("session_recall_enabled", True)
+            else ""
+        )
+        return self._base_system_prompt_block() + expand
+
+    def _base_system_prompt_block(self) -> str:
         if self._recall_surface():
             return (
                 "# Qdrant Memory\n"
@@ -975,7 +1003,44 @@ class QdrantMemoryProvider(MemoryProvider):
                 self._executor.submit(self._run_shadow_retrieve, query, sid, "prefetch", result)
             except Exception:
                 logger.debug("Shadow submit failed", exc_info=True)
+        if self._config.get("session_prefetch_enabled"):
+            return self._with_session_prefetch(query, session_id or self._session_id, result)
         return result
+
+    def _with_session_prefetch(self, query: str, session_id: str, legacy: str) -> str:
+        """Append the session-recall lane to ``legacy``; fail-open to ``legacy`` unchanged.
+
+        Any error, a timeout, or a previous lane call still running returns ``legacy``
+        byte for byte. The lane runs on its own single worker, so a slow reranker or
+        embedder can delay this turn by at most ``session_prefetch_timeout_s`` and can
+        never pile up work across turns. It is read-only (see ``session_prefetch``).
+        """
+        try:
+            if not self._config.get("session_recall_enabled", True):
+                return legacy
+            settings = PrefetchSettings.from_config(self._config)
+            budget = settings.lane_budget(len(legacy))
+            if budget < SESSION_PREFETCH_MIN_CHARS:
+                return legacy
+            lane = SessionPrefetchLane(
+                self._ensure_session_recall(), settings, expand_hint=self._session_expand_enabled()
+            )
+            with self._session_prefetch_guard:
+                pending = self._session_prefetch_future
+                if pending is not None and not pending.done():
+                    logger.debug("Session prefetch skipped: the previous lane call is still running")
+                    return legacy
+                if self._session_prefetch_executor is None:
+                    self._session_prefetch_executor = ThreadPoolExecutor(
+                        max_workers=1, thread_name_prefix="qdrant-session-prefetch"
+                    )
+                future = self._session_prefetch_executor.submit(lane.build, query, session_id, budget)
+                self._session_prefetch_future = future
+            block = future.result(timeout=settings.timeout_s)
+        except Exception:
+            logger.debug("Session prefetch failed or timed out; legacy prefetch unchanged", exc_info=True)
+            return legacy
+        return compose_prefetch(legacy, block or "")
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         # Phase 6H: ``queue_prefetch`` is purely a cache-priming step.
@@ -1258,9 +1323,10 @@ class QdrantMemoryProvider(MemoryProvider):
         self._collect_source_extraction_candidates(messages, source_hook="on_session_end")
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        if self._recall_surface():
-            return RECALL_TOOL_SCHEMAS
-        return TOOL_SCHEMAS
+        schemas = RECALL_TOOL_SCHEMAS if self._recall_surface() else TOOL_SCHEMAS
+        if self._session_expand_enabled():
+            return schemas
+        return [schema for schema in schemas if schema["name"] not in OPT_IN_TOOL_NAMES]
 
     def _tool_status(self) -> str:
         qdrant_ok = False
@@ -4092,6 +4158,37 @@ class QdrantMemoryProvider(MemoryProvider):
             return _json_error("Session recall failed (no raw exception leaked; see server logs)")
         return json.dumps(result)
 
+    def _tool_session_expand(self, args: dict) -> str:
+        """Messages around a message id from state.db (read-only); indexed windows if pruned."""
+        if not self._active:
+            return _json_error("Qdrant memory provider is not initialized")
+        if not self._session_expand_enabled():
+            return _json_error("session expand is disabled (session_expand_enabled=false)")
+        if not self._config.get("session_recall_enabled", True):
+            return _json_error("session recall is disabled (session_recall_enabled=false)")
+        try:
+            msg_id = int(str(args.get("msg_id") or ""))
+        except Exception:
+            return _json_error("msg_id must be an integer")
+        if msg_id < 1:
+            return _json_error("msg_id must be positive")
+        try:
+            result = expand_messages(
+                self._ensure_session_recall(),
+                msg_id,
+                session_id=str(args.get("session_id") or "").strip(),
+                current_session_id=self._session_id,
+                before=_clamp_int(args.get("before"), 3, 0, 20),
+                after=_clamp_int(args.get("after"), 3, 0, 20),
+                max_chars=_clamp_int(args.get("max_chars"), 6000, 500, 16000),
+            )
+        except SessionRecallError as exc:
+            return _json_error(str(exc))
+        except Exception:
+            logger.debug("Session expand failed", exc_info=True)
+            return _json_error("Session expand failed (no raw exception leaked; see server logs)")
+        return json.dumps(result)
+
     def _tool_graph_search(self, args: dict) -> str:
         query = str(args.get("query") or "").strip()
         if not query:
@@ -4212,6 +4309,8 @@ class QdrantMemoryProvider(MemoryProvider):
             return self._tool_retrieve(args)
         if tool_name == "qdrant_memory_session_recall":
             return self._tool_session_recall(args)
+        if tool_name == "qdrant_memory_session_expand":
+            return self._tool_session_expand(args)
         return _json_error(f"Unknown tool: {tool_name}")
 
     def shutdown(self) -> None:
@@ -4221,6 +4320,11 @@ class QdrantMemoryProvider(MemoryProvider):
         thread = self._session_recall_thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=10.0)
+        lane_executor = getattr(self, "_session_prefetch_executor", None)
+        if lane_executor is not None:
+            # A lane call is read-only; one stuck on a slow service is abandoned, not awaited.
+            lane_executor.shutdown(wait=False, cancel_futures=True)
+            self._session_prefetch_executor = None
         if self._executor:
             self._executor.shutdown(wait=True, cancel_futures=False)
             self._executor = None

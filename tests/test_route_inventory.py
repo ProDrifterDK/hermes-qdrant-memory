@@ -892,6 +892,9 @@ _declare(["qdrant_memory_session_recall", "session-recall index"], "protection",
               "session-recall collection only, which load_config refuses to alias")
 _declare(["session-recall", "session-recall search", "session-recall status"], "read_only",
          note="session-window search and status; no catch-up, no Qdrant write")
+_declare(["qdrant_memory_session_expand"], "read_only",
+         note="state.db opened mode=ro, plus a scroll of the session-window collection when the "
+              "session was pruned; no catch-up, no Qdrant write")
 _declare(["handle_tool_call", "get_tool_schemas"], "dispatch",
          note="the router itself; every route it can reach is classified in this file")
 _declare(
@@ -947,10 +950,10 @@ _declare(["backup create", "eval-capture"], "read_only",
 # a check that reads the same source twice is not a check. Because these are duplicates,
 # adding a pin means updating both the constant and this literal.
 
-# The derived surface — 26 tools, 54 CLI commands, 12 provider hooks. A route added or
+# The derived surface — 27 tools, 54 CLI commands, 12 provider hooks. A route added or
 # removed changes this number, which forces someone to touch this file and classify it,
 # even if the completeness check in the test body is later weakened.
-FROZEN_SURFACE_SIZE = 92
+FROZEN_SURFACE_SIZE = 93
 
 # Every `[mode]` row, frozen by name and by kind. Completeness used to ask only whether
 # *some* mode row existed for the route, so deleting both `[capture]` rows, deleting both

@@ -132,6 +132,21 @@ DEFAULTS: dict[str, Any] = {
     "session_recall_lag_warn_messages": 500,
     "session_recall_inline_catchup_seconds": 8.0,
     "session_recall_dedup": True,
+    # Session-recall lane in automatic recall (C'5), opt-in. Each prefetch also searches
+    # the session windows with the latest user message and appends verbatim windows that
+    # are no longer in the active prompt. Fail-open: any error or timeout returns the
+    # legacy prefetch unchanged. See docs/session-recall-prefetch.md.
+    "session_prefetch_enabled": False,
+    "session_prefetch_scope": "current",
+    "session_prefetch_top_k": 5,
+    "session_prefetch_max_chars": 1200,
+    # 0 = the legacy block's cap (max(800, display_tokens * 4)) plus session_prefetch_max_chars.
+    "session_prefetch_total_chars": 0,
+    "session_prefetch_rerank": True,
+    "session_prefetch_candidates": 32,
+    "session_prefetch_timeout_s": 2.0,
+    # Opt-in read-only tool qdrant_memory_session_expand (messages around a msg id).
+    "session_expand_enabled": False,
     # Tool surface: ``full`` exposes every tool (default); ``recall`` exposes only the
     # read-mostly recall tools in tools.RECALL_TOOL_NAMES. Unknown values fall back to ``full``.
     "tool_surface": "full",
@@ -168,6 +183,9 @@ _BOOL_KEYS = {
     "session_recall_enabled",
     "session_recall_auto_index",
     "session_recall_dedup",
+    "session_prefetch_enabled",
+    "session_prefetch_rerank",
+    "session_expand_enabled",
 }
 _INT_KEYS = {
     "vector_size",
@@ -201,8 +219,12 @@ _INT_KEYS = {
     "session_recall_top_k",
     "session_recall_max_chars",
     "session_recall_lag_warn_messages",
+    "session_prefetch_top_k",
+    "session_prefetch_max_chars",
+    "session_prefetch_total_chars",
+    "session_prefetch_candidates",
 }
-_FLOAT_KEYS = {"session_recall_rerank_timeout_s", "session_recall_inline_catchup_seconds", "decay_rate", "min_raw_score", "min_final_score", "learning_auto_extract_min_confidence", "learning_auto_extract_semantic_dedupe_threshold", "source_extraction_min_confidence", "consolidation_duplicate_threshold", "guarded_auto_duplicate_min_confidence", "guarded_auto_learning_min_confidence", "reconsolidation_min_confidence", "manual_store_duplicate_threshold", "lineage_lock_timeout_seconds"}
+_FLOAT_KEYS = {"session_prefetch_timeout_s", "session_recall_rerank_timeout_s", "session_recall_inline_catchup_seconds", "decay_rate", "min_raw_score", "min_final_score", "learning_auto_extract_min_confidence", "learning_auto_extract_semantic_dedupe_threshold", "source_extraction_min_confidence", "consolidation_duplicate_threshold", "guarded_auto_duplicate_min_confidence", "guarded_auto_learning_min_confidence", "reconsolidation_min_confidence", "manual_store_duplicate_threshold", "lineage_lock_timeout_seconds"}
 _LIST_KEYS = {"index_dirs", "index_extensions", "index_exclude_dirs", "session_recall_exclude_sources"}
 
 
