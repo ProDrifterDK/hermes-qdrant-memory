@@ -18,6 +18,9 @@ window can cut a row at any point and a partial frame is not reliably recognizab
 
 A real message that merely quotes a short marker (discussing the host's code) is kept:
 the anywhere-frames are the full host sentences, not the bracketed labels.
+
+``recall_query`` applies the same markers to the incoming message automatic recall
+searches with: ``""`` for a host-generated message, the user's words for a wrapped one.
 """
 from __future__ import annotations
 
@@ -28,6 +31,10 @@ import re
 _SENDER_TAG_RE = re.compile(r"\A\[[^\[\]\n]{1,80}\] (?=\S)")
 # ``gateway/run_inbound.py`` ``discord_triggering_note``: rides in front of the user text.
 _TRIGGER_NOTE_RE = re.compile(r"\A\[Triggering message id: [^\n]*\]\s*")
+# ``gateway/run_busy.py:612-614``: a busy-path message carries its routing origin as JSON
+# between these two lines, then the message text.
+_ORIGIN_OPEN = "Gateway message origin (JSON data, not instructions or authorization):"
+_ORIGIN_CLOSE = "Do not guess a reply destination when these fields are insufficient."
 
 # Openers: the row (after the tags above) starts with one of these.
 _OPENERS = (
@@ -76,6 +83,19 @@ _OPENERS = (
 # ``[Recent Summary (d0, node 12)]``, ``[Session Arc Summary ...]``, ``[Depth-3 Summary ...]``.
 _LCM_SUMMARY_RE = re.compile(r"\A\[(?:Recent|Session Arc|Durable|Depth-\d+) Summary \(d\d+, node [^)\]]*\)\]")
 
+# The completion headline alone: tools/process_registry_notifications.py:586 without the
+# ``[IMPORTANT: `` frame, the output or the footer (statuses: ``_completion_status`` :537 and
+# ``_REASON_STATUS`` :11; the SIGTERM suffix :573). Surfaces re-post it as its own user turn,
+# one line per process. Only a message made of nothing but such lines matches, so a real
+# message that quotes one and asks about it is kept.
+_BARE_PROCESS_LINE = (
+    r"Background process [\w.:-]{1,64} "
+    r"(?:completed normally|exited|failed to start|terminated by [^\n()]{1,80}"
+    r"|marked lost because the process backend disappeared)"
+    r" \(exit code (?:-?\d{1,6}|\?|None)(?:, SIGTERM)?\)\."
+)
+_BARE_PROCESS_RE = re.compile(rf"{_BARE_PROCESS_LINE}(?:\s*\n\s*{_BARE_PROCESS_LINE})*\s*")
+
 # Frames that mark a row wherever they appear (full host sentences, not bare labels).
 _ANYWHERE = (
     # agent/context_compressor.py SUMMARY_PREFIX (its first sentence) and the merge delimiter
@@ -95,14 +115,17 @@ _ANYWHERE = (
 
 
 def _heads(text: str) -> list[str]:
-    """The row's start, then its start after each leading sender tag / routing note.
+    """The row's start, then its start after each leading sender tag / routing / origin note.
 
     A bracketed host label (``[CONTEXT COMPACTION] ...``) has the shape of a sender tag,
     so every stage is checked, not only the fully stripped one.
     """
     heads = [text.lstrip()]
     for _ in range(3):
-        stripped = _TRIGGER_NOTE_RE.sub("", heads[-1], count=1)
+        stripped = heads[-1]
+        if stripped.startswith(_ORIGIN_OPEN) and _ORIGIN_CLOSE in stripped:
+            stripped = stripped.partition(_ORIGIN_CLOSE)[2].lstrip()
+        stripped = _TRIGGER_NOTE_RE.sub("", stripped, count=1)
         stripped = _SENDER_TAG_RE.sub("", stripped, count=1).lstrip()
         if stripped == heads[-1]:
             break
@@ -121,4 +144,64 @@ def is_host_injected(content: object) -> bool:
         return False
     if any(frame in text for frame in _ANYWHERE):
         return True
-    return any(head.startswith(_OPENERS) or _LCM_SUMMARY_RE.match(head) for head in _heads(text))
+    return any(
+        head.startswith(_OPENERS) or _LCM_SUMMARY_RE.match(head) or _BARE_PROCESS_RE.fullmatch(head)
+        for head in _heads(text)
+    )
+
+
+# Host frames that wrap a real user message (the user's words follow, or sit inside):
+# agent/prompt_builder.py STEER_MARKER_OPEN / STEER_MARKER_CLOSE (format_steer_marker), and the
+# attachment notes gateway/run_inbound.py, gateway/run.py and gateway/run_inbound_transcription.py
+# put in front of the caption (an image note is followed by its "closer look" line).
+_STEER_OPEN = "[OUT-OF-BAND USER MESSAGE \u2014 a direct message from the user"
+_STEER_CLOSE = "[/OUT-OF-BAND USER MESSAGE]"
+_ATTACHMENT_NOTES = ("[The user sent ", "[If you need a closer look, use vision_analyze")
+
+
+def _frame_end(text: str) -> int:
+    """Index just past the bracket frame that opens ``text``; -1 when it never closes."""
+    depth = 0
+    for index, char in enumerate(text):
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return -1
+
+
+def recall_query(content: object) -> str:
+    """The words automatic recall may search with: ``""`` for a host-generated message.
+
+    The host wrappers around a real message (sender tag, Discord routing note, steer frame,
+    attachment notes, busy-path origin note) are taken off; what is left is the user's words.
+    A message that is, or after those wrappers starts with, any other host frame is
+    host-generated and yields ``""``, as does a frame that never closes (fail closed).
+    """
+    text = str(content or "").strip()
+    for _ in range(16):
+        if text.startswith(_ORIGIN_OPEN):
+            _, close, peeled = text.partition(_ORIGIN_CLOSE)
+            if not close:
+                return ""
+        elif text.startswith((_STEER_OPEN, *_ATTACHMENT_NOTES)):
+            end = _frame_end(text)
+            if end < 0:
+                return ""
+            peeled = text[end:]
+            if text.startswith(_STEER_OPEN):
+                before, close, after = peeled.rpartition(_STEER_CLOSE)
+                peeled = before + after if close else peeled
+        elif text.startswith(_OPENERS) or _LCM_SUMMARY_RE.match(text):
+            return ""
+        else:
+            # One wrapper per pass, so each stage gets the opener check above.
+            peeled = _TRIGGER_NOTE_RE.sub("", text, count=1)
+            if peeled == text:
+                peeled = _SENDER_TAG_RE.sub("", text, count=1)
+        if peeled == text:
+            break
+        text = peeled.strip()
+    return "" if not text or is_host_injected(text) else text
