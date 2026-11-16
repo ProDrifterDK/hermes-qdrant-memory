@@ -238,6 +238,54 @@ def test_a_report_only_night_deletes_nothing(monkeypatch, tmp_path, capsys):
     assert _listing(root) == before
 
 
+# --- quarantine expiry wording (decision: quarantine is permanent until restored) -------------
+#
+# X1 the CLI help or the tool schema promises a later hard deletion that nothing performs;
+# X2 something starts acting on ``consolidation_quarantine_until``: a guarded-auto night
+#    hard-deletes, or silently un-quarantines, a point whose date has passed.
+
+
+def _help(argv, capsys):
+    import pytest
+
+    from test_watcher_cp6 import _parser
+
+    with pytest.raises(SystemExit):
+        _parser().parse_args(argv + ["--help"])
+    return " ".join(capsys.readouterr().out.split())
+
+
+def test_quarantine_days_text_promises_no_deletion(capsys):
+    from qdrant_memory.tools import CONSOLIDATION_APPLY_SCHEMA
+
+    texts = [_help(["qdrant", "watcher", "run"], capsys), _help(["qdrant", "watcher", "install"], capsys),
+             _help(["qdrant", "apply"], capsys),
+             CONSOLIDATION_APPLY_SCHEMA["parameters"]["properties"]["quarantine_days"]["description"]]
+    for text in texts:
+        assert "deletion" not in text.lower(), text  # X1
+    for text in texts[:2] + texts[3:]:
+        assert "until restored" in text, text
+
+
+def test_a_quarantined_point_past_its_date_stays_quarantined_and_is_never_deleted(monkeypatch, tmp_path, capsys):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    provider = _provider(home)
+    past = {"consolidation_quarantined": True, "consolidation_quarantined_at": _iso(400),
+            "consolidation_quarantine_until": _iso(370), "consolidation_quarantine_reason": "guarded-auto heading_noise"}
+    provider._qdrant = WindowQdrant({"memory": [_point("q-old", "Tareas", **past), _point("h-new", "Notas")],
+                                     "learnings": []})
+    argv = ["qdrant", "watcher", "run", "--scope", "memory", "--autonomy-mode", "guarded-auto", "--json"]
+    assert _run_watcher(argv, provider) == 0
+    capsys.readouterr()
+    qdrant = provider._qdrant
+    assert qdrant.deleted_ids == []  # X2
+    assert all(point_id != "q-old" for _name, point_id, _update in qdrant.payload_updates)
+    stored = next(p for p in qdrant.by_collection["memory"] if p["id"] == "q-old")
+    assert stored["payload"]["consolidation_quarantined"] is True
+    assert {point_id for _name, point_id, _update in qdrant.payload_updates} == {"h-new"}  # control: the path is live
+
+
 def test_retention_defaults_are_seven_and_thirty():
     from qdrant_memory.config import load_config
 

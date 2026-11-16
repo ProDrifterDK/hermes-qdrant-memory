@@ -463,7 +463,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     apply_parser.add_argument("--action", required=True, choices=["merge", "delete", "quarantine", "promote_to_skill", "draft_review"], help="Expected proposal action.")
     _add_dry_run_flags(apply_parser)
     apply_parser.add_argument("--backup-first", action="store_true", help="Create a fresh backup before live apply.")
-    apply_parser.add_argument("--quarantine-days", type=_positive_int, default=30, help="Days to quarantine stale low-value memories when action=quarantine. Default: 30.")
+    apply_parser.add_argument("--quarantine-days", type=_positive_int, default=30, help="For action=quarantine: review date written on the points (consolidation_quarantine_until), this many days ahead. Quarantine stays until restored. Default: 30.")
     apply_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
 
     watcher = subcommands.add_parser("watcher", help="Inspect watcher helpers; run defaults to report-only, guarded-auto is opt-in.")
@@ -487,7 +487,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     watcher_run.add_argument("--force-alert", action="store_true", help="Record an alert event even when the proposal signature is unchanged.")
     watcher_run.add_argument("--autonomy-mode", choices=["report-only", "guarded-auto"], default="report-only", help="Watcher autonomy policy. Default: report-only.")
     watcher_run.add_argument("--max-auto-actions", type=_positive_int, default=10, help="Maximum guarded-auto actions per run. Default: 10.")
-    watcher_run.add_argument("--quarantine-days", type=_positive_int, default=30, help="Days to quarantine stale low-value memories before later hard deletion. Default: 30.")
+    watcher_run.add_argument("--quarantine-days", type=_positive_int, default=30, help="Review date written on quarantined points (consolidation_quarantine_until), this many days ahead. Quarantine stays until restored: nothing deletes or releases quarantined points automatically. Default: 30.")
     watcher_run.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
 
     watcher_install = watcher_subcommands.add_parser("install", help="Install or update the managed crontab watcher entry.")
@@ -506,7 +506,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     watcher_install.add_argument("--approve", action="store_true", help="Required to replace an existing different managed watcher entry.")
     watcher_install.add_argument("--autonomy-mode", choices=["report-only", "guarded-auto"], default="report-only", help="Scheduled watcher autonomy policy. Default: report-only.")
     watcher_install.add_argument("--max-auto-actions", type=_positive_int, default=10, help="Maximum guarded-auto actions per run. Default: 10.")
-    watcher_install.add_argument("--quarantine-days", type=_positive_int, default=30, help="Days to quarantine stale low-value memories before later hard deletion. Default: 30.")
+    watcher_install.add_argument("--quarantine-days", type=_positive_int, default=30, help="Review date written on quarantined points (consolidation_quarantine_until), this many days ahead. Quarantine stays until restored: nothing deletes or releases quarantined points automatically. Default: 30.")
     watcher_install.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
 
     watcher_uninstall = watcher_subcommands.add_parser("uninstall", help="Remove the managed crontab watcher entry. Requires --approve.")

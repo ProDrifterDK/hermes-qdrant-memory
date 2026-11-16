@@ -330,7 +330,7 @@ CONSOLIDATION_APPLY_SCHEMA = {
             "action": {"type": "string", "enum": ["merge", "delete", "quarantine", "promote_to_skill", "draft_review"], "description": "Expected action for the proposal type."},
             "dry_run": {"type": "boolean", "description": "When true, return the operation plan without mutating Qdrant or writing drafts. Defaults true."},
             "approve": {"type": "boolean", "description": "Required true when dry_run=false."},
-            "quarantine_days": {"type": "integer", "description": "For action=quarantine, days to keep a reversible quarantine marker before later hard deletion.", "minimum": 1, "maximum": 365},
+            "quarantine_days": {"type": "integer", "description": "For action=quarantine, days ahead of the review date written on the reversible quarantine marker (consolidation_quarantine_until). Quarantine stays until restored; nothing deletes quarantined points automatically.", "minimum": 1, "maximum": 365},
         },
         "required": ["report_id", "proposal_id"],
         "additionalProperties": False,
