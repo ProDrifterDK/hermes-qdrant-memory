@@ -67,6 +67,10 @@ DEFAULTS: dict[str, Any] = {
     # Messages with fewer letters/digits than this skip automatic recall (legacy, hybrid and
     # lane). Off by default ("off", "", null or 0).
     "auto_recall_min_word_chars": "off",
+    # Opt-in: the legacy block and the hybrid dense lane leave out stored conversation turns of
+    # one-shot runs and probes (qdrant_memory/recall_noise.py), e.g. a test harness's
+    # "Reply with exactly: OK". Turns of delegated and subagent sessions are kept.
+    "auto_recall_exclude_machine": False,
     "provenance_ranking_enabled": True,
     "qdrant_api_key": "",
     "embedding_api_key": "",
@@ -222,6 +226,7 @@ _BOOL_KEYS = {
     "index_dry_run_default",
     "provenance_ranking_enabled",
     "auto_recall_shadow_enabled",
+    "auto_recall_exclude_machine",
     "session_recall_enabled",
     "session_recall_auto_index",
     "session_recall_dedup",
