@@ -281,6 +281,16 @@ CONSOLIDATE_SCHEMA = {
             "persist": {"type": "boolean", "description": "Persist the report as a local JSON artifact. Defaults to config/default true."},
             "include_reconsolidation": {"type": "boolean", "description": "Include M10 reconsolidation candidates. Defaults to config/default false."},
             "reconsolidation_max_candidates": {"type": "integer", "description": "Maximum reconsolidation candidates to include.", "minimum": 1, "maximum": 100},
+            "scan_window": {"type": "string", "enum": ["fixed", "rotating"], "description": "fixed (default) inspects the first max_points IDs; rotating starts at scan_offsets and returns the continuation in scan_window."},
+            "scan_offsets": {
+                "type": "object",
+                "description": "Rotating window only: point ID to start each collection's scroll at (null starts a new cycle).",
+                "properties": {
+                    "memory": {"type": ["string", "integer", "null"]},
+                    "learning": {"type": ["string", "integer", "null"]},
+                },
+                "additionalProperties": False,
+            },
         },
         "additionalProperties": False,
     },

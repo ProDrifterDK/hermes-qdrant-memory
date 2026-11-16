@@ -357,6 +357,58 @@ include_examples=false
 include_reconsolidation=true
 ```
 
+### Rotating scan window
+
+`--scan-window fixed` (the default) inspects the first `--max-points` point IDs of each collection on every run, so a large collection gets the same report every night. `--scan-window rotating` resumes each collection's scroll where the previous successful run stopped:
+
+- the cursor is a Qdrant point ID, persisted per collection in `watcher_state.json` under `scan_window` (`next_offset`, `cycle`, `runs_in_cycle`, `scanned_in_cycle`, `last_completed_cycle_scanned`); N runs read N × `--max-points` distinct IDs until the collection is covered, then the cursor resets and the next run starts a new cycle (17,728 points at 300 a night is a 60-night cycle; a collection smaller than the window is read whole every night);
+- Qdrant scrolls in point-ID order and treats the offset as a lower bound, so a cursor whose point was deleted still resumes at the next ID, and new points (random UUIDs) are reached within one cycle;
+- a failed run does not advance the cursor; a cursor recorded for another collection name, or a malformed one, starts a new cycle;
+- the report carries `scan_window` (start and next offset, points read, whether the end was reached, and a digest of the IDs read); the log event carries the per-collection counts;
+- in rotating mode a clean window (no proposals, nothing applied, no error) does not raise an alert; any window with proposals does, because each window is new.
+
+Point-ID order rather than recency was chosen because it needs no payload index on the production collection, has no ties or missing timestamps, and is stable while points are added or quarantined. Duplicate detection only compares points inside one window, so it finds duplicates whose IDs fall in the same window (exact duplicates written as one point per content are unaffected).
+
+### What guarded-auto does with each proposal type
+
+| Proposal type | Guarded-auto | Condition |
+|---|---|---|
+| `heading_noise` (known fingerprint) | quarantine (never delete) | one point, known heading fingerprint, not quarantined, no `session_origin`, no identity/money/security/secret signal, not lineage-managed |
+| `heading_noise` (generic markdown heading) | review only | |
+| `duplicate_cluster` (`exact_normalized`) | merge: canonical point gets `consolidated_from`, the other copies are quarantined with `consolidation_duplicate_of` (never deleted) | confidence ≥ 0.98, ≤ 20 points, no point with `session_origin`, identity/fact metadata, money/security/secret signal or lineage identity |
+| `duplicate_cluster` (`near_duplicate`) | review only | |
+| `stale_low_value` | quarantine for `--quarantine-days` | age ≥ `consolidation_stale_days`, importance below `consolidation_min_importance_for_keep`, never accessed, confidence ≤ 0.5, same exclusions as above |
+| `learning_promotion_candidate` | skill draft only (`promoted_to_skill_draft` on the learning, a draft file under proposals) | confidence ≥ 0.90, importance ≥ 8, no fact/identity metadata, no money/security/secret signal |
+| `quality_warning` (possible secret) | review only | |
+| `reconsolidation_candidate`, `fact_conflict_candidate`, `fact_supersession_candidate`, `fact_status_update_candidate` | review only (draft through the manual apply path) | |
+
+Money, security and identity are detected from the point text and tags with deliberately broad English and Spanish patterns (`sensitive_topic_categories` in `qdrant_memory/consolidation.py`); a false positive only keeps an item in review.
+
+### Backups and audit trail for every mutation
+
+A guarded-auto run, before its first mutation:
+
+1. evaluates every proposal against the policy, capped at `--max-auto-actions`;
+2. preflights each candidate through `qdrant_memory_consolidation_apply` with `dry_run=true` (every current-point check runs, nothing is written); a refusal is reported as a `provider_rejected` error;
+3. takes one full plugin backup of the collections it is about to touch (`hermes qdrant backup list` shows it). If the backup fails, nothing is applied and the run reports `backup_failed`.
+
+Each live apply then carries that backup ID; the apply path refuses a watcher mutation without a readable, non-partial backup manifest that holds the target collection, and refuses `delete` outright. Immediately before writing it saves the points it is about to change, with payloads and vectors, as a partial plugin backup whose manifest records the report, proposal, action and the point digests the report sealed (the snapshot is refused if the points changed). Undo one action with `hermes qdrant restore --backup <snapshot backup_id> --no-dry-run --approve`; it puts back exactly those points. The application record (`consolidation/applications/application-*.json`) carries `guarded_auto`, `pre_apply_backup_id` and `pre_mutation_snapshot`.
+
+Disk: a full backup of a 17,728-point, 1024-dimension memory collection measured 264 MB and took about 12 s; one is taken only on nights that mutate (the touched collections only). Prune old `backup-*` directories under `$HERMES_HOME/qdrant_memory/backups/` by hand.
+
+Quarantine takes a point out of the hybrid router and of the sparse lane. The legacy dense lane (`auto_recall_mode: legacy`) does not filter `consolidation_quarantined`: there a quarantined point stays recallable until that lane honours the marker. Quarantine loses nothing either way.
+
+### Turning guarded-auto on
+
+```bash
+hermes qdrant backup create --scope both          # first restorable baseline (design review m5)
+hermes qdrant watcher install --approve --schedule "0 3 * * *" --scope both --max-points 300 \
+  --max-groups 20 --reconsolidation-max-candidates 10 --scan-window rotating \
+  --autonomy-mode guarded-auto --max-auto-actions 10 --quarantine-days 30
+```
+
+The 03:05 notifier (`qdrant_native_watcher_notify.py`) keeps working unchanged: every field it reads is still written. The state also gains `scan_window`, `last_scan_window` and `last_guarded_auto_would_apply_count`, which it may show but does not need.
+
 Watcher alert policy:
 
 - store a stable proposal signature in watcher state;
@@ -374,7 +426,8 @@ Proposal classes:
 | Proposal type | Meaning | Allowed operator path |
 |---|---|---|
 | `duplicate_cluster` | likely duplicate or near-duplicate memories | review, then optional `merge` apply |
-| `stale_low_value` | low-value stale memory candidate | review, then optional `delete` apply |
+| `stale_low_value` | low-value stale memory candidate | review, then optional `quarantine` (reversible) or `delete` apply |
+| `heading_noise` | standalone heading chunk with no memory value | review, then optional `quarantine` or `delete` apply |
 | `learning_promotion_candidate` | procedural learning that may deserve a skill draft | review, then optional `promote_to_skill` draft creation |
 | `reconsolidation_candidate` | possible fact conflict | manual review, then optional `draft_review` only |
 | `quality_warning` | possible secret/noise/unsafe content | manual review only; never live-apply |
