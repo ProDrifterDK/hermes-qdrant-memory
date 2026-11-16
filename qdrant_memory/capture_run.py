@@ -162,6 +162,7 @@ class _Run:
         self.drops: Counter = Counter()
         self.rows: Counter = Counter()
         self.errors: list[str] = []
+        self.mirror_stats: dict[str, Any] | None = None
 
     # --- reading ----------------------------------------------------------------------
 
@@ -433,6 +434,8 @@ class _Run:
                        "by_lane_route": dict(Counter(f"{c['lane']}:{c['route']}" for c in kept)),
                        "drops": dict(self.drops)},
             "candidates": rows, "expired": expired, "errors": self.errors,
+            **({"mirror": {key: dict(value) if isinstance(value, Counter) else value
+                           for key, value in self.mirror_stats.items()}} if self.mirror_stats is not None else {}),
         }
 
 

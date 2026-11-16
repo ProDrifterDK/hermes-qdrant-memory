@@ -158,6 +158,9 @@ DEFAULTS: dict[str, Any] = {
     "capture_daily_auto_cap": 5,
     # Dense near-duplicate threshold among stored captures (cosine); a match merges the citation.
     "capture_dedupe_threshold": 0.92,
+    # Lane C: mirror the agent's built-in memory tool writes (target=memory stored, target=user
+    # reviewed, replaced/removed text kept as superseded captures). Part of capture run.
+    "capture_mirror_builtin_memory": False,
     "session_prefetch_candidates": 32,
     "session_prefetch_timeout_s": 2.0,
     # Lane relevance floors: a reranked excerpt needs at least min_rerank_score, a dense-ordered
@@ -245,6 +248,7 @@ _BOOL_KEYS = {
     "session_prefetch_exclude_machine",
     "session_expand_enabled",
     "capture_auto_apply",
+    "capture_mirror_builtin_memory",
 }
 _INT_KEYS = {
     "vector_size",
