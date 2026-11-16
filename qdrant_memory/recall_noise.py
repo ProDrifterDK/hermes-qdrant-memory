@@ -8,7 +8,7 @@ leave out a conversation-turn point (``memory_kind=conversation_turn``, or
   ``sessions.source`` is in ``capture_reader.ONE_SHOT_SOURCES``. Its text does not matter.
 - ``host_user_side``: its user side is host text under ``capture_reader.classify_row`` (the
   session-lane filter's classifier), judged with the session's fields when its row exists.
-- ``echo_probe``: its session has no row in ``state.db`` (the host prunes sessions; turn points
+- ``echo_probe``: its session has no row in ``state.db`` (sessions leave it, turn points
   outlive them) or ``state.db`` cannot be read, and its own text proves a scripted check: the
   user side demands an exact reply and the whole assistant side is that literal, copied from
   the user side (``is_echo_probe``).

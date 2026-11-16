@@ -175,8 +175,9 @@ The rule, in order (`recall_noise.turn_noise_reason`):
    (`one_shot_session`); every other session, interactive or agent (a delegated child is a
    `subagent` session; cron, tool, API clients), is kept. A probe typed into a person's
    interactive session is therefore kept.
-3. **Session gone.** The host prunes sessions while their turn points stay in Qdrant: on one
-   install 7,260 of 10,355 turn points (70%) name a session no `state.db` holds any more. Such a
+3. **Session gone.** Sessions leave `state.db` (retention, pruning) while their turn points stay in
+   Qdrant: on one
+   install 7,260 of 10,355 turn points (70%) name a session its `state.db` no longer holds. Such a
    point (or any point while `state.db` cannot be read) is kept unless its own text proves a
    scripted check (`echo_probe`, `recall_noise.is_echo_probe`): the user side, envelopes
    stripped, is at most 500 characters and demands an exact reply (`exactly`, `exactamente`,
