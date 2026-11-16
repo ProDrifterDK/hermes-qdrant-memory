@@ -5,7 +5,7 @@ from typing import Any
 from .fact_metadata import derive_fact_metadata
 from .lineage import lineage_overwrite_refusal
 from .schema import build_payload, clean_text_for_memory, make_point_id, score_importance
-from .session_origin import merge_session_origin, validate_session_origin
+from .session_origin import merge_session_origin, origin_session_id, validate_session_origin
 
 
 class ManagedOverwriteRefused(RuntimeError):
@@ -175,6 +175,8 @@ class ConversationWriter:
                 validate_session_origin(origin)
         if origin is not None:
             payload = {**payload, "session_origin": origin}
+            if session_origin is not None:
+                payload["session_id"] = origin_session_id(origin, payload.get("session_id"))
         vector = self.embeddings.embed_document(clean)
         self.qdrant.upsert(self.collection_name, [{"id": point_id, "vector": vector, "payload": payload}])
         return point_id

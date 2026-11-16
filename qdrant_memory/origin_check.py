@@ -68,9 +68,10 @@ def check_origins(qdrant: Any, collection_name: str, *, state_db: str, scope: Ma
                   limit: Any = DEFAULT_LIMIT, offset: Any = None, max_ids: Any = DEFAULT_MAX_IDS) -> dict[str, Any]:
     """One bounded page of the check over ``collection_name``.
 
-    ``qdrant`` needs ``get_collections`` and ``scroll_page`` only. Counts are per citation
-    (the status belongs to the citation); ``point_ids`` lists each point under every status
-    one of its citations has. A valid mapping with no citation (``unresolved:<reason>``) is
+    ``qdrant`` needs ``get_collections`` and ``scroll_page`` only. ``counts`` are per citation
+    (the status belongs to the citation); ``point_counts`` and ``point_ids`` count and list
+    each point once under every status one of its citations has (``point_counts`` is never
+    truncated). A valid mapping with no citation (``unresolved:<reason>``) is
     reported under ``uncited_*``, a mapping that fails the v1 validator under ``invalid_*``;
     neither aborts the page. Raises only what the Qdrant client raises.
     """
@@ -81,7 +82,7 @@ def check_origins(qdrant: Any, collection_name: str, *, state_db: str, scope: Ma
                               "offset": start}
     if collection_name not in set(qdrant.get_collections()):
         result.update({"collection_missing": True, "points_checked": 0, "citations_checked": 0, "counts": {},
-                       "point_ids": {}, "point_ids_truncated": [], "uncited_counts": {}, "uncited_point_ids": {},
+                       "point_counts": {}, "point_ids": {}, "point_ids_truncated": [], "uncited_counts": {}, "uncited_point_ids": {},
                        "invalid_count": 0, "invalid_point_ids": [], "next_offset": None, "complete": True,
                        "note": NOTE})
         return result
@@ -120,6 +121,7 @@ def check_origins(qdrant: Any, collection_name: str, *, state_db: str, scope: Ma
         "points_checked": len(points),
         "citations_checked": citations_checked,
         "counts": dict(sorted(counts.items())),
+        "point_counts": {status: len(ids) for status, ids in sorted(by_status.items())},
         "point_ids": point_ids,
         "point_ids_truncated": sorted(set(truncated) | {f"uncited:{key}" for key in uncited_truncated}),
         "uncited_counts": dict(sorted(uncited_counts.items())),

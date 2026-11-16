@@ -35,6 +35,9 @@ class FakeQdrant:
         self.upserts.append((name, points))
         return {"status": "ok"}
 
+    def retrieve(self, name, ids, with_payload=True, with_vector=False):
+        return []  # no stored points: every store is a create
+
     def search(self, name, vector, limit, filter=None, with_payload=True, with_vector=False):
         self.searches.append((name, vector, limit, filter, with_payload, with_vector))
         if self.raise_on_search:

@@ -89,6 +89,9 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     _add_tag_flags(store)
     _add_dry_run_flags(store)
     store.add_argument("--preview-duplicates", dest="preview_duplicates", action="store_true", help="Search for semantic duplicates before storing.")
+    store.add_argument("--cite", default=None, metavar="FIRST:LAST", help="Cite messages FIRST..LAST (state.db message ids) of --session-id as the fact's origin. Needs session_origin_mode: recorded; preview (dry-run) first, then approve with the same arguments.")
+    store.add_argument("--session-id", dest="session_id", default=None, help="Session of the --cite span (required with --cite).")
+    store.add_argument("--cite-quote", dest="cite_quote", action="store_true", help="Also store a redacted quote of the cited messages (with --cite).")
     store.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
 
     search = subcommands.add_parser("search", help="Search semantic memories.")

@@ -19,6 +19,7 @@ from qdrant_memory.lineage import (
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from qdrant_memory.client import QdrantClient
+from qdrant_memory.session_origin import SessionOriginRefused, merge_session_origins
 from qdrant_memory.config import read_source_collections
 
 SCHEMA_VERSION = 1
@@ -624,7 +625,18 @@ def plan_restore(qdrant: Any, config: dict[str, Any], manifest: dict[str, Any], 
             else:
                 changed.append(record)
         to_upsert = changed + missing
-        upserts_by_scope[scope] = [_point_for_upsert(record) for record in to_upsert]
+        upserts: list[dict[str, Any]] = []
+        origin_carried: list[str] = []
+        for record in to_upsert:
+            point = _point_for_upsert(record)
+            existing = existing_by_id.get(str(record["id"]))
+            current_origin = ((existing or {}).get("payload") or {}).get("session_origin")
+            if current_origin is not None:
+                point = {**point, "payload": _restored_payload_keeping_origin(
+                    str(record["id"]), point["payload"], current_origin)}
+                origin_carried.append(str(record["id"]))
+            upserts.append(point)
+        upserts_by_scope[scope] = upserts
         plan_collections[scope] = {
             "collection_name": collection_name,
             "total": len(records),
@@ -636,7 +648,24 @@ def plan_restore(qdrant: Any, config: dict[str, Any], manifest: dict[str, Any], 
             "missing_ids": sorted(str(record["id"]) for record in missing),
             "upserted": 0,
         }
+        if origin_carried:
+            plan_collections[scope]["session_origin_kept_ids"] = sorted(origin_carried)
     return plan_collections, upserts_by_scope
+
+
+def _restored_payload_keeping_origin(point_id: str, payload: dict[str, Any], current_origin: Any) -> dict[str, Any]:
+    """The snapshot payload with the live point's ``session_origin`` merged in (C'6).
+
+    Restore replaces a payload in place; a snapshot taken before a citation was recorded
+    would otherwise drop it. The snapshot's own mapping (if any) and the live one are merged
+    with the system-merge rule (earliest capture first, bounded, never refused); an invalid
+    mapping on either side refuses the restore instead of dropping it.
+    """
+    try:
+        merged, _trimmed = merge_session_origins([payload.get("session_origin"), current_origin])
+    except SessionOriginRefused as exc:
+        raise BackupError(f"restore would drop the session_origin of point {point_id}: {exc}") from exc
+    return {**payload, "session_origin": merged}
 
 
 def _lineage_managed(payload: dict[str, Any]) -> bool:

@@ -103,6 +103,13 @@ RECEIPT: dict[str, Any] = {"oracle": "C'3 session_origin on extraction approval,
                            "cases": {}}
 
 
+def _without_later_tools(schemas_json: str) -> str:
+    """The head schema list minus tools added after this oracle's base (C'4's origin-check,
+    whose own off-mode oracle pins that one entry), so the pin keeps checking everything else."""
+    return json.dumps([schema for schema in json.loads(schemas_json)
+                       if schema.get("name") not in {"qdrant_memory_origin_check"}], sort_keys=True)
+
+
 # --- fixtures -----------------------------------------------------------------
 
 
@@ -409,6 +416,8 @@ def test_off_mode_is_byte_identical_to_base(live, state, tmp_path):
                 live.qdrant.delete_ids(collection, ids)
             assert live.qdrant.count(collection) == 0
 
+    for label in ("base", "head"):
+        outputs[label]["schemas"] = _without_later_tools(outputs[label]["schemas"])
     differing = sorted(key for key in outputs["base"] if outputs["base"][key] != outputs["head"].get(key))
     assert set(outputs["base"]) == set(outputs["head"])
     assert not differing, {key: (outputs["base"][key], outputs["head"][key]) for key in differing}
