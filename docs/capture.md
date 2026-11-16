@@ -7,6 +7,7 @@ built in slices; this page describes what exists today.
 |---|---|---|
 | CP1 | Removes the session-hook capture paths that never worked | done |
 | CP2 | Read-only `state.db` reader, authorship classifier, cursor, opt-in session-lane filter | done |
+| CP2 follow-up | Opt-in legacy/hybrid recall filter for stored turns of harnesses and probes | done |
 | later | Mirror of built-in memory writes, persisted review queue, watcher drain | not built |
 
 Nothing in this page writes to Qdrant or to `state.db`.
@@ -153,6 +154,58 @@ loses none there, and drops a few dozen windows of a 66,000-window index.
 
 Dropped windows are listed in `SessionPrefetchLane.last_excluded` (ids only). With the option off
 the lane is unchanged.
+
+### Legacy-recall filter (opt-in)
+
+`auto_recall_exclude_machine: true` (default `false`) does the same for the legacy block and the
+hybrid mode's dense lane: they leave out a stored conversation-turn point (`memory_kind`
+`conversation_turn`, or `source_type` `conversation` with `chunk_type` `turn`) that a test harness
+or a probe produced. Module: `qdrant_memory/recall_noise.py`. Query time only: the index is not
+rewritten, and nothing is written to Qdrant or to `state.db`.
+
+The rule, in order (`recall_noise.turn_noise_reason`):
+
+1. **Host text** (`host_user_side`): the turn's user side is host text under `classify_row`,
+   judged with the session's fields. Today the always-on scaffolding filter already hides almost
+   all of these; the classifier adds the shapes `host_markers` does not know (for example the
+   tool-iteration limit notice).
+2. **Known session.** When `state.db` has the turn's session (payload `session_id`), structure
+   decides and the text does not: a session with a `parent_session_id` (a delegated child, a
+   compression continuation) is kept; a `oneshot` session (`ONE_SHOT_SOURCES`, the same kind the
+   session-lane filter drops) is left out (`one_shot_session`); every other session, interactive
+   or agent (subagent, cron, tool, API clients), is kept. A probe typed into a person's
+   interactive session is therefore kept.
+3. **Session gone.** The host prunes sessions while their turn points stay in Qdrant: on one
+   install 7,260 of 10,355 turn points (70%) name a session no `state.db` holds any more. Such a
+   point (or any point while `state.db` cannot be read) is kept unless its own text proves a
+   scripted check (`echo_probe`, `recall_noise.is_echo_probe`): the user side, envelopes
+   stripped, is at most 500 characters and demands an exact reply (`exactly`, `exactamente`,
+   `verbatim`, `literally`, `literalmente`), and the whole assistant side is one line of at most
+   80 characters that occurs in the user side (case-insensitive, without trailing `.`/`!` and
+   quotes). "Reply with exactly: OK" answered "OK" is one; a long prompt (a group-chat
+   transcript, a brief) or an answer that adds anything is not.
+
+The session's fields come from one read-only query per recall, through the C' reader without
+its lock retry (a busy `state.db` means "no structural evidence", never a wait on the turn), for
+the session ids not yet cached. Rows found are cached for the process (a session's source and
+parent never change); ids with no row are re-checked after ten minutes.
+
+The filter runs before the top-k cut: the provider asks the retriever for
+`max(auto_recall_top_k, min(20, search_candidates))` results, which is the same Qdrant request
+as without the filter, drops the noise and keeps the first `auto_recall_top_k`. A dropped turn
+frees its slot for the next memory, and the kept memories keep their scores and order. RAPTOR
+cited leaves and graph relations of the hybrid mode are not filtered (on one install two RAPTOR
+leaves are turn points, neither a probe).
+
+Measured on one install (main profile floors: final score 0.05, 12 word characters, read-only):
+
+- 10,355 turn points: 71 newly left out (7 `one_shot_session`, 64 `echo_probe`); 3,920 more are
+  `host_user_side`, all of them already hidden by the always-on scaffolding filter.
+- The gate sets of C'5 (`scripts/c5_gate_harness.py --legacy-exclude-machine`), legacy arm: 6 of
+  51 hits off and on, no question lost or gained, and the injected text was identical for all 51
+  (no probe turn ranked among their candidates).
+- A probe-shaped message ("Reply with exactly: OK, and tell me about the relay gateway") received
+  three stored probe turns (749 characters) with the option off and nothing with it on.
 
 ### CLI
 

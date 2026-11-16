@@ -139,6 +139,7 @@ from qdrant_memory.raptor.apply import (
     validate_manifest,
 )
 from qdrant_memory.raptor.search import RaptorSearcher
+from qdrant_memory.recall_noise import NoiseFilteredRecall, SessionFactsCache, TurnNoiseFilter
 from qdrant_memory.hybrid.router import (
     HybridRouter,
     HybridRouteResult,
@@ -603,6 +604,8 @@ class QdrantMemoryProvider(MemoryProvider):
         self._session_prefetch_executor: Optional[ThreadPoolExecutor] = None
         self._session_prefetch_future: Any = None
         self._session_prefetch_guard = threading.Lock()
+        # auto_recall_exclude_machine: session rows of recalled turn points, read-only, cached.
+        self._turn_session_facts: Optional[SessionFactsCache] = None
 
     @property
     def name(self) -> str:
@@ -632,6 +635,7 @@ class QdrantMemoryProvider(MemoryProvider):
             self._write_enabled = False
         self._active = bool(self._config.get("enabled", True))
         self._session_recall = None
+        self._turn_session_facts = None
         if not self._active:
             return
         self._qdrant = QdrantClient(
@@ -859,6 +863,9 @@ class QdrantMemoryProvider(MemoryProvider):
                 # own collection. The formatter emits text bodies only, so the prompt
                 # reveals nothing more than it does without read sources.
                 router = dataclasses.replace(router, base_retriever=recall)
+            filtered = self._noise_filtered(router.base_retriever)
+            if filtered is not router.base_retriever:
+                router = dataclasses.replace(router, base_retriever=filtered)
             result = router.retrieve(
                 query,
                 top_k=int(self._config["auto_recall_top_k"]),
@@ -1047,9 +1054,11 @@ class QdrantMemoryProvider(MemoryProvider):
         """The legacy auto-recall block: dense top-k, the relevance floor, the formatter.
 
         Below ``auto_recall_min_final_score`` / ``auto_recall_min_raw_score`` a memory is
-        left out; with none left the block is ``""`` (no header).
+        left out; with none left the block is ``""`` (no header). With
+        ``auto_recall_exclude_machine`` the stored turns of one-shot runs and probes are left
+        out first (``qdrant_memory.recall_noise``).
         """
-        chunks = (self._memory_recall() or self._retriever).search(
+        chunks = self._noise_filtered(self._memory_recall() or self._retriever).search(
             query, top_k=int(self._config["auto_recall_top_k"]), update_access=False
         )
         chunks = above_auto_recall_floor(
@@ -1058,6 +1067,19 @@ class QdrantMemoryProvider(MemoryProvider):
             self._config.get("auto_recall_min_raw_score"),
         )
         return format_for_prompt(chunks, int(self._config["display_tokens"]))
+
+    def _noise_filtered(self, recall: Any) -> Any:
+        """``recall`` itself when ``auto_recall_exclude_machine`` is off, else wrapped in the filter.
+
+        Read-only: the session lookups go to ``state.db`` through the C' read-only reader and
+        are cached for the provider's lifetime (``qdrant_memory.recall_noise``).
+        """
+        if not self._config.get("auto_recall_exclude_machine") or recall is None:
+            return recall
+        if self._turn_session_facts is None:
+            self._turn_session_facts = SessionFactsCache(self._state_db_path())
+        widened = max(int(self._config["auto_recall_top_k"]), min(20, int(self._config.get("search_candidates", 20))))
+        return NoiseFilteredRecall(recall, TurnNoiseFilter(self._turn_session_facts), widened)
 
     def _with_session_prefetch(self, query: str, session_id: str, legacy: str) -> str:
         """Append the session-recall lane to ``legacy``; fail-open to ``legacy`` unchanged.

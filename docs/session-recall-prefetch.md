@@ -372,6 +372,7 @@ the tool only on profiles that may read the whole local conversation history.
 | `auto_recall_min_final_score` | `off` | Legacy block floor on the ranked score. |
 | `auto_recall_min_raw_score` | `off` | Legacy block floor on raw cosine. |
 | `auto_recall_min_word_chars` | `off` | Shorter messages skip automatic recall (legacy, hybrid and lane). |
+| `auto_recall_exclude_machine` | `false` | Legacy block and hybrid dense lane: leave out stored conversation turns of one-shot runs, and of pruned sessions whose text is a scripted exact-reply check; turns of delegated and subagent sessions are kept. See docs/capture.md "Legacy-recall filter". `c5_gate_harness.py --legacy-exclude-machine` measures it. |
 | `session_expand_enabled` | `false` | Register `qdrant_memory_session_expand`. |
 
 ## Measurement (gate C'5)
