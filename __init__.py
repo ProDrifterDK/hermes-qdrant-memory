@@ -173,6 +173,7 @@ from qdrant_memory.session_origin import (
 )
 from qdrant_memory.tools import (
     ALL_TOOL_NAMES,
+    CAPTURE_TOOL_NAMES,
     OPT_IN_TOOL_NAMES,
     RECALL_TOOL_NAMES,
     RECALL_TOOL_SCHEMAS,
@@ -580,6 +581,11 @@ class QdrantMemoryProvider(MemoryProvider):
         # approval requires one. Candidates themselves are never held here: the hook producers
         # that queued them in memory were removed (capture CP1).
         self._reviewed_extraction_candidate_ids: set[str] = set()
+        # Capture queue items whose dry-run approval / rejection this process has shown. The
+        # queue itself lives only in $HERMES_HOME/qdrant_memory/capture/queue.jsonl.
+        self._reviewed_capture_ids: set[str] = set()
+        self._reviewed_capture_reject_ids: set[str] = set()
+        self._agent_context = "primary"
         self._pending_improve_reports: dict[str, dict[str, Any]] = {}
         self._reviewed_improve_candidate_keys: set[str] = set()
         self._reviewed_raptor_keys: set[str] = set()
@@ -627,6 +633,7 @@ class QdrantMemoryProvider(MemoryProvider):
         self._user_id_hash = _hash_value(str(kwargs.get("user_id") or ""))
         self._chat_id_hash = _hash_value(str(kwargs.get("chat_id") or kwargs.get("thread_id") or ""))
         agent_context = str(kwargs.get("agent_context") or "primary")
+        self._agent_context = agent_context
         self._write_enabled = agent_context != "subagent" or bool(self._config.get("sync_subagents"))
         if agent_context in {"cron", "flush"}:
             self._write_enabled = False
@@ -1246,6 +1253,9 @@ class QdrantMemoryProvider(MemoryProvider):
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         schemas = RECALL_TOOL_SCHEMAS if self._recall_surface() else TOOL_SCHEMAS
+        if not self._capture_enabled():
+            # capture_mode off (the default): the list is the one it was before capture existed.
+            schemas = [schema for schema in schemas if schema["name"] not in CAPTURE_TOOL_NAMES]
         if self._session_origin_mode() == "recorded":
             # The store gains `cite` only in recorded mode; with the mode off the list is
             # the one it was before session origin existed.
@@ -1433,6 +1443,16 @@ class QdrantMemoryProvider(MemoryProvider):
         capture = capture if isinstance(capture, Mapping) else {}
         captured = str(capture.get("session_id") or "")
         now = self._utc_now_z()
+        if isinstance(capture.get("citation"), Mapping):
+            # A capture-queue candidate pinned its exact row at capture time: re-verify that
+            # citation (capture_apply.capture_origin) instead of searching for the text again.
+            from qdrant_memory.capture_apply import capture_origin
+            from qdrant_memory.capture_queue import QueueItem
+
+            item = QueueItem("", {"session_id": captured, "at": capture.get("captured_at") or now,
+                                  "citation": dict(capture["citation"])},
+                             extra_citations=[dict(c) for c in capture.get("extra_citations") or []])
+            return capture_origin(self, item, producer=producer, approval=bool(capture.get("approval", True)))
         citation = resolve_source_line(self._state_db_path(), captured, str(capture.get("source_text") or ""),
                                        role=str(capture.get("role") or "") or None)
         origin = build_session_origin(producer=producer, captured_session_id=captured,
@@ -1703,26 +1723,15 @@ class QdrantMemoryProvider(MemoryProvider):
             if write_decision.decision != "store":
                 return _json_error("write gate requires review before storing memory candidate")
             capture = None
-            lock_stack = ExitStack()
             try:
                 if recorded:
                     capture = self._session_origin_capture(str(preview["id"]), cite)
-                    # Read-merge-upsert of session_origin under the collection lock forget
-                    # also takes, so two re-stores cannot drop each other's citation.
-                    try:
-                        lock_stack.enter_context(collection_write_lock(
-                            collection_name=self._config["collection_name"],
-                            timeout=float(self._config.get("lineage_lock_timeout_seconds", 5.0)),
-                            lock_dir=str(self._config.get("lineage_lock_dir") or ""),
-                        ))
-                    except (TimeoutError, RuntimeError):
-                        return _json_error(LINEAGE_LOCK_UNAVAILABLE)
-                if recorded:
-                    point_id = self._writer.store_text(
-                        text, source_type=source_type, importance=importance, tags=tags, session_origin=capture,
-                    )
+                    point_id = self._manual_store_write(text, source_type=source_type, importance=importance,
+                                                        tags=tags, session_origin=capture)
                 else:
                     point_id = self._writer.store_text(text, source_type=source_type, importance=importance, tags=tags)
+            except LineageLockUnavailable:
+                return _json_error(LINEAGE_LOCK_UNAVAILABLE)
             except ManagedOverwriteRefused as exc:
                 # The store id is derived from the content, so re-storing the same
                 # text targets the existing point. Replacing a payload that carries
@@ -1732,8 +1741,6 @@ class QdrantMemoryProvider(MemoryProvider):
                 return _json_error(str(exc))
             except SessionOriginRefused as exc:
                 return _json_error(str(exc))
-            finally:
-                lock_stack.close()
             stored = {"dry_run": False, "saved": bool(point_id), "id": point_id, "source_type": source_type, "collection_name": self._config["collection_name"], "write_decision": write_decision.to_dict()}
             if recorded and capture is not None:
                 if cite is not None:
@@ -1746,6 +1753,172 @@ class QdrantMemoryProvider(MemoryProvider):
             return json.dumps(stored)
         except Exception as exc:
             return _json_error(f"Failed to store memory: {exc}")
+
+    def _manual_store_write(self, text: str, *, source_type: str = "manual", importance: Optional[int] = None,
+                            tags: Optional[list[str]] = None, session_origin: Optional[dict[str, Any]] = None,
+                            source: str = "hermes_tool", extra_payload: Optional[Mapping[str, Any]] = None) -> str:
+        """The manual store's write step: ``ConversationWriter.store_text`` under the collection lock.
+
+        Shared by ``qdrant_memory_store`` (recorded mode) and the capture routes, so there is one
+        manual write path. ``store_text`` re-reads the target, refuses to replace a payload that
+        carries lineage identity or W2 review state (``ManagedOverwriteRefused``) and merges
+        ``session_origin`` (C'2 rule); the lock (the one forget takes) keeps two re-stores from
+        dropping each other's citation. Raises ``LineageLockUnavailable`` when the lock is busy.
+        """
+        if self._writer is None:
+            raise RuntimeError("Qdrant memory provider is not initialized")
+        lock_stack = ExitStack()
+        try:
+            lock_stack.enter_context(self._origin_lock(self._config["collection_name"]))
+        except (TimeoutError, RuntimeError) as exc:
+            raise LineageLockUnavailable(LINEAGE_LOCK_UNAVAILABLE) from exc
+        with lock_stack:
+            return self._writer.store_text(text, source_type=source_type, importance=importance, tags=tags,
+                                           source=source, session_origin=session_origin,
+                                           extra_payload=extra_payload)
+
+    # --- capture queue routes (docs/capture.md) ---------------------------------------
+
+    def _capture_enabled(self) -> bool:
+        return str((getattr(self, "_config", None) or {}).get("capture_mode") or "off") in {"dry_run", "on"}
+
+    def _is_cron_context(self) -> bool:
+        """True in a scheduled (cron) agent session: decision P7, cron agents never approve.
+
+        The host initializes a cron run's provider with ``platform="cron"`` and
+        ``agent_context="cron"`` (cron/scheduler.py ``platform="cron"``;
+        agent/agent_init_memory_provider.py ``_memory_provider_init_kwargs``) and marks the run's
+        context with ``HERMES_CRON_SESSION`` (cron/scheduler.py ``_cron_session_var.set("1")``,
+        read through gateway/session_context.get_session_env). Any one of them counts.
+        """
+        if str(getattr(self, "_agent_context", "") or "") == "cron" or str(self._platform or "") == "cron":
+            return True
+        values = [os.environ.get("HERMES_CRON_SESSION", "")]
+        try:
+            from gateway.session_context import get_session_env  # type: ignore
+
+            values.append(str(get_session_env("HERMES_CRON_SESSION", "") or ""))
+        except Exception:
+            pass
+        return any(str(value).strip().lower() in {"1", "true", "yes", "on"} for value in values)
+
+    def _capture_refusal(self, *, decides: bool) -> str:
+        if not self._capture_enabled():
+            return _json_error("capture is off (qdrant_memory.capture_mode: off); see docs/capture.md")
+        if decides and self._is_cron_context():
+            return _json_error("a cron session cannot approve or reject capture items (cron agents never "
+                               "approve; review them in chat or with hermes qdrant capture)")
+        return ""
+
+    def _capture_queue(self) -> Any:
+        from qdrant_memory.capture_queue import CaptureQueue
+
+        return CaptureQueue(str(self._hermes_home or Path.home() / ".hermes"))
+
+    def capture_review(self, *, offset: int = 0, limit: int = 10) -> str:
+        refusal = self._capture_refusal(decides=False)
+        if refusal:
+            return refusal
+        offset = max(0, int(offset or 0))
+        limit = max(1, min(50, int(limit or 10)))
+        pending = self._capture_queue().pending()
+        page = pending[offset:offset + limit]
+        return json.dumps({"total": len(pending), "offset": offset, "limit": limit,
+                           "next_offset": offset + limit if offset + limit < len(pending) else None,
+                           "items": [item.summary() for item in page]})
+
+    def _capture_item(self, ident: str) -> tuple[Any, str]:
+        from qdrant_memory.capture_queue import CaptureQueueError
+
+        try:
+            item = self._capture_queue().find(str(ident or ""))
+        except CaptureQueueError as exc:
+            return None, _json_error(str(exc))
+        if item.status != "pending":
+            return None, _json_error(f"capture item {item.short_id} is {item.status}; only pending review items "
+                                     "can be approved or rejected")
+        return item, ""
+
+    def capture_approve(self, ident: str, *, dry_run: bool = True, approve: bool = False, actor: str = "tool") -> str:
+        """Approve one review item: dry run first, then the write through its gated path."""
+        from qdrant_memory.capture_apply import write_item
+        from qdrant_memory.capture_queue import audit_event, citation_digest
+
+        refusal = self._capture_refusal(decides=True)
+        if refusal:
+            return refusal
+        item, error = self._capture_item(ident)
+        if error:
+            return error
+        cid = item.candidate_id
+        if not dry_run:
+            if not approve:
+                return _json_error("approve=true is required when dry_run=false")
+            if cid not in self._reviewed_capture_ids:
+                return _json_error("dry-run preview is required before live capture approval")
+        result = write_item(self, item, dry_run=dry_run, approve=approve, approval=True)
+        if "error" in result:
+            return _json_error(result["error"])
+        base = {"id": cid, "short_id": item.short_id, "fact": item.fact, "lane": item.queued.get("lane"),
+                "kind": item.queued.get("kind"), **result}
+        if dry_run:
+            self._reviewed_capture_ids.add(cid)
+            base["citation_check"] = {"status": "verified"}
+            return json.dumps(base)
+        self._reviewed_capture_ids.discard(cid)
+        queue = self._capture_queue()
+        approved = audit_event("approved", cid, actor=actor, approver_session_id=self._session_id or "",
+                               approver_platform=self._platform or "", lane=item.queued.get("lane"),
+                               outcome="saved" if result.get("saved") else (
+                                   "proposal_draft" if result.get("proposal_created") else "not_saved"))
+        events = [approved]
+        if result.get("saved"):
+            events.append(audit_event("applied", cid, point_id=str(result.get("point_id") or ""), route="review",
+                                      rule="review:approved", citation_sha256=citation_digest(item.queued["citation"]),
+                                      fact_sha256=item.queued.get("fact_sha256"), lane=item.queued.get("lane"),
+                                      kind=item.queued.get("kind")))
+        queue.append(*events)
+        return json.dumps(base)
+
+    def capture_reject(self, ident: str, *, dry_run: bool = True, approve: bool = False, actor: str = "tool") -> str:
+        """Reject one review item: an event, never a Qdrant write."""
+        from qdrant_memory.capture_queue import audit_event
+
+        refusal = self._capture_refusal(decides=True)
+        if refusal:
+            return refusal
+        item, error = self._capture_item(ident)
+        if error:
+            return error
+        cid = item.candidate_id
+        if dry_run:
+            self._reviewed_capture_reject_ids.add(cid)
+            return json.dumps({"dry_run": True, "rejected": False, "would_reject": True, "id": cid,
+                               "short_id": item.short_id, "fact": item.fact})
+        if not approve:
+            return _json_error("approve=true is required when dry_run=false")
+        if cid not in self._reviewed_capture_reject_ids:
+            return _json_error("dry-run preview is required before live capture rejection")
+        self._reviewed_capture_reject_ids.discard(cid)
+        self._capture_queue().append(audit_event(
+            "rejected", cid, actor=actor, approver_session_id=self._session_id or "",
+            approver_platform=self._platform or "", lane=item.queued.get("lane"), kind=item.queued.get("kind")))
+        return json.dumps({"dry_run": False, "rejected": True, "id": cid, "short_id": item.short_id})
+
+    def _tool_capture(self, tool_name: str, args: dict[str, Any]) -> str:
+        if tool_name == "qdrant_capture_review":
+            try:
+                return self.capture_review(offset=int(args.get("offset") or 0), limit=int(args.get("limit") or 10))
+            except (TypeError, ValueError):
+                return _json_error("offset and limit must be integers")
+        ident = str(args.get("id") or "").strip()
+        if not ident:
+            return _json_error("id is required")
+        dry_run = parse_bool_arg(args.get("dry_run"), default=True)
+        approve = parse_bool_arg(args.get("approve"), default=False)
+        if tool_name == "qdrant_capture_approve":
+            return self.capture_approve(ident, dry_run=dry_run, approve=approve, actor="tool")
+        return self.capture_reject(ident, dry_run=dry_run, approve=approve, actor="tool")
 
     @staticmethod
     def _labelled_search(
@@ -3006,12 +3179,19 @@ class QdrantMemoryProvider(MemoryProvider):
         }
         # session_origin_mode recorded: the origin is the session frozen on the candidate at
         # hook time, never the approver's self._session_id (it follows session switches).
-        recorded = self._session_origin_mode() == "recorded"
+        # A capture-queue candidate carries its pinned citation and always records it (design
+        # I2: every stored capture is cited), whatever session_origin_mode says.
+        origin_capture = getattr(candidate, "origin_capture", None) or {}
+        recorded = self._session_origin_mode() == "recorded" or isinstance(origin_capture.get("citation"), Mapping)
         if dry_run:
-            self._reviewed_extraction_candidate_ids.add(candidate_id)
             previewed = {"dry_run": True, "saved": False, "proposal_created": False, **base}
             if recorded:
-                previewed["session_origin"] = self._candidate_session_origin("source_extraction", candidate.origin_capture)
+                try:
+                    previewed["session_origin"] = self._candidate_session_origin("source_extraction",
+                                                                                 candidate.origin_capture)
+                except SessionOriginRefused as exc:
+                    return _json_error(str(exc))
+            self._reviewed_extraction_candidate_ids.add(candidate_id)
             return json.dumps(previewed)
         if not approve:
             return _json_error("approve=true is required when dry_run=false")
@@ -4780,6 +4960,8 @@ class QdrantMemoryProvider(MemoryProvider):
             return self._tool_session_recall(args)
         if tool_name == "qdrant_memory_session_expand":
             return self._tool_session_expand(args)
+        if tool_name in ("qdrant_capture_review", "qdrant_capture_approve", "qdrant_capture_reject"):
+            return self._tool_capture(tool_name, args)
         return _json_error(f"Unknown tool: {tool_name}")
 
     def shutdown(self) -> None:

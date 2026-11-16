@@ -583,6 +583,23 @@ def _register_capture(subcommands) -> None:
                       help="Move the cursor to the end of this scan. Without it the cursor is left unchanged.")
     scan.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
 
+    review = capture_subcommands.add_parser(
+        "review", help="List capture items waiting for review (pending, oldest first). Read-only.")
+    review.set_defaults(qdrant_subcommand="capture")
+    review.add_argument("--limit", type=_positive_int, default=10, help="Items per page (max 50). Default: 10.")
+    review.add_argument("--offset", type=int, default=0, help="Items to skip. Default: 0.")
+    review.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
+
+    for name, text in (("approve", "Approve one review item: re-verify its cited message, then store it. "
+                                   "Dry-run by default."),
+                       ("reject", "Reject one review item (an event; nothing is written to memory). "
+                                  "Dry-run by default.")):
+        decide = capture_subcommands.add_parser(name, help=text)
+        decide.set_defaults(qdrant_subcommand="capture")
+        decide.add_argument("id", help="Capture item id: the full id or its 12-character short id.")
+        _add_dry_run_flags(decide)
+        decide.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
+
 
 def _register_session_recall(subcommands) -> None:
     recall = subcommands.add_parser(

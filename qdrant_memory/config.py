@@ -143,6 +143,11 @@ DEFAULTS: dict[str, Any] = {
     # Opt-in: drop a recalled window prompted only by a one-shot run (capture_reader.window_is_lane_noise),
     # e.g. a test harness's "Reply with exactly: OK" turn. Agent-prompted windows are kept.
     "session_prefetch_exclude_machine": False,
+    # Automatic capture (docs/capture.md). ``off`` (default): no capture tools, ``capture run``
+    # refuses. ``dry_run``: runs only report. ``on``: ``capture run --apply`` queues, writes the
+    # auto and mirror routes and advances the cursor. Review items expire after N days.
+    "capture_mode": "off",
+    "capture_review_expiry_days": 21,
     "session_prefetch_candidates": 32,
     "session_prefetch_timeout_s": 2.0,
     # Lane relevance floors: a reranked excerpt needs at least min_rerank_score, a dense-ordered
@@ -264,7 +269,8 @@ _INT_KEYS = {
     "session_prefetch_total_chars",
     "session_prefetch_candidates",
 }
-_FLOAT_KEYS = {"session_prefetch_timeout_s", "session_recall_rerank_timeout_s", "session_recall_inline_catchup_seconds", "decay_rate", "min_raw_score", "min_final_score", "consolidation_duplicate_threshold", "guarded_auto_duplicate_min_confidence", "guarded_auto_learning_min_confidence", "reconsolidation_min_confidence", "manual_store_duplicate_threshold", "lineage_lock_timeout_seconds"}
+_CAPTURE_MODES = frozenset({"off", "dry_run", "on"})
+_FLOAT_KEYS = {"capture_review_expiry_days", "session_prefetch_timeout_s", "session_recall_rerank_timeout_s", "session_recall_inline_catchup_seconds", "decay_rate", "min_raw_score", "min_final_score", "consolidation_duplicate_threshold", "guarded_auto_duplicate_min_confidence", "guarded_auto_learning_min_confidence", "reconsolidation_min_confidence", "manual_store_duplicate_threshold", "lineage_lock_timeout_seconds"}
 _LIST_KEYS = {"index_dirs", "index_extensions", "index_exclude_dirs", "session_recall_exclude_sources"}
 # Automatic-recall relevance floors. "off" (also "", null, false) disables every one of them.
 # On the legacy floors 0 disables too (their scores are never negative); on the lane floors 0
@@ -461,6 +467,11 @@ def _coerce(key: str, value: Any) -> Any:
         return candidate if candidate in _SESSION_ORIGIN_MODES else "off"
     if key == "read_sources":
         return _as_read_sources(value)
+    if key == "capture_mode":
+        if isinstance(value, bool):  # YAML 1.1 reads a bare on/off as a boolean
+            return "on" if value else "off"
+        candidate = value.strip().lower().replace("-", "_") if isinstance(value, str) else ""
+        return candidate if candidate in _CAPTURE_MODES else "off"
     if isinstance(default, str):
         return str(value)
     return value

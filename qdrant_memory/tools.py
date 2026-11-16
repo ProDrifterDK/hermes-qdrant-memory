@@ -667,6 +667,53 @@ SESSION_EXPAND_SCHEMA = {
     },
 }
 
+_CAPTURE_ID_PROPERTY = {
+    "type": "string",
+    "description": "Exact capture item id from qdrant_capture_review (full id or its 12-character short id).",
+}
+_CAPTURE_DECIDE_PROPERTIES = {
+    "id": _CAPTURE_ID_PROPERTY,
+    "dry_run": {"type": "boolean", "description": "When true (default), show what would happen without writing."},
+    "approve": {"type": "boolean", "description": "Required true when dry_run=false."},
+}
+
+CAPTURE_REVIEW_SCHEMA = {
+    "name": "qdrant_capture_review",
+    "description": (
+        "List the automatic-capture items waiting for the owner's review (pending, oldest first, paginated): "
+        "id, kind, one-line fact, cited session and message, expiry. Read-only."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "offset": {"type": "integer", "description": "Items to skip. Default 0."},
+            "limit": {"type": "integer", "description": "Items per page, 1 to 50. Default 10."},
+        },
+        "additionalProperties": False,
+    },
+}
+
+CAPTURE_APPROVE_SCHEMA = {
+    "name": "qdrant_capture_approve",
+    "description": (
+        "Approve exactly one pending capture item, only when the owner asked for it. Dry-run defaults to true "
+        "and re-verifies the cited message; live approval requires approve=true and a prior dry run of the same "
+        "id. The fact is stored with the captured conversation as its origin. Refused in cron sessions."
+    ),
+    "parameters": {"type": "object", "properties": _CAPTURE_DECIDE_PROPERTIES, "required": ["id"],
+                   "additionalProperties": False},
+}
+
+CAPTURE_REJECT_SCHEMA = {
+    "name": "qdrant_capture_reject",
+    "description": (
+        "Reject exactly one pending capture item, only when the owner asked for it. Nothing is written to "
+        "memory. Dry-run defaults to true; live rejection requires approve=true. Refused in cron sessions."
+    ),
+    "parameters": {"type": "object", "properties": _CAPTURE_DECIDE_PROPERTIES, "required": ["id"],
+                   "additionalProperties": False},
+}
+
 TOOL_SCHEMAS = [
     STATUS_SCHEMA,
     STORE_SCHEMA,
@@ -692,11 +739,16 @@ TOOL_SCHEMAS = [
     RETRIEVE_SCHEMA,
     SESSION_RECALL_SCHEMA,
     SESSION_EXPAND_SCHEMA,
+    CAPTURE_REVIEW_SCHEMA,
+    CAPTURE_APPROVE_SCHEMA,
+    CAPTURE_REJECT_SCHEMA,
 ]  # noqa: E501
 
 # Tools registered only when their config flag is on (``session_expand_enabled``); with the
 # flag off the provider's schema list is exactly the one it had before the tool existed.
 OPT_IN_TOOL_NAMES = frozenset({"qdrant_memory_session_expand"})
+# Capture review tools: full surface only, and only while ``capture_mode`` is not ``off``.
+CAPTURE_TOOL_NAMES = frozenset({"qdrant_capture_review", "qdrant_capture_approve", "qdrant_capture_reject"})
 
 # ``tool_surface: recall``: the read-mostly tools a slow local model needs to recall.
 RECALL_TOOL_NAMES = frozenset({

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 
 from .fact_metadata import derive_fact_metadata
 from .lineage import lineage_overwrite_refusal
@@ -140,7 +140,7 @@ class ConversationWriter:
             }
         return None
 
-    def store_text(self, text: str, *, source_type: str = "manual", chunk_type: str = "fact", importance: int | None = None, tags: list[str] | None = None, source: str = "hermes_tool", session_origin: dict[str, Any] | None = None) -> str:
+    def store_text(self, text: str, *, source_type: str = "manual", chunk_type: str = "fact", importance: int | None = None, tags: list[str] | None = None, source: str = "hermes_tool", session_origin: dict[str, Any] | None = None, extra_payload: Mapping[str, Any] | None = None) -> str:
         preview = self.preview_text(text, source_type=source_type, chunk_type=chunk_type, importance=importance, tags=tags, source=source)
         clean = preview["text"]
         if not clean:
@@ -167,6 +167,14 @@ class ConversationWriter:
         # unchanged. Either way the validator runs here, so an invalid or oversized mapping
         # is refused before anything is written. A point without one is written as before.
         payload = preview["payload"]
+        if extra_payload:
+            # Plain extra fields (capture metadata, fact_status). They can never replace the
+            # text, the provenance mapping or the session fields set here.
+            reserved = {"text", "session_origin", "session_id", "profile_id", "source", "source_type"}
+            clash = sorted(set(extra_payload) & reserved)
+            if clash:
+                raise ValueError(f"extra_payload may not set {', '.join(clash)}")
+            payload = {**payload, **dict(extra_payload)}
         if session_origin is not None:
             origin = merge_session_origin(existing_origin, session_origin)
         else:

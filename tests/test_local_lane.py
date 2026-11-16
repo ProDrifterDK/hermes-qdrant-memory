@@ -287,8 +287,10 @@ def test_merged_recall_ranks_own_and_read_source_hits_on_one_scale(monkeypatch, 
 
 def test_recall_surface_exposes_six_tools_and_refuses_hidden_writes(monkeypatch, tmp_path, caplog):
     store, log = {}, []
-    # The opt-in session expand tool is off by default: every surface is exactly what it was.
-    default_schemas = [s for s in plugin.TOOL_SCHEMAS if s["name"] != EXPAND]
+    # The opt-in session expand tool and the capture tools (capture_mode off) are off by
+    # default: every surface is exactly what it was.
+    default_schemas = [s for s in plugin.TOOL_SCHEMAS
+                       if s["name"] != EXPAND and s["name"] not in plugin.CAPTURE_TOOL_NAMES]
     full = _local_provider(monkeypatch, tmp_path, store, log, read_sources=[])
     assert full.get_tool_schemas() == default_schemas and len(full.get_tool_schemas()) == 23
 
@@ -304,7 +306,8 @@ def test_recall_surface_exposes_six_tools_and_refuses_hidden_writes(monkeypatch,
 
     # With session_expand_enabled the expand tool joins both surfaces and the prompt block.
     full_x = _local_provider(monkeypatch, tmp_path, store, log, read_sources=[], session_expand_enabled=True)
-    assert full_x.get_tool_schemas() == plugin.TOOL_SCHEMAS and len(full_x.get_tool_schemas()) == 24
+    assert full_x.get_tool_schemas() == [s for s in plugin.TOOL_SCHEMAS if s["name"] not in plugin.CAPTURE_TOOL_NAMES]
+    assert len(full_x.get_tool_schemas()) == 24
     recall_x = _local_provider(
         monkeypatch, tmp_path, store, log, read_sources=[], tool_surface="recall", session_expand_enabled=True
     )
