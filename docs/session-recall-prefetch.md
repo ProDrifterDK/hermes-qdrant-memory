@@ -283,7 +283,7 @@ the tool only on profiles that may read the whole local conversation history.
 | `session_prefetch_timeout_s` | `2.0` | Hard limit for the lane; fail-open to legacy. |
 | `session_prefetch_min_rerank_score` | `off` | Lane floor for reranked excerpts (see "Relevance floor"; model-specific). |
 | `session_prefetch_min_dense_score` | `off` | Lane floor for dense-ordered excerpts (model-specific). |
-| `session_prefetch_exclude_machine` | `false` | Drop a window whose user side is host or machine text only (scripted runs, cron and agent prompts), judged by the capture classifier; see docs/capture.md. `c5_gate_harness.py --exclude-machine` measures it. |
+| `session_prefetch_exclude_machine` | `false` | Drop a window prompted only by a one-shot run (test harnesses, probes), judged by the capture classifier; windows prompted by a person or an agent (delegation briefs, subagent, cron, tool runs) are kept. See docs/capture.md. `c5_gate_harness.py --exclude-machine` measures it. |
 | `auto_recall_min_final_score` | `off` | Legacy block floor on the ranked score. |
 | `auto_recall_min_raw_score` | `off` | Legacy block floor on raw cosine. |
 | `auto_recall_min_word_chars` | `off` | Shorter messages skip automatic recall (legacy, hybrid and lane). |

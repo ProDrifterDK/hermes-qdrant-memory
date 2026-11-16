@@ -103,9 +103,10 @@ threshold. Decision order:
    the `[Name] ` sender tag is removed (a bracket label with a colon is never a sender). Nothing
    left: host `envelope_only` (`media_note` when the row was only a media description).
 4. **Session source.** A `user` row whose session source is not one a person types into
-   (`cli`, `tui`, `desktop`, `gui`, `local`, `acp` and the messaging gateways) is `machine`
-   `non_interactive_source`: cron, subagent, one-shot and tool runs, API clients, test canaries,
-   and rows whose session row is missing.
+   (`cli`, `tui`, `desktop`, `gui`, `local`, `acp` and the messaging gateways) is `machine`:
+   `one_shot` when the source is the host's one-shot run (`oneshot`: a single scripted prompt,
+   such as a test harness or a probe), otherwise `non_interactive_source` (cron, subagent and
+   tool runs, API clients, test canaries, and rows whose session row is missing).
 5. **Delegation brief.** A `user` row is `machine` `delegation_brief` when all of these hold:
    the session source is a messaging gateway (telegram, discord, slack, whatsapp, signal, matrix,
    mattermost, email, sms); the session has no `parent_session_id`; it carries no gateway identity
@@ -133,19 +134,23 @@ Host shapes this module adds without editing `host_markers.py` (to reconcile the
 ### Session-lane filter (opt-in)
 
 `session_prefetch_exclude_machine: true` (default `false`) makes the automatic-recall session lane
-drop a recalled window whose prompting user side is machine text only. The user side is the
-window's eligible `user` rows that are not host text; host rows decide nothing, because the lane
-already cuts host text out of every window and a person's conversation is full of host notices.
-When the window holds no such row (a window inside one long answer, or one whose only user rows are
-notices), it is the last non-host `user` row before the window: the prompt its assistant text
-answers. The window is dropped when that set is non-empty and every row in it is machine text. A
-window with no such row anywhere before it is kept.
+drop a recalled window prompted only by a one-shot run: a test harness's "Reply with exactly: OK",
+a smoke probe. The prompting user side is the window's eligible `user` rows that are not host
+text; host rows decide nothing, because the lane already cuts host text out of every window and a
+person's conversation is full of host notices. When the window holds no such row (a window inside
+one long answer, or one whose only user rows are notices), it is the last non-host `user` row
+before the window: the prompt its assistant text answers. The window is dropped when that set is
+non-empty and every row in it is a machine kind in `capture_reader.LANE_NOISE_KINDS`, which is
+`one_shot` alone. A window with no such row anywhere before it is kept
+(`capture_reader.window_is_lane_noise`).
 
-Why host rows decide nothing: on one install's recall question sets, the literal rule "drop when
-every user row in the window is host or machine" dropped 563 windows and cost four reranked hits,
-mostly windows of the person's own sessions whose only user rows were host notices. The rule above
-dropped 17 windows and cost one hit, whose answer sat in a delegated agent's session: a window
-prompted by an agent's brief is machine-prompted, and the filter drops it by design.
+Windows prompted by an agent are kept: delegation briefs, subagent, cron, tool and API-client
+runs. Those sessions hold findings the user asks about later, so dropping every machine-prompted
+window costs real recall. On one install's recall question sets, a rule that dropped every
+machine-prompted window lost a question whose answer sat only in a delegated agent's session, and
+a rule that also counted host rows as machine text lost more (four hits net). The one-shot rule
+loses none there, and drops a few dozen windows of a 66,000-window index.
+
 Dropped windows are listed in `SessionPrefetchLane.last_excluded` (ids only). With the option off
 the lane is unchanged.
 

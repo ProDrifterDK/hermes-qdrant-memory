@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping
 
-from qdrant_memory.capture_reader import window_is_machine_only
+from qdrant_memory.capture_reader import window_is_lane_noise
 from qdrant_memory.config import relevance_floor
 from qdrant_memory.host_markers import is_host_injected
 from qdrant_memory.lesson_extractor import contains_secret, redact_secret_spans
@@ -89,8 +89,8 @@ class PrefetchSettings:
     # dense-ordered one (no reranker, or the reranker failed) by its cosine similarity.
     min_rerank_score: float | None = None
     min_dense_score: float | None = None
-    # Drop a window whose prompting user side is machine text only (opt-in;
-    # capture_reader.window_is_machine_only).
+    # Drop a window prompted only by a one-shot run, e.g. a test harness or probe (opt-in;
+    # capture_reader.window_is_lane_noise). Agent-prompted windows are kept.
     exclude_machine: bool = False
 
     @classmethod
@@ -288,7 +288,7 @@ class SessionPrefetchLane:
         self.expand_hint = expand_hint
         self.last_rerank = ""  # the window search's rerank status of the last collect
         # (session_id, first_msg_id, last_msg_id) of the windows the last collect dropped
-        # because their prompting user side is machine text (exclude_machine).
+        # because only a one-shot run prompts them (exclude_machine).
         self.last_excluded: list[tuple[str, int, int]] = []
 
     def build(
@@ -366,7 +366,7 @@ class SessionPrefetchLane:
                 if self.settings.exclude_machine:
                     span = (str(result.get("session_id") or ""), int(result.get("first_msg_id") or 0),
                             int(result.get("last_msg_id") or 0))
-                    if window_is_machine_only(conn, *span):
+                    if window_is_lane_noise(conn, *span):
                         self.last_excluded.append(span)
                         continue
                 text, msg_id = hidden_text(conn, view, result, emitted)

@@ -11,8 +11,9 @@ Failure modes (design CP2), each pinned below:
 - schema drift (optional columns missing, required columns missing);
 - a locked database;
 - any write to ``state.db``;
-- the session lane recalling a window whose user side is all host or machine text (opt-in),
-  or changing anything when the option is off.
+- the session lane (opt-in) recalling a window prompted by a one-shot run, dropping a window
+  prompted by a person or by an agent (delegation brief, subagent, cron, tool, API client), or
+  changing anything when the option is off.
 
 Everything here is synthetic text in a ``state.db`` built from the host's dumped schema.
 """
@@ -107,10 +108,18 @@ def test_assistant_rows_are_machine_unless_host():
 # --- classifier: machine ------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("source", ["cron", "subagent", "oneshot", "tool", "api_server", "some-test-canary", ""])
+@pytest.mark.parametrize("source", ["cron", "subagent", "tool", "api_server", "some-test-canary", ""])
 def test_rows_of_non_interactive_sessions_are_machine(source):
     verdict = cr.classify_row(_ctx("Reply with exactly: OK", source=source))
     assert (verdict.classification, verdict.kind) == ("machine", "non_interactive_source")
+
+
+def test_rows_of_one_shot_runs_are_machine_with_their_own_kind():
+    verdict = cr.classify_row(_ctx("Reply with exactly: OK", source="oneshot"))
+    assert (verdict.classification, verdict.kind) == ("machine", "one_shot")
+    # Host text in a one-shot run is still host (it decides nothing in the lane filter).
+    assert cr.classify_row(_ctx("[IMPORTANT: Background process proc_1 completed]", source="oneshot")
+                           ).classification == "host"
 
 
 def test_a_row_without_a_session_is_machine():
@@ -343,17 +352,60 @@ def test_a_locked_state_db_is_a_read_error_and_the_cursor_stays(db, tmp_path):
 # --- session lane filter --------------------------------------------------------------------
 
 
-def test_window_is_machine_only_judges_the_prompting_user_side(db):
-    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+@pytest.fixture
+def lane_db(tmp_path):
+    """One session per prompting shape the lane filter must tell apart; message ids by name."""
+    path = tmp_path / "lane" / "state.db"
+    path.parent.mkdir()
+    conn = _make_db(path)
+    ids: dict[str, int] = {}
+    _session(conn, "human")
+    ids["human_user"] = _message(conn, "human", "user", HUMAN_TEXT, 1)
+    ids["human_answer"] = _message(conn, "human", "assistant", "Noted.", 2)
+    ids["human_notice"] = _message(conn, "human", "user", "[IMPORTANT: Background process proc_1 completed normally]", 3)
+    _session(conn, "brief", "telegram", identity=False, title=None)
+    ids["brief_user"] = _message(conn, "brief", "user", "Review the diff and report blockers.", 4)
+    ids["brief_answer"] = _message(conn, "brief", "assistant", "Two blockers.", 5)
+    for source in ("subagent", "cron", "tool", "api_server"):
+        _session(conn, source, source)
+        ids[f"{source}_user"] = _message(conn, source, "user", "Investigate the failing deploy and report.", 6)
+        ids[f"{source}_answer"] = _message(conn, source, "assistant", "The deploy fails on the port check.", 7)
+    _session(conn, "probe", "oneshot")
+    ids["probe_user"] = _message(conn, "probe", "user", "Reply with exactly: OK", 8)
+    ids["probe_answer"] = _message(conn, "probe", "assistant", "OK", 9)
+    ids["probe_notice"] = _message(conn, "probe", "user", "[IMPORTANT: Background process proc_2 completed]", 10)
+    ids["probe_after"] = _message(conn, "probe", "assistant", "Still OK.", 11)
+    _session(conn, "headless", "oneshot")
+    ids["headless_answer"] = _message(conn, "headless", "assistant", "An answer with no prompt row.", 12)
+    conn.commit()
+    conn.close()
+    return path, ids
+
+
+@pytest.mark.parametrize("session,first,last,dropped", [
+    # Dropped: one-shot probes, with the prompt in the window or only before it (F3); host rows decide nothing.
+    ("probe", "probe_user", "probe_answer", True),
+    ("probe", "probe_answer", "probe_answer", True),
+    ("probe", "probe_notice", "probe_after", True),
+    # Kept: agent-prompted sessions hold findings asked about later (F1, F2).
+    ("brief", "brief_user", "brief_answer", False),
+    ("brief", "brief_answer", "brief_answer", False),
+    ("subagent", "subagent_user", "subagent_answer", False),
+    ("subagent", "subagent_answer", "subagent_answer", False),
+    ("cron", "cron_user", "cron_answer", False),
+    ("tool", "tool_user", "tool_answer", False),
+    ("api_server", "api_server_user", "api_server_answer", False),
+    # Kept: a person's conversation, also where only a host notice is in the window (F4).
+    ("human", "human_user", "human_answer", False),
+    ("human", "human_notice", "human_notice", False),
+    # Kept: nothing prompts the window (F5).
+    ("headless", "headless_answer", "headless_answer", False),
+])
+def test_the_lane_filter_drops_only_windows_prompted_by_one_shot_runs(lane_db, session, first, last, dropped):
+    path, ids = lane_db
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
-        assert cr.window_is_machine_only(conn, "cron-1", 0, 10**9) is True
-        assert cr.window_is_machine_only(conn, "brief-1", 6, 7) is True        # the brief and its answer
-        assert cr.window_is_machine_only(conn, "brief-1", 6, 8) is False       # a person answers in it
-        assert cr.window_is_machine_only(conn, "human-1", 0, 10**9) is False
-        assert cr.window_is_machine_only(conn, "human-1", 2, 3) is False       # answers the person's row 1
-        assert cr.window_is_machine_only(conn, "human-1", 4, 4) is False       # a host notice in a person's session
-        assert cr.window_is_machine_only(conn, "brief-1", 7, 7) is True        # answers the brief
-        assert cr.window_is_machine_only(conn, "cron-1", 0, 0) is False        # nothing before it
+        assert cr.window_is_lane_noise(conn, session, ids[first], ids[last]) is dropped
     finally:
         conn.close()
 

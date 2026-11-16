@@ -869,8 +869,9 @@ keep loading, have no effect, and log one warning per process. Remove them from 
 What exists of the replacement so far is read-only: `qdrant_memory/capture_reader.py` reads new
 `state.db` rows after a persisted cursor and classifies who wrote each one (host, machine, or a
 person), and `hermes qdrant capture scan [--since-days N] [--json] [--advance]` reports the counts.
-`session_prefetch_exclude_machine: true` (default `false`) uses the same classifier to keep scripted,
-cron and agent-prompt windows out of the automatic-recall session lane. See
+`session_prefetch_exclude_machine: true` (default `false`) uses the same classifier to keep windows
+of one-shot runs (test harnesses, probes) out of the automatic-recall session lane; windows prompted
+by an agent (delegation briefs, subagent, cron, tool runs) stay recallable. See
 [docs/capture.md](docs/capture.md).
 
 ### `qdrant_memory_session_recall`

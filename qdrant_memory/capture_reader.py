@@ -37,8 +37,10 @@ Features and decision order, all verifiable on the row and its session:
    ``EXTRA_HOST_SHAPES`` (shapes this module adds without editing ``host_markers``). A row
    with nothing left after the envelopes is host ``envelope_only``.
 4. Session source. ``user`` rows of a session whose ``sessions.source`` is not one a person
-   types into (``HUMAN_SOURCES``: cron, subagent, oneshot, tool, api_server, a test canary,
-   or no session row at all) are ``machine`` ``non_interactive_source``.
+   types into (``HUMAN_SOURCES``) are ``machine``: ``one_shot`` for the host's one-shot runs
+   (``ONE_SHOT_SOURCES``: a single scripted prompt such as a test harness or a probe), else
+   ``non_interactive_source`` (cron, subagent, tool, api_server, a test canary, or no session
+   row at all).
 5. Delegation brief. A ``user`` row is ``machine`` ``delegation_brief`` when ALL hold:
    the session source is a messaging gateway (``GATEWAY_SOURCES``); the session has no
    ``parent_session_id``; the session carries no gateway identity (``user_id``, ``chat_type``
@@ -88,6 +90,8 @@ HUMAN_SOURCES = frozenset({
     "cli", "tui", "desktop", "gui", "local", "acp",
     "telegram", "discord", "slack", "whatsapp", "signal", "matrix", "mattermost", "email", "sms",
 })
+# The host's one-shot runs (``agent/session_source.ONESHOT_SOURCE``): one scripted prompt, one answer.
+ONE_SHOT_SOURCES = frozenset({"oneshot"})
 # Messaging gateways: a real message into one of these sessions gives it a gateway identity.
 GATEWAY_SOURCES = frozenset({"telegram", "discord", "slack", "whatsapp", "signal", "matrix", "mattermost",
                              "email", "sms"})
@@ -292,6 +296,8 @@ def classify_row(row: RowContext | Mapping[str, Any]) -> Classification:
     if not body:
         kind = "media_note" if "media_note" in envelopes else "envelope_only"
         return Classification(CLASS_HOST, kind, body, sender, envelopes, features)
+    if r.session_known and source in ONE_SHOT_SOURCES:
+        return Classification(CLASS_MACHINE, "one_shot", body, sender, envelopes, features)
     if not r.session_known or source not in HUMAN_SOURCES:
         return Classification(CLASS_MACHINE, "non_interactive_source", body, sender, envelopes, features)
     if (source in GATEWAY_SOURCES and not features["has_parent"] and not features["gateway_identity"]
@@ -424,8 +430,15 @@ def _prompt_before(conn: sqlite3.Connection, session_id: str, msg_id: int, *, lo
     return []
 
 
-def window_is_machine_only(conn: sqlite3.Connection, session_id: str, first_msg_id: int, last_msg_id: int) -> bool:
-    """True when the user side that prompts a session window is machine text only.
+# Machine kinds whose windows the session lane drops (``session_prefetch_exclude_machine``):
+# prompts with no conversational value. Agent-prompted kinds (``delegation_brief``, and
+# ``non_interactive_source``: subagent, cron, tool and API runs) are not here on purpose: their
+# sessions hold findings the user asks about later.
+LANE_NOISE_KINDS = frozenset({"one_shot"})
+
+
+def window_is_lane_noise(conn: sqlite3.Connection, session_id: str, first_msg_id: int, last_msg_id: int) -> bool:
+    """True when every row of the user side that prompts a session window is a ``LANE_NOISE_KINDS`` kind.
 
     The user side is the window's eligible ``user`` rows that are not host text (the lane cuts
     host text out of windows already, so a notice inside a person's conversation decides
@@ -435,7 +448,8 @@ def window_is_machine_only(conn: sqlite3.Connection, session_id: str, first_msg_
     rows = [row for row in window_user_rows(conn, session_id, first_msg_id, last_msg_id)
             if classify_row(row).classification != CLASS_HOST]
     rows = rows or _prompt_before(conn, session_id, first_msg_id)
-    return bool(rows) and all(classify_row(row).classification == CLASS_MACHINE for row in rows)
+    verdicts = [classify_row(row) for row in rows]
+    return bool(verdicts) and all(v.classification == CLASS_MACHINE and v.kind in LANE_NOISE_KINDS for v in verdicts)
 
 
 # --- cursor ------------------------------------------------------------------------------------
