@@ -20,9 +20,13 @@ from test_consolidation_apply import FakeQdrant, _point, _provider
 
 def _parser():
     import argparse
+    import importlib.util
 
-    import cli
-
+    # Load the plugin's cli.py by path: a bare `import cli` can resolve to Hermes' own cli.py
+    # (hermes-agent is on sys.path), which re-executes the interpreter.
+    spec = importlib.util.spec_from_file_location("qdrant_plugin_cli_cp6_test", Path(__file__).resolve().parents[1] / "cli.py")
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
     parser = argparse.ArgumentParser(prog="hermes")
     subparsers = parser.add_subparsers(dest="command", required=True)
     qdrant_parser = subparsers.add_parser("qdrant")

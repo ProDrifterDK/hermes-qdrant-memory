@@ -170,9 +170,12 @@ def _provider(home: Path, config: dict[str, Any], url: str):
 
 def _watcher_args(mode: str, max_points: int):
     import argparse as _argparse
+    import importlib.util
 
-    import cli
-
+    # By path: a bare `import cli` can resolve to Hermes' own cli.py.
+    spec = importlib.util.spec_from_file_location("qdrant_plugin_cli_e2e", PLUGIN_ROOT / "cli.py")
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
     parser = _argparse.ArgumentParser(prog="hermes")
     sub = parser.add_subparsers(dest="command", required=True)
     qdrant_parser = sub.add_parser("qdrant")
