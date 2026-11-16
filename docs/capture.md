@@ -310,8 +310,14 @@ own marker, `capture/digest.json`.
 1. Set `capture_owner_senders` if the owner writes in shared channels (otherwise only one-to-one
    conversations count).
 2. `capture_mode: dry_run`, then `hermes qdrant capture run --since-days 7` and read the report.
-3. `capture_mode: on`, `capture_mirror_builtin_memory: true`, and schedule
+3. Decide where capture starts. With no cursor yet, the first `--apply` reads every row
+   `state.db` still holds (and the mirror stores every accepted memory write in it). To start from
+   now, with no backfill, run `hermes qdrant capture scan --advance` once: it moves the cursor to
+   the newest row without capturing anything. Otherwise bound the first run with `--since-days`.
+4. `capture_mode: on`, `capture_mirror_builtin_memory: true`, and schedule
    `hermes qdrant capture run --apply` nightly and `hermes qdrant capture digest` daily as
-   no-agent cron jobs. The first `--apply` without `--since-days` reads every row after the cursor
-   (all of history when there is no cursor yet): bound it with `--since-days`.
-4. Keep `capture_auto_apply: false` for the review-only phase.
+   no-agent cron jobs.
+5. Keep `capture_auto_apply: false` for the review-only phase.
+
+Superseded captures are hidden from default recall (like any `superseded` fact); they stay
+reachable through searches that include fact history.
