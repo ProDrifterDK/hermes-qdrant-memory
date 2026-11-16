@@ -243,16 +243,22 @@ class Simulator:
 
 
 def lane_record(provider, query: str, session_id: str, legacy_text: str, *, scope: str, rerank: bool,
-                before_iso: str | None, candidates: int, top_k: int, max_chars: int, total_chars: int) -> dict:
+                before_iso: str | None, candidates: int, top_k: int, max_chars: int, total_chars: int,
+                exclude_machine: bool = False) -> dict:
+    import dataclasses
+
     from qdrant_memory.session_prefetch import PrefetchSettings, SessionPrefetchLane
 
     settings = PrefetchSettings(scope=scope, top_k=top_k, max_chars=max_chars, total_chars=total_chars,
                                 rerank=rerank, candidates=candidates, timeout_s=30.0)
+    if exclude_machine:  # capture CP2 opt-in; a checkout without the field cannot run this arm
+        settings = dataclasses.replace(settings, exclude_machine=True)
     lane = SessionPrefetchLane(provider._ensure_session_recall(), settings)
     if not hasattr(lane, "collect"):
         return {"block": lane.build(query, session_id, settings.lane_budget(len(legacy_text)), before=before_iso)}
     entries = lane.collect(query, session_id, before=before_iso, floors=False)
-    return {"rerank": lane.last_rerank, "entries": [
+    return {"rerank": lane.last_rerank, "excluded": [list(span) for span in getattr(lane, "last_excluded", [])],
+            "entries": [
         {"label": e.label, "msg_id": e.msg_id, "text": e.text, "dense_score": e.dense_score,
          "rerank_score": e.rerank_score} for e in entries]}
 
@@ -389,7 +395,8 @@ def run(args) -> dict[str, Any]:
                           provider._config.get("auto_recall_min_raw_score"))
         parity.append(mine == provider.prefetch(q["q"], session_id=""))
 
-    lane_kw = dict(candidates=args.candidates, top_k=5, max_chars=1200, total_chars=legacy_cap + 1200 + 2)
+    lane_kw = dict(candidates=args.candidates, top_k=5, max_chars=1200, total_chars=legacy_cap + 1200 + 2,
+                   exclude_machine=bool(args.exclude_machine))
     rows = []
     started_at = time.time()
     for set_name, q, sid, cutoff in items:
@@ -496,6 +503,8 @@ def main() -> int:
                         "min_query_word_chars (index 0 = the base point), optional points")
     parser.add_argument("--analyze-only", default="", help="recompute the grid from a recorded run")
     parser.add_argument("--tag", default="run")
+    parser.add_argument("--exclude-machine", action="store_true",
+                        help="lane arms with session_prefetch_exclude_machine on (capture CP2)")
     args = parser.parse_args()
     grid = dict(DEFAULT_GRID)
     if args.grid:

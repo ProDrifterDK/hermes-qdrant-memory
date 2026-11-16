@@ -946,6 +946,11 @@ _declare(["qdrant_memory_origin_check", "origin-check"], "read_only",
          note="scans this provider's own memory/learning collection for session_origin and re-verifies each "
               "citation; no payload, access-counter, index, collection or state.db write")
 
+# Capture CP2: reads state.db read-only and classifies rows; `--advance` writes only the capture
+# cursor file under $HERMES_HOME/qdrant_memory/capture/. No Qdrant access at all.
+_declare(["capture", "capture scan"], "read_only",
+         note="state.db opened mode=ro through the C' reader; the only write is the cursor file with --advance")
+
 # Writes outside Qdrant (files, reports, proposal state) with no payload to protect.
 _declare(["backup create", "eval-capture"], "read_only",
          note="writes files only; the restore route that consumes them is the protection row")
@@ -963,10 +968,10 @@ _declare(["backup create", "eval-capture"], "read_only",
 # a check that reads the same source twice is not a check. Because these are duplicates,
 # adding a pin means updating both the constant and this literal.
 
-# The derived surface — 24 tools, 53 CLI commands, 12 provider hooks. A route added or
+# The derived surface — 24 tools, 55 CLI commands, 12 provider hooks. A route added or
 # removed changes this number, which forces someone to touch this file and classify it,
 # even if the completeness check in the test body is later weakened.
-FROZEN_SURFACE_SIZE = 89
+FROZEN_SURFACE_SIZE = 91
 
 # Every `[mode]` row, frozen by name and by kind. Completeness used to ask only whether
 # *some* mode row existed for the route, so deleting both `[capture]` rows, deleting both

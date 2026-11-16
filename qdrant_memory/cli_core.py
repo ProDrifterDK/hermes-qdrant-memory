@@ -2348,9 +2348,47 @@ def _execute_session_recall_command(args: Namespace, stdout) -> int:
     return 1 if subcommand == "index" and payload.get("lock") == "busy" else 0
 
 
+def _format_capture_scan(payload: dict[str, Any]) -> str:
+    cursor = payload.get("cursor") or {}
+    by_class = payload.get("by_class") or {}
+    lines = [
+        f"Capture scan: {payload.get('rows', 0)} rows "
+        f"(host {by_class.get('host', 0)}, machine {by_class.get('machine', 0)}, human {by_class.get('human', 0)})",
+        f"msg ids: {payload.get('first_msg_id')}..{payload.get('last_msg_id')} (snapshot max {payload.get('snapshot_max_id')})",
+        f"cursor: {cursor.get('before')} -> {cursor.get('after')} "
+        + ("(advanced)" if cursor.get("advanced") else "(not advanced; pass --advance to move it)"),
+    ]
+    for key, count in sorted((payload.get("by_kind") or {}).items()):
+        lines.append(f"  {key}: {count}")
+    return "\n".join(lines)
+
+
+def _execute_capture_command(args: Namespace, stdout) -> int:
+    """`capture scan`: classify state.db rows after the cursor. Never writes state.db or Qdrant."""
+    from qdrant_memory.capture_reader import CaptureReadError, scan
+
+    if getattr(args, "capture_subcommand", None) != "scan":
+        raise CliUsageError("unsupported qdrant capture command")
+    hermes_home, config = _local_config()
+    home = str(hermes_home)
+    state_db = str(config.get("session_recall_state_db") or "$HERMES_HOME/state.db").replace("$HERMES_HOME", home)
+    state_db = str(Path(state_db).expanduser())
+    try:
+        payload = scan(state_db, home, since_days=getattr(args, "since_days", None),
+                       advance=bool(getattr(args, "advance", False)))
+    except CaptureReadError as exc:
+        _print_cli_error(str(exc), args, sys.stderr)
+        return 1
+    payload["state_db"] = state_db
+    _print_payload(payload, args, stdout, _format_capture_scan)
+    return 0
+
+
 def _execute_local_command(args: Namespace, stdout, *, provider_factory: Callable[[], Any] | None = None) -> int | None:
     if getattr(args, "qdrant_subcommand", None) == "session-recall":
         return _execute_session_recall_command(args, stdout)
+    if getattr(args, "qdrant_subcommand", None) == "capture":
+        return _execute_capture_command(args, stdout)
     inspection_exit = _execute_inspection_command(args, stdout)
     if inspection_exit is not None:
         return inspection_exit

@@ -549,6 +549,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     improve_apply.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
 
     _register_session_recall(subcommands)
+    _register_capture(subcommands)
 
 
 def _recall_top_k(value: str) -> int:
@@ -563,6 +564,24 @@ def _non_negative_float(value: str) -> float:
     if parsed < 0:
         raise argparse.ArgumentTypeError("must be zero or more")
     return parsed
+
+
+def _register_capture(subcommands) -> None:
+    capture = subcommands.add_parser(
+        "capture",
+        help="Automatic capture: read state.db since the capture cursor and classify who wrote each row.",
+    )
+    capture_subcommands = capture.add_subparsers(dest="capture_subcommand", required=True)
+    scan = capture_subcommands.add_parser(
+        "scan",
+        help="Count new state.db rows per author class (host, machine, human) since the cursor. Read-only.",
+    )
+    scan.set_defaults(qdrant_subcommand="capture")
+    scan.add_argument("--since-days", type=_non_negative_float, default=None,
+                      help="Only rows from the last N days (bounds a first scan).")
+    scan.add_argument("--advance", action="store_true",
+                      help="Move the cursor to the end of this scan. Without it the cursor is left unchanged.")
+    scan.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
 
 
 def _register_session_recall(subcommands) -> None:

@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping
 
+from qdrant_memory.capture_reader import window_is_machine_only
 from qdrant_memory.config import relevance_floor
 from qdrant_memory.host_markers import is_host_injected
 from qdrant_memory.lesson_extractor import contains_secret, redact_secret_spans
@@ -88,6 +89,8 @@ class PrefetchSettings:
     # dense-ordered one (no reranker, or the reranker failed) by its cosine similarity.
     min_rerank_score: float | None = None
     min_dense_score: float | None = None
+    # Drop a window whose user rows are all host or machine text (opt-in).
+    exclude_machine: bool = False
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "PrefetchSettings":
@@ -110,6 +113,7 @@ class PrefetchSettings:
             timeout_s=_clamp(config.get("session_prefetch_timeout_s"), 2.0, 0.1, 30.0),
             min_rerank_score=_floor(config.get("session_prefetch_min_rerank_score")),
             min_dense_score=_floor(config.get("session_prefetch_min_dense_score")),
+            exclude_machine=bool(config.get("session_prefetch_exclude_machine", False)),
         )
 
     def admits(self, rerank_score: float | None, dense_score: float | None) -> bool:
@@ -282,6 +286,9 @@ class SessionPrefetchLane:
         self.settings = settings
         self.expand_hint = expand_hint
         self.last_rerank = ""  # the window search's rerank status of the last collect
+        # (session_id, first_msg_id, last_msg_id) of the windows the last collect dropped
+        # because every user row in them is host or machine text (exclude_machine).
+        self.last_excluded: list[tuple[str, int, int]] = []
 
     def build(
         self, query: str, session_id: str, budget_chars: int, *, before: Any = None, deadline: float | None = None
@@ -348,12 +355,19 @@ class SessionPrefetchLane:
                 rerank_deadline=rerank_deadline,
             )
             self.last_rerank = str(found.get("rerank") or "")
+            self.last_excluded = []
             chain_ids = set(chain)
             entries: list[_Entry] = []
             emitted = ""
             for result in found.get("results") or []:
                 if floors and not self.settings.admits(result.get("rerank_score"), result.get("dense_score")):
                     continue
+                if self.settings.exclude_machine:
+                    span = (str(result.get("session_id") or ""), int(result.get("first_msg_id") or 0),
+                            int(result.get("last_msg_id") or 0))
+                    if window_is_machine_only(conn, *span):
+                        self.last_excluded.append(span)
+                        continue
                 text, msg_id = hidden_text(conn, view, result, emitted)
                 text = redact_secret_spans(" ".join(text.split()))
                 if not text or contains_secret(text):

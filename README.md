@@ -866,6 +866,13 @@ persisted capture queue that replaces them; see [docs/capture.md](docs/capture.m
 The settings `learning_auto_extract_*` and `source_extraction_*` are still accepted so existing configs
 keep loading, have no effect, and log one warning per process. Remove them from your config.
 
+What exists of the replacement so far is read-only: `qdrant_memory/capture_reader.py` reads new
+`state.db` rows after a persisted cursor and classifies who wrote each one (host, machine, or a
+person), and `hermes qdrant capture scan [--since-days N] [--json] [--advance]` reports the counts.
+`session_prefetch_exclude_machine: true` (default `false`) uses the same classifier to keep scripted,
+cron and agent-prompt windows out of the automatic-recall session lane. See
+[docs/capture.md](docs/capture.md).
+
 ### `qdrant_memory_session_recall`
 
 Recalls the exact earlier text of Hermes conversations. See [Session recall](#session-recall).
@@ -1127,6 +1134,7 @@ hermes qdrant restore --backup BACKUP_ID --dry-run
 hermes qdrant session-recall status
 hermes qdrant session-recall index --max-seconds 600
 hermes qdrant session-recall search "what did we decide about the gateway" --scope past
+hermes qdrant capture scan --since-days 30
 ```
 
 Default output is human-readable text. Use `--json` for scripts and automation; JSON success output is one parseable object, and JSON errors are written to stderr with a non-zero exit code. Do not parse default human summaries in automation. See [docs/CLI_OUTPUT_CONTRACT.md](docs/CLI_OUTPUT_CONTRACT.md) for the stdout/stderr, redaction, and per-command contract.

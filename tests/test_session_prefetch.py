@@ -617,3 +617,53 @@ def test_default_config_keeps_short_message_recall_and_still_filters_host_text(m
     for text in HOST_TEXT:  # neither the legacy turn point nor any window brings host text
         assert text not in out, text
     assert _mutations(log) == []
+
+
+SCRIPTED_ROWS = [
+    ("scripted", "user", "relay gateway port shards cache queue depth deploy freeze: reply with exactly SCRIPTEDOK", 1, 0, 0),
+    ("scripted", "assistant", "SCRIPTEDOK relay gateway port shards cache queue depth deploy freeze answer", 1, 0, 0),
+]
+
+
+def _state_db_with_scripted_session(path: Path) -> Path:
+    """The tip/root fixture plus a real 'other' session and a scripted one-shot session."""
+    _state_db_with_other_session(path)
+    conn = sqlite3.connect(path)
+    conn.execute("INSERT INTO sessions (id, source, started_at) VALUES ('scripted', 'oneshot', 1.65e9)")
+    for index, (sid, role, content, active, compacted, summary) in enumerate(SCRIPTED_ROWS):
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp, active, compacted, _compressed_summary) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (sid, role, content, 1.65e9 + index * 60, active, compacted, summary),
+        )
+    conn.commit()
+    conn.close()
+    return path
+
+
+def test_exclude_machine_drops_windows_whose_user_side_is_all_machine_text(monkeypatch, tmp_path):
+    for exclude in (False, True):
+        _check_exclude_machine(monkeypatch, tmp_path / str(exclude), exclude)
+
+
+def _check_exclude_machine(monkeypatch, tmp_path, exclude):
+    tmp_path.mkdir()
+    """Capture CP2 lane filter: off by default and then unchanged; on, a window whose user rows are
+    all host or machine text (here a scripted one-shot run) is not recalled, real sessions still are."""
+    _state_db_with_scripted_session(tmp_path / "state.db")
+    store, log = {}, []
+    overrides = dict(session_prefetch_enabled=True, session_prefetch_scope="all", session_prefetch_top_k=10,
+                     session_prefetch_max_chars=6000, session_prefetch_total_chars=8000)
+    if exclude:
+        overrides["session_prefetch_exclude_machine"] = True
+    provider = _provider(monkeypatch, tmp_path, store, log, **overrides)
+    _index_windows(provider)
+    assert any("SCRIPTEDOK" in p["payload"]["text"] for p in store[WINDOWS].values())
+    log.clear()
+
+    lane = provider.prefetch(QUERY, session_id="tip")
+
+    assert lane.startswith("# Recalled Earlier Conversation")  # real windows are still recalled
+    assert ("SCRIPTEDOK" in lane) is (not exclude)
+    assert provider._config["session_prefetch_exclude_machine"] is exclude
+    assert _mutations(log) == []
