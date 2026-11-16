@@ -620,6 +620,10 @@ def _register_capture(subcommands) -> None:
         decide = capture_subcommands.add_parser(name, help=text)
         decide.set_defaults(qdrant_subcommand="capture")
         decide.add_argument("id", help="Capture item id: the full id or its 12-character short id.")
+        if name == "approve":
+            decide.add_argument("--fact", default=None, metavar="TEXT",
+                                help="Store this one-sentence statement instead of the queued text. The citation "
+                                     "still points at the queued message; the audit records the edit.")
         _add_dry_run_flags(decide)
         decide.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
 

@@ -329,7 +329,7 @@ shapes, actions and outcomes.
 
 ```bash
 hermes qdrant capture review [--limit 10] [--offset 0] [--json]
-hermes qdrant capture approve <id> [--no-dry-run --approve] [--json]
+hermes qdrant capture approve <id> [--fact "one sentence"] [--no-dry-run --approve] [--json]
 hermes qdrant capture reject <id> [--no-dry-run --approve] [--json]
 ```
 
@@ -337,6 +337,21 @@ The tools `qdrant_capture_review` (pending items, paginated), `qdrant_capture_ap
 `qdrant_capture_reject` (exact id, `dry_run` defaults to true, a live call needs `approve: true`
 and a dry run of the same id in the same process) do the same in chat. They exist only on the
 `full` tool surface and only while `capture_mode` is not `off`.
+
+**Distilled fact.** A heuristic item queues the owner's whole message. Approval takes an optional
+`fact` (tool argument, CLI `--fact TEXT`): a rewritten one-sentence statement of what holds,
+written by the agent (the tool description asks it to propose one and show it) or by the owner.
+Whitespace is collapsed to one line; at most 500 characters. The rest does not change:
+
+- the citation is still the queued row and is re-verified as above;
+- the write gate (extraction gate for heuristic items, manual gate for mirror items) runs on the
+  new text, so a secret in it is refused;
+- the dry run binds the text: a live call with another text, or with none, needs its own dry run;
+- the stored point carries `capture_fact_edited: true` and `capture_original_fact_sha256`, and the
+  `approved` and `applied` events carry `fact_edited: true` and `original_fact_sha256` (the
+  digest of the queued text, never the text); `applied.fact_sha256` is the stored text's digest.
+
+Mirror items are already sentences; `fact` is optional there too.
 
 - Approval re-verifies the pinned citation against `state.db` and refuses when the row changed
   (`drifted`) or is gone (`expired`, `partially_missing`).

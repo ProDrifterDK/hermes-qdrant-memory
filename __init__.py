@@ -1864,10 +1864,17 @@ class QdrantMemoryProvider(MemoryProvider):
                                      "can be approved or rejected")
         return item, ""
 
-    def capture_approve(self, ident: str, *, dry_run: bool = True, approve: bool = False, actor: str = "tool") -> str:
-        """Approve one review item: dry run first, then the write through its gated path."""
-        from qdrant_memory.capture_apply import write_item
-        from qdrant_memory.capture_queue import audit_event, citation_digest
+    def capture_approve(self, ident: str, *, dry_run: bool = True, approve: bool = False, actor: str = "tool",
+                        fact: Optional[str] = None) -> str:
+        """Approve one review item: dry run first, then the write through its gated path.
+
+        ``fact`` (optional) is a rewritten one-sentence statement to store instead of the queued
+        text. The citation is still the queued row, re-verified; the write gate runs on the new
+        text; the audit records the edit as digests. The live call must carry the same text the
+        dry run previewed.
+        """
+        from qdrant_memory.capture_apply import normalize_edited_fact, with_fact, write_item
+        from qdrant_memory.capture_queue import audit_event, citation_digest, sha256_text
 
         refusal = self._capture_refusal(decides=True)
         if refusal:
@@ -1876,32 +1883,43 @@ class QdrantMemoryProvider(MemoryProvider):
         if error:
             return error
         cid = item.candidate_id
+        original_sha = str(item.queued.get("fact_sha256") or sha256_text(item.fact))
+        edited = fact is not None
+        if edited:
+            try:
+                item = with_fact(item, normalize_edited_fact(fact))
+            except ValueError as exc:
+                return _json_error(str(exc))
+        # The preview binds the text: a live call with another text (or none) needs its own dry run.
+        review_key = f"{cid}:{sha256_text(item.fact) if edited else ''}"
         if not dry_run:
             if not approve:
                 return _json_error("approve=true is required when dry_run=false")
-            if cid not in self._reviewed_capture_ids:
-                return _json_error("dry-run preview is required before live capture approval")
+            if review_key not in self._reviewed_capture_ids:
+                return _json_error("dry-run preview is required before live capture approval (with the same fact)")
         result = write_item(self, item, dry_run=dry_run, approve=approve, approval=True)
         if "error" in result:
             return _json_error(result["error"])
-        base = {"id": cid, "short_id": item.short_id, "fact": item.fact, "lane": item.queued.get("lane"),
-                "kind": item.queued.get("kind"), **result}
+        base = {"id": cid, "short_id": item.short_id, "fact": item.fact, "fact_edited": edited,
+                "lane": item.queued.get("lane"), "kind": item.queued.get("kind"), **result}
         if dry_run:
-            self._reviewed_capture_ids.add(cid)
+            self._reviewed_capture_ids.add(review_key)
             base["citation_check"] = {"status": "verified"}
             return json.dumps(base)
-        self._reviewed_capture_ids.discard(cid)
+        self._reviewed_capture_ids.discard(review_key)
+        edit_fields: dict[str, Any] = {"fact_edited": True, "original_fact_sha256": original_sha} if edited else {}
         queue = self._capture_queue()
         approved = audit_event("approved", cid, actor=actor, approver_session_id=self._session_id or "",
                                approver_platform=self._platform or "", lane=item.queued.get("lane"),
                                outcome="saved" if result.get("saved") else (
-                                   "proposal_draft" if result.get("proposal_created") else "not_saved"))
+                                   "proposal_draft" if result.get("proposal_created") else "not_saved"),
+                               **edit_fields)
         events = [approved]
         if result.get("saved"):
             events.append(audit_event("applied", cid, point_id=str(result.get("point_id") or ""), route="review",
                                       rule="review:approved", citation_sha256=citation_digest(item.queued["citation"]),
                                       fact_sha256=item.queued.get("fact_sha256"), lane=item.queued.get("lane"),
-                                      kind=item.queued.get("kind")))
+                                      kind=item.queued.get("kind"), **edit_fields))
         queue.append(*events)
         return json.dumps(base)
 
@@ -1942,7 +1960,9 @@ class QdrantMemoryProvider(MemoryProvider):
         dry_run = parse_bool_arg(args.get("dry_run"), default=True)
         approve = parse_bool_arg(args.get("approve"), default=False)
         if tool_name == "qdrant_capture_approve":
-            return self.capture_approve(ident, dry_run=dry_run, approve=approve, actor="tool")
+            fact = args.get("fact")
+            return self.capture_approve(ident, dry_run=dry_run, approve=approve, actor="tool",
+                                        fact=None if fact is None else str(fact))
         return self.capture_reject(ident, dry_run=dry_run, approve=approve, actor="tool")
 
     @staticmethod

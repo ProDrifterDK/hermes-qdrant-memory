@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import importlib.util
 import json
 import os
@@ -2416,7 +2417,7 @@ def _format_capture_review(payload: dict[str, Any]) -> str:
     if payload.get("next_offset") is not None:
         lines.append(f"  more: --offset {payload['next_offset']}")
     if items:
-        lines.append("Approve: hermes qdrant capture approve <id> --no-dry-run --approve")
+        lines.append("Approve: hermes qdrant capture approve <id> --no-dry-run --approve [--fact \"one sentence\"]")
         lines.append("Reject:  hermes qdrant capture reject <id> --no-dry-run --approve")
     return "\n".join(lines)
 
@@ -2446,8 +2447,9 @@ def _execute_capture_decision(args: Namespace, stdout, provider_factory: Callabl
         result = provider.capture_review(offset=int(getattr(args, "offset", 0) or 0),
                                          limit=int(getattr(args, "limit", 10) or 10))
     else:
-        decide = provider.capture_approve if sub == "approve" else provider.capture_reject
         ident = str(getattr(args, "id", "") or "")
+        decide = (functools.partial(provider.capture_approve, fact=getattr(args, "fact", None))
+                  if sub == "approve" else provider.capture_reject)
         # One process per command: a live decision runs its own dry run first (the explicit
         # --no-dry-run --approve flags are the owner's confirmation).
         result = decide(ident, dry_run=True, actor="cli")

@@ -11,7 +11,10 @@ Events (``EVENTS``):
   ``mirror``). It carries the fact text, the pinned citation and the write it would make
   (``write``): this file and the stored point are the only places fact text lives.
 - ``approved`` / ``rejected``: the owner's decision on a review item (actor, approving session).
-- ``applied``: the write happened; point id, rule id and digests.
+  An approval that stored a rewritten fact (``fact`` at approval time) carries
+  ``fact_edited: true`` and ``original_fact_sha256``, the digest of the queued text.
+- ``applied``: the write happened; point id, rule id and digests (``fact_sha256`` is the
+  digest of the text actually stored).
 - ``expired``: a review item reached ``capture_review_expiry_days`` without a decision; no
   write.
 - ``merged``: a duplicate candidate's citation was added to a queued item or a stored point
@@ -56,7 +59,7 @@ DAY = 86400.0
 AUDIT_KEYS = frozenset({
     "schema", "event", "at", "candidate_id", "point_id", "run_id", "route", "rule", "actor",
     "approver_session_id", "approver_platform", "citation", "citation_sha256", "fact_sha256", "into", "outcome",
-    "reason", "lane", "kind",
+    "reason", "lane", "kind", "fact_edited", "original_fact_sha256",
 })
 # Heuristic kinds -> (extraction candidate type, memory kind) of the extraction write gate.
 KIND_TYPES = {

@@ -708,10 +708,17 @@ CAPTURE_APPROVE_SCHEMA = {
     "description": (
         "Approve exactly one pending capture item, only when the owner asked for it. Dry-run defaults to true "
         "and re-verifies the cited message; live approval requires approve=true and a prior dry run of the same "
-        "id. The fact is stored with the captured conversation as its origin. Refused in cron sessions."
+        "id and the same fact. Heuristic items queue the owner's whole message: propose a distilled one-sentence "
+        "fact (what holds from now on, without greetings, praise or the request itself), show it to the owner, "
+        "and pass the sentence they accept as fact. The citation stays the original message. The fact is stored "
+        "with the captured conversation as its origin. Refused in cron sessions."
     ),
-    "parameters": {"type": "object", "properties": _CAPTURE_DECIDE_PROPERTIES, "required": ["id"],
-                   "additionalProperties": False},
+    "parameters": {"type": "object", "properties": {
+        **_CAPTURE_DECIDE_PROPERTIES,
+        "fact": {"type": "string", "description": (
+            "Optional one-sentence statement to store instead of the queued text (at most 500 characters), "
+            "written by the agent or the owner at approval time. Omit it to store the queued text as is.")},
+    }, "required": ["id"], "additionalProperties": False},
 }
 
 CAPTURE_REJECT_SCHEMA = {
