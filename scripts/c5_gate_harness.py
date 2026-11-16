@@ -46,6 +46,10 @@ Usage (Hermes venv, from the repo root):
   python scripts/c5_gate_harness.py --frozen questions.json --continuity continuity.json \\
       --noise noise.json --out outputs/ [--display-tokens 0] [--grid grid.json] [--plugin-root DIR]
   python scripts/c5_gate_harness.py --analyze-only outputs/c5_gate_run.json --grid grid.json --out outputs/
+
+``--legacy-exclude-machine`` runs the legacy arms with ``auto_recall_exclude_machine`` on (the
+provider's own turn filter; dropped ``(point id, reason)`` pairs per row in ``legacy_excluded``);
+``--legacy-only`` skips the lane arms.
 """
 from __future__ import annotations
 
@@ -185,13 +189,24 @@ def build_provider(plugin, hermes_home: str):
     return provider, ReadOnlyQdrant
 
 
-def legacy_chunks(provider, query: str, until_iso: str | None) -> list[Any]:
-    """Exactly prefetch's legacy search, plus the time cutoff (floors applied later)."""
+def legacy_chunks(provider, query: str, until_iso: str | None, excluded: list | None = None) -> list[Any]:
+    """Exactly prefetch's legacy search, plus the time cutoff (floors applied later).
+
+    With ``auto_recall_exclude_machine`` on, the search goes through the provider's own turn
+    filter (``_noise_filtered``), and the ``(point id, reason)`` pairs it dropped are appended
+    to ``excluded``.
+    """
     recall = provider._memory_recall() or provider._retriever
+    if hasattr(provider, "_noise_filtered"):  # a checkout without the option measures its own path
+        recall = provider._noise_filtered(recall)
     kwargs: dict[str, Any] = {"update_access": False}
     if until_iso:
         kwargs["until"] = until_iso
-    return recall.search(query, top_k=int(provider._config["auto_recall_top_k"]), **kwargs)
+    chunks = recall.search(query, top_k=int(provider._config["auto_recall_top_k"]), **kwargs)
+    noise = getattr(recall, "noise", None)
+    if excluded is not None and noise is not None:
+        excluded.extend(list(pair) for pair in noise.last_excluded)
+    return chunks
 
 
 def chunk_record(chunk) -> dict[str, Any]:
@@ -369,6 +384,8 @@ def run(args) -> dict[str, Any]:
 
     if args.display_tokens > 0:
         provider._config["display_tokens"] = args.display_tokens
+    # The legacy turn filter follows the flag, whatever the measured home's config says.
+    provider._config["auto_recall_exclude_machine"] = bool(args.legacy_exclude_machine)
     display_tokens = int(provider._config["display_tokens"])
     legacy_cap = max(800, display_tokens * 4)
     memory_collections = {provider._config["collection_name"]} | {
@@ -403,11 +420,13 @@ def run(args) -> dict[str, Any]:
         until_iso = datetime.fromtimestamp(cutoff, tz=timezone.utc).isoformat()
         before_iso = datetime.fromtimestamp(cutoff).isoformat(timespec="seconds")
         row: dict[str, Any] = {"set": set_name, "id": q["id"], "q": q["q"], "key": q.get("key"),
-                               "gpu_before": _gpu(), "legacy": {}, "lane": {}, "lane_errors": {}}
+                               "gpu_before": _gpu(), "legacy": {}, "lane": {}, "lane_errors": {},
+                               "legacy_excluded": []}
         lat: dict[str, float] = {}
 
         t0 = time.monotonic()
-        row["legacy"]["A"] = [chunk_record(c) for c in legacy_chunks(provider, q["q"], until_iso)]
+        row["legacy"]["A"] = [chunk_record(c) for c in legacy_chunks(provider, q["q"], until_iso,
+                                                                     row["legacy_excluded"])]
         lat["A"] = time.monotonic() - t0
         text_a = sim.legacy(row["legacy"]["A"])
 
@@ -420,7 +439,7 @@ def run(args) -> dict[str, Any]:
         finally:
             client.exclude_turns_in = frozenset()
 
-        scopes = ["current", "all"] if set_name == "continuity" else ["all"]
+        scopes = [] if args.legacy_only else ["current", "all"] if set_name == "continuity" else ["all"]
         for scope in scopes:
             for rerank in (True, False):
                 arm = f"C_{'cur' if scope == 'current' else 'all'}_{'rr' if rerank else 'dn'}"
@@ -464,6 +483,13 @@ def run(args) -> dict[str, Any]:
             "collection_name": provider._config["collection_name"],
             "read_sources": provider._read_sources("memory"),
             "auto_recall_top_k": provider._config["auto_recall_top_k"],
+            "search_candidates": provider._config.get("search_candidates"),
+            "auto_recall_min_final_score": provider._config.get("auto_recall_min_final_score"),
+            "auto_recall_min_raw_score": provider._config.get("auto_recall_min_raw_score"),
+            "auto_recall_min_word_chars": provider._config.get("auto_recall_min_word_chars"),
+            "auto_recall_exclude_machine": provider._config.get("auto_recall_exclude_machine"),
+            "session_recall_state_db": provider._state_db_path() if hasattr(provider, "_state_db_path") else None,
+            "legacy_only": bool(args.legacy_only),
             "display_tokens": display_tokens,
             "legacy_cap_chars": legacy_cap,
             "session_recall_collection": provider._config["session_recall_collection"],
@@ -505,6 +531,10 @@ def main() -> int:
     parser.add_argument("--tag", default="run")
     parser.add_argument("--exclude-machine", action="store_true",
                         help="lane arms with session_prefetch_exclude_machine on (capture CP2)")
+    parser.add_argument("--legacy-exclude-machine", action="store_true",
+                        help="legacy arms with auto_recall_exclude_machine on (dropped turn ids per row)")
+    parser.add_argument("--legacy-only", action="store_true",
+                        help="skip the session-lane arms (C_*); only A and B are measured")
     args = parser.parse_args()
     grid = dict(DEFAULT_GRID)
     if args.grid:

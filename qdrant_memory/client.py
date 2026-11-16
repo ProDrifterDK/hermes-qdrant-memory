@@ -227,3 +227,42 @@ class QdrantClient:
             if offset is None or not batch:
                 break
         return points
+
+    def scroll_window(
+        self,
+        name: str,
+        filter: dict[str, Any],
+        *,
+        start_offset: Any = None,
+        max_total: int,
+        page_limit: int = 256,
+        with_payload: bool = True,
+        with_vector: bool = False,
+    ) -> tuple[list[dict[str, Any]], Any]:
+        """Scroll at most ``max_total`` points starting at ``start_offset`` (a point ID).
+
+        Returns the points and the continuation offset; ``None`` means the scroll reached
+        the end of the collection. Qdrant scrolls in point-ID order and treats the offset as
+        a lower bound, so a cursor whose point was deleted in the meantime still resumes at
+        the next ID.
+        """
+        points: list[dict[str, Any]] = []
+        offset: Any = start_offset
+        while True:
+            remaining = int(max_total) - len(points)
+            if remaining <= 0:
+                break
+            batch, offset = self.scroll_page(
+                name,
+                filter,
+                limit=min(int(page_limit), remaining),
+                offset=offset,
+                with_payload=with_payload,
+                with_vector=with_vector,
+            )
+            points.extend(batch)
+            if not batch:
+                offset = None
+            if offset is None:
+                break
+        return points, offset

@@ -305,32 +305,88 @@ def _export_collection_to_file(
     artifact_type: str,
     created_at: str | None = None,
 ) -> dict[str, Any]:
-    records = [normalize_point(point) for point in qdrant.scroll_by_filter(collection_name, {}, limit=256, with_payload=True, with_vector=True)]
+    # Streamed page by page: holding a whole 17k-point, 1024-d collection (records plus its
+    # JSONL text) in memory took more than 3 GB. The bytes written are the same as before:
+    # the header line, then one canonical JSON record per line.
     vector_size = _vector_size_from_client(qdrant, collection_name, config)
-    for record in records:
-        _validate_vector_size(record, vector_size, scope=scope)
-    created = created_at or utc_timestamp()
-    header = {
-        "schema_version": SCHEMA_VERSION,
-        "artifact_type": artifact_type,
-        "scope": scope,
-        "collection_name": collection_name,
-        "created_at": created,
-        "record_count": len(records),
-        "vector_size": vector_size,
-        "contains_raw_memory_text": True,
-        "contains_vectors": True,
-    }
-    _safe_atomic_write_text(out_path, _jsonl_text(header, records), overwrite=overwrite)
+    if out_path.exists() and not overwrite:
+        raise BackupError(f"artifact already exists: {out_path}")
+    out_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    body = out_path.parent / f".{out_path.name}.body-{uuid.uuid4().hex}"
+    count = 0
+    try:
+        with os.fdopen(os.open(body, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as handle:
+            for point in _iter_collection_points(qdrant, collection_name):
+                record = normalize_point(point)
+                _validate_vector_size(record, vector_size, scope=scope)
+                handle.write(_canonical_json(record) + "\n")
+                count += 1
+        created = created_at or utc_timestamp()
+        header = {
+            "schema_version": SCHEMA_VERSION,
+            "artifact_type": artifact_type,
+            "scope": scope,
+            "collection_name": collection_name,
+            "created_at": created,
+            "record_count": count,
+            "vector_size": vector_size,
+            "contains_raw_memory_text": True,
+            "contains_vectors": True,
+        }
+        _safe_atomic_write_stream(out_path, _canonical_json(header) + "\n", body, overwrite=overwrite)
+    finally:
+        try:
+            body.unlink()
+        except FileNotFoundError:
+            pass
     return {
         "scope": scope,
         "collection_name": collection_name,
         "path": str(out_path),
         "file": out_path.name,
-        "count": len(records),
+        "count": count,
         "sha256": file_sha256(out_path),
         "vector_size": vector_size,
     }
+
+
+def _iter_collection_points(qdrant: Any, collection_name: str):
+    if not callable(getattr(qdrant, "scroll_page", None)):
+        yield from qdrant.scroll_by_filter(collection_name, {}, limit=256, with_payload=True, with_vector=True)
+        return
+    offset: Any = None
+    while True:
+        batch, offset = qdrant.scroll_page(collection_name, {}, limit=256, offset=offset, with_payload=True, with_vector=True)
+        yield from batch
+        if offset is None or not batch:
+            return
+
+
+def _safe_atomic_write_stream(path: Path, head: str, body: Path, *, overwrite: bool) -> None:
+    """``_safe_atomic_write_text`` for ``head`` followed by the contents of ``body``."""
+    import shutil
+
+    if path.exists() and not overwrite:
+        raise BackupError(f"artifact already exists: {path}")
+    tmp = path.parent / f".{path.name}.tmp-{uuid.uuid4().hex}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle, body.open("r", encoding="utf-8") as source:
+            handle.write(head)
+            shutil.copyfileobj(source, handle, 1024 * 1024)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        try:
+            path.chmod(0o600)
+        except PermissionError:
+            pass
+    except Exception:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def export_collection(qdrant: Any, config: dict[str, Any], *, scope: str, out_file: str | Path, overwrite: bool = False) -> dict[str, Any]:
@@ -397,6 +453,97 @@ def create_backup(qdrant: Any, config: dict[str, Any], *, hermes_home: str | Pat
     return sanitize_manifest(manifest, backup_dir=backup_dir)
 
 
+def create_point_snapshot_backup(
+    raw_points: list[Any],
+    config: dict[str, Any],
+    *,
+    hermes_home: str | Path,
+    scope: str,
+    collection_name: str,
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    """Write a partial plugin backup holding exactly ``raw_points`` (payloads and vectors).
+
+    The layout is the regular backup layout, so ``hermes qdrant restore --backup <id>`` puts
+    back exactly these points (restore upserts only the records a backup holds). The
+    manifest carries ``partial: true`` and the ``snapshot`` metadata; a partial backup never
+    counts as the full pre-mutation backup the watcher requires.
+    """
+    if scope not in SCOPES:
+        raise BackupError("scope must be one of: memory, learning")
+    records = [normalize_point(point) for point in raw_points]
+    if not records:
+        raise BackupError("point snapshot has no points")
+    vector_size: int | None = None
+    first_vector = records[0].get("vector")
+    if isinstance(first_vector, list) and first_vector:
+        vector_size = len(first_vector)
+    for record in records:
+        _validate_vector_size(record, vector_size, scope=scope)
+    root = ensure_private_dir(backup_root(config, hermes_home))
+    backup_id = validate_backup_id(generate_backup_id())
+    backup_dir = backup_dir_for_id(root, backup_id)
+    if backup_dir.exists():
+        raise BackupError(f"backup already exists: {backup_id}")
+    ensure_private_dir(backup_dir)
+    created_at = utc_timestamp()
+    file_name = f"{scope}.jsonl"
+    header = {
+        "schema_version": SCHEMA_VERSION,
+        "artifact_type": "qdrant_memory_point_snapshot",
+        "scope": scope,
+        "collection_name": collection_name,
+        "created_at": created_at,
+        "record_count": len(records),
+        "vector_size": vector_size,
+        "contains_raw_memory_text": True,
+        "contains_vectors": True,
+    }
+    out_path = backup_dir / file_name
+    _safe_atomic_write_text(out_path, _jsonl_text(header, records), overwrite=False)
+    redacted_url = _redacted_qdrant_url(config)
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "artifact_type": "qdrant_memory_backup",
+        "backup_id": backup_id,
+        "created_at": created_at,
+        "scope": scope,
+        "partial": True,
+        "qdrant_url": redacted_url,
+        "redacted_qdrant_url": redacted_url,
+        "contains_raw_memory_text": True,
+        "contains_vectors": True,
+        "collections": {
+            scope: {
+                "collection_name": collection_name,
+                "file": file_name,
+                "count": len(records),
+                "sha256": file_sha256(out_path),
+                "vector_size": vector_size,
+            }
+        },
+        "snapshot": snapshot,
+    }
+    _safe_atomic_write_text(backup_dir / "manifest.json", _canonical_json(manifest) + "\n", overwrite=False)
+    return {**sanitize_manifest(manifest, backup_dir=backup_dir), "partial": True}
+
+
+def read_backup_manifest(config: dict[str, Any], *, hermes_home: str | Path, backup_id: str) -> dict[str, Any]:
+    """Read and validate one backup manifest without loading the collection files."""
+    backup_dir = backup_dir_for_id(backup_root(config, hermes_home), backup_id)
+    manifest = _load_manifest_from_dir(backup_dir)
+    collections = manifest.get("collections")
+    if not isinstance(collections, dict) or not collections:
+        raise BackupError("backup manifest has no collections")
+    for details in collections.values():
+        if not isinstance(details, dict):
+            raise BackupError("backup collection manifest is invalid")
+        path = _safe_collection_file(backup_dir, str(details.get("file") or ""))
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise BackupError(f"backup collection file is missing: {path.name}")
+    return manifest
+
+
 def _load_manifest_from_dir(backup_dir: Path) -> dict[str, Any]:
     manifest_path = backup_dir / "manifest.json"
     if not manifest_path.exists():
@@ -431,11 +578,19 @@ def _read_collection_file(path: Path, *, expected_sha256: str, scope: str, expec
     actual_sha = file_sha256(path)
     if actual_sha != expected_sha256:
         raise BackupError(f"backup collection file checksum mismatch: {path.name}")
-    lines = path.read_text(encoding="utf-8").splitlines()
-    if not lines:
+    with path.open("r", encoding="utf-8") as handle:
+        return _parse_collection_lines(handle, path=path, scope=scope, expected_vector_size=expected_vector_size)
+
+
+def _parse_collection_lines(handle: Any, *, path: Path, scope: str, expected_vector_size: int | None) -> list[dict[str, Any]]:
+    # Line by line: the whole-file string and its split copy were two more full copies of a
+    # backup that can be several hundred MB.
+    lines = iter(handle)
+    first = next(lines, None)
+    if first is None:
         raise BackupError(f"backup collection file is empty: {path.name}")
     try:
-        header = json.loads(lines[0])
+        header = json.loads(first)
     except Exception as exc:
         raise BackupError(f"backup collection header is invalid: {path.name}: {exc}") from exc
     if not isinstance(header, dict):
@@ -445,7 +600,7 @@ def _read_collection_file(path: Path, *, expected_sha256: str, scope: str, expec
         raise BackupError(f"backup collection schema_version is unsupported: {path.name}")
     records: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for line_number, line in enumerate(lines[1:], start=2):
+    for line_number, line in enumerate(lines, start=2):
         if not line.strip():
             continue
         try:
@@ -842,7 +997,10 @@ def restore_backup(
             )
         for scope, points in upserts_by_scope.items():
             if points:
-                qdrant.upsert(collection_names[scope], points)
+                # Batched: one request with every point of a full collection backup (17k+
+                # 1024-d vectors) exceeds Qdrant's request size limit (32 MB by default).
+                for batch in _chunks(points, 128):
+                    qdrant.upsert(collection_names[scope], batch)
                 collections[scope]["upserted"] = len(points)
                 total_upserted += len(points)
     result.update({"applied": True, "upserted": total_upserted})

@@ -17,7 +17,12 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from qdrant_memory.guarded_auto import GuardedAutoPolicy, apply_guarded_auto
-from qdrant_memory.watcher_state import proposal_signature, watcher_state_fields
+from qdrant_memory.watcher_state import (
+    next_scan_window_state,
+    proposal_signature,
+    scan_offsets_from_state,
+    watcher_state_fields,
+)
 from qdrant_memory import evaluation as _evaluation
 
 
@@ -354,6 +359,8 @@ def _watcher_run_command(args: Namespace) -> str:
     ]
     if not getattr(args, "include_reconsolidation", True):
         parts.append("--no-include-reconsolidation")
+    if getattr(args, "scan_window", "fixed") != "fixed":
+        parts.extend(["--scan-window", args.scan_window])
     if getattr(args, "autonomy_mode", "report-only") != "report-only":
         parts.extend(["--autonomy-mode", args.autonomy_mode])
         parts.extend(["--max-auto-actions", str(getattr(args, "max_auto_actions", 10))])
@@ -456,6 +463,24 @@ def _proposal_signature(report: dict[str, Any]) -> str:
     return proposal_signature(report.get("proposals"))
 
 
+def _watcher_scan_offsets() -> dict[str, Any]:
+    """Start cursors for a rotating-window run, from the persisted watcher state."""
+    from qdrant_memory.config import load_config
+
+    state, _, _ = _read_watcher_state()
+    if state.get("error"):
+        state = {}
+    try:
+        config = load_config(hermes_home=str(_hermes_home()))
+        names = {
+            "memory": str(config.get("collection_name") or ""),
+            "learning": str(config.get("learning_collection_name") or ""),
+        }
+    except Exception:
+        names = {}
+    return scan_offsets_from_state(state.get("scan_window"), names)
+
+
 def _guarded_auto_policy_from_args(args: Namespace) -> GuardedAutoPolicy:
     return GuardedAutoPolicy(
         mode=str(getattr(args, "autonomy_mode", "report-only") or "report-only"),
@@ -486,6 +511,21 @@ def _record_watcher_run(args: Namespace, report: dict[str, Any]) -> None:
     guarded_auto = report.get("guarded_auto") if isinstance(report.get("guarded_auto"), dict) else {}
     guarded_auto_applied = len(guarded_auto.get("applied", []) or []) if guarded_auto else 0
     guarded_auto_errors = len(guarded_auto.get("errors", []) or []) if guarded_auto else 0
+    guarded_auto_would_apply = len(guarded_auto.get("would_apply", []) or []) if guarded_auto else 0
+    rotating = isinstance(report.get("scan_window"), dict) and report["scan_window"].get("mode") == "rotating"
+    if rotating:
+        # Every rotating window differs, so the signature changes nightly; a clean window
+        # (no proposals) carries nothing to review and does not page the notifier.
+        alerted = bool((signature_changed and proposal_list) or force_alert)
+        state["scan_window"] = next_scan_window_state(state.get("scan_window"), report["scan_window"])
+        state["last_scan_window"] = {
+            label: {
+                key: entry.get(key)
+                for key in ("collection_name", "scanned", "reached_end")
+            }
+            for label, entry in report["scan_window"].items()
+            if isinstance(entry, dict)
+        }
     if guarded_auto_applied or guarded_auto_errors:
         alerted = True
     state.update(
@@ -500,6 +540,7 @@ def _record_watcher_run(args: Namespace, report: dict[str, Any]) -> None:
             "last_guarded_auto_mode": guarded_auto.get("mode") if guarded_auto else getattr(args, "autonomy_mode", "report-only"),
             "last_guarded_auto_applied_count": guarded_auto_applied,
             "last_guarded_auto_error_count": guarded_auto_errors,
+            "last_guarded_auto_would_apply_count": guarded_auto_would_apply,
             **shared_state,
             "updated_at": timestamp,
         }
@@ -521,6 +562,8 @@ def _record_watcher_run(args: Namespace, report: dict[str, Any]) -> None:
             "guarded_auto_mode": guarded_auto.get("mode") if guarded_auto else getattr(args, "autonomy_mode", "report-only"),
             "guarded_auto_applied_count": guarded_auto_applied,
             "guarded_auto_error_count": guarded_auto_errors,
+            "guarded_auto_would_apply_count": guarded_auto_would_apply,
+            **({"scan_window": state["last_scan_window"]} if rotating else {}),
         }
     )
 
@@ -2709,7 +2752,7 @@ def build_tool_call(args: Namespace) -> tuple[str, dict[str, Any]]:
     if subcommand == "watcher":
         watcher_subcommand = getattr(args, "watcher_subcommand", None)
         if watcher_subcommand == "run":
-            return "qdrant_memory_consolidate", {
+            tool_args = {
                 "dry_run": True,
                 "scope": args.scope,
                 "persist": True,
@@ -2719,6 +2762,10 @@ def build_tool_call(args: Namespace) -> tuple[str, dict[str, Any]]:
                 "max_groups": args.max_groups,
                 "reconsolidation_max_candidates": args.reconsolidation_max_candidates,
             }
+            if getattr(args, "scan_window", "fixed") == "rotating":
+                tool_args["scan_window"] = "rotating"
+                tool_args["scan_offsets"] = _watcher_scan_offsets()
+            return "qdrant_memory_consolidate", tool_args
         raise CliUsageError("unsupported qdrant watcher command")
 
     if subcommand == "graph-search":

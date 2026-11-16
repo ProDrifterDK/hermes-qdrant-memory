@@ -7,10 +7,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from qdrant_memory.backup import create_point_snapshot_backup, read_backup_manifest
 from qdrant_memory.consolidation import (
     _point_requires_manual_review,
     is_guarded_auto_heading_noise_text,
     normalize_text_fingerprint,
+    points_from_qdrant,
 )
 from qdrant_memory.lesson_extractor import contains_secret
 
@@ -274,6 +276,7 @@ def validate_guarded_auto_current_points(
     elif proposal_type == "heading_noise":
         eligible = (
             len(points) == 1
+            and not (getattr(points[0], "payload", {}) or {}).get("consolidation_quarantined")
             and is_guarded_auto_heading_noise_text(str(getattr(points[0], "text", "") or ""))
             and proposal.get("preauthorized_policy") == "guarded-auto:heading-noise"
         )
@@ -313,9 +316,12 @@ def _public_result_summary(result: dict[str, Any]) -> dict[str, Any]:
     for key in ("dry_run", "applied", "would_apply"):
         if isinstance(result.get(key), bool):
             summary[key] = result[key]
-    for key in ("application_id", "canonical_id"):
+    for key in ("application_id", "canonical_id", "pre_apply_backup_id"):
         if result.get(key):
             summary[key] = _safe_handle(result[key])
+    snapshot = result.get("pre_mutation_snapshot")
+    if isinstance(snapshot, dict) and snapshot.get("backup_id"):
+        summary["snapshot_backup_id"] = _safe_handle(snapshot["backup_id"])
     for key in ("deleted_ids", "quarantined_ids"):
         values = result.get(key)
         if isinstance(values, list):
@@ -352,7 +358,7 @@ def guarded_auto_action_for_proposal(proposal: dict[str, Any], policy: GuardedAu
             and proposal.get("guarded_auto_eligible") is True
             and proposal.get("preauthorized_policy") == "guarded-auto:heading-noise"
         ):
-            return "delete", "known heading/indexer noise is preauthorized for exact-ID cleanup"
+            return "quarantine", "known heading/indexer noise is preauthorized for reversible exact-ID quarantine"
         return None, "heading_noise proposal is not marked guarded-auto eligible"
 
     if proposal_type == "duplicate_cluster":
@@ -399,7 +405,114 @@ def guarded_auto_action_for_proposal(proposal: dict[str, Any], policy: GuardedAu
     return None, "proposal type is review-only"
 
 
+def _public_backup_summary(backup: Any) -> dict[str, Any]:
+    if not isinstance(backup, dict):
+        return {}
+    collections = backup.get("collections") if isinstance(backup.get("collections"), dict) else {}
+    return {
+        "backup_id": _safe_handle(backup.get("backup_id")),
+        "scope": str(backup.get("scope") or ""),
+        "collections": {
+            str(scope): {
+                "collection_name": _safe_handle(details.get("collection_name")),
+                "count": _as_int(details.get("count"), 0),
+            }
+            for scope, details in collections.items()
+            if isinstance(details, dict)
+        },
+    }
+
+
+def _backup_scope_for(report: dict[str, Any], proposals: list[dict[str, Any]]) -> str:
+    collections = report.get("collections") if isinstance(report.get("collections"), dict) else {}
+    learning_name = str(collections.get("learning") or "")
+    scopes = {
+        "learning" if learning_name and str(proposal.get("collection_name") or "") == learning_name else "memory"
+        for proposal in proposals
+    }
+    return scopes.pop() if len(scopes) == 1 else "both"
+
+
+def guarded_auto_backup_manifest(config: dict[str, Any], hermes_home: str, backup_id: str) -> dict[str, Any]:
+    """Return the manifest of a full (non-partial) plugin backup, or raise."""
+    manifest = read_backup_manifest(config, hermes_home=hermes_home, backup_id=backup_id)
+    if manifest.get("partial") is True:
+        raise ValueError("a partial point snapshot is not a full pre-mutation backup")
+    return manifest
+
+
+def write_guarded_auto_snapshot(
+    *,
+    raw_points: list[Any],
+    report_id: str,
+    proposal: dict[str, Any],
+    action: str,
+    collection_name: str,
+    config: dict[str, Any],
+    hermes_home: str,
+) -> dict[str, Any]:
+    """Write the digest-bound snapshot of the points one guarded-auto action is about to change.
+
+    The snapshot is a partial plugin backup (payloads and vectors), so
+    ``hermes qdrant restore --backup <backup_id> --no-dry-run --approve`` undoes exactly this action. It is
+    refused unless the points read now are the ones the report sealed: same IDs, same
+    content and payload digests.
+    """
+    affected_ids = _affected_ids(proposal)
+    points = points_from_qdrant(list(raw_points or []), collection_name=collection_name)
+    if sorted(str(point.id) for point in points) != sorted(set(affected_ids)):
+        raise ValueError("snapshot points do not match the proposal's affected IDs")
+    digests = _point_digest_records(points)
+    sealed = proposal.get("guarded_auto_snapshot") if isinstance(proposal.get("guarded_auto_snapshot"), dict) else {}
+    if sealed.get("point_digests") != digests:
+        raise ValueError("snapshot points do not match the sealed proposal digests")
+    if collection_name == str(config.get("collection_name") or ""):
+        scope = "memory"
+    elif collection_name == str(config.get("learning_collection_name") or ""):
+        scope = "learning"
+    else:
+        raise ValueError("snapshot collection is not a configured collection")
+    manifest = create_point_snapshot_backup(
+        list(raw_points),
+        config,
+        hermes_home=hermes_home,
+        scope=scope,
+        collection_name=collection_name,
+        snapshot={
+            "kind": "guarded_auto_pre_mutation",
+            "report_id": report_id,
+            "proposal_id": str(proposal.get("proposal_id") or ""),
+            "proposal_type": str(proposal.get("proposal_type") or ""),
+            "proposal_sha256": str(proposal.get("guarded_auto_proposal_sha256") or ""),
+            "action": action,
+            "point_digests": digests,
+        },
+    )
+    details = (manifest.get("collections") or {}).get(scope) or {}
+    return {
+        "backup_id": manifest.get("backup_id"),
+        "backup_dir": manifest.get("backup_dir"),
+        "collection_name": collection_name,
+        "point_ids": sorted(str(point.id) for point in points),
+        "point_digests": digests,
+        "file_sha256": details.get("sha256"),
+    }
+
+
 def apply_guarded_auto(provider: Any, report: dict[str, Any], policy: GuardedAutoPolicy) -> dict[str, Any]:
+    """Apply the preauthorized proposals of one watcher report.
+
+    Order: static policy decision per proposal, capped at ``max_actions``; a dry-run
+    preflight through the provider's exact-ID apply path (every current-point check runs,
+    nothing is written); one full plugin backup of the touched collections
+    (``provider.guarded_auto_backup``); then each live apply carrying that backup ID. The
+    apply path refuses a watcher mutation without a verified backup and writes a
+    digest-bound point snapshot plus an application record per action. If the backup fails,
+    nothing is applied.
+
+    In report-only mode the same static decision is reported as ``would_apply`` and the
+    provider is not called.
+    """
     summary: dict[str, Any] = {
         "mode": policy.mode,
         "enabled": policy.enabled,
@@ -407,55 +520,129 @@ def apply_guarded_auto(provider: Any, report: dict[str, Any], policy: GuardedAut
         "applied": [],
         "skipped": [],
         "errors": [],
+        "would_apply": [],
     }
+    raw_proposals = report.get("proposals")
+    proposals = raw_proposals if isinstance(raw_proposals, list) else []
+    preview_policy = policy if policy.enabled else GuardedAutoPolicy(**{**policy.__dict__, "mode": "guarded-auto"})
+
+    candidates: list[tuple[dict[str, Any], str, str]] = []
+    for proposal in proposals:
+        if not isinstance(proposal, dict):
+            continue
+        proposal_handle = _safe_handle(str(proposal.get("proposal_id") or "").strip())
+        proposal_type = _safe_proposal_type(proposal.get("proposal_type"))
+        action, reason = guarded_auto_action_for_proposal(proposal, preview_policy)
+        if not action:
+            if policy.enabled:
+                summary["skipped"].append({"proposal_id": proposal_handle, "proposal_type": proposal_type, "reason": reason})
+            continue
+        if len(candidates) >= policy.max_actions:
+            if policy.enabled:
+                summary["skipped"].append({"proposal_id": proposal_handle, "proposal_type": proposal_type, "reason": "guarded-auto max_actions reached"})
+            continue
+        candidates.append((proposal, action, reason))
     if not policy.enabled:
+        summary["would_apply"] = [
+            {
+                "proposal_id": _safe_handle(str(proposal.get("proposal_id") or "")),
+                "proposal_type": _safe_proposal_type(proposal.get("proposal_type")),
+                "action": action,
+                "affected_ids": [_safe_handle(value) for value in _affected_ids(proposal)],
+            }
+            for proposal, action, _reason in candidates
+        ]
         return summary
 
     report_id = str(report.get("report_id") or "").strip()
-    raw_proposals = report.get("proposals")
-    proposals = raw_proposals if isinstance(raw_proposals, list) else []
     if not report_id:
         summary["errors"].append({"code": "missing_report_id"})
         return summary
 
-    for proposal in proposals:
-        if not isinstance(proposal, dict):
-            continue
-        proposal_id = str(proposal.get("proposal_id") or "").strip()
-        proposal_handle = _safe_handle(proposal_id)
-        proposal_type = _safe_proposal_type(proposal.get("proposal_type"))
-        action, reason = guarded_auto_action_for_proposal(proposal, policy)
-        if not action:
-            summary["skipped"].append({"proposal_id": proposal_handle, "proposal_type": proposal_type, "reason": reason})
-            continue
-        if summary["attempted"] >= policy.max_actions:
-            summary["skipped"].append({"proposal_id": proposal_handle, "proposal_type": proposal_type, "reason": "guarded-auto max_actions reached"})
-            continue
-        args = {
-            "report_id": report_id,
-            "proposal_id": proposal_id,
-            "action": action,
-            "dry_run": False,
-            "approve": True,
-            "_guarded_auto": True,
-        }
-        if action == "quarantine":
-            args["quarantine_days"] = policy.quarantine_days
-        summary["attempted"] += 1
+    def _call(args: dict[str, Any], proposal_handle: str, action: str) -> dict[str, Any] | None:
         try:
             raw = provider.handle_tool_call("qdrant_memory_consolidation_apply", args)
         except Exception:
             summary["errors"].append({"code": "provider_exception", "proposal_handle": proposal_handle, "action": action})
-            continue
+            return None
         try:
             result = json.loads(raw)
         except Exception:
             summary["errors"].append({"code": "invalid_provider_response", "proposal_handle": proposal_handle, "action": action})
-            continue
+            return None
         if not isinstance(result, dict):
             summary["errors"].append({"code": "invalid_provider_response", "proposal_handle": proposal_handle, "action": action})
+            return None
+        return result
+
+    def _base_args(proposal: dict[str, Any], action: str) -> dict[str, Any]:
+        args = {
+            "report_id": report_id,
+            "proposal_id": str(proposal.get("proposal_id") or "").strip(),
+            "action": action,
+            "_guarded_auto": True,
+        }
+        if action == "quarantine":
+            args["quarantine_days"] = policy.quarantine_days
+        return args
+
+    ready: list[tuple[dict[str, Any], str, str]] = []
+    for proposal, action, reason in candidates:
+        proposal_handle = _safe_handle(str(proposal.get("proposal_id") or "").strip())
+        result = _call({**_base_args(proposal, action), "dry_run": True}, proposal_handle, action)
+        if result is None:
             continue
-        if isinstance(result, dict) and result.get("error"):
+        if result.get("error") or result.get("would_apply") is not True:
+            # A proposal the report marked preauthorized that the exact-ID apply path now
+            # refuses (changed point, lineage-managed target, ...) is surfaced, not hidden.
+            summary["errors"].append({"code": "provider_rejected", "proposal_handle": proposal_handle, "action": action})
+            continue
+        ready.append((proposal, action, reason))
+        summary["would_apply"].append(
+            {
+                "proposal_id": proposal_handle,
+                "proposal_type": _safe_proposal_type(proposal.get("proposal_type")),
+                "action": action,
+                "affected_ids": [_safe_handle(value) for value in _affected_ids(proposal)],
+            }
+        )
+    if not ready:
+        return summary
+
+    backup_scope = _backup_scope_for(report, [proposal for proposal, _action, _reason in ready])
+    backup_fn = getattr(provider, "guarded_auto_backup", None)
+    backup: Any = None
+    if callable(backup_fn):
+        try:
+            backup = backup_fn(scope=backup_scope)
+        except Exception:
+            backup = None
+    backup_id = str(backup.get("backup_id") or "").strip() if isinstance(backup, dict) else ""
+    if not backup_id:
+        summary["errors"].append({"code": "backup_failed", "scope": backup_scope})
+        for proposal, _action, _reason in ready:
+            summary["skipped"].append(
+                {
+                    "proposal_id": _safe_handle(str(proposal.get("proposal_id") or "").strip()),
+                    "proposal_type": _safe_proposal_type(proposal.get("proposal_type")),
+                    "reason": "pre-mutation backup failed; nothing applied",
+                }
+            )
+        return summary
+    summary["backup"] = _public_backup_summary(backup)
+
+    for proposal, action, reason in ready:
+        proposal_handle = _safe_handle(str(proposal.get("proposal_id") or "").strip())
+        proposal_type = _safe_proposal_type(proposal.get("proposal_type"))
+        summary["attempted"] += 1
+        result = _call(
+            {**_base_args(proposal, action), "dry_run": False, "approve": True, "guarded_auto_backup_id": backup_id},
+            proposal_handle,
+            action,
+        )
+        if result is None:
+            continue
+        if result.get("error"):
             summary["errors"].append({"code": "provider_rejected", "proposal_handle": proposal_handle, "action": action})
             continue
         summary["applied"].append(

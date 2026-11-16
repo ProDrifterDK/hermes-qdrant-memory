@@ -36,12 +36,15 @@ except Exception:  # pragma: no cover - used only for standalone tests without H
 
 from qdrant_memory.graph_retriever import GraphExpansionPolicy, GraphMemoryRetriever
 from qdrant_memory.guarded_auto import (
+    guarded_auto_backup_manifest,
+    write_guarded_auto_snapshot,
     guarded_auto_report_metadata_matches,
     seal_guarded_auto_proposals,
     validate_guarded_auto_current_points,
 )
 from qdrant_memory.client import QdrantClient
 from qdrant_memory.backup import create_backup
+from qdrant_memory.watcher_state import scan_offset_or_none as _scan_offset_or_none
 from qdrant_memory.config import load_config, read_source_collections
 from qdrant_memory.read_sources import MergedRecall
 from qdrant_memory.context import ContextTemplateError, build_context_packet, default_context_top_k
@@ -139,6 +142,7 @@ from qdrant_memory.raptor.apply import (
     validate_manifest,
 )
 from qdrant_memory.raptor.search import RaptorSearcher
+from qdrant_memory.recall_noise import NoiseFilteredRecall, SessionFactsCache, TurnNoiseFilter
 from qdrant_memory.hybrid.router import (
     HybridRouter,
     HybridRouteResult,
@@ -609,6 +613,8 @@ class QdrantMemoryProvider(MemoryProvider):
         self._session_prefetch_executor: Optional[ThreadPoolExecutor] = None
         self._session_prefetch_future: Any = None
         self._session_prefetch_guard = threading.Lock()
+        # auto_recall_exclude_machine: session rows of recalled turn points, read-only, cached.
+        self._turn_session_facts: Optional[SessionFactsCache] = None
 
     @property
     def name(self) -> str:
@@ -639,6 +645,7 @@ class QdrantMemoryProvider(MemoryProvider):
             self._write_enabled = False
         self._active = bool(self._config.get("enabled", True))
         self._session_recall = None
+        self._turn_session_facts = None
         if not self._active:
             return
         self._qdrant = QdrantClient(
@@ -866,6 +873,9 @@ class QdrantMemoryProvider(MemoryProvider):
                 # own collection. The formatter emits text bodies only, so the prompt
                 # reveals nothing more than it does without read sources.
                 router = dataclasses.replace(router, base_retriever=recall)
+            filtered = self._noise_filtered(router.base_retriever)
+            if filtered is not router.base_retriever:
+                router = dataclasses.replace(router, base_retriever=filtered)
             result = router.retrieve(
                 query,
                 top_k=int(self._config["auto_recall_top_k"]),
@@ -1054,9 +1064,11 @@ class QdrantMemoryProvider(MemoryProvider):
         """The legacy auto-recall block: dense top-k, the relevance floor, the formatter.
 
         Below ``auto_recall_min_final_score`` / ``auto_recall_min_raw_score`` a memory is
-        left out; with none left the block is ``""`` (no header).
+        left out; with none left the block is ``""`` (no header). With
+        ``auto_recall_exclude_machine`` the stored turns of one-shot runs and probes are left
+        out first (``qdrant_memory.recall_noise``).
         """
-        chunks = (self._memory_recall() or self._retriever).search(
+        chunks = self._noise_filtered(self._memory_recall() or self._retriever).search(
             query, top_k=int(self._config["auto_recall_top_k"]), update_access=False
         )
         chunks = above_auto_recall_floor(
@@ -1065,6 +1077,19 @@ class QdrantMemoryProvider(MemoryProvider):
             self._config.get("auto_recall_min_raw_score"),
         )
         return format_for_prompt(chunks, int(self._config["display_tokens"]))
+
+    def _noise_filtered(self, recall: Any) -> Any:
+        """``recall`` itself when ``auto_recall_exclude_machine`` is off, else wrapped in the filter.
+
+        Read-only: the session lookups go to ``state.db`` through the C' read-only reader and
+        are cached for the provider's lifetime (``qdrant_memory.recall_noise``).
+        """
+        if not self._config.get("auto_recall_exclude_machine") or recall is None:
+            return recall
+        if self._turn_session_facts is None:
+            self._turn_session_facts = SessionFactsCache(self._state_db_path())
+        widened = max(int(self._config["auto_recall_top_k"]), min(20, int(self._config.get("search_candidates", 20))))
+        return NoiseFilteredRecall(recall, TurnNoiseFilter(self._turn_session_facts), widened)
 
     def _with_session_prefetch(self, query: str, session_id: str, legacy: str) -> str:
         """Append the session-recall lane to ``legacy``; fail-open to ``legacy`` unchanged.
@@ -2348,27 +2373,53 @@ class QdrantMemoryProvider(MemoryProvider):
         except Exception:
             reconsolidation_max_candidates = 10
         base_scope = self._scope_filter_values()
+        scan_window_mode = str(args.get("scan_window") or "fixed").strip().lower()
+        if scan_window_mode not in {"fixed", "rotating"}:
+            return _json_error("scan_window must be one of: fixed, rotating")
+        raw_offsets = args.get("scan_offsets") if isinstance(args.get("scan_offsets"), dict) else {}
+        scan_window: dict[str, Any] = {"mode": scan_window_mode}
         memory_points = []
         learning_points = []
-        try:
-            if scope in {"memory", "both"}:
-                raw_memory = self._qdrant.scroll_by_filter(
-                    self._config["collection_name"],
-                    make_filter(base_scope),
+
+        def _scroll(collection_label: str, collection_name: str, scroll_filter: dict[str, Any]) -> list[dict[str, Any]]:
+            if scan_window_mode == "fixed":
+                return self._qdrant.scroll_by_filter(
+                    collection_name,
+                    scroll_filter,
                     limit=max_points,
                     with_payload=True,
                     with_vector=False,
                     max_total=max_points,
                 )
+            start_offset = _scan_offset_or_none(raw_offsets.get(collection_label))
+            raw, next_offset = self._qdrant.scroll_window(
+                collection_name,
+                scroll_filter,
+                start_offset=start_offset,
+                max_total=max_points,
+                with_payload=True,
+                with_vector=False,
+            )
+            scanned_ids = [str(point.get("id")) for point in raw if point.get("id") is not None]
+            scan_window[collection_label] = {
+                "collection_name": collection_name,
+                "start_offset": start_offset,
+                "next_offset": _scan_offset_or_none(next_offset),
+                "scanned": len(scanned_ids),
+                "reached_end": next_offset is None,
+                "scanned_ids_sha256": hashlib.sha256("\n".join(sorted(scanned_ids)).encode("utf-8")).hexdigest(),
+            }
+            return raw
+
+        try:
+            if scope in {"memory", "both"}:
+                raw_memory = _scroll("memory", self._config["collection_name"], make_filter(base_scope))
                 memory_points = points_from_qdrant(raw_memory, collection_name=self._config["collection_name"])
             if scope in {"learning", "both"}:
-                raw_learning = self._qdrant.scroll_by_filter(
+                raw_learning = _scroll(
+                    "learning",
                     self._config["learning_collection_name"],
                     make_filter(base_scope, source_type="learning"),
-                    limit=max_points,
-                    with_payload=True,
-                    with_vector=False,
-                    max_total=max_points,
                 )
                 learning_points = points_from_qdrant(raw_learning, collection_name=self._config["learning_collection_name"])
             report = build_consolidation_report(
@@ -2430,6 +2481,8 @@ class QdrantMemoryProvider(MemoryProvider):
                     "chat_id_hash": self._chat_id_hash,
                 }
             )
+            if scan_window_mode == "rotating":
+                report["scan_window"] = scan_window
             if parse_bool_arg(args.get("persist"), default=bool(self._config.get("consolidation_persist_reports", True))):
                 report = persist_consolidation_report(
                     report,
@@ -2638,6 +2691,47 @@ class QdrantMemoryProvider(MemoryProvider):
 
         return max(points, key=key)
 
+    def guarded_auto_backup(self, scope: str) -> dict[str, Any]:
+        """Take the plugin backup the watcher requires before its first mutation of a run.
+
+        Raises on any failure; the caller must then apply nothing.
+        """
+        if not self._qdrant:
+            raise RuntimeError("Qdrant memory provider is not initialized")
+        return create_backup(self._qdrant, self._config, hermes_home=self._hermes_home, scope=scope)
+
+    def _guarded_auto_backup_covers(self, backup_id: str, collection_name: str) -> bool:
+        """True when ``backup_id`` names a readable backup manifest holding ``collection_name``."""
+        try:
+            manifest = guarded_auto_backup_manifest(self._config, self._hermes_home, backup_id)
+        except Exception:
+            return False
+        collections = manifest.get("collections") if isinstance(manifest.get("collections"), dict) else {}
+        return any(
+            isinstance(details, dict) and str(details.get("collection_name") or "") == collection_name
+            for details in collections.values()
+        )
+
+    def _write_guarded_auto_snapshot(
+        self,
+        *,
+        report_id: str,
+        proposal: dict[str, Any],
+        action: str,
+        collection_name: str,
+        affected_ids: list[str],
+    ) -> dict[str, Any]:
+        raw = self._qdrant.retrieve(collection_name, affected_ids, with_payload=True, with_vector=True)
+        return write_guarded_auto_snapshot(
+            raw_points=raw,
+            report_id=report_id,
+            proposal=proposal,
+            action=action,
+            collection_name=collection_name,
+            config=self._config,
+            hermes_home=self._hermes_home,
+        )
+
     def _tool_consolidation_apply(self, args: dict) -> str:
         proposal_id = str(args.get("proposal_id") or "").strip()
         if not proposal_id:
@@ -2671,7 +2765,8 @@ class QdrantMemoryProvider(MemoryProvider):
                 return _json_error("proposal requires manual review and cannot be applied automatically")
             action = str(args.get("action") or expected_action).strip()
             allowed_actions = {expected_action}
-            if proposal_type == "stale_low_value":
+            if proposal_type in {"stale_low_value", "heading_noise"}:
+                # Both are reversible cleanups: guarded-auto quarantines instead of deleting.
                 allowed_actions.add("quarantine")
             if action not in allowed_actions:
                 return _json_error("action mismatch for proposal type")
@@ -2758,6 +2853,17 @@ class QdrantMemoryProvider(MemoryProvider):
             if dry_run:
                 return json.dumps({"dry_run": True, "would_apply": True, **plan})
             pre_apply: dict[str, Any] = {}
+            watcher_mutation = guarded_auto_requested and action in {"merge", "delete", "quarantine", "promote_to_skill"}
+            if watcher_mutation:
+                # The unattended watcher never mutates without a verified backup of the target
+                # collection taken this run (design review m5). Checked before anything else
+                # can write, including the optional manual backup below.
+                if action == "delete":
+                    return _json_error("guarded-auto never deletes; reversible cleanups use action=quarantine")
+                backup_id = str(args.get("guarded_auto_backup_id") or "").strip()
+                if not backup_id or not self._guarded_auto_backup_covers(backup_id, collection_name):
+                    return _json_error("guarded-auto requires a verified pre-mutation backup of the target collection; nothing applied")
+                pre_apply["pre_apply_backup_id"] = backup_id
             if parse_bool_arg(args.get("backup_first"), default=False):
                 backup = create_backup(self._qdrant, self._config, hermes_home=self._hermes_home, scope="both")
                 pre_apply["pre_apply_backup_id"] = backup.get("backup_id")
@@ -2776,6 +2882,21 @@ class QdrantMemoryProvider(MemoryProvider):
                 )
                 if not eligible:
                     return _json_error(validation_reason)
+            if watcher_mutation:
+                # Digest-bound snapshot of exactly the points about to change, vectors
+                # included, written before the first write. No snapshot, no mutation.
+                try:
+                    pre_apply["pre_mutation_snapshot"] = self._write_guarded_auto_snapshot(
+                        report_id=report_id,
+                        proposal=proposal,
+                        action=action,
+                        collection_name=collection_name,
+                        affected_ids=affected_ids,
+                    )
+                except Exception:
+                    logger.exception("Guarded-auto pre-mutation snapshot failed")
+                    return _json_error("guarded-auto pre-mutation snapshot failed; nothing applied")
+                pre_apply["guarded_auto"] = True
             if action == "draft_review":
                 write_decision = evaluate_write_candidate(
                     text="\n".join(point.text for point in points),
@@ -2807,7 +2928,7 @@ class QdrantMemoryProvider(MemoryProvider):
                 quarantine_until = (datetime.utcnow() + timedelta(days=quarantine_days)).isoformat() + "Z"
                 payload_update = {
                     "consolidation_quarantined": True,
-                    "consolidation_quarantine_reason": "guarded-auto stale_low_value",
+                    "consolidation_quarantine_reason": f"guarded-auto {proposal_type}",
                     "consolidation_quarantined_at": quarantined_at,
                     "consolidation_quarantine_until": quarantine_until,
                     "consolidation_proposal_id": proposal_id,
@@ -2857,6 +2978,23 @@ class QdrantMemoryProvider(MemoryProvider):
                             merged_origin, (canonical.payload or {}).get("session_id"))
                     origin_extra = {"session_origin_merge": origin_summary}
                 self._qdrant.update_payload(collection_name, canonical.id, payload_update)
+                if watcher_mutation:
+                    # Unattended merges are reversible: the duplicates are quarantined (out of
+                    # recall, still restorable in place) instead of deleted.
+                    quarantined_at = datetime.utcnow().isoformat() + "Z"
+                    for duplicate_id in delete_ids:
+                        self._qdrant.update_payload(collection_name, duplicate_id, {
+                            "consolidation_quarantined": True,
+                            "consolidation_quarantine_reason": "guarded-auto duplicate_cluster",
+                            "consolidation_quarantined_at": quarantined_at,
+                            "consolidation_duplicate_of": canonical.id,
+                            "consolidation_proposal_id": proposal_id,
+                            "consolidation_report_id": report_id,
+                        })
+                    plan.pop("delete_ids", None)
+                    plan["quarantine_ids"] = delete_ids
+                    record = persist_application_record({"applied": True, **plan, **pre_apply, "canonical_id": canonical.id, "quarantined_ids": delete_ids, **origin_extra}, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))
+                    return json.dumps({"dry_run": False, "applied": True, **plan, **pre_apply, "canonical_id": canonical.id, "quarantined_ids": delete_ids, **origin_extra, "application_id": record.get("application_id"), "application_artifact": record.get("artifact_path")})
                 if delete_ids:
                     self._qdrant.delete_ids(collection_name, delete_ids)
                 record = persist_application_record({"applied": True, **plan, **pre_apply, "canonical_id": canonical.id, "deleted_ids": delete_ids, **origin_extra}, hermes_home=self._hermes_home, configured_dir=str(self._config.get("consolidation_artifact_dir") or ""))

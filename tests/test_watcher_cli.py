@@ -41,15 +41,25 @@ class StaticJsonProvider:
 
 
 class ApplyingProvider:
+    """Models the provider contract guarded-auto relies on: a dry-run preflight answers
+    would_apply, the backup hook returns a backup ID, a live apply reports applied."""
+
     def __init__(self, report):
         self.report = report
         self.calls = []
+        self.backups = []
+
+    def guarded_auto_backup(self, scope):
+        self.backups.append(scope)
+        return {"backup_id": "backup-test-0001", "scope": scope, "collections": {}}
 
     def handle_tool_call(self, tool_name, args):
         self.calls.append((tool_name, args))
         if tool_name == "qdrant_memory_consolidate":
             return json.dumps(self.report)
         if tool_name == "qdrant_memory_consolidation_apply":
+            if args.get("dry_run"):
+                return json.dumps({"dry_run": True, "would_apply": True, "proposal_id": args["proposal_id"], "action": args["action"]})
             return json.dumps({"dry_run": False, "applied": True, "proposal_id": args["proposal_id"], "action": args["action"], "affected_ids": ["x"]})
         raise AssertionError(f"unexpected tool: {tool_name}")
 
@@ -655,6 +665,12 @@ def test_watcher_run_guarded_auto_applies_eligible_proposals_and_records_state(m
     assert provider.calls[1][0] == "qdrant_memory_consolidation_apply"
     assert provider.calls[1][1]["proposal_id"] == "dup1"
     assert provider.calls[1][1]["action"] == "merge"
+    assert provider.calls[1][1]["dry_run"] is True
+    # The live apply comes after the backup and carries its ID.
+    assert provider.backups == ["memory"]
+    assert provider.calls[2][1]["dry_run"] is False
+    assert provider.calls[2][1]["guarded_auto_backup_id"] == "backup-test-0001"
+    assert len(provider.calls) == 3
     payload = json.loads(capsys.readouterr().out)
     assert payload["guarded_auto"]["enabled"] is True
     assert len(payload["guarded_auto"]["applied"]) == 1

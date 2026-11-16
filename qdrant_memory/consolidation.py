@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from qdrant_memory.lesson_extractor import contains_secret
+from qdrant_memory.lineage import lineage_managed_reasons
 
 SECRET_KEYWORDS = ("api_key", "apikey", "token", "password", "passwd", "secret", "authorization", "bearer", "credential", "private_key")
 
@@ -123,6 +124,51 @@ def identity_bearing_payload(payload: dict[str, Any]) -> bool:
     return any(_identity_bearing_metadata_value(payload.get(key)) for key in _IDENTITY_FACT_METADATA_KEYS)
 
 
+# Topics guarded-auto never acts on without a human (standing policy: identity, secrets,
+# money and security stay review-only). Deliberately broad, English and Spanish: a false
+# positive only keeps an item in review, a false negative lets the watcher mutate it.
+_SENSITIVE_TOPIC_PATTERNS: dict[str, re.Pattern[str]] = {
+    "identity": re.compile(
+        r"[\w.+-]+@[\w-]+\.[\w.]+"  # e-mail address
+        r"|\+\d{1,3}[\s.-]?\(?\d{1,4}\)?(?:[\s.-]?\d{2,4}){2,4}"  # international phone number
+        r"|\b\d{1,2}\.?\d{3}\.?\d{3}-[\dkK]\b"  # Chilean RUT
+        r"|\b(?:passport|pasaporte|ssn|social security|date of birth|fecha de nacimiento|"
+        r"birthday|cumpleaños|home address|direcci[oó]n|domicilio|rut|dni|c[eé]dula|"
+        r"phone number|tel[eé]fono|celular|whatsapp)\b",
+        re.IGNORECASE,
+    ),
+    "money": re.compile(
+        r"[$€£]\s?\d|\b\d[\d.,]*\s?(?:usd|clp|eur|uf|btc|eth)\b"
+        r"|\b(?:bank|banco|bancari\w*|iban|swift|credit card|tarjeta|invoice|factura\w*|billing|"
+        r"payment|pago|pagos|salary|sueldo|salario|loan|pr[eé]stamo|deuda|debt|mortgage|hipoteca|"
+        r"tax|impuesto\w*|wallet|crypto\w*|bitcoin|transferencia\w*|budget|presupuesto|price|precio|"
+        r"cost|costo|subscription|suscripci[oó]n|stripe|paypal)\b",
+        re.IGNORECASE,
+    ),
+    "security": re.compile(
+        r"\b(?:security|seguridad|password|passwords|contraseña\w*|passphrase|credential\w*|credencial\w*|"
+        r"secret|secrets|secreto\w*|api[ _-]?keys?|access[ _-]?tokens?|auth(?:entication|enticated|orization|orized)?|oauth|2fa|mfa|totp|otp|"
+        r"ssh|gpg|pgp|private key|llave privada|firewall|vpn|cve-\d+|vulnerab\w*|exploit\w*|malware|"
+        r"phishing|sudo|root access|permission\w*|permiso\w*|encrypt\w*|cifrad\w*|certificate|"
+        r"certificado|keyring|vault token)\b",
+        re.IGNORECASE,
+    ),
+}
+
+
+def sensitive_topic_categories(text: str) -> list[str]:
+    """Return the sensitive policy categories (identity, money, security) a text touches."""
+    value = str(text or "")
+    return [name for name, pattern in _SENSITIVE_TOPIC_PATTERNS.items() if pattern.search(value)]
+
+
+def _point_sensitive_topics(point: ConsolidationPoint) -> list[str]:
+    payload = point.payload or {}
+    tags = payload.get("tags")
+    tag_text = " ".join(str(tag) for tag in tags) if isinstance(tags, list) else str(tags or "")
+    return sensitive_topic_categories(f"{point.text}\n{tag_text}")
+
+
 def _point_requires_manual_review(point: ConsolidationPoint) -> bool:
     payload = point.payload or {}
     if identity_bearing_payload(payload):
@@ -130,6 +176,8 @@ def _point_requires_manual_review(point: ConsolidationPoint) -> bool:
     # A conversation-born fact with a recorded session origin (C'6) is never retired, merged
     # or quarantined by guarded-auto maintenance without a human: its citations are evidence.
     if payload.get("session_origin") is not None:
+        return True
+    if _point_sensitive_topics(point):
         return True
     return any(str(payload.get(key) or "").strip() for key in _FACT_METADATA_KEYS)
 
@@ -141,6 +189,15 @@ def _point_is_identity_bearing(point: ConsolidationPoint) -> bool:
 def _point_contains_secret(point: ConsolidationPoint) -> bool:
     payload_text = json.dumps(point.payload or {}, sort_keys=True, default=str)
     return contains_secret(point.text) or contains_secret(payload_text)
+
+
+def _point_lineage_managed(point: ConsolidationPoint) -> bool:
+    """A file chunk or entity bound to lineage records: the exact-ID apply path refuses to
+    retire it (LINEAGE_MANAGED_RETIREMENT_REFUSED), so it is never guarded-auto eligible."""
+    return bool(lineage_managed_reasons(point.payload or {}))
+
+
+_LINEAGE_MANAGED_REVIEW_REASON = "lineage-managed point: retirement needs the reviewed lineage path"
 
 
 def _point_snippet(point: ConsolidationPoint, *, max_chars: int = 160) -> str:
@@ -541,6 +598,14 @@ def _heading_noise_proposals(points: list[ConsolidationPoint], *, include_exampl
     proposals: list[dict[str, Any]] = []
     for point in candidates[:max_groups]:
         _, guarded_safe, _normalized, reason = _heading_noise_details(point.text)
+        if guarded_safe and (_point_requires_manual_review(point) or _point_contains_secret(point)):
+            # Same rule as every other guarded-auto builder: a heading that carries a
+            # session_origin citation, identity metadata or a secret stays review-only.
+            guarded_safe = False
+            reason = "known heading fingerprint, but the point requires manual review"
+        elif guarded_safe and _point_lineage_managed(point):
+            guarded_safe = False
+            reason = _LINEAGE_MANAGED_REVIEW_REASON
         proposal: dict[str, Any] = {
             "proposal_id": _proposal_id("heading_noise", [point.id]),
             "proposal_type": "heading_noise",
@@ -564,7 +629,13 @@ def _heading_noise_proposals(points: list[ConsolidationPoint], *, include_exampl
 
 
 def _duplicate_proposals(points: list[ConsolidationPoint], *, max_groups: int, include_examples: bool, threshold: float = 0.92) -> list[dict[str, Any]]:
-    fingerprints = [(point, normalize_text_fingerprint(point.text)) for point in points]
+    # A quarantined point (an earlier merge's retired duplicate, a stale item) is already out
+    # of recall; proposing it again would re-merge the same cluster on every scan cycle.
+    fingerprints = [
+        (point, normalize_text_fingerprint(point.text))
+        for point in points
+        if not (point.payload or {}).get("consolidation_quarantined")
+    ]
     used: set[str] = set()
     proposals: list[dict[str, Any]] = []
     for point, fingerprint in fingerprints:
@@ -585,7 +656,8 @@ def _duplicate_proposals(points: list[ConsolidationPoint], *, max_groups: int, i
         exact_normalized = len(group_fingerprints) == 1
         contains_secret_text = any(contains_secret(member.text) or contains_secret(json.dumps(member.payload or {}, sort_keys=True, default=str)) for member in group)
         manual_review_point = any(_point_requires_manual_review(member) for member in group)
-        guarded_auto_safe = exact_normalized and not contains_secret_text and not manual_review_point
+        lineage_managed = any(_point_lineage_managed(member) for member in group)
+        guarded_auto_safe = exact_normalized and not contains_secret_text and not manual_review_point and not lineage_managed
         proposal: dict[str, Any] = {
             "proposal_id": _proposal_id("duplicate_cluster", affected_ids),
             "proposal_type": "duplicate_cluster",
@@ -604,6 +676,8 @@ def _duplicate_proposals(points: list[ConsolidationPoint], *, max_groups: int, i
         if manual_review_point:
             proposal["manual_review_required"] = True
             proposal["manual_review_reason"] = "profile or fact-like memory requires manual review"
+        elif lineage_managed:
+            proposal["manual_review_reason"] = _LINEAGE_MANAGED_REVIEW_REASON
         if proposal.get("guarded_auto_eligible"):
             proposal["preauthorized_policy"] = "guarded-auto:exact-duplicate-merge"
         if include_examples:
@@ -639,7 +713,8 @@ def _stale_low_value_proposals(
             continue
         stale_manual_review = _point_requires_manual_review(point)
         contains_secret_text = contains_secret(point.text) or contains_secret(json.dumps(point.payload or {}, sort_keys=True, default=str))
-        guarded_auto_safe = not stale_manual_review and not contains_secret_text
+        lineage_managed = _point_lineage_managed(point)
+        guarded_auto_safe = not stale_manual_review and not contains_secret_text and not lineage_managed
         proposal: dict[str, Any] = {
             "proposal_id": _proposal_id("stale_low_value", [point.id]),
             "proposal_type": "stale_low_value",
@@ -664,7 +739,11 @@ def _stale_low_value_proposals(
             proposal["preauthorized_policy"] = "guarded-auto:stale-low-value-quarantine"
         else:
             proposal["manual_review_required"] = True
-            proposal["manual_review_reason"] = "secret-bearing, profile, or fact-like memory requires manual review"
+            proposal["manual_review_reason"] = (
+                _LINEAGE_MANAGED_REVIEW_REASON
+                if lineage_managed and not stale_manual_review and not contains_secret_text
+                else "secret-bearing, profile, or fact-like memory requires manual review"
+            )
         if contains_secret_text:
             proposal["contains_secret_text"] = True
         if include_examples:
