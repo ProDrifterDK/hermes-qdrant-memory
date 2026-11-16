@@ -396,7 +396,7 @@ Each live apply then carries that backup ID; the apply path refuses a watcher mu
 
 Disk: a full backup of a 17,728-point, 1024-dimension memory collection measured 264 MB and took about 12 s; one is taken only on nights that mutate (the touched collections only). Prune old `backup-*` directories under `$HERMES_HOME/qdrant_memory/backups/` by hand.
 
-Quarantine takes a point out of the hybrid router and of the sparse lane. The legacy dense lane (`auto_recall_mode: legacy`) does not filter `consolidation_quarantined`: there a quarantined point stays recallable until that lane honours the marker. Quarantine loses nothing either way.
+Quarantine takes a point out of every recall path: the legacy automatic-recall block (`auto_recall_mode: legacy`), the hybrid router and its dense, sparse, RAPTOR and graph lanes, memory read sources, `qdrant_memory_search`, `qdrant_memory_context`, `qdrant_learning_search` and `qdrant_memory_graph_search`. The dense search sends `consolidation_quarantined: true` as a server-side `must_not`, so a quarantined point never takes a top-k slot, and every candidate is checked again client-side. `qdrant_memory_inspect` and `qdrant_memory_trace` (by point id) and `restore` still reach it, and restoring a snapshot puts the payload back without the marker, so the point is recalled again. Quarantine loses nothing.
 
 ### Turning guarded-auto on
 

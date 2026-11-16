@@ -55,6 +55,15 @@ def normalize_pools(pools: list[CandidatePool]) -> list[list[float]]:
 
 
 _HIDDEN_FACT_STATUSES = {"deprecated", "superseded"}
+# The marker the watcher's quarantine writes (guarded-auto heading noise, duplicate copies,
+# stale items). A quarantined point is out of every recall path; inspect and restore reach it
+# by id.
+QUARANTINE_KEY = "consolidation_quarantined"
+QUARANTINE_CONDITION: dict[str, Any] = {"key": QUARANTINE_KEY, "match": {"value": True}}
+
+
+def is_quarantined(payload: Any) -> bool:
+    return isinstance(payload, dict) and payload.get(QUARANTINE_KEY) is True
 
 
 def _filter_value(value: Any) -> str:
@@ -149,6 +158,8 @@ def _payload_allowed(
     # Structural lineage records and pending chunks never surface as
     # retrieval results, even if a server-side filter was bypassed.
     if payload.get("lineage_record") or payload.get("lineage_pending"):
+        return False
+    if is_quarantined(payload):
         return False
     if not _payload_value_matches(payload.get("source_type"), source_type):
         return False
@@ -300,6 +311,8 @@ def _scope_filter(
     # budget is consumed.
     must_not.append({"key": "lineage_record", "match": {"value": True}})
     must_not.append({"key": "lineage_pending", "match": {"value": True}})
+    # Quarantined points too, server-side, so they never take a top-k slot.
+    must_not.append(dict(QUARANTINE_CONDITION))
     result: dict[str, Any] = {}
     if must:
         result["must"] = must
