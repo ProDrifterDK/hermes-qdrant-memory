@@ -24,6 +24,7 @@ from typing import Any
 from qdrant_memory.capture_queue import QueueItem, point_id_for
 from qdrant_memory.extraction_candidates import ExtractionCandidate
 from qdrant_memory.session_origin import (
+    MAX_CITATIONS,
     SessionOriginRefused,
     build_session_origin,
     validate_session_origin,
@@ -61,9 +62,15 @@ def capture_origin(provider: Any, item: QueueItem, *, producer: str, approval: b
     origin = build_session_origin(producer=producer, captured_session_id=captured,
                                   captured_at=str(queued.get("at") or now),
                                   citation={**queued["citation"], "verified_at": now})
+    seen = {queued["citation"].get("uids_sha256")}
     for extra in item.extra_citations:
+        # One citation per distinct message (a compaction clone keeps its message_uid),
+        # never more than the mapping's bound; extras that no longer verify are left out.
+        if len(origin["citations"]) >= MAX_CITATIONS or extra.get("uids_sha256") in seen:
+            continue
         if verify_citation(extra, state_db=state_db)["status"] == "verified":
             origin["citations"].append({**extra, "verified_at": now})
+            seen.add(extra.get("uids_sha256"))
     if approval and (provider._session_id or "") != captured:
         origin["approved_session_id"] = provider._session_id or ""
         origin["approved_at"] = now

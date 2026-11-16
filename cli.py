@@ -583,6 +583,19 @@ def _register_capture(subcommands) -> None:
                       help="Move the cursor to the end of this scan. Without it the cursor is left unchanged.")
     scan.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
 
+    run = capture_subcommands.add_parser(
+        "run", help="Capture batch: new owner rows (heuristic detector) and, when enabled, the built-in memory "
+                    "mirror. Dry-run by default.")
+    run.set_defaults(qdrant_subcommand="capture")
+    run_mode = run.add_mutually_exclusive_group()
+    run_mode.add_argument("--dry-run", dest="apply", action="store_false", default=False,
+                          help="Report what would happen; write only the run report. Default.")
+    run_mode.add_argument("--apply", dest="apply", action="store_true",
+                          help="Queue, apply the auto/mirror routes and advance the cursor (capture_mode: on).")
+    run.add_argument("--since-days", type=_non_negative_float, default=None,
+                     help="Only rows from the last N days (bounds a first run).")
+    run.add_argument("--json", action="store_true", help="Emit machine-readable JSON output (ids only).")
+
     review = capture_subcommands.add_parser(
         "review", help="List capture items waiting for review (pending, oldest first). Read-only.")
     review.set_defaults(qdrant_subcommand="capture")

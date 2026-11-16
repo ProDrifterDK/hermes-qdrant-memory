@@ -2418,12 +2418,48 @@ def _execute_capture_decision(args: Namespace, stdout, provider_factory: Callabl
     return 0
 
 
+def _format_capture_run(payload: dict[str, Any]) -> str:
+    counts = payload.get("counts") or {}
+    cursor = payload.get("cursor") or {}
+    lines = [
+        f"Capture run {payload.get('run_id')} ({'apply' if payload.get('apply') else 'dry run'}; mode "
+        f"{payload.get('mode')}; mirror {'on' if payload.get('mirror_enabled') else 'off'}; auto "
+        f"{'on' if payload.get('auto_apply') else 'off'}, cap {payload.get('daily_auto_cap')}/day)",
+        f"rows: {json.dumps(payload.get('rows') or {}, sort_keys=True)}",
+        f"routes: {json.dumps(counts.get('by_route') or {}, sort_keys=True)}",
+        f"kinds: {json.dumps(counts.get('by_kind') or {}, sort_keys=True)}",
+        f"drops: {json.dumps(counts.get('drops') or {}, sort_keys=True)}",
+        f"expired: {len(payload.get('expired') or [])}; errors: {len(payload.get('errors') or [])}",
+        f"cursor: {cursor.get('before')} -> {cursor.get('after')} (bound {cursor.get('upto')})"
+        + ("" if payload.get("apply") else "; dry run: cursor unchanged"),
+    ]
+    return "\n".join(lines)
+
+
+def _execute_capture_run(args: Namespace, stdout, provider_factory: Callable[[], Any] | None) -> int:
+    from qdrant_memory.capture_run import CaptureRunRefused, run_capture
+
+    if provider_factory is None:
+        raise CliUsageError("capture run needs the provider")
+    provider = provider_factory()
+    try:
+        result = run_capture(provider, apply=bool(getattr(args, "apply", False)),
+                             since_days=getattr(args, "since_days", None))
+    except CaptureRunRefused as exc:
+        _print_cli_error(str(exc), args, sys.stderr)
+        return 2
+    _print_payload(result["report"], args, stdout, _format_capture_run)
+    return 0
+
+
 def _execute_capture_command(args: Namespace, stdout, provider_factory: Callable[[], Any] | None = None) -> int:
-    """`capture scan` (read-only classification) and the review routes."""
+    """`capture scan` (read-only classification), `capture run` and the review routes."""
     from qdrant_memory.capture_reader import CaptureReadError, scan
 
     if getattr(args, "capture_subcommand", None) in {"review", "approve", "reject"}:
         return _execute_capture_decision(args, stdout, provider_factory)
+    if getattr(args, "capture_subcommand", None) == "run":
+        return _execute_capture_run(args, stdout, provider_factory)
     if getattr(args, "capture_subcommand", None) != "scan":
         raise CliUsageError("unsupported qdrant capture command")
     hermes_home, config = _local_config()

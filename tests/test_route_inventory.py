@@ -848,6 +848,9 @@ SESSION_RECALL_PINS = [
 ]
 # Capture approval writes only through the extraction approval path and the manual store's
 # write step; these run the overwrite refusal through the capture route itself.
+CAPTURE_RUN_PINS = [
+    "tests/test_capture_run.py::test_the_run_never_overwrites_a_protected_point",
+]
 CAPTURE_APPROVE_PINS = [
     "tests/test_capture_queue.py::test_capture_approval_refuses_to_overwrite_a_protected_point",
     "tests/test_capture_queue.py::test_capture_approval_of_a_mirror_item_refuses_to_overwrite_a_protected_point",
@@ -963,6 +966,9 @@ _declare(["qdrant_capture_review", "capture review"], "read_only",
          note="reads $HERMES_HOME/qdrant_memory/capture/queue.jsonl; no Qdrant or state.db write")
 _declare(["qdrant_capture_reject", "capture reject"], "read_only",
          note="appends a rejected event to the capture queue file; no Qdrant access")
+_declare(["capture run"], "protection", pins=CAPTURE_RUN_PINS,
+         note="dry run reads only; --apply (capture_mode on) writes the auto and mirror routes through the same "
+              "gated paths as approve and merges duplicate citations through the extraction locked upsert")
 _declare(["qdrant_capture_approve", "capture approve"], "protection", pins=CAPTURE_APPROVE_PINS,
          note="re-verifies the pinned citation, then approve_extraction_candidate or _manual_store_write")
 
@@ -983,10 +989,10 @@ _declare(["backup create", "eval-capture"], "read_only",
 # a check that reads the same source twice is not a check. Because these are duplicates,
 # adding a pin means updating both the constant and this literal.
 
-# The derived surface — 27 tools, 58 CLI commands, 12 provider hooks. A route added or
+# The derived surface — 27 tools, 59 CLI commands, 12 provider hooks. A route added or
 # removed changes this number, which forces someone to touch this file and classify it,
 # even if the completeness check in the test body is later weakened.
-FROZEN_SURFACE_SIZE = 97
+FROZEN_SURFACE_SIZE = 98
 
 # Every `[mode]` row, frozen by name and by kind. Completeness used to ask only whether
 # *some* mode row existed for the route, so deleting both `[capture]` rows, deleting both
@@ -1003,6 +1009,7 @@ EXPECTED_MODE_ROWS = {
 }
 
 EXPECTED_PROTECTION_ROUTES = {
+    "capture run": ("tests/test_capture_run.py::test_the_run_never_overwrites_a_protected_point",),
     "qdrant_capture_approve": (
         "tests/test_capture_queue.py::test_capture_approval_refuses_to_overwrite_a_protected_point",
         "tests/test_capture_queue.py::test_capture_approval_of_a_mirror_item_refuses_to_overwrite_a_protected_point",
