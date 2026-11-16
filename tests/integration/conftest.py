@@ -330,3 +330,43 @@ def lineage_context() -> Iterator[LineageContext]:
         )
     finally:
         _delete_and_verify(qdrant, created, prefix)
+
+
+# Tools capture CP1 removed (their only input was the hook queue). Off-mode oracles that
+# compare head with an older base tree drop them from the base side.
+CP1_REMOVED_TOOLS = frozenset({"qdrant_learning_preview", "qdrant_learning_approve",
+                               "qdrant_memory_extraction_preview", "qdrant_memory_extraction_approve"})
+
+
+# --- captured candidates for the approval backends ----------------------------
+# The session hooks used to produce these (capture CP1 removed that producer). The live
+# session-origin oracles build the same candidate the hook built, with the capture the
+# provider froze at hook time, and hand it to the surviving write path.
+
+
+def captured_extraction_candidate(provider, text: str, line: str, *, role: str = "assistant",
+                                  hook: str = "on_pre_compress") -> Any:
+    """The extraction candidate the hook producer built for ``line`` of ``text``, captured
+    in ``provider``'s current session."""
+    import dataclasses
+
+    from qdrant_memory.source_extraction import extract_source_candidates_from_text
+
+    session = provider._session_id or "current"
+    lines = text.splitlines()
+    candidates = [c for c in extract_source_candidates_from_text(
+        text, source_uri=f"session://{session}/{hook}", source_type="completed_turn",
+        derivation_type="completed_turn", lifecycle_id=f"{session}:{hook}", min_confidence=0.0)
+        if lines[int(c.locator.get("line_start") or 0) - 1] == line]
+    assert candidates, f"the source extractor finds no candidate in {line!r}"
+    return dataclasses.replace(candidates[0], origin_capture=provider._freeze_origin_capture(hook, line, role))
+
+
+def captured_learning_candidate(provider, source_text: str, *, role: str = "user", hook: str = "on_pre_compress",
+                                **fields: Any) -> Any:
+    """A learning candidate read from ``source_text``, captured in ``provider``'s current session."""
+    from qdrant_memory.lesson_extractor import LearningCandidate
+
+    candidate = LearningCandidate(source_hook=hook, source_text=source_text, source_role=role, **fields)
+    candidate.origin_capture = provider._freeze_origin_capture(hook, source_text, role)
+    return candidate

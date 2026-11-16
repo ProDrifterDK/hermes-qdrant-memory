@@ -52,15 +52,11 @@ Low thresholds can surface weakly related chunks. Tune:
 - `min_final_score`
 - `display_tokens`
 
-## Learning auto-extraction is gated
+## No automatic learning extraction from session hooks
 
 M7 implements the `hermes_learnings` collection plus explicit `qdrant_learning_store` and `qdrant_learning_search` tools. These tools are enabled by default and can be disabled with `qdrant_memory.learning_enabled: false`.
 
-M7.1 adds heuristic candidate extraction, not blind auto-learning. `learning_auto_extract_enabled` defaults to false. When turned on, candidates are kept pending for review through `qdrant_learning_preview`; `qdrant_learning_approve` defaults to dry-run and requires explicit `dry_run: false` to store.
-
-M7.2 adds semantic dedupe against existing `hermes_learnings` before preview/pending. This reduces repeated candidates, but the threshold uses the raw Qdrant similarity score, so deployments using a non-default distance/embedding scale may need to tune `learning_auto_extract_semantic_dedupe_threshold`.
-
-The extractor is deliberately narrow: explicit user corrections and tool failures only when followed by a correction/resolution. It does not use an LLM yet and should not be treated as a full learning pipeline. Compression/session-end behavior must preserve the [LCM boundary](LCM_BOUNDARY.md).
+The heuristic learning extractor and the source-line extractor that ran in `on_pre_compress` / `on_session_end` (M7.1, M7.2, source extraction) were removed in capture CP1, with their preview/approve tools; `learning_auto_extract_*` and `source_extraction_*` are accepted and ignored with one warning. Automatic capture now starts from a read-only batch reader over `state.db` with an authorship classifier ([capture.md](capture.md)); it does not write anything yet. Compression/session-end behavior must preserve the [LCM boundary](LCM_BOUNDARY.md).
 
 ## Consolidation live actions are gated in M9
 

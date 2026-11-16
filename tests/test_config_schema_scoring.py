@@ -13,9 +13,6 @@ def test_config_defaults_when_no_file(tmp_path):
     assert cfg["qdrant_url"] == "http://127.0.0.1:6333"
     assert cfg["embedding_model"] == "bge-m3"
     assert cfg["vector_size"] == 1024
-    assert cfg["learning_auto_extract_semantic_dedupe_enabled"] is True
-    assert cfg["learning_auto_extract_semantic_dedupe_threshold"] == 0.9
-    assert cfg["learning_auto_extract_semantic_dedupe_top_k"] == 3
     assert cfg["consolidation_report_max_points"] == 200
     assert cfg["consolidation_report_max_groups"] == 20
     assert cfg["consolidation_duplicate_threshold"] == 0.92
@@ -86,9 +83,6 @@ def test_config_overrides_from_qdrant_memory_section(tmp_path):
                 "enabled": "false",
                 "auto_recall_top_k": "9",
                 "distance": "Dot",
-                "learning_auto_extract_semantic_dedupe_enabled": "false",
-                "learning_auto_extract_semantic_dedupe_threshold": "0.93",
-                "learning_auto_extract_semantic_dedupe_top_k": "7",
                 "consolidation_report_max_points": "42",
                 "consolidation_report_max_groups": "8",
                 "consolidation_duplicate_threshold": "0.88",
@@ -100,9 +94,6 @@ def test_config_overrides_from_qdrant_memory_section(tmp_path):
     assert cfg["enabled"] is False
     assert cfg["auto_recall_top_k"] == 9
     assert cfg["distance"] == "Dot"
-    assert cfg["learning_auto_extract_semantic_dedupe_enabled"] is False
-    assert cfg["learning_auto_extract_semantic_dedupe_threshold"] == 0.93
-    assert cfg["learning_auto_extract_semantic_dedupe_top_k"] == 7
     assert cfg["consolidation_report_max_points"] == 42
     assert cfg["consolidation_report_max_groups"] == 8
     assert cfg["consolidation_duplicate_threshold"] == 0.88

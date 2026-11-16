@@ -544,14 +544,6 @@ qdrant_memory:
   sync_turns: true
   sync_subagents: false
   learning_enabled: true
-  learning_auto_extract_enabled: false
-  learning_auto_extract_mode: preview
-  learning_auto_extract_min_confidence: 0.85
-  learning_auto_extract_max_candidates_per_session: 3
-  learning_auto_extract_require_evidence: true
-  learning_auto_extract_semantic_dedupe_enabled: true
-  learning_auto_extract_semantic_dedupe_threshold: 0.9
-  learning_auto_extract_semantic_dedupe_top_k: 3
   consolidation_enabled: false
   consolidation_report_max_points: 200
   consolidation_report_max_groups: 20
@@ -859,15 +851,20 @@ Useful arguments:
 - `until`
 - `include_metadata`
 
-### `qdrant_learning_preview`
+### Removed: automatic learning and source extraction from session hooks
 
-Previews gated automatic learning candidates collected by `on_pre_compress` and `on_session_end`. It is dry-run only and never writes to Qdrant.
+`qdrant_learning_preview`, `qdrant_learning_approve`, `qdrant_memory_extraction_preview` and
+`qdrant_memory_extraction_approve` are gone, together with the `hermes qdrant learning preview|approve`
+commands. Their only input was a queue of candidates that `on_pre_compress` and `on_session_end` kept in
+provider memory, produced by a learning heuristic and a source-line extractor that, measured on real
+conversations, matched almost nothing a person wrote, ran for under half of the conversation (sessions
+reaped without an end hook never reached them) and lost everything on restart. Both hooks now collect
+nothing. The gated write paths behind those tools stay (the write gate, the extraction approval with its
+lineage refusal and locked origin-carrying upsert, and the learning approval) as the backend of the
+persisted capture queue that replaces them; see [docs/capture.md](docs/capture.md).
 
-M7.1 keeps automatic extraction disabled by default with `learning_auto_extract_enabled: false`. When enabled, candidates are buffered for review rather than stored automatically. M7.2 semantically checks existing `hermes_learnings` before adding a candidate to the pending buffer, so already-learned lessons are suppressed when the raw Qdrant score is at or above `learning_auto_extract_semantic_dedupe_threshold`.
-
-### `qdrant_learning_approve`
-
-Approves one pending candidate by `candidate_id`. `dry_run` defaults to true; live approval with `dry_run: false` stores into `hermes_learnings` only.
+The settings `learning_auto_extract_*` and `source_extraction_*` are still accepted so existing configs
+keep loading, have no effect, and log one warning per process. Remove them from your config.
 
 ### `qdrant_memory_session_recall`
 
@@ -1003,17 +1000,17 @@ The payload mapping (`session-origin-v1`, closed: unknown keys are refused):
 
 ### Session origin on extraction and learning approval
 
-With `session_origin_mode: recorded`, three more writes record a `session_origin` mapping (same contract, limits and merge rule as above). With `off`, their schemas, payloads and outputs are unchanged.
+With `session_origin_mode: recorded`, three more writes record a `session_origin` mapping (same contract, limits and merge rule as above). With `off`, their schemas, payloads and outputs are unchanged. Since capture CP1 the extraction and learning approvals are provider methods (`approve_extraction_candidate`, `approve_learning_candidate`) with no tool of their own; the persisted capture queue will call them.
 
-- **Hook candidates keep their own session.** When `on_pre_compress` or `on_session_end` produces a learning candidate (`learning_auto_extract_enabled`) or a source-extraction candidate (`source_extraction_enabled`), the candidate keeps the session the hook ran in, the hook time, and the exact text the extractor read: the source line for extraction, the user correction or the assistant reply that resolved a tool failure for learnings. This capture lives only on the in-memory pending candidate and never appears in tool output.
-- **Approval cites the captured session, not the approver's.** `qdrant_memory_extraction_approve` (producer `source_extraction`) and `qdrant_learning_approve` (producer `learning_approval`) record `captured_session_id` as the hook's session even when the approval happens after a compression switched the conversation to a continuation session; the approving session is recorded as `approved_session_id`/`approved_at` only when it differs. The dry-run preview of either tool shows the mapping the approval would record.
-- **Exact-text match across the session chain.** At approval the captured text is looked up in the user and assistant messages of the captured session and its whole `parent_session_id` chain, as one of a message's lines or its whole content, with the role it had. Copies of one message that share a `message_uid` (Hermes carries a compaction's tail into the next generation) count once and are cited at the original row. One message gives a one-message span citation with `basis: extractor_source_line`. No message gives `unresolved:no_match`. Two or more messages give `unresolved:ambiguous_match`, with no citation: the plugin never picks one. Either way the approval still stores. Hook transcripts are redacted for egress, so a line the host masked usually reads `no_match`.
+- **Candidates keep their own session.** A candidate carries the session it was captured in, the capture time, and the exact text it was read from (`origin_capture`). This capture lives only on the candidate and never appears in output.
+- **Approval cites the captured session, not the approver's.** Extraction approval (producer `source_extraction`) and learning approval (producer `learning_approval`) record `captured_session_id` as the capture's session even when the approval happens after a compression switched the conversation to a continuation session; the approving session is recorded as `approved_session_id`/`approved_at` only when it differs. The dry run of either approval shows the mapping it would record.
+- **Exact-text match across the session chain.** At approval the captured text is looked up in the user and assistant messages of the captured session and its whole `parent_session_id` chain, as one of a message's lines or its whole content, with the role it had. Copies of one message that share a `message_uid` (Hermes carries a compaction's tail into the next generation) count once and are cited at the original row. One message gives a one-message span citation with `basis: extractor_source_line`. No message gives `unresolved:no_match`. Two or more messages give `unresolved:ambiguous_match`, with no citation: the plugin never picks one. Either way the approval still stores. Text the host masked for egress usually reads `no_match`.
 - **Learning store.** `qdrant_learning_store` (and `hermes qdrant learning store`) has no extractor line; it records producer `learning_store` with a `tool_position` citation for the calling session, like a manual store without `cite`.
 - **Learning re-store merges.** A learning's id is derived from its content, so storing or approving the same learning again lands on the same point. The new citation is merged into the existing `session_origin` (first capture kept, identical citations not repeated, at most 8, refused past the limits) under the learning collection's write lock, instead of the upsert replacing it. With the mode `off` no new citation is recorded, but an existing mapping is carried forward unchanged (extraction approval does the same), so switching the mode back to `off` never destroys recorded provenance.
 
 ### Session origin on improve, origin-check and trace
 
-- **Improve records the captured session.** With `session_origin_mode: recorded`, `qdrant_memory_improve_apply` (producer `improve`) records a `session_origin` mapping on a conversation-born point: a candidate from `source_text` under a `session://` source URI (the default), or from `pending_session` (the hook candidates above). The capture is frozen at preview time: the preview's session and the exact line the extractor read, resolved at apply time by exact line match across that session's chain, as for extraction approval. The approver appears only as `approved_session_id`/`approved_at` when it differs. The dry-run apply shows the mapping (`session_origin`, or `null` when none would be recorded). In `recorded` mode a persisted preview (the default) also writes the captures to a private file next to the report (`improve_reports/<report_id>.origin.json`, mode 0600), so an apply after a restart still cites the line. Only with `persist: false` and a restart in between does the citation read `unresolved:no_match`.
+- **Improve records the captured session.** With `session_origin_mode: recorded`, `qdrant_memory_improve_apply` (producer `improve`) records a `session_origin` mapping on a conversation-born point: a candidate from `source_text` under a `session://` source URI (the default). The `pending_session` scope, fed by the removed hook queue, is gone; a report persisted with it before still applies. The capture is frozen at preview time: the preview's session and the exact line the extractor read, resolved at apply time by exact line match across that session's chain, as for extraction approval. The approver appears only as `approved_session_id`/`approved_at` when it differs. The dry-run apply shows the mapping (`session_origin`, or `null` when none would be recorded). In `recorded` mode a persisted preview (the default) also writes the captures to a private file next to the report (`improve_reports/<report_id>.origin.json`, mode 0600), so an apply after a restart still cites the line. Only with `persist: false` and a restart in between does the citation read `unresolved:no_match`.
 - **No citation from a Qdrant point.** A `point_ids` candidate records no `session_origin` at all, also when its input is a legacy conversation-turn point whose session and words are still in `state.db`: a stored turn is not evidence of a `state.db` span. A `source_text` candidate whose `source_uri` is not a `session://` URI records none either.
 - **Improve never overwrites.** The insert re-reads the target under the memory collection's write lock and refuses a point that already exists, so improve can never replace a payload or drop its `session_origin`.
 - **`qdrant_memory_origin_check`** (and `hermes qdrant origin-check [--collection memory|learning] [--limit N] [--offset ID] [--max-ids N] [--json]`) scans the points that carry `session_origin` in this provider's own memory or learning collection, within the profile scope, re-verifies every citation against `state.db`, and reports `counts` per current status (counted per citation), `point_counts` per status (distinct points, never truncated), `point_ids` per status (a point appears under each status one of its citations has), `uncited_counts`/`uncited_point_ids` for mappings recorded as `unresolved:<reason>` with no citation, and `invalid_count`/`invalid_point_ids` for mappings that fail the v1 validator. One call is one page: at most `limit` points (default 100, at most 500) and `max_ids` ids per status (default 100, at most 500); `next_offset` continues and `complete` is true on the last page. It never writes: it scrolls instead of searching, so no access counter changes; it goes through a client that refuses any write to the two collections; it creates no payload index or collection; it opens `state.db` read-only. No status flags, demotes or changes anything: `expired` is the host's retention, not a retraction. It never scans `read_sources` or the session-window collection. It is not on the `tool_surface: recall` surface: that surface has no tool that produces `session_origin`, and the check does not read `read_sources`.
@@ -1029,9 +1026,6 @@ qdrant_memory:
   session_origin_mode: recorded        # off (default) | recorded
   # optional: where state.db lives; default $HERMES_HOME/state.db
   session_recall_state_db: $HERMES_HOME/state.db
-  # producers that only exist when their own switches are on:
-  learning_auto_extract_enabled: true  # hook learning candidates (approval cites the captured session)
-  source_extraction_enabled: true      # hook source-extraction candidates
 sessions:                              # Hermes' own config, not the plugin's (see retention above)
   retention_days: 180
 ```
@@ -1114,9 +1108,7 @@ hermes qdrant index docs README.md --dry-run
 hermes qdrant forget POINT_ID --dry-run
 hermes qdrant learning search "tool failure" --top-k 5
 hermes qdrant learning search "tool failure" --learning-type workflow_lesson --tag pytest --project-path /repo
-hermes qdrant learning preview
 hermes qdrant learning store "Prefer dry-run before broad indexing" --learning-type workflow_lesson --confidence 0.8 --tag cli
-hermes qdrant learning approve CANDIDATE_ID --dry-run
 hermes qdrant consolidate --scope both --persist --dry-run
 hermes qdrant watcher status --verbose
 hermes qdrant watcher install --schedule "0 3 * * *"
@@ -1145,7 +1137,6 @@ Mutation safety mirrors the tool surface:
 - `store` and `learning store` are explicit live storage commands by design and require non-empty positional text/lesson;
 - mutating maintenance commands default to `--dry-run`;
 - live maintenance mutation requires both `--no-dry-run` and `--approve`;
-- `learning approve` follows the same live approval gate;
 - `forget` only accepts explicit point IDs;
 - `watcher run` defaults to report-only consolidation with `dry_run=true`, `persist=true`, and no apply/proposal mutation; when explicitly run with `--autonomy-mode guarded-auto`, it may apply only preauthorized low-risk exact-ID proposals through the same exact `report_id` + `proposal_id` apply path and records guarded-auto counts in watcher state/logs; `--force-alert` only affects alerting and does not widen Qdrant authority;
 - `watcher install` / `watcher uninstall --approve` edit only the sentinel-managed crontab block; replacing an existing different watcher block requires `--approve`;

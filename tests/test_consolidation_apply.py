@@ -1379,10 +1379,6 @@ def test_extraction_approval_uses_configured_lineage_upsert_lock(tmp_path):
     provider._qdrant = FakeQdrant({"memory": [], "learnings": []})
     provider._embeddings = FakeEmbedding()
     provider._config.update({
-        "source_extraction_enabled": True,
-        "source_extraction_mode": "preview",
-        "source_extraction_min_confidence": 0.65,
-        "source_extraction_max_candidates_per_session": 8,
         "lineage_lock_dir": str(tmp_path / "writer-locks"),
         "lineage_lock_timeout_seconds": 0.15,
     })
@@ -1390,24 +1386,18 @@ def test_extraction_approval_uses_configured_lineage_upsert_lock(tmp_path):
         "Decision: keep extraction approvals behind the configured collection lock.",
         source_uri="session://lineage-lock/extraction",
     )[0]
-    provider._pending_extraction_candidates[candidate.candidate_id] = candidate
-    reviewed = json.loads(provider.handle_tool_call(
-        "qdrant_memory_extraction_approve", {"candidate_id": candidate.candidate_id},
-    ))
+    reviewed = json.loads(provider.approve_extraction_candidate(candidate))
     assert reviewed["dry_run"] is True
 
     result = _invoke_writer_while_configured_lock_is_held(
         provider,
-        lambda: provider.handle_tool_call(
-            "qdrant_memory_extraction_approve",
-            {"candidate_id": candidate.candidate_id, "dry_run": False, "approve": True},
-        ),
+        lambda: provider.approve_extraction_candidate(candidate, dry_run=False, approve=True),
     )
 
     assert result == {
         "error": "Extraction approval failed: lineage collection lock unavailable",
     }
-    assert candidate.candidate_id in provider._pending_extraction_candidates
+    assert candidate.candidate_id in provider._reviewed_extraction_candidate_ids
 
 
 def test_improve_apply_uses_configured_lineage_upsert_lock(tmp_path):
@@ -2055,10 +2045,6 @@ def test_all_lineage_lock_refusals_share_one_fixed_inner_text(tmp_path):
     extraction._qdrant = FakeQdrant({"memory": [], "learnings": []})
     extraction._embeddings = FakeEmbedding()
     extraction._config.update({
-        "source_extraction_enabled": True,
-        "source_extraction_mode": "preview",
-        "source_extraction_min_confidence": 0.65,
-        "source_extraction_max_candidates_per_session": 8,
         "lineage_lock_dir": str(tmp_path / "extraction" / "locks"),
         "lineage_lock_timeout_seconds": 0.15,
     })
@@ -2066,20 +2052,10 @@ def test_all_lineage_lock_refusals_share_one_fixed_inner_text(tmp_path):
         "Decision: keep extraction approvals behind the configured collection lock.",
         source_uri="session://lineage-lock/extraction",
     )[0]
-    extraction._pending_extraction_candidates[extraction_candidate.candidate_id] = extraction_candidate
-    assert json.loads(extraction.handle_tool_call(
-        "qdrant_memory_extraction_approve",
-        {"candidate_id": extraction_candidate.candidate_id},
-    ))["dry_run"] is True
+    assert json.loads(extraction.approve_extraction_candidate(extraction_candidate))["dry_run"] is True
     observed["extraction_approval"] = _invoke_writer_while_configured_lock_is_held(
         extraction,
-        lambda: extraction.handle_tool_call(
-            "qdrant_memory_extraction_approve",
-            {
-                "candidate_id": extraction_candidate.candidate_id,
-                "dry_run": False, "approve": True,
-            },
-        ),
+        lambda: extraction.approve_extraction_candidate(extraction_candidate, dry_run=False, approve=True),
     )["error"]
 
     improve = _provider(tmp_path / "improve")
@@ -2187,29 +2163,18 @@ def test_lock_directory_os_text_never_reaches_a_tool_response(tmp_path):
     extraction._qdrant = FakeQdrant({"memory": [], "learnings": []})
     extraction._embeddings = FakeEmbedding()
     extraction._config.update({
-        "source_extraction_enabled": True,
-        "source_extraction_mode": "preview",
-        "source_extraction_min_confidence": 0.65,
-        "source_extraction_max_candidates_per_session": 8,
         "lineage_lock_dir": unusable_lock_dir,
     })
     candidate = extract_source_candidates_from_text(
         "Decision: keep extraction approvals behind the configured collection lock.",
         source_uri="session://lineage-lock/extraction",
     )[0]
-    extraction._pending_extraction_candidates[candidate.candidate_id] = candidate
-    assert json.loads(extraction.handle_tool_call(
-        "qdrant_memory_extraction_approve",
-        {"candidate_id": candidate.candidate_id},
-    ))["dry_run"] is True
-    writer_text = extraction.handle_tool_call(
-        "qdrant_memory_extraction_approve",
-        {"candidate_id": candidate.candidate_id, "dry_run": False, "approve": True},
-    )
+    assert json.loads(extraction.approve_extraction_candidate(candidate))["dry_run"] is True
+    writer_text = extraction.approve_extraction_candidate(candidate, dry_run=False, approve=True)
     assert json.loads(writer_text) == {"error": f"Extraction approval failed: {fixed}"}
     assert_no_os_text(writer_text)
     assert extraction._qdrant.upserts == []
-    assert candidate.candidate_id in extraction._pending_extraction_candidates
+    assert candidate.candidate_id in extraction._reviewed_extraction_candidate_ids
 
     forget = _provider(tmp_path / "forget")
     forget._config["lineage_lock_dir"] = unusable_lock_dir
@@ -2661,32 +2626,21 @@ def test_locked_writer_body_failure_is_not_reported_as_a_lock_refusal(tmp_path, 
     provider._qdrant = BodyFailsOnUpsert({"memory": [], "learnings": []})
     provider._embeddings = FakeEmbedding()
     provider._config.update({
-        "source_extraction_enabled": True,
-        "source_extraction_mode": "preview",
-        "source_extraction_min_confidence": 0.65,
-        "source_extraction_max_candidates_per_session": 8,
         "lineage_lock_dir": str(tmp_path / "locks"),
     })
     candidate = extract_source_candidates_from_text(
         "Decision: keep extraction approvals behind the configured collection lock.",
         source_uri="session://lineage-lock/extraction",
     )[0]
-    provider._pending_extraction_candidates[candidate.candidate_id] = candidate
-    assert json.loads(provider.handle_tool_call(
-        "qdrant_memory_extraction_approve",
-        {"candidate_id": candidate.candidate_id},
-    ))["dry_run"] is True
+    assert json.loads(provider.approve_extraction_candidate(candidate))["dry_run"] is True
 
-    text = provider.handle_tool_call(
-        "qdrant_memory_extraction_approve",
-        {"candidate_id": candidate.candidate_id, "dry_run": False, "approve": True},
-    )
+    text = provider.approve_extraction_candidate(candidate, dry_run=False, approve=True)
 
     assert json.loads(text) == {
         "error": "Extraction approval failed: store exploded inside the locked body",
     }
     assert LINEAGE_LOCK_FIXED_TEXT not in text
-    assert candidate.candidate_id in provider._pending_extraction_candidates
+    assert candidate.candidate_id in provider._reviewed_extraction_candidate_ids
 
 
 def test_lock_refusal_redactor_is_idempotent_and_leaves_other_text_alone():
@@ -3560,30 +3514,20 @@ def _extraction_provider(tmp_path, mode):
     provider._qdrant = FakeQdrant({"memory": [], "learnings": []})
     provider._embeddings = FakeEmbedding()
     provider._config.update({
-        "source_extraction_enabled": True,
-        "source_extraction_mode": "preview",
-        "source_extraction_min_confidence": 0.65,
-        "source_extraction_max_candidates_per_session": 8,
         "lineage_lock_dir": str(tmp_path / "locks"),
     })
     candidate = extract_source_candidates_from_text(
         "Decision: keep extraction approvals behind the configured collection lock.",
         source_uri="session://lineage-managed/extraction",
     )[0]
-    provider._pending_extraction_candidates[candidate.candidate_id] = candidate
     return provider, candidate
 
 
 def _approve(provider, candidate):
     """Dry-run review then live approval, the shape the tool requires."""
-    reviewed = json.loads(provider.handle_tool_call(
-        "qdrant_memory_extraction_approve", {"candidate_id": candidate.candidate_id},
-    ))
+    reviewed = json.loads(provider.approve_extraction_candidate(candidate))
     assert reviewed["dry_run"] is True
-    return json.loads(provider.handle_tool_call(
-        "qdrant_memory_extraction_approve",
-        {"candidate_id": candidate.candidate_id, "dry_run": False, "approve": True},
-    ))
+    return json.loads(provider.approve_extraction_candidate(candidate, dry_run=False, approve=True))
 
 
 @pytest.mark.parametrize("mode", ["off", "capture", "reconcile"])

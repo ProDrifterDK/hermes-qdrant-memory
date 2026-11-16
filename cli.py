@@ -422,7 +422,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
         help="Emit machine-readable JSON output (default: human summary).",
     )
 
-    learning = subcommands.add_parser("learning", help="Search or preview procedural learnings.")
+    learning = subcommands.add_parser("learning", help="Search or store procedural learnings.")
     learning_subcommands = learning.add_subparsers(dest="learning_subcommand", required=True)
 
     learning_search = learning_subcommands.add_parser("search", help="Search procedural learnings.")
@@ -433,11 +433,6 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     _add_search_filter_flags(learning_search)
     learning_search.add_argument("--include-metadata", action="store_true", help="Include full payload metadata.")
     learning_search.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
-
-    learning_preview = learning_subcommands.add_parser("preview", help="Preview pending gated learning candidates.")
-    learning_preview.set_defaults(qdrant_subcommand="learning")
-    learning_preview.add_argument("--include-metadata", action="store_true", help="Include hook/source metadata.")
-    learning_preview.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
 
     learning_store = learning_subcommands.add_parser("store", help="Store an explicit procedural learning.")
     learning_store.set_defaults(qdrant_subcommand="learning")
@@ -454,12 +449,6 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     _add_tag_flags(learning_store)
     learning_store.add_argument("--promote-to-skill-candidate", action="store_true", help="Mark as candidate for future skill promotion.")
     learning_store.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
-
-    learning_approve = learning_subcommands.add_parser("approve", help="Approve one pending gated learning candidate. Dry-run by default.")
-    learning_approve.set_defaults(qdrant_subcommand="learning")
-    learning_approve.add_argument("candidate_id", help="Candidate ID from learning preview.")
-    _add_dry_run_flags(learning_approve)
-    learning_approve.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
 
     consolidate = subcommands.add_parser("consolidate", help="Generate a report-only consolidation proposal set.")
     consolidate.add_argument("--scope", choices=["memory", "learning", "both"], default="both", help="Report scope. Default: both.")
@@ -542,7 +531,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
 
     improve_preview = improve_subcommands.add_parser("preview", help="Preview improve candidates as a dry-run report. No Qdrant writes.")
     improve_preview.set_defaults(qdrant_subcommand="improve")
-    improve_preview.add_argument("--source-scope", choices=["source_text", "point_ids", "pending_session"], default=None, help="Source scope for extraction.")
+    improve_preview.add_argument("--source-scope", choices=["source_text", "point_ids"], default=None, help="Source scope for extraction.")
     improve_preview.add_argument("--source-text", default=None, help="Explicit source text to extract from.")
     improve_preview.add_argument("--source-uri", default=None, help="Source URI for explicit source text.")
     improve_preview.add_argument("--point-ids", nargs="*", default=None, help="Qdrant point IDs to read as source (when scope=point_ids).")

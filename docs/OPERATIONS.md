@@ -194,7 +194,6 @@ hermes qdrant doctor
 hermes qdrant doctor --json
 hermes qdrant search "Hermes Qdrant memory" --top-k 3 --include-metadata
 hermes qdrant search "Hermes Qdrant memory" --top-k 3 --include-metadata --json
-hermes qdrant learning preview
 hermes qdrant consolidate --scope both --persist --include-reconsolidation
 hermes qdrant watcher status --verbose
 hermes qdrant watcher status --verbose --json
@@ -213,7 +212,6 @@ Optional explicit-write smoke, only when you intentionally want harmless test re
 hermes qdrant store "Release smoke explicit memory" --source-type manual --importance 5 --tag smoke --preview-duplicates
 hermes qdrant store "Release smoke explicit memory" --source-type manual --importance 5 --tag smoke --preview-duplicates --no-dry-run --approve
 hermes qdrant learning store "Release smoke procedural lesson" --learning-type workflow_lesson --confidence 0.8 --tag smoke
-hermes qdrant learning approve CANDIDATE_ID --dry-run --json
 ```
 
 Expected behavior:
@@ -224,7 +222,6 @@ Expected behavior:
 - `store` previews by default (`--dry-run`) and performs no Qdrant mutation unless `--no-dry-run --approve` is supplied. Use `--preview-duplicates` before intentional live manual writes; duplicate hits skip the upsert and never merge/delete existing points.
 - `learning store` is an explicit live write; use only harmless smoke text and remove later by explicit point ID if needed.
 - `search` returns a bounded human result summary by default; zero results is acceptable on a fresh install. Use `--json` for scripts.
-- `learning preview` and `learning approve --dry-run` return bounded human summaries by default and perform no mutation; use `--json` for scripts.
 - `consolidate --persist` creates a local report artifact under `$HERMES_HOME/qdrant_memory/consolidation/` and performs no Qdrant mutation.
 - `reports list/show` and `proposals show` inspect persisted consolidation artifacts by exact ID only; they do not contact Qdrant or apply proposals.
 - `show POINT_ID --collection memory|learning` is an exact-ID Qdrant read. It omits payloads and vectors unless `--include-payload` or `--include-vector` is explicit.

@@ -62,8 +62,6 @@ Typical Qdrant tools:
 - `qdrant_memory_consolidation_apply`
 - `qdrant_learning_store`
 - `qdrant_learning_search`
-- `qdrant_learning_preview`
-- `qdrant_learning_approve`
 
 ---
 
@@ -182,7 +180,7 @@ Allowed patterns:
 
 - Qdrant may index review-gated session-end summaries after the session ends, if they are treated as durable memory candidates rather than active-session recovery.
 - Qdrant may index review-gated LCM-derived summaries only after injected memory blocks are stripped.
-- Qdrant may store durable procedural learnings discovered around compression/session-end boundaries, but only through learning preview/approval gates.
+- Qdrant may store durable procedural learnings, but only through the gated learning write path (explicit `qdrant_learning_store`, or the reviewed capture queue; the compression/session-end hook candidates were removed in capture CP1).
 - Qdrant may store references to session IDs or source metadata to help a future operator know where a memory originated.
 - LCM may be used during operator review to inspect the active session that produced a proposed memory or learning.
 - Qdrant may help answer cross-session questions where LCM has no current-session history to inspect.
@@ -250,7 +248,7 @@ This section describes the current implementation shape so the boundary is groun
 - `initialize` creates Qdrant, embedding, retriever, writer, learning, and collection components.
 - `prefetch` and `queue_prefetch` perform semantic auto-recall when enabled.
 - `sync_turn` can store completed turns asynchronously when write/sync settings allow it.
-- `on_pre_compress` and `on_session_end` collect learning candidates; they do not blindly convert every candidate into durable approved memory.
+- `on_pre_compress` and `on_session_end` are no-ops since capture CP1: they collect no candidates and add nothing to the compression summary.
 - `handle_tool_call` exposes memory, learning, consolidation, and apply tools.
 - `qdrant_memory/retriever.py` formats recalled context as `# Relevant Long-Term Memory` and states that memories are context, not instructions.
 - `qdrant_memory/schema.py` strips injected memory/learning blocks before write-through.

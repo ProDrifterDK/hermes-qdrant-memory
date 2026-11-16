@@ -864,17 +864,18 @@ _declare(
          "with session_origin_mode=recorded and stays off the read-only recall surface (it is a write)",
 )
 _declare(["qdrant_memory_forget", "forget"], "protection", pins=FORGET_PINS)
-_declare(
-    ["qdrant_memory_extraction_approve", "learning approve"], "protection", pins=EXTRACTION_PINS,
-    note="upserts a regenerated candidate id",
-)
+# The extraction and learning approval tools (and the `learning approve` command) were removed
+# in capture CP1 with the in-memory hook queue they read. Their write path survives as the
+# provider methods ``approve_extraction_candidate`` / ``approve_learning_candidate`` (CP4 wires
+# them to a persisted queue); no tool, command or hook reaches them, so they have no row here.
+# EXTRACTION_PINS still execute against that backend.
 _declare(["restore"], "protection", pins=RESTORE_PINS, note="the third in-place overwrite route")
 _declare(["qdrant_memory_index [off]", "index [off]"], "protection", pins=INDEX_OFF_PINS,
          note="rewrites chunk payloads at content-derived ids and deletes stale ids, per file")
 _declare(["qdrant_memory_consolidation_apply", "apply"], "protection", pins=CONSOLIDATION_PINS,
          note="merge/delete/quarantine; the managed check runs before the lock (N5)")
 _declare(
-    ["qdrant_learning_store", "learning store", "qdrant_learning_approve"], "protection",
+    ["qdrant_learning_store", "learning store"], "protection",
     pins=LEARNING_STORE_PINS,
     note="no payload predicate: protected by the collection-separation invariant only",
 )
@@ -907,7 +908,7 @@ _declare(
     note="config, client construction, in-process cache and session bookkeeping; no payload write",
 )
 _declare(["on_pre_compress", "on_session_end"], "read_only",
-         note="collects extraction candidates into local artifacts; the store modes that would write are inert")
+         note="no-ops since capture CP1: they collect nothing and return nothing for the summary")
 
 _declare(["qdrant_memory_improve_apply", "improve apply"], "uncovered",
          reason="predicate read on 567eeac; stricter than the shared one on the traced shapes, never executed. "
@@ -923,14 +924,13 @@ _declare([
     "qdrant_memory_context", "qdrant_memory_retrieve", "qdrant_memory_inspect",
     "qdrant_memory_trace", "qdrant_memory_expand", "qdrant_memory_source_status",
     "qdrant_memory_consolidate", "qdrant_memory_memory_pr", "qdrant_memory_raptor_status",
-    "qdrant_memory_improve_preview", "qdrant_memory_extraction_preview",
-    "qdrant_learning_preview", "qdrant_learning_search",
+    "qdrant_memory_improve_preview", "qdrant_learning_search",
     # cli reads
     "status", "doctor", "config", "config show", "search", "graph-search", "retrieve",
     "context", "show", "inspect", "trace", "expand", "source-status",
     "export", "export memory", "export learning", "reports", "reports list",
     "reports show", "proposals", "proposals show", "eval", "eval-capture", "eval-gate",
-    "learning", "learning search", "learning preview", "consolidate",
+    "learning", "learning search", "consolidate",
     "improve", "improve preview", "backup", "backup list", "backup inspect",
     "watcher", "watcher status", "watcher logs", "watcher inspect-state",
     "watcher install", "watcher uninstall", "watcher reset-signature",
@@ -963,10 +963,10 @@ _declare(["backup create", "eval-capture"], "read_only",
 # a check that reads the same source twice is not a check. Because these are duplicates,
 # adding a pin means updating both the constant and this literal.
 
-# The derived surface — 28 tools, 55 CLI commands, 12 provider hooks. A route added or
+# The derived surface — 24 tools, 53 CLI commands, 12 provider hooks. A route added or
 # removed changes this number, which forces someone to touch this file and classify it,
 # even if the completeness check in the test body is later weakened.
-FROZEN_SURFACE_SIZE = 95
+FROZEN_SURFACE_SIZE = 89
 
 # Every `[mode]` row, frozen by name and by kind. Completeness used to ask only whether
 # *some* mode row existed for the route, so deleting both `[capture]` rows, deleting both
@@ -1007,16 +1007,6 @@ EXPECTED_PROTECTION_ROUTES = {
         "tests/test_consolidation_apply.py::test_forget_refuses_any_dependent_and_deletes_all_clear_targets",
         "tests/test_consolidation_apply.py::test_forget_lock_contention_refuses_without_any_write_and_respects_timeout",
     ),
-    "qdrant_memory_extraction_approve": (
-        "tests/test_consolidation_apply.py::test_extraction_approval_refuses_to_overwrite_a_protected_point",
-        "tests/test_consolidation_apply.py::test_extraction_approval_refuses_a_history_only_dependent",
-        "tests/test_consolidation_apply.py::test_extraction_approval_fails_closed_when_the_target_cannot_be_read",
-    ),
-    "learning approve": (
-        "tests/test_consolidation_apply.py::test_extraction_approval_refuses_to_overwrite_a_protected_point",
-        "tests/test_consolidation_apply.py::test_extraction_approval_refuses_a_history_only_dependent",
-        "tests/test_consolidation_apply.py::test_extraction_approval_fails_closed_when_the_target_cannot_be_read",
-    ),
     "restore": (
         "tests/test_backup_cli.py::test_restore_refuses_to_overwrite_every_protected_payload",
         "tests/test_backup_cli.py::test_restore_refuses_a_protected_target_in_the_learnings_scope",
@@ -1056,9 +1046,6 @@ EXPECTED_PROTECTION_ROUTES = {
         "tests/test_config_schema_scoring.py::test_config_rejects_one_collection_for_memories_and_learnings",
     ),
     "learning store": (
-        "tests/test_config_schema_scoring.py::test_config_rejects_one_collection_for_memories_and_learnings",
-    ),
-    "qdrant_learning_approve": (
         "tests/test_config_schema_scoring.py::test_config_rejects_one_collection_for_memories_and_learnings",
     ),
     "watcher run": (

@@ -1,12 +1,18 @@
+"""Secret detection and the learning candidate type.
+
+``contains_secret`` and ``redact_secret_spans`` are used across the plugin. ``LearningCandidate``
+and ``candidate_to_learning_args`` feed the learning approval backend
+(``QdrantMemoryProvider.approve_learning_candidate``). The heuristic learning extractor this
+module was named for (user-correction and tool-failure regexes run by the session hooks) was
+removed in capture CP1: it fired on the Spanish word "no" and on host warnings, and its
+candidates lived only in provider memory.
+"""
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
-
-VALID_LEARNING_TYPES = {"tool_failure_lesson", "user_correction", "workflow_lesson", "environment_quirk"}
 
 _SECRET_PATTERNS = [
     re.compile(r"(?<![A-Za-z0-9_])sk-[A-Za-z0-9_-]{10,}"),
@@ -113,19 +119,6 @@ def _looks_like_secret_value(value: str) -> bool:
     has_digit = any(ch.isdigit() for ch in value)
     alphanumeric_count = sum(ch.isalnum() for ch in value)
     return has_digit or alphanumeric_count >= 16
-
-_EXPLICIT_CORRECTION_PATTERNS = [
-    re.compile(r"(?i)\bactually[, ]+(?P<body>.+)"),
-    re.compile(r"(?i)\bno[, ]+(?P<body>.+)"),
-    re.compile(r"(?i)\bcorrection[: ]+(?P<body>.+)"),
-    re.compile(r"(?i)\bremember this[: ]+(?P<body>.+)"),
-    re.compile(r"(?i)\bi prefer (?P<body>.+)"),
-]
-
-_NOT_PATTERN = re.compile(r"(?i)(?P<correct>[^.\n,;:]{2,80}?)\s*,?\s+not\s+(?P<mistake>[^.\n,;:]{2,80})")
-_TOOL_FAILURE_PATTERN = re.compile(r"(?i)(failed|error|exception|traceback|exit code|command not found|not found|http\s*\d{3})")
-_RESOLUTION_PATTERN = re.compile(r"(?i)(correction|fix|solution|resolved|use|instead|rerun|run)[: ]+(?P<body>.+)")
-
 
 def contains_secret(text: str) -> bool:
     """Return True when ``text`` contains a secret-shaped value.
@@ -275,174 +268,3 @@ def candidate_to_learning_args(candidate: LearningCandidate) -> dict[str, Any]:
         "tags": list(dict.fromkeys([*candidate.tags, f"source:{candidate.source_hook}"])),
         "promote_to_skill_candidate": candidate.learning_type in {"workflow_lesson", "tool_failure_lesson"},
     }
-
-
-def _message_text(message: Any) -> str:
-    if isinstance(message, str):
-        return message
-    if not isinstance(message, dict):
-        return str(message or "")
-    content = message.get("content")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, dict):
-                parts.append(str(item.get("text") or item.get("content") or ""))
-            else:
-                parts.append(str(item))
-        return "\n".join(part for part in parts if part)
-    if content is None:
-        return json.dumps(message, ensure_ascii=False)
-    return str(content)
-
-
-def _message_role(message: Any) -> str:
-    return str(message.get("role") or "") if isinstance(message, dict) else ""
-
-
-def _message_tool_name(message: Any) -> str:
-    if not isinstance(message, dict):
-        return ""
-    return str(message.get("name") or message.get("tool_name") or "")
-
-
-def _dedupe_and_gate(candidates: list[LearningCandidate], *, min_confidence: float, max_candidates: int) -> list[LearningCandidate]:
-    seen: set[str] = set()
-    accepted: list[LearningCandidate] = []
-    for candidate in candidates:
-        if candidate.learning_type not in VALID_LEARNING_TYPES:
-            continue
-        combined = "\n".join([candidate.lesson, candidate.trigger, candidate.mistake, candidate.correction, candidate.evidence, candidate.command])
-        if contains_secret(combined):
-            continue
-        if candidate.confidence < min_confidence:
-            continue
-        if candidate.candidate_id in seen:
-            continue
-        seen.add(candidate.candidate_id)
-        accepted.append(candidate)
-        if len(accepted) >= max_candidates:
-            break
-    return accepted
-
-
-def _extract_user_correction(user_content: str, assistant_content: str, *, source_hook: str) -> LearningCandidate | None:
-    text = (user_content or "").strip()
-    if not text or contains_secret(text):
-        return None
-    if not any(pattern.search(text) for pattern in _EXPLICIT_CORRECTION_PATTERNS):
-        return None
-    mistake = ""
-    correction = text
-    not_match = _NOT_PATTERN.search(text)
-    if not_match:
-        correction = not_match.group("correct").strip(" .,:;\n\t")
-        mistake = not_match.group("mistake").strip(" .,:;\n\t")
-    lesson = f"User correction: use {correction}."
-    if mistake:
-        lesson = f"User correction: use {correction}, not {mistake}."
-    return LearningCandidate(
-        lesson=lesson,
-        learning_type="user_correction",
-        trigger=text[:240],
-        mistake=mistake,
-        correction=correction,
-        evidence="Explicit user correction followed by assistant acknowledgement." if assistant_content else "Explicit user correction.",
-        confidence=0.9,
-        importance=8,
-        tags=["auto_candidate", "gated", "user_correction"],
-        source_hook=source_hook,
-        reason="explicit user correction signal",
-        source_text=text,
-        source_role="user",
-    )
-
-
-def extract_learning_candidates_from_turn(
-    user_content: str,
-    assistant_content: str,
-    *,
-    source_hook: str = "sync_turn",
-    min_confidence: float = 0.85,
-    max_candidates: int = 3,
-) -> list[LearningCandidate]:
-    candidates: list[LearningCandidate] = []
-    correction = _extract_user_correction(user_content, assistant_content, source_hook=source_hook)
-    if correction:
-        candidates.append(correction)
-    return _dedupe_and_gate(candidates, min_confidence=min_confidence, max_candidates=max_candidates)
-
-
-def _extract_tool_failure_candidates(messages: list[Any], *, source_hook: str) -> list[LearningCandidate]:
-    candidates: list[LearningCandidate] = []
-    for idx, message in enumerate(messages):
-        role = _message_role(message)
-        text = _message_text(message).strip()
-        if not text or contains_secret(text) or not _TOOL_FAILURE_PATTERN.search(text):
-            continue
-        is_toolish = role == "tool" or bool(_message_tool_name(message)) or "failed" in text.lower() or "error" in text.lower()
-        if not is_toolish:
-            continue
-        next_text = ""
-        for later in messages[idx + 1 : idx + 4]:
-            if _message_role(later) == "assistant":
-                next_text = _message_text(later).strip()
-                break
-        resolution = _RESOLUTION_PATTERN.search(next_text or "")
-        if not resolution or contains_secret(next_text):
-            continue
-        correction = resolution.group("body").strip()
-        lesson = f"When {text[:120]}, {correction}"
-        candidates.append(
-            LearningCandidate(
-                lesson=lesson,
-                learning_type="tool_failure_lesson",
-                trigger=text[:240],
-                mistake=text[:240],
-                correction=correction,
-                evidence=f"Tool failure followed by assistant correction: {next_text[:240]}",
-                tool_name=_message_tool_name(message),
-                command=_extract_command(text),
-                confidence=0.86,
-                importance=8,
-                tags=["auto_candidate", "gated", "tool_failure"],
-                source_hook=source_hook,
-                reason="tool failure with explicit follow-up correction",
-                # The tool row is not an eligible state.db row; the assistant reply that
-                # carries the correction is.
-                source_text=next_text,
-                source_role="assistant",
-            )
-        )
-    return candidates
-
-
-def _extract_command(text: str) -> str:
-    if "command" in text.lower():
-        return text[:160]
-    return ""
-
-
-def extract_learning_candidates_from_messages(
-    messages: list[Any],
-    *,
-    source_hook: str = "on_session_end",
-    min_confidence: float = 0.85,
-    max_candidates: int = 3,
-) -> list[LearningCandidate]:
-    candidates: list[LearningCandidate] = []
-    for idx, message in enumerate(messages):
-        if _message_role(message) != "user":
-            continue
-        assistant_text = ""
-        for later in messages[idx + 1 : idx + 3]:
-            if _message_role(later) == "assistant":
-                assistant_text = _message_text(later)
-                break
-        candidate = _extract_user_correction(_message_text(message), assistant_text, source_hook=source_hook)
-        if candidate:
-            candidates.append(candidate)
-    candidates.extend(_extract_tool_failure_candidates(messages, source_hook=source_hook))
-    return _dedupe_and_gate(candidates, min_confidence=min_confidence, max_candidates=max_candidates)

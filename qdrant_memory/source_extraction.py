@@ -1,9 +1,17 @@
+"""Source-first extraction: deterministic line signals, the extraction write gate, proposals.
+
+``extract_source_candidates_from_text`` stays because ``improve.py`` builds its candidates
+with it. ``evaluate_source_extraction_candidate`` and ``build_source_extraction_proposal`` are
+the gate and draft path of the extraction approval backend
+(``QdrantMemoryProvider.approve_extraction_candidate``). The session-hook producer that ran
+these rules over every compressed or ended transcript (``extract_source_candidates_from_messages``)
+and its preview were removed in capture CP1: it matched no message on the labelled sample.
+"""
 from __future__ import annotations
 
 import re
 from typing import Any, Iterable, Mapping
 
-from qdrant_memory.consolidation import redact_secrets
 from qdrant_memory.extraction_candidates import ExtractionCandidate, build_extraction_candidate
 from qdrant_memory.lesson_extractor import contains_secret
 from qdrant_memory.schema import build_assertion_payload, build_payload, clean_text_for_memory
@@ -35,31 +43,6 @@ _CANDIDATE_KIND_TO_MEMORY_KIND = {
     "graph_entity_candidate": {"graph_entity"},
     "graph_edge_candidate": {"graph_edge"},
 }
-
-
-def _message_text(message: Any) -> str:
-    if isinstance(message, str):
-        return message
-    if not isinstance(message, Mapping):
-        return str(message or "")
-    content = message.get("content")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, Mapping):
-                parts.append(str(item.get("text") or item.get("content") or ""))
-            else:
-                parts.append(str(item or ""))
-        return "\n".join(part for part in parts if part)
-    if content is None:
-        return ""
-    return str(content)
-
-
-def _message_role(message: Any) -> str:
-    return str(message.get("role") or "") if isinstance(message, Mapping) else ""
 
 
 def _clamp_confidence(value: float) -> float:
@@ -314,70 +297,6 @@ def extract_source_candidates_from_text(
     return _dedupe_candidates(candidates, max_candidates=max_candidates)
 
 
-def extract_source_candidates_from_messages(
-    messages: list[Any],
-    *,
-    source_uri: str,
-    source_type: str = "completed_turn",
-    lifecycle_id: str = "",
-    min_confidence: float = LOW_CONFIDENCE_DRAFT_THRESHOLD,
-    max_candidates: int = 8,
-) -> list[ExtractionCandidate]:
-    candidates: list[ExtractionCandidate] = []
-    for index, message in enumerate(messages or []):
-        locator = {"message_index": index}
-        role = _message_role(message)
-        if role:
-            locator["role"] = role
-        candidates.extend(
-            extract_source_candidates_from_text(
-                _message_text(message),
-                source_uri=source_uri,
-                source_type=source_type,
-                locator=locator,
-                derivation_type="completed_turn",
-                lifecycle_id=lifecycle_id,
-                min_confidence=min_confidence,
-                max_candidates=max_candidates,
-            )
-        )
-        if len(candidates) >= max_candidates:
-            break
-    return _dedupe_candidates(candidates, max_candidates=max_candidates)
-
-
-def extract_source_candidates_from_point(
-    point: Any,
-    *,
-    lifecycle_id: str = "",
-    min_confidence: float = LOW_CONFIDENCE_DRAFT_THRESHOLD,
-    max_candidates: int = 8,
-) -> list[ExtractionCandidate]:
-    if isinstance(point, Mapping):
-        point_id = str(point.get("id") or "")
-        raw_payload = point.get("payload")
-        payload = raw_payload if isinstance(raw_payload, Mapping) else {}
-        text = str(point.get("text") or payload.get("text") or "")
-    else:
-        point_id = str(getattr(point, "id", "") or "")
-        raw_payload = getattr(point, "payload", None)
-        payload = raw_payload if isinstance(raw_payload, Mapping) else {}
-        text = str(getattr(point, "text", "") or payload.get("text") or "")
-    source_uri = str(payload.get("source_uri") or (f"qdrant://memory/{point_id}" if point_id else ""))
-    locator = payload.get("locator") if isinstance(payload.get("locator"), Mapping) else {}
-    return extract_source_candidates_from_text(
-        text,
-        source_uri=source_uri,
-        source_type="recalled_point",
-        locator=locator,
-        derivation_type="recalled_point",
-        lifecycle_id=lifecycle_id,
-        min_confidence=min_confidence,
-        max_candidates=max_candidates,
-        point_id=point_id,
-    )
-
-
 def _candidate_payload_text(candidate: ExtractionCandidate) -> str:
     payload = candidate.proposed_payload or {}
     return str(payload.get("text") or payload.get("claim_text") or "")
@@ -415,20 +334,6 @@ def evaluate_source_extraction_candidate(
         persisted_payload=persisted_payload,
         low_confidence_threshold=LOW_CONFIDENCE_DRAFT_THRESHOLD,
     )
-
-
-def preview_source_extraction_candidates(candidates: list[ExtractionCandidate]) -> dict[str, Any]:
-    items: list[dict[str, Any]] = []
-    for candidate in candidates:
-        decision = evaluate_source_extraction_candidate(candidate)
-        item = redact_secrets(candidate.to_dict())
-        if not isinstance(item, dict):
-            item = candidate.to_dict()
-        item["write_decision"] = decision.to_dict()
-        item["would_store"] = decision.decision == "store"
-        item["would_create_proposal"] = decision.decision == "draft_review"
-        items.append(item)
-    return {"candidates": items, "count": len(items), "dry_run": True}
 
 
 def build_source_extraction_proposal(candidate: ExtractionCandidate, write_decision: WriteDecision | dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:

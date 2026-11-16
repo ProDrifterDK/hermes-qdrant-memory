@@ -845,10 +845,6 @@ def _build_provider(
                 "vector_size": 1024,
                 "learning_collection_name": "learnings",
                 "learning_enabled": True,
-                "learning_auto_extract_enabled": False,
-                "learning_auto_extract_mode": "preview",
-                "source_extraction_enabled": False,
-                "source_extraction_mode": "preview",
                 "consolidation_enabled": False,
                 "consolidation_persist_reports": True,
                 "reconsolidation_enabled": False,
@@ -871,8 +867,6 @@ def _build_provider(
             self._raptor_searcher = None
             self._graph_retriever = None
             # Collections referenced by _tool_status:
-            self._pending_learning_candidates = {}
-            self._pending_extraction_candidates = {}
 
         def _ensure_hybrid_router(self, collection_name):  # noqa: D401
             if hybrid_result is not None:

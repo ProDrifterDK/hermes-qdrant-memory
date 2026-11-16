@@ -28,18 +28,6 @@ DEFAULTS: dict[str, Any] = {
     "sync_turns": True,
     "sync_subagents": False,
     "learning_enabled": True,
-    "learning_auto_extract_enabled": False,
-    "learning_auto_extract_mode": "preview",
-    "learning_auto_extract_min_confidence": 0.85,
-    "learning_auto_extract_max_candidates_per_session": 3,
-    "learning_auto_extract_require_evidence": True,
-    "learning_auto_extract_semantic_dedupe_enabled": True,
-    "learning_auto_extract_semantic_dedupe_threshold": 0.9,
-    "learning_auto_extract_semantic_dedupe_top_k": 3,
-    "source_extraction_enabled": False,
-    "source_extraction_mode": "preview",
-    "source_extraction_min_confidence": 0.0,
-    "source_extraction_max_candidates_per_session": 8,
     "consolidation_enabled": False,
     "consolidation_report_max_points": 200,
     "consolidation_report_max_groups": 20,
@@ -177,6 +165,40 @@ DEFAULTS: dict[str, Any] = {
     "read_sources": [],
 }
 
+# Keys of the session-hook capture paths removed in capture CP1 (the learning heuristic and the
+# source-line hook extractor). Configs that still set them keep loading: the keys are ignored
+# and the first load that sees one logs a single warning for the process.
+DEPRECATED_KEY_PREFIXES: tuple[str, ...] = ("learning_auto_extract_", "source_extraction_")
+_deprecation_warned = False
+
+
+def deprecated_keys_set(*sources: Mapping[str, Any] | None) -> list[str]:
+    """The removed capture keys present in ``sources`` (config mappings or ``os.environ``)."""
+    found: set[str] = set()
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        for key in source:
+            name = str(key)
+            if name.startswith("HERMES_QDRANT_MEMORY_"):
+                name = name[len("HERMES_QDRANT_MEMORY_"):].lower()
+            if name.startswith(DEPRECATED_KEY_PREFIXES):
+                found.add(name)
+    return sorted(found)
+
+
+def _warn_deprecated_once(keys: list[str]) -> None:
+    global _deprecation_warned
+    if not keys or _deprecation_warned:
+        return
+    _deprecation_warned = True
+    logger.warning(
+        "qdrant_memory: ignoring removed capture settings %s; the session-hook learning and "
+        "source extraction paths no longer exist (see docs/capture.md). Remove them from your config.",
+        ", ".join(keys),
+    )
+
+
 TOOL_SURFACES: frozenset[str] = frozenset({"full", "recall"})
 READ_SOURCE_KINDS: frozenset[str] = frozenset({"memory", "learning"})
 
@@ -186,10 +208,6 @@ _BOOL_KEYS = {
     "sync_turns",
     "sync_subagents",
     "learning_enabled",
-    "learning_auto_extract_enabled",
-    "learning_auto_extract_require_evidence",
-    "learning_auto_extract_semantic_dedupe_enabled",
-    "source_extraction_enabled",
     "consolidation_enabled",
     "consolidation_persist_reports",
     "obsidian_adapter_enabled",
@@ -217,9 +235,6 @@ _INT_KEYS = {
     "max_chunk_tokens",
     "display_tokens",
     "index_max_files",
-    "learning_auto_extract_max_candidates_per_session",
-    "learning_auto_extract_semantic_dedupe_top_k",
-    "source_extraction_max_candidates_per_session",
     "consolidation_report_max_points",
     "consolidation_report_max_groups",
     "consolidation_stale_days",
@@ -245,7 +260,7 @@ _INT_KEYS = {
     "session_prefetch_total_chars",
     "session_prefetch_candidates",
 }
-_FLOAT_KEYS = {"session_prefetch_timeout_s", "session_recall_rerank_timeout_s", "session_recall_inline_catchup_seconds", "decay_rate", "min_raw_score", "min_final_score", "learning_auto_extract_min_confidence", "learning_auto_extract_semantic_dedupe_threshold", "source_extraction_min_confidence", "consolidation_duplicate_threshold", "guarded_auto_duplicate_min_confidence", "guarded_auto_learning_min_confidence", "reconsolidation_min_confidence", "manual_store_duplicate_threshold", "lineage_lock_timeout_seconds"}
+_FLOAT_KEYS = {"session_prefetch_timeout_s", "session_recall_rerank_timeout_s", "session_recall_inline_catchup_seconds", "decay_rate", "min_raw_score", "min_final_score", "consolidation_duplicate_threshold", "guarded_auto_duplicate_min_confidence", "guarded_auto_learning_min_confidence", "reconsolidation_min_confidence", "manual_store_duplicate_threshold", "lineage_lock_timeout_seconds"}
 _LIST_KEYS = {"index_dirs", "index_extensions", "index_exclude_dirs", "session_recall_exclude_sources"}
 # Automatic-recall relevance floors. "off" (also "", null, false) disables every one of them.
 # On the legacy floors 0 disables too (their scores are never negative); on the lane floors 0
@@ -477,11 +492,15 @@ def load_config(*, hermes_home: str | None = None, hermes_config: Mapping[str, A
     environment variables named HERMES_QDRANT_MEMORY_<KEY>.
     """
     merged: dict[str, Any] = dict(DEFAULTS)
-    merged.update({k: v for k, v in _load_json_config(hermes_home).items() if k in DEFAULTS})
+    json_config = _load_json_config(hermes_home)
+    merged.update({k: v for k, v in json_config.items() if k in DEFAULTS})
     root_cfg = dict(hermes_config) if hermes_config is not None else _load_hermes_config()
     section = root_cfg.get("qdrant_memory", {}) if isinstance(root_cfg, Mapping) else {}
     if isinstance(section, Mapping):
         merged.update({k: v for k, v in section.items() if k in DEFAULTS})
+    plugin_env = {k: v for k, v in os.environ.items() if k.startswith("HERMES_QDRANT_MEMORY_")}
+    _warn_deprecated_once(deprecated_keys_set(json_config, section if isinstance(section, Mapping) else None,
+                                              plugin_env))
     for key in DEFAULTS:
         env_key = f"HERMES_QDRANT_MEMORY_{key.upper()}"
         if env_key in os.environ:

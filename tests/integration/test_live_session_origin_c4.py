@@ -43,7 +43,7 @@ from typing import Any, Iterator
 
 import pytest
 
-from conftest import DeterministicEmbedding, _delete_and_verify
+from conftest import CP1_REMOVED_TOOLS, DeterministicEmbedding, _delete_and_verify
 from qdrant_memory.client import QdrantClient
 from qdrant_memory.config import load_config
 
@@ -455,7 +455,7 @@ def test_off_mode_is_byte_identical_to_base_except_the_new_tool(live, state, tmp
     base_out, head_out = outputs["base"], outputs["head"]
     # The one schema delta: the new read-only tool, on the full surface only.
     head_schemas = json.loads(head_out.pop("schemas_full"))
-    base_schemas = json.loads(base_out.pop("schemas_full"))
+    base_schemas = [s for s in json.loads(base_out.pop("schemas_full")) if s["name"] not in CP1_REMOVED_TOOLS]
     added = [s for s in head_schemas if s["name"] not in {b["name"] for b in base_schemas}]
     assert [s["name"] for s in added] == ["qdrant_memory_origin_check"], added
     assert [s for s in head_schemas if s["name"] != "qdrant_memory_origin_check"] == base_schemas

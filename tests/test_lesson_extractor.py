@@ -4,8 +4,6 @@ from qdrant_memory.lesson_extractor import (
     LearningCandidate,
     candidate_to_learning_args,
     contains_secret,
-    extract_learning_candidates_from_messages,
-    extract_learning_candidates_from_turn,
 )
 
 
@@ -14,69 +12,10 @@ def _credential_assignment(key: str, value: str, *, separator: str = "=") -> str
     return key + " " + separator + " " + value
 
 
-def test_extract_user_correction_candidate_requires_explicit_correction():
-    candidates = extract_learning_candidates_from_turn(
-        "Actually, my surname is Gárate, not Garate.",
-        "Thanks, I will spell it as Gárate from now on.",
-        source_hook="sync_turn",
-        min_confidence=0.8,
-    )
-
-    assert len(candidates) == 1
-    candidate = candidates[0]
-    assert candidate.learning_type == "user_correction"
-    assert "Gárate" in candidate.lesson
-    assert "Garate" in candidate.mistake
-    assert "Gárate" in candidate.correction
-    assert candidate.confidence >= 0.8
-    assert "auto_candidate" in candidate.tags
-    assert candidate.gated is True
-
-
-def test_no_candidate_for_generic_conversation():
-    candidates = extract_learning_candidates_from_turn(
-        "Tell me about Qdrant collections.",
-        "Qdrant collections hold vectors and payloads.",
-    )
-
-    assert candidates == []
-
-
-def test_extract_tool_failure_candidate_only_with_resolution():
-    messages = [
-        {"role": "user", "content": "Run the tests."},
-        {"role": "tool", "name": "terminal", "content": "pytest: command not found"},
-        {"role": "assistant", "content": "The terminal command failed. Correction: use <hermes-venv>/bin/python -m pytest tests -q."},
-    ]
-
-    candidates = extract_learning_candidates_from_messages(messages, source_hook="on_session_end", min_confidence=0.8)
-
-    assert len(candidates) == 1
-    candidate = candidates[0]
-    assert candidate.learning_type == "tool_failure_lesson"
-    assert candidate.tool_name == "terminal"
-    assert "pytest" in candidate.trigger
-    assert "<hermes-venv>/bin/python -m pytest" in candidate.correction
-    assert candidate.confidence >= 0.8
-
-
-def test_tool_failure_without_correction_is_ignored():
-    messages = [
-        {"role": "tool", "name": "terminal", "content": "curl failed with HTTP 500"},
-        {"role": "assistant", "content": "The command failed."},
-    ]
-
-    assert extract_learning_candidates_from_messages(messages, source_hook="on_session_end") == []
-
-
-def test_secret_bearing_candidate_is_blocked():
+def test_secret_bearing_text_is_detected():
     openai_like = "".join(["s", "k", "-", "1234567890abcdef"])
-    candidates = extract_learning_candidates_from_turn(
-        f"Actually, remember this API key: {openai_like} and use it for tests.",
-        "I will use that key.",
-    )
 
-    assert candidates == []
+    assert contains_secret(f"Actually, remember this API key: {openai_like} and use it for tests.")
 
 
 def test_bearer_github_aws_and_jwt_secrets_are_blocked():
@@ -94,7 +33,7 @@ def test_bearer_github_aws_and_jwt_secrets_are_blocked():
     ]
 
     for text in secret_inputs:
-        assert extract_learning_candidates_from_turn(text, "ok") == []
+        assert contains_secret(text)
 
 
 def test_contains_secret_preserves_credential_detection_while_ignoring_token_concepts():
@@ -322,18 +261,3 @@ def test_candidate_ids_are_stable_and_args_match_learning_store_shape():
     assert args["trigger"] == "pytest command not found"
     assert args["correction"] == "run venv/bin/python -m pytest"
     assert "auto_candidate" in args["tags"]
-
-
-def test_candidate_limit_is_enforced():
-    messages = []
-    for idx in range(10):
-        messages.extend(
-            [
-                {"role": "tool", "name": "terminal", "content": f"command {idx} failed with exit code 1"},
-                {"role": "assistant", "content": f"Correction: rerun command {idx} with --fixed."},
-            ]
-        )
-
-    candidates = extract_learning_candidates_from_messages(messages, max_candidates=3, min_confidence=0.8)
-
-    assert len(candidates) == 3

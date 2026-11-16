@@ -40,7 +40,7 @@ from typing import Any, Iterator
 
 import pytest
 
-from conftest import DeterministicEmbedding, _delete_and_verify
+from conftest import CP1_REMOVED_TOOLS, DeterministicEmbedding, _delete_and_verify
 from qdrant_memory.client import QdrantClient
 from qdrant_memory.config import load_config
 
@@ -87,10 +87,12 @@ RECEIPT: dict[str, Any] = {"oracle": "C'2 session_origin manual store", "cases":
 
 
 def _without_later_tools(schemas_json: str) -> str:
-    """The head schema list minus tools added after this oracle's base (C'4's origin-check,
-    whose own off-mode oracle pins that one entry), so the pin keeps checking everything else."""
+    """The schema list minus tools added after this oracle's base (C'4's origin-check, whose
+    own off-mode oracle pins that one entry) and tools capture CP1 removed, so the pin keeps
+    checking everything else."""
     return json.dumps([schema for schema in json.loads(schemas_json)
-                       if schema.get("name") not in {"qdrant_memory_origin_check"}], sort_keys=True)
+                       if schema.get("name") not in {"qdrant_memory_origin_check", *CP1_REMOVED_TOOLS}],
+                      sort_keys=True)
 
 
 # --- fixtures -----------------------------------------------------------------

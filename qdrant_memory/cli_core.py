@@ -1717,8 +1717,6 @@ def _format_status_summary(payload: dict[str, Any]) -> str:
         count = payload.get("learning_point_count")
         count_text = "unknown" if count is None else str(count)
         lines.append(f"learnings: {count_text} (collection: {payload.get('learning_collection_name')})")
-    if "pending_learning_candidate_count" in payload:
-        lines.append(f"pending_learning_candidates: {payload.get('pending_learning_candidate_count')}")
     return "\n".join(lines)
 
 
@@ -1874,22 +1872,6 @@ def _format_forget_summary(payload: dict[str, Any]) -> str:
     return f"Forgot memories: deleted={payload.get('deleted', 0)}"
 
 
-def _format_learning_preview_summary(payload: dict[str, Any]) -> str:
-    candidates = payload.get("candidates") if isinstance(payload.get("candidates"), list) else []
-    count = payload.get("count", len(candidates))
-    lines = [f"Pending learning candidates: {count}"]
-    for index, item in enumerate(candidates[:10], start=1):
-        if not isinstance(item, dict):
-            continue
-        candidate_id = item.get("candidate_id") or item.get("id") or "<unknown>"
-        learning_type = item.get("learning_type") or "learning"
-        lesson = _one_line(item.get("lesson") or item.get("text") or "", max_chars=180)
-        lines.append(f"{index}. {candidate_id} [{learning_type}] {lesson}".rstrip())
-    if len(candidates) > 10:
-        lines.append(f"... {len(candidates) - 10} more candidates not shown")
-    return "\n".join(lines)
-
-
 def _proposal_count(payload: dict[str, Any]) -> int:
     proposals = payload.get("proposals")
     if isinstance(proposals, list):
@@ -1957,13 +1939,6 @@ def _format_apply_summary(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _format_learning_approve_summary(payload: dict[str, Any]) -> str:
-    if payload.get("dry_run", True):
-        candidate = payload.get("candidate") if isinstance(payload.get("candidate"), dict) else {}
-        return f"Learning approval dry-run: candidate={candidate.get('candidate_id') or candidate.get('id') or '<unknown>'}"
-    return _format_store_summary(payload, learning=True)
-
-
 def _format_generic_summary(payload: Any, args: Namespace, tool_name: str = "") -> str:
     subcommand = getattr(args, "qdrant_subcommand", None) or tool_name or "command"
     if isinstance(payload, dict):
@@ -2003,10 +1978,6 @@ def _format_human_payload(payload: Any, args: Namespace, tool_name: str) -> str:
         return _format_index_summary(payload)
     if tool_name == "qdrant_memory_forget":
         return _format_forget_summary(payload)
-    if tool_name == "qdrant_learning_preview":
-        return _format_learning_preview_summary(payload)
-    if tool_name == "qdrant_learning_approve":
-        return _format_learning_approve_summary(payload)
     if tool_name == "qdrant_memory_consolidate":
         return _format_consolidate_summary(payload)
     if tool_name == "qdrant_memory_consolidation_apply":
@@ -2578,8 +2549,6 @@ def build_tool_call(args: Namespace) -> tuple[str, dict[str, Any]]:
             }
             tool_args.update(_search_filter_tool_args(args))
             return "qdrant_learning_search", tool_args
-        if learning_subcommand == "preview":
-            return "qdrant_learning_preview", {"include_metadata": args.include_metadata}
         if learning_subcommand == "store":
             lesson = _non_empty(args.lesson, "lesson")
             return "qdrant_learning_store", {
@@ -2596,10 +2565,6 @@ def build_tool_call(args: Namespace) -> tuple[str, dict[str, Any]]:
                 "tags": _split_tags(getattr(args, "tag", [])),
                 "promote_to_skill_candidate": args.promote_to_skill_candidate,
             }
-        if learning_subcommand == "approve":
-            _require_live_approval(args)
-            candidate_id = _non_empty(args.candidate_id, "candidate_id")
-            return "qdrant_learning_approve", {"candidate_id": candidate_id, "dry_run": args.dry_run}
 
     if subcommand == "watcher":
         watcher_subcommand = getattr(args, "watcher_subcommand", None)

@@ -57,14 +57,14 @@ SCHEMA = Path(__file__).resolve().parent / "fixtures" / "state_db_schema.sql"
 MEMORY, LEARNING, WINDOWS = "unit_memory", "unit_learnings", "unit_session_windows"
 _READ_POST = {"points", "points/search", "points/scroll", "points/count"}
 
-# The 26 tool names the plugin registered before the session expand tool existed, in order.
+# The tool names the plugin registers without the session expand tool, in order (capture CP1
+# removed the learning and extraction preview/approve tools).
 MAIN_TOOL_NAMES = [
     "qdrant_memory_status", "qdrant_memory_store", "qdrant_memory_search", "qdrant_memory_context",
     "qdrant_memory_index", "qdrant_memory_forget", "qdrant_memory_inspect", "qdrant_memory_trace",
     "qdrant_memory_expand", "qdrant_memory_source_status", "qdrant_memory_origin_check",
     "qdrant_learning_store", "qdrant_learning_search",
-    "qdrant_learning_preview", "qdrant_learning_approve", "qdrant_memory_extraction_preview",
-    "qdrant_memory_extraction_approve", "qdrant_memory_consolidate", "qdrant_memory_memory_pr",
+    "qdrant_memory_consolidate", "qdrant_memory_memory_pr",
     "qdrant_memory_consolidation_apply", "qdrant_memory_graph_search", "qdrant_memory_improve_preview",
     "qdrant_memory_improve_apply", "qdrant_memory_raptor_apply", "qdrant_memory_raptor_status",
     "qdrant_memory_retrieve", "qdrant_memory_session_recall",
