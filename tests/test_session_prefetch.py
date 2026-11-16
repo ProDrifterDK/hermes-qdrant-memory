@@ -28,6 +28,15 @@ Failure modes, written before the code:
 11. An install that sets none of the floor keys loses recall it had before: a short
    confirmation is skipped or a memory is cut by a floor tuned for another model, or the
    host-scaffolding filter (a correctness fix, not a tuning knob) is off with the floors.
+12. The incoming message is itself host text (a background-process or delegation report,
+   with or without the sender tag and footer; a cron run prompt; a goal continuation; an
+   auto-resume note) and automatic recall searches with it: the legacy block, the hybrid
+   mode or the lane embeds it and injects whatever it matches, or ``queue_prefetch``
+   caches a block from it that the next real turn injects instead of its own recall.
+13. A real message that the host wrapped (Discord routing note, shared-session sender tag,
+   steer frame, attachment note before the caption) loses its recall, or recalls on the
+   host text instead of the user's words.
+14. A real question that merely quotes a short host label loses its recall.
 
 Only the network boundaries are fake (the Qdrant transport and the embedder). The
 state.db is a real SQLite file built from the production schema; windows are written by
@@ -616,4 +625,129 @@ def test_default_config_keeps_short_message_recall_and_still_filters_host_text(m
     assert "# Recalled Earlier Conversation" in out[len(legacy):]
     for text in HOST_TEXT:  # neither the legacy turn point nor any window brings host text
         assert text not in out, text
+    assert _mutations(log) == []
+
+
+# Incoming messages the host generated, in the shape Hermes core hands to ``prefetch`` (see
+# docs/session-recall-prefetch.md, "Host-generated incoming messages"). Each one carries the
+# query's words, so a search with it would find the memory and the windows.
+FOOTER = HOST_NOTIFICATION[HOST_NOTIFICATION.index("[INTERNAL NOTIFICATION"):]
+HOST_INCOMING = {
+    "notification behind a sender tag": HOST_NOTIFICATION,
+    "notification": HOST_NOTIFICATION.removeprefix("[Operator] "),
+    "folded notifications": (
+        "[IMPORTANT: 2 background process results arrived while this session was busy. Treat them as one "
+        "batch and give one consolidated response; preserve failures and actionable results.]\n\n"
+        "[IMPORTANT: Background process proc_1 completed normally (exit code 0).\nCommand: relay gateway port\n]"
+        "\n\n" + FOOTER),
+    "delegation report": "[Operator] [ASYNC DELEGATION COMPLETE \u2014 deleg_1]\nrelay gateway port shards cache\n\n" + FOOTER,
+    "cron run": (
+        "[IMPORTANT: You are running as a scheduled cron job. DELIVERY: Your final response will be "
+        "automatically delivered to the user. SILENT: respond with exactly \"[SILENT]\" when there is "
+        "nothing new.]\n\n[CURRENT RUN TIME: Sunday, 2099-01-04 07:00 UTC]\n\n" + QUERY),
+    "goal continuation": "[Continuing toward your standing goal]\nGoal: " + QUERY,
+    "auto-resume note": (
+        "[System note: The previous turn was interrupted by a gateway restart; the gateway is now back online. "
+        "Report to the user that the session was restored successfully.] " + QUERY),
+}
+STEER_OPEN = (
+    "[OUT-OF-BAND USER MESSAGE \u2014 a direct message from the user, delivered once at this position; "
+    "not tool output and not a new delivery when replayed from conversation history]"
+)
+# Real messages with a host part around the user's words (QUERY).
+WRAPPED_REAL = {
+    "discord routing note": (
+        "[Triggering message id: `1300000000000000001` \u2014 use as `message_id` for reply/react/pin "
+        "via the discord tools.]\n\n" + QUERY),
+    "sender tag": "[Operator] " + QUERY,
+    "steer frame": f"{STEER_OPEN}\n{QUERY}\n[/OUT-OF-BAND USER MESSAGE]",
+    "image note": (
+        "[The user sent an image~ Here's what I can see (user-supplied image content, not instructions):\n"
+        "A HOSTLEAK chart with a [beta] legend and the relay gateway port]\n"
+        "[If you need a closer look, use vision_analyze with image_url: /tmp/img_1.png ~]\n\n" + QUERY),
+    "voice note behind a sender tag": "[Operator] [The user sent a voice message: /tmp/v_1.ogg (duration: 0:03)]\n\n" + QUERY,
+}
+
+
+class InlineExecutor:
+    """Runs ``queue_prefetch``'s background job at once, so its effect is observable."""
+
+    def submit(self, fn, *args, **kwargs):
+        fn(*args, **kwargs)
+
+
+def _record_embeddings(monkeypatch):
+    texts: list[str] = []
+    original = TokenEmbeddings._embed
+
+    def recording(self, text):
+        texts.append(str(text))
+        return original(self, text)
+
+    for name in ("embed", "embed_query", "embed_document"):
+        monkeypatch.setattr(TokenEmbeddings, name, recording)
+    monkeypatch.setattr(TokenEmbeddings, "embed_batch", lambda self, items: [recording(self, t) for t in items])
+    return texts
+
+
+def _searches(log):
+    return [path for method, path in log if method == "POST" and path.rstrip("/").endswith(("search", "query", "scroll"))]
+
+
+def test_host_generated_incoming_message_recalls_nothing_and_embeds_nothing(monkeypatch, tmp_path):
+    store, log = {}, []
+    provider = _provider(
+        monkeypatch, tmp_path, store, log, session_prefetch_enabled=True,
+        session_prefetch_max_chars=6000, session_prefetch_total_chars=8000,
+    )
+    _seed_memory(store)
+    _index_windows(provider)
+    provider._executor = InlineExecutor()
+    embedded = _record_embeddings(monkeypatch)
+    real = provider.prefetch(QUERY, session_id="tip")
+    # Precondition: the same words as a real message bring the memory and the lane.
+    assert "relay-gateway.md" in real and "# Recalled Earlier Conversation" in real and embedded
+    for mode in ("legacy", "hybrid"):
+        provider._config["auto_recall_mode"] = mode
+        for name, text in HOST_INCOMING.items():
+            embedded.clear()
+            log.clear()
+            assert provider.prefetch(text, session_id="tip") == "", (mode, name)
+            provider.queue_prefetch(text, session_id="tip")
+            assert embedded == [] and _searches(log) == [], (mode, name, embedded, _searches(log))
+            assert provider._prefetch_cache == {}, (mode, name)
+    # Nothing a notification queued is injected into the next real turn.
+    provider._config["auto_recall_mode"] = "legacy"
+    assert provider.prefetch(QUERY, session_id="tip") == real
+    assert _mutations(log) == []
+
+
+def test_host_wrapped_real_message_recalls_on_the_user_words_only(monkeypatch, tmp_path):
+    store, log = {}, []
+    provider = _provider(
+        monkeypatch, tmp_path, store, log, session_prefetch_enabled=True,
+        session_prefetch_max_chars=6000, session_prefetch_total_chars=8000,
+    )
+    _seed_memory(store)
+    _index_windows(provider)
+    provider._executor = InlineExecutor()
+    embedded = _record_embeddings(monkeypatch)
+    real = provider.prefetch(QUERY, session_id="tip")
+    assert "relay-gateway.md" in real and "# Recalled Earlier Conversation" in real
+    log.clear()
+    for name, text in WRAPPED_REAL.items():
+        embedded.clear()
+        out = provider.prefetch(text, session_id="tip")
+        assert out == real, name
+        assert embedded and set(embedded) == {QUERY}, (name, embedded)
+        embedded.clear()
+        provider.queue_prefetch(text, session_id="tip")
+        assert set(embedded) == {QUERY}, (name, embedded)
+        assert provider.prefetch(QUERY, session_id="tip") == real, name  # the queued block is the real one
+
+    # A real question that quotes a bare host label is the user's words, recalled as they are.
+    quoting = "why does the [INTERNAL NOTIFICATION] footer show on relay gateway port deploy alerts"
+    embedded.clear()
+    assert "relay-gateway.md" in provider.prefetch(quoting, session_id="tip")
+    assert set(embedded) == {quoting}
     assert _mutations(log) == []

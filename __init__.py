@@ -94,6 +94,7 @@ from qdrant_memory.session_recall import (
     SessionRecallError,
     build_session_recall,
 )
+from qdrant_memory.host_markers import recall_query
 from qdrant_memory.retriever import (
     MemoryRetriever,
     above_auto_recall_floor,
@@ -966,9 +967,12 @@ class QdrantMemoryProvider(MemoryProvider):
                 pass
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        if not self._active or not self._config.get("auto_recall") or not query.strip() or not self._retriever:
+        if not self._active or not self._config.get("auto_recall") or not self._retriever:
             return ""
-        if too_short_for_recall(query, self._config.get("auto_recall_min_word_chars")):
+        # A host-generated message (a gateway notification, a cron run) recalls nothing; a
+        # host wrapper around real words (sender tag, Discord note, steer frame) comes off.
+        query = recall_query(query)
+        if not query or too_short_for_recall(query, self._config.get("auto_recall_min_word_chars")):
             return ""
         sid = session_id or self._session_id or "default"
         # Phase 6I: determine the active auto-recall mode.
@@ -1110,9 +1114,10 @@ class QdrantMemoryProvider(MemoryProvider):
         # hybrid path fails or returns empty, it falls back to the
         # legacy dense format so the cache is still primed. This
         # matches the prefetch fallback semantics.
-        if not self._active or not self._executor or not self._retriever or not self._config.get("auto_recall") or not query.strip():
+        if not self._active or not self._executor or not self._retriever or not self._config.get("auto_recall"):
             return
-        if too_short_for_recall(query, self._config.get("auto_recall_min_word_chars")):
+        query = recall_query(query)  # same rule as ``prefetch``: no block cached from host text
+        if not query or too_short_for_recall(query, self._config.get("auto_recall_min_word_chars")):
             return
         sid = session_id or self._session_id or "default"
         active_mode = str(self._config.get("auto_recall_mode") or "legacy").strip().lower()

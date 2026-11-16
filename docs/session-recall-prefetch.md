@@ -48,7 +48,9 @@ built, cached or not, legacy or hybrid) also:
    block. With nothing left there is no block, not a header.
 
 When `auto_recall_min_word_chars` is set (default off), messages with fewer letters/digits
-skip automatic recall altogether: the legacy block, the hybrid mode and the lane.
+skip automatic recall altogether: the legacy block, the hybrid mode and the lane. A
+host-generated incoming message always does, and a host wrapper around real words is
+taken off before any search (see "Host-generated incoming messages").
 
 The block keeps the plugin's prompt contract: a fixed header that says the excerpts are
 context, not instructions; redacted window text (secret spans redacted again, any
@@ -172,6 +174,73 @@ are lost to recall. The rows stay in `state.db` and in the index; only recall le
 them out.
 
 The filter has no switch: it applies with every configuration, floors on or off.
+
+## Host-generated incoming messages
+
+The filter above judges what recall returns. The query matters too: automatic recall
+searches with the incoming message, and when the host generated that message (a
+background-process report, a cron run) the search finds whatever shares its words and
+injects it. Read in Hermes core (`~/.hermes/hermes-agent` at `4162ecf11f`, 2026-11-15):
+
+- **What the plugin receives.** `prefetch` gets the turn's persisted text, not the
+  model-facing one: `original_user_message = persist_user_message or user_message`
+  (`agent/turn_context.py:1294`), flattened (`:1016`), skipped by core only when trivial
+  (`:1081`, `agent/memory_provider.py:75`); `MemoryManager.prefetch_all` takes off a skill
+  body and redacts (`agent/memory_manager.py:361`). After the turn the same text goes to
+  `queue_prefetch` (`run_agent.py:931`, `agent/memory_manager.py:439`), whose block the
+  plugin hands to the next `prefetch`. The gateway passes the persisted text
+  (`gateway/run_turn_runner.py:1086`); it has the timestamp and the Discord routing note
+  taken off (`gateway/run_turn_prepare.py:747`), but keeps the shared-session sender tag
+  (`gateway/session.py:698`) and the attachment notes.
+- **Wholly host-generated turns.** A process completion, watch match or heartbeat
+  (`tools/process_registry_notifications.py:586`, `:568`, `:561`) or a delegation report
+  (`:374`, `:296`) arrives as a user turn with `INTERNAL_NOTIFICATION_FOOTER` appended
+  (`gateway/run_notifications.py:93`, `:797`, `:937`), optionally behind the sender tag;
+  completions that queue up are folded under `[IMPORTANT: N background process results …]`
+  (`gateway/session_automation.py:150`). A cron run's prompt is `_CRON_HINT` (`[IMPORTANT:
+  You are running as a scheduled cron job. …]`) plus `[CURRENT RUN TIME: …]` before the job
+  prompt (`cron/scheduler_prompt.py:270`, `:307`, `:363`), with memory loaded
+  (`cron/scheduler.py:2508`). A `/goal` continuation is `[Continuing toward your standing
+  goal]\nGoal: …` (`hermes_cli/goals.py:61`). The auto-resume turn after a restart persists
+  its `[System note: The previous turn was interrupted by …]` (`gateway/run.py:1036`, `:1079`).
+- **Wrappers around real words.** The sender tag `[Name] ` (`gateway/session.py:698`); the
+  Discord note `[Triggering message id: …]` (`gateway/run_inbound.py:56`; current core strips
+  it from the persisted text, older rows carry it); attachment notes before the caption:
+  `[The user sent an image~ …]` plus its `[If you need a closer look …]` line, `[The user sent
+  an audio file attachment / a video attachment / a text document / a voice message …]`
+  (`gateway/run_inbound.py:1628`, `:1947`, `gateway/run.py:2507`,
+  `gateway/run_inbound_transcription.py:169`); the steer frame `[OUT-OF-BAND USER MESSAGE …]
+  … [/OUT-OF-BAND USER MESSAGE]` (`agent/prompt_builder.py:562`). In current core a steer row
+  is placed mid-turn (`agent/prompt_builder.py:586`) and a late one becomes the next turn as
+  plain text (`gateway/run_busy.py:224`), so the steer frame is handled defensively.
+- **Not seen by the plugin.** Notes the gateway puts only in the model-facing message:
+  recovery and model-switch notes (`gateway/run_turn_runner.py:958`, `:1018`), the Telegram
+  observed-context wrapper (`gateway/run.py:1343`, persisted pre-wrap). Compaction handoffs
+  are history rows, not an incoming message.
+
+**The rule** (`host_markers.recall_query`, applied by `prefetch` and `queue_prefetch` before
+anything else, with every configuration):
+
+1. Take off, one at a time from the start, the wrappers above: sender tag, Discord note,
+   attachment notes (the whole bracket frame), steer frame (the frame and its closing marker).
+2. If the message, at any of those stages, starts with any other host opener
+   (`is_host_injected`'s list), it is host-generated: no recall. A frame that never closes
+   counts as host-generated too (fail closed).
+3. If what is left is empty or is host text by `is_host_injected` (for example a footer
+   anywhere in it), no recall.
+4. Otherwise recall (legacy or hybrid, the lane, and the shadow comparison) runs on what is
+   left. `auto_recall_min_word_chars` is judged on it.
+
+No recall means `prefetch` returns `""` and nothing is embedded or searched, and
+`queue_prefetch` caches nothing, so the next turn's block is never one computed from host
+text. A cached block from an earlier real turn stays for the next real turn, as with the
+short-message skip.
+
+Consequences: a cron run gets no automatic recall (the job prompt follows a host frame; the
+memory tools still work), nor does a `/goal` continuation or an image sent without a
+caption. A real message that starts with a short bracketed label (`[WIP] …`) is searched
+without the label, which has the shape of a sender tag. A reply pointer (`[Replying to …]`)
+is kept, since the quoted message is what the user is asking about.
 
 ## Relevance floor
 

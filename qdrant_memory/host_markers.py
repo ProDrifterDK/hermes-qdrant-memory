@@ -18,6 +18,9 @@ window can cut a row at any point and a partial frame is not reliably recognizab
 
 A real message that merely quotes a short marker (discussing the host's code) is kept:
 the anywhere-frames are the full host sentences, not the bracketed labels.
+
+``recall_query`` applies the same markers to the incoming message automatic recall
+searches with: ``""`` for a host-generated message, the user's words for a wrapped one.
 """
 from __future__ import annotations
 
@@ -122,3 +125,56 @@ def is_host_injected(content: object) -> bool:
     if any(frame in text for frame in _ANYWHERE):
         return True
     return any(head.startswith(_OPENERS) or _LCM_SUMMARY_RE.match(head) for head in _heads(text))
+
+
+# Host frames that wrap a real user message (the user's words follow, or sit inside):
+# agent/prompt_builder.py STEER_MARKER_OPEN / STEER_MARKER_CLOSE (format_steer_marker), and the
+# attachment notes gateway/run_inbound.py, gateway/run.py and gateway/run_inbound_transcription.py
+# put in front of the caption (an image note is followed by its "closer look" line).
+_STEER_OPEN = "[OUT-OF-BAND USER MESSAGE \u2014 a direct message from the user"
+_STEER_CLOSE = "[/OUT-OF-BAND USER MESSAGE]"
+_ATTACHMENT_NOTES = ("[The user sent ", "[If you need a closer look, use vision_analyze")
+
+
+def _frame_end(text: str) -> int:
+    """Index just past the bracket frame that opens ``text``; -1 when it never closes."""
+    depth = 0
+    for index, char in enumerate(text):
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return -1
+
+
+def recall_query(content: object) -> str:
+    """The words automatic recall may search with: ``""`` for a host-generated message.
+
+    The host wrappers around a real message (sender tag, Discord routing note, steer frame,
+    attachment notes) are taken off; what is left is the user's words. A message that is,
+    or after those wrappers starts with, any other host frame is host-generated and yields
+    ``""``, as does a frame that never closes (fail closed).
+    """
+    text = str(content or "").strip()
+    for _ in range(16):
+        if text.startswith((_STEER_OPEN, *_ATTACHMENT_NOTES)):
+            end = _frame_end(text)
+            if end < 0:
+                return ""
+            peeled = text[end:]
+            if text.startswith(_STEER_OPEN):
+                before, close, after = peeled.rpartition(_STEER_CLOSE)
+                peeled = before + after if close else peeled
+        elif text.startswith(_OPENERS) or _LCM_SUMMARY_RE.match(text):
+            return ""
+        else:
+            # One wrapper per pass, so each stage gets the opener check above.
+            peeled = _TRIGGER_NOTE_RE.sub("", text, count=1)
+            if peeled == text:
+                peeled = _SENDER_TAG_RE.sub("", text, count=1)
+        if peeled == text:
+            break
+        text = peeled.strip()
+    return "" if not text or is_host_injected(text) else text
