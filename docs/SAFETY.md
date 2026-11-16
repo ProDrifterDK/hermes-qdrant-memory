@@ -47,7 +47,7 @@ Dry-run-first applies to:
 
 - `qdrant_memory_index`;
 - `qdrant_memory_forget`;
-- `qdrant_learning_approve`;
+- the learning and extraction approval write paths (`approve_learning_candidate`, `approve_extraction_candidate`; no tool since capture CP1);
 - `qdrant_memory_consolidation_apply`;
 - `hermes qdrant restore`;
 - any future CLI wrapper for index, forget, learning approval, consolidation/apply, or watcher operations.

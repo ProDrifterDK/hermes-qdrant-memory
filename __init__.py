@@ -76,7 +76,7 @@ from qdrant_memory.lineage import (
     redact_lock_refusals,
     validate_lineage_impact_snapshot,
 )
-from qdrant_memory.lesson_extractor import LearningCandidate, candidate_to_learning_args, contains_secret, extract_learning_candidates_from_messages
+from qdrant_memory.lesson_extractor import LearningCandidate, candidate_to_learning_args, contains_secret
 from qdrant_memory.memory_pr import (
     MemoryPRValidationError,
     attach_review_point_snapshots,
@@ -105,11 +105,8 @@ from qdrant_memory.retriever import (
 from qdrant_memory.sources import expand_point, inspect_point, retrieve_point, source_status_for_point, trace_point
 from qdrant_memory.proposals import proposal_draft_metadata, write_proposal_draft
 from qdrant_memory.source_extraction import (
-    _message_text as source_message_text,
     build_source_extraction_proposal,
     evaluate_source_extraction_candidate,
-    extract_source_candidates_from_messages,
-    preview_source_extraction_candidates,
 )
 from qdrant_memory.improve import (
     IMPROVE_MAX_CANDIDATES_DEFAULT,
@@ -579,8 +576,9 @@ class QdrantMemoryProvider(MemoryProvider):
         self._chat_id_hash = ""
         self._active = False
         self._write_enabled = True
-        self._pending_learning_candidates: dict[str, LearningCandidate] = {}
-        self._pending_extraction_candidates: dict[str, Any] = {}
+        # Exact extraction candidate ids whose dry-run approval this process has shown; a live
+        # approval requires one. Candidates themselves are never held here: the hook producers
+        # that queued them in memory were removed (capture CP1).
         self._reviewed_extraction_candidate_ids: set[str] = set()
         self._pending_improve_reports: dict[str, dict[str, Any]] = {}
         self._reviewed_improve_candidate_keys: set[str] = set()
@@ -1225,167 +1223,26 @@ class QdrantMemoryProvider(MemoryProvider):
         if reset:
             with self._prefetch_lock:
                 self._prefetch_cache.clear()
-            self._pending_learning_candidates.clear()
-            self._pending_extraction_candidates.clear()
             self._reviewed_extraction_candidate_ids.clear()
             self._pending_improve_reports.clear()
             self._reviewed_improve_candidate_keys.clear()
             self._reviewed_raptor_keys.clear()
             self._pending_raptor_manifests.clear()
 
-    def _auto_learning_enabled(self) -> bool:
-        return bool(self._config.get("learning_enabled", True)) and bool(self._config.get("learning_auto_extract_enabled", False))
-
-    def _candidate_limits(self) -> tuple[float, int]:
-        try:
-            min_confidence = float(self._config.get("learning_auto_extract_min_confidence", 0.85))
-        except Exception:
-            min_confidence = 0.85
-        try:
-            max_candidates = int(self._config.get("learning_auto_extract_max_candidates_per_session", 3))
-        except Exception:
-            max_candidates = 3
-        return min_confidence, max(1, max_candidates)
-
-    def _is_semantic_duplicate_learning_candidate(self, candidate: LearningCandidate) -> bool:
-        if not self._config.get("learning_auto_extract_semantic_dedupe_enabled", True):
-            return False
-        store = self._ensure_learning_store()
-        if not store:
-            return False
-        try:
-            threshold = float(self._config.get("learning_auto_extract_semantic_dedupe_threshold", 0.9))
-        except Exception:
-            threshold = 0.9
-        try:
-            top_k = int(self._config.get("learning_auto_extract_semantic_dedupe_top_k", 3))
-        except Exception:
-            top_k = 3
-        query = "\n".join(part for part in [candidate.lesson, candidate.trigger, candidate.correction] if part)
-        try:
-            return bool(
-                store.find_semantic_duplicate(
-                    query,
-                    learning_type=candidate.learning_type,
-                    threshold=threshold,
-                    top_k=top_k,
-                )
-            )
-        except Exception:
-            logger.debug("Qdrant learning semantic dedupe failed open", exc_info=True)
-            return False
-
-    def _collect_learning_candidates(self, messages: list[Any], *, source_hook: str) -> list[LearningCandidate]:
-        if not self._auto_learning_enabled():
-            return []
-        mode = str(self._config.get("learning_auto_extract_mode") or "preview")
-        if mode not in {"preview", "store"}:
-            return []
-        min_confidence, max_candidates = self._candidate_limits()
-        remaining = max_candidates - len(self._pending_learning_candidates)
-        if remaining <= 0:
-            return []
-        candidates = extract_learning_candidates_from_messages(
-            messages,
-            source_hook=source_hook,
-            min_confidence=min_confidence,
-            max_candidates=remaining,
-        )
-        if self._config.get("learning_auto_extract_require_evidence", True):
-            candidates = [candidate for candidate in candidates if candidate.evidence.strip()]
-        accepted: list[LearningCandidate] = []
-        for candidate in candidates:
-            if len(self._pending_learning_candidates) >= max_candidates:
-                break
-            if candidate.candidate_id in self._pending_learning_candidates:
-                continue
-            if self._is_semantic_duplicate_learning_candidate(candidate):
-                continue
-            candidate.origin_capture = self._freeze_origin_capture(
-                source_hook, candidate.source_text, candidate.source_role)
-            self._pending_learning_candidates[candidate.candidate_id] = candidate
-            accepted.append(candidate)
-        if mode == "store":
-            # Intentionally conservative: M7.1 still routes through approval/dry-run.
-            logger.info("qdrant learning auto_extract_mode=store is not active yet; candidates kept pending")
-        return accepted
-
-    def _source_extraction_enabled(self) -> bool:
-        return bool(self._config.get("source_extraction_enabled", False))
-
-    def _source_extraction_limits(self) -> tuple[float, int]:
-        try:
-            min_confidence = float(self._config.get("source_extraction_min_confidence", 0.0))
-        except Exception:
-            min_confidence = 0.0
-        try:
-            max_candidates = int(self._config.get("source_extraction_max_candidates_per_session", 8))
-        except Exception:
-            max_candidates = 8
-        return max(0.0, min(1.0, min_confidence)), max(1, max_candidates)
-
-    def _collect_source_extraction_candidates(self, messages: list[Any], *, source_hook: str) -> list[Any]:
-        if not self._source_extraction_enabled():
-            return []
-        mode = str(self._config.get("source_extraction_mode") or "preview")
-        if mode not in {"preview", "store"}:
-            return []
-        min_confidence, max_candidates = self._source_extraction_limits()
-        remaining = max_candidates - len(self._pending_extraction_candidates)
-        if remaining <= 0:
-            return []
-        source_uri = f"session://{self._session_id or 'current'}/{source_hook}"
-        candidates = extract_source_candidates_from_messages(
-            messages,
-            source_uri=source_uri,
-            lifecycle_id=f"{self._session_id or 'current'}:{source_hook}",
-            min_confidence=min_confidence,
-            max_candidates=remaining,
-        )
-        accepted: list[Any] = []
-        for candidate in candidates:
-            if len(self._pending_extraction_candidates) >= max_candidates:
-                break
-            if candidate.candidate_id in self._pending_extraction_candidates:
-                continue
-            decision = evaluate_source_extraction_candidate(candidate)
-            if decision.decision == "reject":
-                continue
-            candidate = dataclasses.replace(candidate, origin_capture=self._freeze_origin_capture(
-                source_hook, *self._extraction_source_line(messages, candidate)))
-            self._pending_extraction_candidates[candidate.candidate_id] = candidate
-            accepted.append(candidate)
-        if mode == "store":
-            # Source extraction never auto-mutates; exact candidate approval remains required.
-            logger.info("qdrant source_extraction_mode=store is not active; candidates kept pending")
-        return accepted
-
     def on_pre_compress(self, messages: list[Any]) -> str:
-        learning_candidates = self._collect_learning_candidates(messages, source_hook="on_pre_compress")
-        source_candidates = self._collect_source_extraction_candidates(messages, source_hook="on_pre_compress")
-        blocks: list[str] = []
-        if learning_candidates:
-            lines = [
-                "# Qdrant Learning Candidates",
-                "Potential procedural lessons detected but not stored. Review with qdrant_learning_preview and approve explicitly.",
-            ]
-            for candidate in learning_candidates:
-                lines.append(f"- {candidate.candidate_id} [{candidate.learning_type}] {candidate.lesson[:220]}")
-            blocks.append("\n".join(lines))
-        if source_candidates:
-            lines = [
-                "# Qdrant Source Extraction Candidates",
-                "Potential source-backed memory/assertion candidates detected but not stored. Review with qdrant_memory_extraction_preview and approve explicitly.",
-            ]
-            for candidate in source_candidates:
-                text = str(candidate.proposed_payload.get("text") or "")[:220]
-                lines.append(f"- {candidate.candidate_id} [{candidate.candidate_type}] {text}")
-            blocks.append("\n".join(lines))
-        return "\n\n".join(blocks)
+        """Contributes nothing to the compression summary.
+
+        This hook used to run the learning heuristic and the source-line extractor and queue
+        their candidates in provider memory. Both were removed (capture CP1): on real data
+        they matched almost nothing a person wrote, the hooks fire for under half of the
+        conversation, and the in-memory queue died with the process. Capture now reads
+        state.db in a batch (``qdrant_memory.capture_reader``).
+        """
+        return ""
 
     def on_session_end(self, messages: list[Any]) -> None:
-        self._collect_learning_candidates(messages, source_hook="on_session_end")
-        self._collect_source_extraction_candidates(messages, source_hook="on_session_end")
+        """Collects nothing (see ``on_pre_compress``)."""
+        return None
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         schemas = RECALL_TOOL_SCHEMAS if self._recall_surface() else TOOL_SCHEMAS
@@ -1556,28 +1413,18 @@ class QdrantMemoryProvider(MemoryProvider):
         return build_session_origin(producer="manual_store", captured_session_id=self._session_id,
                                     captured_at=now, citation=citation)
 
-    # --- session origin for hook candidates and learnings (C'3) ---------------------
+    # --- session origin for extraction and learning candidates (C'3) ----------------
 
     def _freeze_origin_capture(self, source_hook: str, source_text: str, role: str) -> dict[str, Any]:
-        """The capture a hook candidate keeps until approval: never re-read from the approver.
+        """The capture a candidate keeps until approval: never re-read from the approver.
 
-        Recorded in every mode (it lives only on the in-memory candidate, never in an output),
-        so a candidate captured while the mode was off still cites its own session later.
+        Set on a candidate before it reaches ``approve_extraction_candidate`` or
+        ``approve_learning_candidate``. Recorded in every mode (it lives only on the
+        candidate, never in an output), so a candidate captured while the mode was off still
+        cites its own session later.
         """
         return {"session_id": self._session_id or "", "captured_at": self._utc_now_z(), "hook": source_hook,
                 "source_text": str(source_text or ""), "role": str(role or "")}
-
-    @staticmethod
-    def _extraction_source_line(messages: list[Any], candidate: Any) -> tuple[str, str]:
-        """The exact line the source extractor read for ``candidate`` (from its locator)."""
-        locator = candidate.locator if isinstance(candidate.locator, dict) else {}
-        index, line_no = locator.get("message_index"), locator.get("line_start")
-        if not isinstance(index, int) or not isinstance(line_no, int) or not 0 <= index < len(messages or []):
-            return "", ""
-        lines = source_message_text(messages[index]).splitlines()
-        if not 1 <= line_no <= len(lines):
-            return "", ""
-        return lines[line_no - 1], str(locator.get("role") or "")
 
     def _candidate_session_origin(self, producer: str, capture: Mapping[str, Any]) -> dict[str, Any]:
         """The ``session_origin`` an approval records: the candidate's captured session and
@@ -1730,12 +1577,6 @@ class QdrantMemoryProvider(MemoryProvider):
             "learning_collection_vector_size_matches": learning_collection_vector_size == self._config["vector_size"] if learning_collection_vector_size is not None else False,
             "learning_point_count": learning_point_count,
             "learning_enabled": self._config.get("learning_enabled", True),
-            "learning_auto_extract_enabled": self._config.get("learning_auto_extract_enabled", False),
-            "learning_auto_extract_mode": self._config.get("learning_auto_extract_mode", "preview"),
-            "pending_learning_candidate_count": len(self._pending_learning_candidates),
-            "source_extraction_enabled": self._config.get("source_extraction_enabled", False),
-            "source_extraction_mode": self._config.get("source_extraction_mode", "preview"),
-            "pending_extraction_candidate_count": len(self._pending_extraction_candidates),
             "consolidation_enabled": self._config.get("consolidation_enabled", False),
             "consolidation_persist_reports": self._config.get("consolidation_persist_reports", True),
             "consolidation_apply_enabled": True,
@@ -3042,21 +2883,19 @@ class QdrantMemoryProvider(MemoryProvider):
         except Exception as exc:
             return _json_error(f"Learning search failed: {exc}")
 
-    def _tool_learning_preview(self, args: dict) -> str:
-        include_metadata = bool(args.get("include_metadata", False))
-        candidates = [candidate.to_dict(include_metadata=include_metadata) for candidate in self._pending_learning_candidates.values()]
-        return json.dumps({"candidates": candidates, "count": len(candidates), "dry_run": True})
+    def approve_learning_candidate(self, candidate: LearningCandidate, *, dry_run: bool = True) -> str:
+        """Write path for one learning candidate: the learning write gate, then the store.
 
-    def _tool_learning_approve(self, args: dict) -> str:
+        The backend the learning approval route had before capture CP1, kept for the CP4
+        persisted review queue. It takes the candidate object itself; nothing is looked up
+        in provider memory. The origin it records is ``candidate.origin_capture`` (the
+        session the candidate came from), never the approver's session. Returns the same
+        JSON the ``qdrant_learning_approve`` tool returned.
+        """
         if not self._config.get("learning_enabled", True):
             return _json_error("Qdrant learning tools are disabled by qdrant_memory.learning_enabled")
-        candidate_id = str(args.get("candidate_id") or "").strip()
-        if not candidate_id:
-            return _json_error("candidate_id is required")
-        candidate = self._pending_learning_candidates.get(candidate_id)
-        if not candidate:
-            return _json_error(f"Unknown learning candidate: {candidate_id}")
-        dry_run = bool(args.get("dry_run", True))
+        if not isinstance(candidate, LearningCandidate):
+            return _json_error("a LearningCandidate is required")
         learning_args = candidate_to_learning_args(candidate)
         store = self._ensure_learning_store()
         learning_type = str(learning_args.get("learning_type") or "")
@@ -3112,22 +2951,14 @@ class QdrantMemoryProvider(MemoryProvider):
                 return _json_error("learning candidate requires manual draft review before storing")
             if not recorded:
                 point_id = store.store(**learning_args)
-                self._pending_learning_candidates.pop(candidate_id, None)
                 return json.dumps({"dry_run": False, "saved": bool(point_id), "id": point_id, "collection_name": self._config["learning_collection_name"], "write_decision": write_decision.to_dict()})
             origin = self._candidate_session_origin("learning_approval", candidate.origin_capture)
             point_id, origin_error = self._store_learning_with_origin(store, learning_args, origin)
             if origin_error:
                 return _json_error(origin_error)
-            self._pending_learning_candidates.pop(candidate_id, None)
             return json.dumps({"dry_run": False, "saved": bool(point_id), "id": point_id, "collection_name": self._config["learning_collection_name"], "write_decision": write_decision.to_dict(), "session_origin": self._origin_summary(origin)})
         except Exception as exc:
             return _json_error(f"Learning approval failed: {exc}")
-
-    def _tool_extraction_preview(self, args: dict) -> str:
-        candidates = list(self._pending_extraction_candidates.values())
-        preview = preview_source_extraction_candidates(candidates)
-        self._reviewed_extraction_candidate_ids.update(str(candidate.candidate_id) for candidate in candidates)
-        return json.dumps(preview)
 
     def _source_extraction_approval_payload(self, candidate: Any) -> dict[str, Any]:
         payload = dict(candidate.proposed_payload or {})
@@ -3146,15 +2977,20 @@ class QdrantMemoryProvider(MemoryProvider):
         )
         return payload
 
-    def _tool_extraction_approve(self, args: dict) -> str:
-        candidate_id = str(args.get("candidate_id") or "").strip()
+    def approve_extraction_candidate(self, candidate: Any, *, dry_run: bool = True, approve: bool = False) -> str:
+        """Write path for one source-extraction candidate (``ExtractionCandidate``).
+
+        The backend the extraction approval route had before capture CP1, kept for the CP4
+        persisted review queue: the extraction write gate (``evaluate_source_extraction_candidate``,
+        on the candidate and again on the persisted payload), the lineage overwrite refusal,
+        then the locked upsert that carries ``session_origin``. It takes the candidate object
+        itself; nothing is looked up in provider memory. A live approval still requires a
+        dry run of the same candidate id in this process first, and ``approve=True``.
+        Returns the same JSON the ``qdrant_memory_extraction_approve`` tool returned.
+        """
+        candidate_id = str(getattr(candidate, "candidate_id", "") or "").strip()
         if not candidate_id:
-            return _json_error("candidate_id is required")
-        candidate = self._pending_extraction_candidates.get(candidate_id)
-        if not candidate:
-            return _json_error(f"Unknown extraction candidate: {candidate_id}")
-        dry_run = parse_bool_arg(args.get("dry_run"), default=True)
-        approve = parse_bool_arg(args.get("approve"), default=False)
+            return _json_error("an extraction candidate with a candidate_id is required")
         write_decision = evaluate_source_extraction_candidate(candidate)
         proposal_payload: dict[str, Any] = {}
         if write_decision.decision == "draft_review":
@@ -3194,7 +3030,6 @@ class QdrantMemoryProvider(MemoryProvider):
                 config=self._config,
                 write_decision=write_decision,
             )
-            self._pending_extraction_candidates.pop(candidate_id, None)
             self._reviewed_extraction_candidate_ids.discard(candidate_id)
             draft_path = str(draft["path"])
             return json.dumps(
@@ -3233,7 +3068,6 @@ class QdrantMemoryProvider(MemoryProvider):
                     config=self._config,
                     write_decision=persisted_decision,
                 )
-                self._pending_extraction_candidates.pop(candidate_id, None)
                 self._reviewed_extraction_candidate_ids.discard(candidate_id)
                 draft_path = str(draft["path"])
                 return json.dumps(
@@ -3290,7 +3124,6 @@ class QdrantMemoryProvider(MemoryProvider):
                 self._locked_upsert_carrying_origin(
                     self._config["collection_name"], candidate.candidate_id, vector, payload,
                 )
-            self._pending_extraction_candidates.pop(candidate_id, None)
             self._reviewed_extraction_candidate_ids.discard(candidate_id)
             return json.dumps(
                 {
@@ -3326,7 +3159,7 @@ class QdrantMemoryProvider(MemoryProvider):
             elif point_ids:
                 source_scope = "point_ids"
             else:
-                source_scope = "pending_session"
+                return _json_error("source_text or point_ids is required")
 
         profile_id = self._profile_id
         all_candidates: list[Any] = []
@@ -3384,9 +3217,9 @@ class QdrantMemoryProvider(MemoryProvider):
             all_candidates = deduped[:max_candidates]
 
         elif source_scope == "pending_session":
-            # Use already-pending extraction candidates from session hooks
-            all_candidates = list(self._pending_extraction_candidates.values())[:max_candidates]
-            source_handles = [f"session://{session_id or 'current'}"]
+            # Its only input was the in-memory queue of the removed hook producers.
+            return _json_error("source_scope=pending_session was removed with the session hook producers; "
+                               "pass source_text or point_ids")
 
         else:
             return _json_error(f"unsupported source_scope: {source_scope}")
@@ -3422,15 +3255,14 @@ class QdrantMemoryProvider(MemoryProvider):
         """Freeze the origin capture of each conversation-born candidate of a preview (C'4).
 
         ``source_text`` under a ``session://`` URI: the preview's session and the exact line
-        the extractor read (the candidate's ``line_start``). ``pending_session``: the hook
-        capture the candidate already carries (C'3). ``point_ids``: never anything. A Qdrant
+        the extractor read (the candidate's ``line_start``). ``point_ids``: never anything. A Qdrant
         point, a legacy conversation turn above all, is not evidence of a ``state.db`` span
         (design 5.1), even when its session and its words are still in ``state.db``.
         Recorded in every mode in memory, like the hook captures. In recorded mode a
         persisted preview also writes them to a private sidecar next to the report (C'6), so
         a restart between preview and apply still cites the line.
         """
-        if source_scope not in ("source_text", "pending_session"):
+        if source_scope != "source_text":
             return
         if session_id == "current":  # the caller's spelling of "this session"
             session_id = self._session_id or ""
@@ -3441,15 +3273,12 @@ class QdrantMemoryProvider(MemoryProvider):
             key = (report_id, str(candidate.candidate_id))
             if key in captures:  # the first preview's capture time stands
                 continue
-            if source_scope == "source_text":
-                if not str(candidate.source_uri or "").startswith("session://"):
-                    continue
-                line_no = (candidate.locator if isinstance(candidate.locator, dict) else {}).get("line_start")
-                line = lines[line_no - 1] if isinstance(line_no, int) and 1 <= line_no <= len(lines) else ""
-                captures[key] = {"session_id": session_id or "", "captured_at": now, "hook": "improve_preview",
-                                 "source_text": line, "role": ""}
-            else:
-                captures[key] = dict(getattr(candidate, "origin_capture", None) or {})
+            if not str(candidate.source_uri or "").startswith("session://"):
+                continue
+            line_no = (candidate.locator if isinstance(candidate.locator, dict) else {}).get("line_start")
+            line = lines[line_no - 1] if isinstance(line_no, int) and 1 <= line_no <= len(lines) else ""
+            captures[key] = {"session_id": session_id or "", "captured_at": now, "hook": "improve_preview",
+                             "source_text": line, "role": ""}
         if persist and self._session_origin_mode() == "recorded":
             mine = {cid: capture for (rid, cid), capture in captures.items() if rid == report_id}
             try:
@@ -3469,6 +3298,7 @@ class QdrantMemoryProvider(MemoryProvider):
         the report but the source line is not, so the citation is ``unresolved:no_match``.
         """
         scope = str(report.get("source_scope") or "")
+        # pending_session: only in reports persisted before capture CP1 removed that scope.
         if scope not in ("source_text", "pending_session"):
             return None
         capture = self._improve_origin_captures.get((report_id, str(candidate.candidate_id)))
@@ -4934,14 +4764,6 @@ class QdrantMemoryProvider(MemoryProvider):
             return self._tool_learning_store(args)
         if tool_name == "qdrant_learning_search":
             return self._tool_learning_search(args)
-        if tool_name == "qdrant_learning_preview":
-            return self._tool_learning_preview(args)
-        if tool_name == "qdrant_learning_approve":
-            return self._tool_learning_approve(args)
-        if tool_name == "qdrant_memory_extraction_preview":
-            return self._tool_extraction_preview(args)
-        if tool_name == "qdrant_memory_extraction_approve":
-            return self._tool_extraction_approve(args)
         if tool_name == "qdrant_memory_graph_search":
             return self._tool_graph_search(args)
         if tool_name == "qdrant_memory_improve_preview":

@@ -1,7 +1,8 @@
 """C'3 oracle: hook candidates and learnings record the session they were captured in.
 
-Real path: the provider's hooks (``on_pre_compress``), ``on_session_switch`` and its
-learning / extraction approval and learning store tools against a real Qdrant, in
+Real path: ``on_session_switch``, the learning / extraction approval backends
+(``approve_learning_candidate`` / ``approve_extraction_candidate``) and the learning store
+tool against a real Qdrant, in
 disposable collections that must start with ``tmp_c3_``, and a synthetic ``state.db``
 built from the dumped host schema (``tests/fixtures/state_db_schema.sql``) that the product
 opens read-only. Vectors come from the deterministic integration embedder.
@@ -20,8 +21,15 @@ Cases (design 5.9, C'3) and the failure each one names:
                                           -- replace semantics on the learning upsert
   4 a learning re-store keeps the existing origin byte-equal
                                           -- the upsert dropping session_origin
-  5 session_origin_mode off is byte-identical to the pre-C'3 tree
-                                          -- off mode leaking schema/payload/output
+
+Capture CP1 removed the hook producer and the preview/approve tools. A candidate is now built
+here the way the hook built it (``conftest.captured_extraction_candidate`` /
+``captured_learning_candidate``: the same extractor and the capture frozen in the hook's
+session) and handed to the backend. Case 5 (off mode byte-identical to the pre-C'3 tree)
+replayed the hook -> preview -> approve tool journey, which no longer exists on head; it was
+retired with it. Off mode on the backends stays pinned by the C'6 oracle
+(``test_restores_with_the_mode_back_off_keep_the_recorded_origin``), and CP4 re-pins it for the
+queue-backed routes.
 
 Run: RUN_QDRANT_INTEGRATION=1 QDRANT_TEST_URL=http://127.0.0.1:6333 pytest tests/integration/test_live_session_origin_c3.py
 Set SESSION_ORIGIN_C3_RECEIPT=<path> to write the JSON receipt of the run there.
@@ -32,8 +40,6 @@ import hashlib
 import json
 import os
 import sqlite3
-import subprocess
-import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -42,7 +48,7 @@ from typing import Any, Iterator
 
 import pytest
 
-from conftest import DeterministicEmbedding, _delete_and_verify
+from conftest import DeterministicEmbedding, _delete_and_verify, captured_extraction_candidate, captured_learning_candidate
 from qdrant_memory.client import QdrantClient
 from qdrant_memory.config import load_config
 
@@ -54,11 +60,7 @@ pytestmark = pytest.mark.skipif(
 
 REPO = Path(__file__).resolve().parents[2]
 SCHEMA = REPO / "tests" / "fixtures" / "state_db_schema.sql"
-DRIVER = Path(__file__).resolve().parent / "session_origin_c3_offmode_driver.py"
-HERMES_AGENT = Path.home() / ".hermes" / "hermes-agent"
 PREFIX = "tmp_c3_"
-# main at the branch point of C'3: the tree off mode must be byte-identical to.
-C3_BASE = "f144bf2"
 _FORBIDDEN = {"hermes_memory", "hermes_learnings", "hermes_session_windows"}
 VECTOR_SIZE = 64
 
@@ -87,27 +89,13 @@ ROWS = [
     (SID_D, "user", "Say it again.", "d-u2"),
     (SID_D, "assistant", REPEATED, "d-a3"),
 ]
-# What Hermes hands on_pre_compress in session A: egress copies without ids.
-HOOK_A = [
-    {"role": "assistant", "content": DECISION + "\nI will note it."},
-    {"role": "user", "content": CORRECTION},
-    {"role": "assistant", "content": "Understood, the blue pool."},
-]
-HOOK_D = [
-    {"role": "assistant", "content": REPEATED},
-    {"role": "user", "content": "Say it again."},
-    {"role": "assistant", "content": REPEATED},
-]
+LESSON = {"lesson": "User correction: use the blue proxy pool, not the green one.", "learning_type": "user_correction",
+          "trigger": CORRECTION, "mistake": "the green one", "correction": "use the blue proxy pool",
+          "evidence": "Explicit user correction followed by assistant acknowledgement.", "confidence": 0.9,
+          "importance": 8}
 
 RECEIPT: dict[str, Any] = {"oracle": "C'3 session_origin on extraction approval, learning approval and learning store",
                            "cases": {}}
-
-
-def _without_later_tools(schemas_json: str) -> str:
-    """The head schema list minus tools added after this oracle's base (C'4's origin-check,
-    whose own off-mode oracle pins that one entry), so the pin keeps checking everything else."""
-    return json.dumps([schema for schema in json.loads(schemas_json)
-                       if schema.get("name") not in {"qdrant_memory_origin_check"}], sort_keys=True)
 
 
 # --- fixtures -----------------------------------------------------------------
@@ -213,9 +201,6 @@ def _provider(live: Live, db: Path, home: Path, session_id: str, mode: str = "re
         "session_origin_mode": mode,
         "vector_size": VECTOR_SIZE,
         "lineage_lock_dir": str(home / "locks"),
-        "learning_auto_extract_enabled": True,
-        "learning_auto_extract_semantic_dedupe_enabled": False,
-        "source_extraction_enabled": True,
     }})
     for key in ("collection_name", "learning_collection_name"):
         assert str(provider._config[key]).startswith(PREFIX), f"{key} resolved to {provider._config[key]!r}"
@@ -236,29 +221,18 @@ def _payload(live: Live, collection: str, point_id: str) -> dict[str, Any] | Non
     return points[0]["payload"] if points else None
 
 
-def _learning_candidate(provider) -> dict[str, Any]:
-    candidates = _call(provider, "qdrant_learning_preview", {})["candidates"]
-    return next(item for item in candidates if item["learning_type"] == "user_correction")
-
-
-def _extraction_candidate(provider, text: str) -> dict[str, Any]:
-    candidates = _call(provider, "qdrant_memory_extraction_preview", {})["candidates"]
-    return next(item for item in candidates if item["proposed_payload"].get("text") == text)
-
-
-def _approve_learning(provider, candidate_id: str) -> dict[str, Any]:
-    dry = _call(provider, "qdrant_learning_approve", {"candidate_id": candidate_id})
+def _approve_learning(provider, candidate) -> dict[str, Any]:
+    dry = json.loads(provider.approve_learning_candidate(candidate))
     assert dry.get("dry_run") is True, dry
-    live_result = _call(provider, "qdrant_learning_approve", {"candidate_id": candidate_id, "dry_run": False})
+    live_result = json.loads(provider.approve_learning_candidate(candidate, dry_run=False))
     assert live_result.get("saved") is True, live_result
     return {"dry": dry, "live": live_result}
 
 
-def _approve_extraction(provider, candidate_id: str) -> dict[str, Any]:
-    dry = _call(provider, "qdrant_memory_extraction_approve", {"candidate_id": candidate_id})
+def _approve_extraction(provider, candidate) -> dict[str, Any]:
+    dry = json.loads(provider.approve_extraction_candidate(candidate))
     assert dry.get("dry_run") is True, dry
-    live_result = _call(provider, "qdrant_memory_extraction_approve",
-                        {"candidate_id": candidate_id, "dry_run": False, "approve": True})
+    live_result = json.loads(provider.approve_extraction_candidate(candidate, dry_run=False, approve=True))
     assert live_result.get("saved") is True, live_result
     return {"dry": dry, "live": live_result}
 
@@ -269,13 +243,13 @@ def _approve_extraction(provider, candidate_id: str) -> dict[str, Any]:
 def test_hook_in_a_approved_after_compression_switch_records_origin_a(live, state, tmp_path):
     db, ids = state
     provider = _provider(live, db, tmp_path, SID_A)
-    provider.on_pre_compress(HOOK_A)
+    learning_candidate = captured_learning_candidate(provider, CORRECTION, **LESSON)
+    extraction_candidate = captured_extraction_candidate(provider, DECISION + "\nI will note it.", DECISION)
     provider.on_session_switch(SID_A2, parent_session_id=SID_A, reset=False, reason="compression")
-    assert provider._session_id == SID_A2  # the approver is A', the hook ran in A
+    assert provider._session_id == SID_A2  # the approver is A', the capture was made in A
 
-    learning = _approve_learning(provider, _learning_candidate(provider)["candidate_id"])
-    extraction = _approve_extraction(provider, _extraction_candidate(provider, "Decision: route staging traffic "
-                                                                     "through the blue proxy pool.")["candidate_id"])
+    learning = _approve_learning(provider, learning_candidate)
+    extraction = _approve_extraction(provider, extraction_candidate)
 
     learning_origin = _payload(live, live.learnings, learning["live"]["id"])["session_origin"]
     extraction_origin = _payload(live, live.memory, extraction["live"]["id"])["session_origin"]
@@ -311,10 +285,9 @@ def test_hook_in_a_approved_after_compression_switch_records_origin_a(live, stat
 def test_a_source_line_found_twice_is_ambiguous_and_still_stored(live, state, tmp_path):
     db, ids = state
     provider = _provider(live, db, tmp_path, SID_D)
-    provider.on_pre_compress(HOOK_D)
-    candidate = _extraction_candidate(provider, "Decision: pin the scheduler to two workers.")
+    candidate = captured_extraction_candidate(provider, REPEATED, REPEATED)
 
-    extraction = _approve_extraction(provider, candidate["candidate_id"])
+    extraction = _approve_extraction(provider, candidate)
 
     origin = _payload(live, live.memory, extraction["live"]["id"])["session_origin"]
     assert origin["captured_session_id"] == SID_D
@@ -332,10 +305,9 @@ def test_a_source_line_found_twice_is_ambiguous_and_still_stored(live, state, tm
 def test_restoring_a_learning_from_session_b_merges_its_citations(live, state, tmp_path):
     db, ids = state
     provider = _provider(live, db, tmp_path, SID_A)
-    provider.on_pre_compress(HOOK_A)
+    candidate = captured_learning_candidate(provider, CORRECTION, **LESSON)
     provider.on_session_switch(SID_A2, parent_session_id=SID_A, reset=False, reason="compression")
-    candidate_id = _learning_candidate(provider)["candidate_id"]
-    approved = _approve_learning(provider, candidate_id)
+    approved = _approve_learning(provider, candidate)
     point_id = approved["live"]["id"]
     first = _payload(live, live.learnings, point_id)["session_origin"]
 
@@ -384,53 +356,4 @@ def test_the_learning_upsert_keeps_an_existing_origin(live, state, tmp_path):
         "importance_before": before["importance"], "importance_after": after["importance"],
         "origin_unchanged": True, "producer": after["session_origin"]["producer"],
         "citation_basis": after["session_origin"]["citations"][0]["basis"], "pass": True,
-    }
-
-
-def test_off_mode_is_byte_identical_to_base(live, state, tmp_path):
-    db, _ids = state
-    base = tmp_path / "base"
-    base.mkdir()
-    # A scratch copy made with `git archive` (the bite harness) is not a git checkout; it
-    # names the checkout that holds C3_BASE through SESSION_ORIGIN_BASE_REPO.
-    git_dir = os.environ.get("SESSION_ORIGIN_BASE_REPO", "").strip() or str(REPO)
-    archive = subprocess.run(["git", "-C", git_dir, "archive", C3_BASE], capture_output=True)
-    if archive.returncode != 0:
-        pytest.skip(f"base commit {C3_BASE} is not available here: {archive.stderr.decode()[:200]}")
-    subprocess.run(["tar", "-x", "-C", str(base)], input=archive.stdout, check=True)
-    outputs = {}
-    for label, tree in (("base", base), ("head", REPO)):
-        home = tmp_path / f"home-{label}"
-        home.mkdir()
-        out = tmp_path / f"{label}.json"
-        run = subprocess.run(
-            [sys.executable, str(DRIVER), str(tree), str(HERMES_AGENT), live.qdrant_url, live.memory,
-             live.learnings, str(db), str(home), str(out)],
-            capture_output=True, text=True, cwd=str(tmp_path), timeout=120,
-        )
-        assert run.returncode == 0, f"{label} driver failed: {run.stderr[-2000:]}"
-        outputs[label] = json.loads(out.read_text(encoding="utf-8"))
-        for collection in (live.memory, live.learnings):  # each tree starts from empty collections
-            ids = [p["id"] for p in live.qdrant.scroll_page(collection, {}, limit=100, with_payload=False)[0]]
-            if ids:
-                live.qdrant.delete_ids(collection, ids)
-            assert live.qdrant.count(collection) == 0
-
-    for label in ("base", "head"):
-        outputs[label]["schemas"] = _without_later_tools(outputs[label]["schemas"])
-    differing = sorted(key for key in outputs["base"] if outputs["base"][key] != outputs["head"].get(key))
-    assert set(outputs["base"]) == set(outputs["head"])
-    assert not differing, {key: (outputs["base"][key], outputs["head"][key]) for key in differing}
-    for key in ("learning_payload", "extraction_payload", "learning_payload_final"):
-        assert "session_origin" not in outputs["head"][key], key
-    assert json.loads(outputs["head"]["extraction_approve"]).get("saved") is True
-    assert json.loads(outputs["head"]["learning_approve"]).get("saved") is True
-    RECEIPT["cases"]["off_mode_byte_identical"] = {
-        "base": C3_BASE,
-        "observables": {
-            key: hashlib.sha256(value.replace(live.memory, "<memory>").replace(live.learnings, "<learnings>")
-                                .encode("utf-8")).hexdigest()
-            for key, value in sorted(outputs["head"].items())
-        },
-        "differing": differing, "pass": True,
     }

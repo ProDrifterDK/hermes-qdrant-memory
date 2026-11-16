@@ -56,7 +56,7 @@ This document describes the `v0.5.0` and later `hermes qdrant ...` command-line 
 - `store`, `learning store`
   - Default: saved ID summary.
   - `--json`: raw provider store JSON.
-- `index`, `forget`, `learning approve`, `consolidate`, `watcher run`, `apply`
+- `index`, `forget`, `consolidate`, `watcher run`, `apply`
   - Default: safety-oriented summary showing dry-run/live state, IDs, proposal counts, and affected counts.
   - `--json`: raw provider JSON.
 - `export`, `backup create`, `backup list`, `backup inspect`, `restore`

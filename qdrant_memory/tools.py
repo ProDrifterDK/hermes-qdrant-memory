@@ -267,57 +267,6 @@ LEARNING_SEARCH_SCHEMA = {
     },
 }
 
-LEARNING_PREVIEW_SCHEMA = {
-    "name": "qdrant_learning_preview",
-    "description": "Preview gated automatic learning candidates detected from session/compression hooks. Dry-run only; does not store memories.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "include_metadata": {"type": "boolean", "description": "Include hook/source metadata. Defaults to false."},
-        },
-        "additionalProperties": False,
-    },
-}
-
-LEARNING_APPROVE_SCHEMA = {
-    "name": "qdrant_learning_approve",
-    "description": "Approve one pending gated learning candidate by candidate_id. Dry-run defaults to true; live mode stores to the learning collection only.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "candidate_id": {"type": "string", "description": "Candidate ID from qdrant_learning_preview."},
-            "dry_run": {"type": "boolean", "description": "When true, preview approval without storing. Defaults to true."},
-        },
-        "required": ["candidate_id"],
-        "additionalProperties": False,
-    },
-}
-
-SOURCE_EXTRACTION_PREVIEW_SCHEMA = {
-    "name": "qdrant_memory_extraction_preview",
-    "description": "Preview pending source-first extraction candidates. Dry-run only; does not embed or mutate Qdrant.",
-    "parameters": {
-        "type": "object",
-        "properties": {},
-        "additionalProperties": False,
-    },
-}
-
-SOURCE_EXTRACTION_APPROVE_SCHEMA = {
-    "name": "qdrant_memory_extraction_approve",
-    "description": "Approve one pending source-first extraction candidate by exact candidate_id. Dry-run defaults to true; live mode also requires approve=true.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "candidate_id": {"type": "string", "description": "Candidate ID from qdrant_memory_extraction_preview."},
-            "dry_run": {"type": "boolean", "description": "When true, preview approval without storing or writing drafts. Defaults to true."},
-            "approve": {"type": "boolean", "description": "Required true when dry_run=false."},
-        },
-        "required": ["candidate_id"],
-        "additionalProperties": False,
-    },
-}
-
 CONSOLIDATE_SCHEMA = {
     "name": "qdrant_memory_consolidate",
     "description": "Generate a dry-run sleep consolidation report and optionally persist it as a local artifact. Live memory actions require qdrant_memory_consolidation_apply.",
@@ -424,8 +373,8 @@ IMPROVE_PREVIEW_SCHEMA = {
         "properties": {
             "source_scope": {
                 "type": "string",
-                "enum": ["source_text", "point_ids", "pending_session"],
-                "description": "Source scope for candidate extraction. Defaults to source_text if source_text is given, else pending_session.",
+                "enum": ["source_text", "point_ids"],
+                "description": "Source scope for candidate extraction. Defaults to source_text if source_text is given, else point_ids.",
             },
             "source_text": {
                 "type": "string",
@@ -732,10 +681,6 @@ TOOL_SCHEMAS = [
     ORIGIN_CHECK_SCHEMA,
     LEARNING_STORE_SCHEMA,
     LEARNING_SEARCH_SCHEMA,
-    LEARNING_PREVIEW_SCHEMA,
-    LEARNING_APPROVE_SCHEMA,
-    SOURCE_EXTRACTION_PREVIEW_SCHEMA,
-    SOURCE_EXTRACTION_APPROVE_SCHEMA,
     CONSOLIDATE_SCHEMA,
     MEMORY_PR_SCHEMA,
     CONSOLIDATION_APPLY_SCHEMA,

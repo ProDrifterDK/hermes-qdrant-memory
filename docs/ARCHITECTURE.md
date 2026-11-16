@@ -91,9 +91,7 @@ Learning payloads also carry `trigger`, `mistake`, `correction`, `evidence`, `to
 
 M7 is manual/gated: use `qdrant_learning_store` and `qdrant_learning_search`. `qdrant_memory.learning_enabled` controls whether learning tools are available.
 
-M7.1 adds gated automatic extraction candidates from `on_pre_compress` and `on_session_end`. Automatic extraction is disabled by default (`learning_auto_extract_enabled: false`). When enabled, heuristics detect explicit user corrections and tool failures with explicit follow-up corrections, then place candidates in an in-memory pending buffer. The candidates are reviewed with `qdrant_learning_preview` and stored only after explicit `qdrant_learning_approve` with `dry_run: false`. There is still no blind auto-store path.
-
-M7.2 adds semantic dedupe before candidates enter the pending buffer. It queries existing `hermes_learnings` with the same scope and `learning_type`, uses raw Qdrant similarity, does not update access metadata, and fails open if Qdrant/embeddings are unavailable.
+M7.1/M7.2 (heuristic learning candidates from `on_pre_compress` / `on_session_end`, held in an in-memory pending buffer with semantic dedupe, reviewed through `qdrant_learning_preview` / `qdrant_learning_approve`) and the source-line hook extractor were removed in capture CP1: on real conversations they matched almost nothing a person wrote, the hooks never run for reaped sessions, and the buffer died with the process. Both hooks are no-ops. The learning and extraction approval write paths remain as provider methods for the persisted capture queue, which reads `state.db` in a batch through `qdrant_memory/capture_reader.py` (see [capture.md](capture.md)).
 
 ## M8/M9/M10 sleep consolidation
 

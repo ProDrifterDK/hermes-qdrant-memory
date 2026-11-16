@@ -150,9 +150,6 @@ def test_build_tool_call_maps_read_only_commands():
         {"query": "tool failure", "top_k": 2, "learning_type": None, "include_metadata": False},
     )
 
-    preview = parser.parse_args(["qdrant", "learning", "preview", "--include-metadata"])
-    assert build_tool_call(preview) == ("qdrant_learning_preview", {"include_metadata": True})
-
     inspect = parser.parse_args(["qdrant", "inspect", "point-1"])
     assert build_tool_call(inspect) == ("qdrant_memory_inspect", {"point_id": "point-1", "collection": "memory"})
 
@@ -1090,12 +1087,6 @@ def test_provider_backed_commands_default_to_human_summaries_and_json_can_remain
             ["Memory not saved: duplicate found", "duplicate_id: m-existing", "duplicate_score: 0.930"],
         ),
         (
-            ["qdrant", "learning", "preview"],
-            "qdrant_learning_preview",
-            '{"candidates":[{"candidate_id":"c1","learning_type":"workflow","lesson":"Prefer exact IDs"}],"count":1,"dry_run":true}',
-            ["Pending learning candidates: 1", "1. c1 [workflow] Prefer exact IDs"],
-        ),
-        (
             ["qdrant", "watcher", "run", "--scope", "memory"],
             "qdrant_memory_consolidate",
             '{"dry_run":true,"report_only":true,"report_id":"r1","scope":"memory","proposals":[{"proposal_id":"p1"},{"proposal_id":"p2"}],"summary":{"duplicate_cluster":2}}',
@@ -1478,8 +1469,8 @@ def test_build_tool_call_maps_store_with_comma_friendly_tags():
         parser.parse_args(["qdrant", "store", "x", "--importance", "11"])
 
 
-def test_build_tool_call_maps_learning_store_and_approve_gate():
-    from qdrant_memory.cli_core import CliUsageError, build_tool_call
+def test_build_tool_call_maps_learning_store_and_no_approve_command():
+    from qdrant_memory.cli_core import build_tool_call
 
     parser = _parser()
     store = parser.parse_args([
@@ -1527,15 +1518,11 @@ def test_build_tool_call_maps_learning_store_and_approve_gate():
         },
     )
 
-    dry_run = parser.parse_args(["qdrant", "learning", "approve", "candidate-1"])
-    assert build_tool_call(dry_run) == ("qdrant_learning_approve", {"candidate_id": "candidate-1", "dry_run": True})
-
-    unapproved = parser.parse_args(["qdrant", "learning", "approve", "candidate-1", "--no-dry-run"])
-    with pytest.raises(CliUsageError, match="--approve is required"):
-        build_tool_call(unapproved)
-
-    live = parser.parse_args(["qdrant", "learning", "approve", "candidate-1", "--no-dry-run", "--approve"])
-    assert build_tool_call(live) == ("qdrant_learning_approve", {"candidate_id": "candidate-1", "dry_run": False})
+    # `learning preview` / `learning approve` read the in-memory hook queue that capture CP1
+    # removed; the parser no longer offers them.
+    for removed in (["qdrant", "learning", "preview"], ["qdrant", "learning", "approve", "candidate-1"]):
+        with pytest.raises(SystemExit):
+            parser.parse_args(removed)
 
 
 def test_watcher_status_missing_state_without_provider(monkeypatch, tmp_path, capsys):

@@ -23,11 +23,19 @@ Safety:
   and a temporary HERMES_HOME; ``HERMES_QDRANT_MEMORY_*`` variables are ignored.
 - The receipt carries ids, digests and statuses only, never message text.
 
+Capture CP1 removed the session-hook producers (learning heuristic, source-line hook
+extractor) and the extraction/learning preview and approve tools that read their in-memory
+queue. The two checks that went through them now build the candidate the hook used to build
+(same extractor, capture frozen in the source session) and call the surviving write paths,
+``approve_extraction_candidate`` / ``approve_learning_candidate``. The receipt lists them under
+``cp1_changed_checks``.
+
 Prints a JSON receipt with one entry per check and exits non-zero if any check fails.
 """
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import io
 import json
@@ -53,6 +61,17 @@ PROFILE = "c6-e2e"
 MAX_SCAN_SESSIONS = 400
 MAX_HOOK_ROWS = 80
 MAX_MESSAGE_CHARS = 6000
+CP1_CHANGED_CHECKS = {
+    "extraction_after_switch_captured_session_wins": (
+        "was hook on_pre_compress -> qdrant_memory_extraction_preview/_approve tools; now the same source "
+        "extractor builds the candidate from a real row, the capture is frozen in its session, and "
+        "approve_extraction_candidate (the surviving write path) approves it after the session switch"),
+    "learning_approval_then_store_merges": (
+        "was the removed learning heuristic -> qdrant_learning_preview/_approve tools; now a learning candidate "
+        "whose source is one real user row (lesson text synthetic) goes through approve_learning_candidate"),
+    "off_mode_restores_keep_origin": (
+        "the extraction replay goes through approve_extraction_candidate instead of the removed approve tool"),
+}
 
 
 # --- independent digests (design 5.2 / G1 byte formats, not the module under test) ------
@@ -132,6 +151,17 @@ def make_synthetic_state_db(path: Path) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def learning_candidate(run: str, line: str):
+    """A learning candidate whose source is ``line`` (one real user row); the lesson is synthetic."""
+    from qdrant_memory.lesson_extractor import LearningCandidate
+
+    return LearningCandidate(lesson=f"C6 e2e learning {run}: keep the citation on the exact source row.",
+                             learning_type="environment_quirk", trigger=f"c6 e2e {run}",
+                             correction="cite the exact source row", evidence="C6 e2e synthetic lesson.",
+                             confidence=0.9, importance=7, source_hook="on_pre_compress", source_text=line,
+                             source_role="user")
 
 
 # --- receipt ---------------------------------------------------------------------------
@@ -296,9 +326,6 @@ class Context:
             "session_origin_mode": mode,
             "vector_size": self.vector_size,
             "lineage_lock_dir": str(self.home / "locks"),
-            "learning_auto_extract_enabled": True,
-            "learning_auto_extract_semantic_dedupe_enabled": False,
-            "source_extraction_enabled": True,
             "sync_turns": False,
         }
 
@@ -313,6 +340,7 @@ class Context:
         self.report["hermes_config_read"] = False
         from qdrant_memory.session_origin import origin_size  # noqa: F401 - import proves the plugin path
         self.report["plugin_root"] = str(PLUGIN_ROOT)
+        self.report["cp1_changed_checks"] = CP1_CHANGED_CHECKS
         self.picks = Picker(self.state_db, self).pick()
         self.report["picked"] = self.picks["summary"]
 
@@ -525,16 +553,14 @@ class Context:
         pick = self.picks["extraction"]
         approver = self.approver_for(pick["session_id"])
         provider = self.provider(pick["session_id"])
-        provider.on_pre_compress(pick["hook"])
+        candidate = dataclasses.replace(pick["candidate"], origin_capture=provider._freeze_origin_capture(
+            "on_pre_compress", pick["line"], pick["role"]))
         provider.on_session_switch(approver, parent_session_id=pick["session_id"], reset=False, reason="compression")
-        candidates = self.call(provider, "qdrant_memory_extraction_preview", {})["candidates"]
-        candidate = next(c for c in candidates if c["proposed_payload"].get("text") == pick["text"])
-        # Candidate ids carry the payload's created_at, so a re-run of the hook mints a new id;
-        # keep this one to replay the same id later (the off-mode overwrite case).
-        self.spans["extraction_candidate"] = provider._pending_extraction_candidates[candidate["candidate_id"]]
-        dry = self.call(provider, "qdrant_memory_extraction_approve", {"candidate_id": candidate["candidate_id"]})
-        live = self.call(provider, "qdrant_memory_extraction_approve",
-                         {"candidate_id": candidate["candidate_id"], "dry_run": False, "approve": True})
+        # Candidate ids carry the payload's created_at, so a re-extraction mints a new id; keep
+        # this one to replay the same id later (the off-mode overwrite case).
+        self.spans["extraction_candidate"] = candidate
+        dry = json.loads(provider.approve_extraction_candidate(candidate))
+        live = json.loads(provider.approve_extraction_candidate(candidate, dry_run=False, approve=True))
         self.points["extraction"] = str(live.get("id") or "")
         origin = self.origin("memory", self.points["extraction"])
         cited = [pinned(c) for c in origin.get("citations") or []]
@@ -557,13 +583,11 @@ class Context:
         pick = self.picks["learning"]
         approver = self.approver_for(pick["session_id"])
         provider = self.provider(pick["session_id"])
-        provider.on_pre_compress(pick["hook"])
+        candidate = learning_candidate(self.report["run"], pick["line"])
+        candidate.origin_capture = provider._freeze_origin_capture("on_pre_compress", pick["line"], "user")
         provider.on_session_switch(approver, parent_session_id=pick["session_id"], reset=False, reason="compression")
-        candidates = self.call(provider, "qdrant_learning_preview", {"include_metadata": True})["candidates"]
-        candidate = next(c for c in candidates if c["candidate_id"] == pick["candidate_id"])
-        dry = self.call(provider, "qdrant_learning_approve", {"candidate_id": candidate["candidate_id"]})
-        live = self.call(provider, "qdrant_learning_approve", {"candidate_id": candidate["candidate_id"],
-                                                                "dry_run": False})
+        dry = json.loads(provider.approve_learning_candidate(candidate))
+        live = json.loads(provider.approve_learning_candidate(candidate, dry_run=False))
         point_id = str(live.get("id") or "")
         self.points["learning"] = point_id
         first = self.origin("learnings", point_id)
@@ -598,10 +622,8 @@ class Context:
         pick = self.picks["extraction"]
         off_x = self.provider(pick["session_id"], mode="off")
         replay = self.spans["extraction_candidate"]  # the same candidate id lands on the stored point
-        off_x._pending_extraction_candidates[replay.candidate_id] = replay
-        dry = self.call(off_x, "qdrant_memory_extraction_approve", {"candidate_id": replay.candidate_id})
-        approved = self.call(off_x, "qdrant_memory_extraction_approve",
-                             {"candidate_id": replay.candidate_id, "dry_run": False, "approve": True})
+        dry = json.loads(off_x.approve_extraction_candidate(replay))
+        approved = json.loads(off_x.approve_extraction_candidate(replay, dry_run=False, approve=True))
         self.receipt.check(
             "off_mode_restores_keep_origin",
             stored.get("saved") is True and learned.get("saved") is True and approved.get("saved") is True
@@ -862,8 +884,21 @@ class Picker:
         return None
 
     @staticmethod
-    def hook(rows: list[tuple]) -> list[dict[str, str]]:
-        return [{"role": r[1], "content": r[2]} for r in rows[-MAX_HOOK_ROWS:] if len(r[2]) <= MAX_MESSAGE_CHARS]
+    def source_lines(sid: str, rows: list[tuple]):
+        """``(candidate, line, role)`` for every line of the session's last rows that the source
+        extractor recognises: the rule the removed hook producer applied to the same rows."""
+        from qdrant_memory.source_extraction import extract_source_candidates_from_text
+
+        for _row_id, role, content, _uid in rows[-MAX_HOOK_ROWS:]:
+            if len(content) > MAX_MESSAGE_CHARS:
+                continue
+            lines = content.splitlines()
+            for candidate in extract_source_candidates_from_text(
+                    content, source_uri=f"session://{sid}/on_pre_compress", source_type="completed_turn",
+                    derivation_type="completed_turn", lifecycle_id=f"{sid}:on_pre_compress", min_confidence=0.0):
+                line_no = int((candidate.locator or {}).get("line_start") or 0)
+                if 1 <= line_no <= len(lines):
+                    yield candidate, lines[line_no - 1], role
 
     def line_citation(self, sid: str, line: str, role: str | None) -> dict[str, Any] | None:
         """The one-row citation the product resolves, re-derived independently from the row."""
@@ -882,10 +917,10 @@ class Picker:
 
         picks: dict[str, Any] = {}
         scanned: list[tuple[str, list[tuple]]] = []
-        used_sessions: set[str] = set()
         used_lines: set[str] = set()
         scratch = self.ctx.provider("picker")
         scratch._qdrant = None  # the picker never touches Qdrant
+        run = self.ctx.report["run"]
         for sid in self.sessions():
             rows = self.rows(sid)
             if len(rows) < 2:
@@ -894,24 +929,20 @@ class Picker:
                 span = self.span(sid, rows)
                 if span:
                     picks["span_a" if "span_a" not in picks else "span_b"] = span
-                    used_sessions.add(sid)
-            hook = self.hook(rows)
             scratch._session_id = sid
             if "extraction" not in picks or "improve" not in picks or "turn" not in picks:
-                scratch._pending_extraction_candidates.clear()
-                for candidate in scratch._collect_source_extraction_candidates(hook, source_hook="on_pre_compress"):
-                    capture = candidate.origin_capture or {}
-                    line = str(capture.get("source_text") or "")
+                for candidate, line, role in self.source_lines(sid, rows):
                     if not line.strip() or line in used_lines or contains_secret(line):
                         continue
                     if evaluate_source_extraction_candidate(candidate).decision != "store":
                         continue
-                    expected = self.line_citation(sid, line, capture.get("role") or None)
+                    expected = self.line_citation(sid, line, role or None)
                     if not expected:
                         continue
                     if "extraction" not in picks:
-                        picks["extraction"] = {"session_id": sid, "text": candidate.proposed_payload.get("text"),
-                                               "hook": hook, "expected": expected, "expected_status": "verified"}
+                        picks["extraction"] = {"session_id": sid, "candidate": candidate, "line": line, "role": role,
+                                               "text": candidate.proposed_payload.get("text"),
+                                               "expected": expected, "expected_status": "verified"}
                     elif "improve" not in picks:
                         improve = self.improve_candidate(scratch, sid, line)
                         if not improve:
@@ -925,20 +956,25 @@ class Picker:
                         break
                     used_lines.add(line)
             if "learning" not in picks:
-                scratch._pending_learning_candidates.clear()
-                for candidate in scratch._collect_learning_candidates(hook, source_hook="on_pre_compress"):
-                    capture = candidate.origin_capture or {}
-                    line = str(capture.get("source_text") or "")
-                    if not line.strip() or contains_secret(line) or contains_secret(candidate.lesson):
+                # The learning heuristic that chose a row here was removed (capture CP1). Any real,
+                # one-line human-looking user row that resolves to exactly one message serves:
+                # the check is about the origin the approval records, not about the lesson.
+                for _row_id, role, content, _uid in rows:
+                    line = content.strip()
+                    if role != "user" or "\n" in line or not 12 <= len(line) <= 300 or line.startswith("["):
                         continue
-                    dry = json.loads(scratch._tool_learning_approve({"candidate_id": candidate.candidate_id}))
+                    if contains_secret(line) or line in used_lines:
+                        continue
+                    candidate = learning_candidate(run, line)
+                    dry = json.loads(scratch.approve_learning_candidate(candidate))
                     if (dry.get("write_decision") or {}).get("decision") not in {"learning_candidate", "store",
                                                                                  "skill_candidate"}:
                         continue
-                    expected = self.line_citation(sid, line, capture.get("role") or None)
+                    expected = self.line_citation(sid, line, "user")
                     if expected:
-                        picks["learning"] = {"session_id": sid, "candidate_id": candidate.candidate_id, "hook": hook,
-                                             "expected": expected, "expected_status": "verified"}
+                        picks["learning"] = {"session_id": sid, "line": line, "expected": expected,
+                                             "expected_status": "verified"}
+                        used_lines.add(line)
                         break
             if all(key in picks for key in ("span_a", "span_b", "extraction", "improve", "turn", "learning")):
                 break
@@ -963,10 +999,11 @@ class Picker:
     def fallbacks(self, picks: dict[str, Any], scanned: list[tuple[str, list[tuple]]], scratch) -> None:
         """When no row of state.db carries a line the extractors recognise (a live database whose
         conversations never write "Decision: ..." lines has none), exercise the routes on a real
-        session anyway: its real rows plus one synthetic signal line that state.db does not hold.
-        The citation must then be ``unresolved:no_match``, the store must still happen (design
-        5.8) and the captured session must still win. The receipt names every fallback."""
-        from qdrant_memory.source_extraction import evaluate_source_extraction_candidate
+        session anyway, with one synthetic signal line that state.db does not hold. The citation
+        must then be ``unresolved:no_match``, the store must still happen (design 5.8) and the
+        captured session must still win. The receipt names every fallback."""
+        from qdrant_memory.source_extraction import evaluate_source_extraction_candidate, \
+            extract_source_candidates_from_text
 
         run = self.ctx.report["run"]
         reason = (f"no line in the {len(scanned) + 2} scanned sessions matches the source extractor; "
@@ -975,17 +1012,15 @@ class Picker:
         if not others:
             return
         if "extraction" not in picks:
-            sid, rows = others[0]
+            sid, _rows = others[0]
             line = f"Decision: C6 e2e synthetic signal {run}, route staging traffic through the blue pool."
-            hook = self.hook(rows) + [{"role": "assistant", "content": line}]
-            scratch._session_id = sid
-            scratch._pending_extraction_candidates.clear()
-            for candidate in scratch._collect_source_extraction_candidates(hook, source_hook="on_pre_compress"):
-                if (candidate.origin_capture or {}).get("source_text") == line and \
-                        evaluate_source_extraction_candidate(candidate).decision == "store":
-                    picks["extraction"] = {"session_id": sid, "text": candidate.proposed_payload.get("text"),
-                                           "hook": hook, "expected": None, "expected_status": "unresolved:no_match",
-                                           "fallback": reason}
+            for candidate in extract_source_candidates_from_text(
+                    line, source_uri=f"session://{sid}/on_pre_compress", source_type="completed_turn",
+                    derivation_type="completed_turn", lifecycle_id=f"{sid}:on_pre_compress", min_confidence=0.0):
+                if evaluate_source_extraction_candidate(candidate).decision == "store":
+                    picks["extraction"] = {"session_id": sid, "candidate": candidate, "line": line, "role": "assistant",
+                                           "text": candidate.proposed_payload.get("text"), "expected": None,
+                                           "expected_status": "unresolved:no_match", "fallback": reason}
                     break
         if "improve" not in picks:
             sid = others[min(1, len(others) - 1)][0]

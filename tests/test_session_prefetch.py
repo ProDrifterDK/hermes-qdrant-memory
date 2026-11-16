@@ -74,14 +74,14 @@ SCHEMA = Path(__file__).resolve().parent / "fixtures" / "state_db_schema.sql"
 MEMORY, LEARNING, WINDOWS = "unit_memory", "unit_learnings", "unit_session_windows"
 _READ_POST = {"points", "points/search", "points/scroll", "points/count"}
 
-# The 26 tool names the plugin registered before the session expand tool existed, in order.
+# The tool names the plugin registers without the session expand tool, in order (capture CP1
+# removed the learning and extraction preview/approve tools).
 MAIN_TOOL_NAMES = [
     "qdrant_memory_status", "qdrant_memory_store", "qdrant_memory_search", "qdrant_memory_context",
     "qdrant_memory_index", "qdrant_memory_forget", "qdrant_memory_inspect", "qdrant_memory_trace",
     "qdrant_memory_expand", "qdrant_memory_source_status", "qdrant_memory_origin_check",
     "qdrant_learning_store", "qdrant_learning_search",
-    "qdrant_learning_preview", "qdrant_learning_approve", "qdrant_memory_extraction_preview",
-    "qdrant_memory_extraction_approve", "qdrant_memory_consolidate", "qdrant_memory_memory_pr",
+    "qdrant_memory_consolidate", "qdrant_memory_memory_pr",
     "qdrant_memory_consolidation_apply", "qdrant_memory_graph_search", "qdrant_memory_improve_preview",
     "qdrant_memory_improve_apply", "qdrant_memory_raptor_apply", "qdrant_memory_raptor_status",
     "qdrant_memory_retrieve", "qdrant_memory_session_recall",
@@ -646,6 +646,67 @@ def test_default_config_keeps_short_message_recall_and_still_filters_host_text(m
     for text in HOST_TEXT:  # neither the legacy turn point nor any window brings host text
         assert text not in out, text
     assert _mutations(log) == []
+
+
+SCRIPTED_ROWS = [
+    ("scripted", "user", "relay gateway port shards cache queue depth deploy freeze: reply with exactly SCRIPTEDOK", 1, 0, 0),
+    ("scripted", "assistant", "SCRIPTEDOK relay gateway port shards cache queue depth deploy freeze answer", 1, 0, 0),
+    # Agent-prompted sessions: a delegation brief in an identity-less gateway session, and a subagent run.
+    # Their answers repeat the query terms so they rank among the lane's first entries.
+    ("brief", "user", "Investigate the relay gateway port shards cache queue depth deploy freeze and report.", 1, 0, 0),
+    ("brief", "assistant", f"BRIEFFINDING {QUERY} {QUERY} {QUERY}", 1, 0, 0),
+    ("child", "user", "Check the relay gateway port shards cache queue depth deploy freeze and report.", 1, 0, 0),
+    ("child", "assistant", f"CHILDFINDING {QUERY} {QUERY} {QUERY}", 1, 0, 0),
+]
+
+
+def _state_db_with_scripted_session(path: Path) -> Path:
+    """The tip/root fixture plus a real 'other' session, a scripted one-shot session, and two
+    agent-prompted sessions (a delegation brief, a subagent)."""
+    _state_db_with_other_session(path)
+    conn = sqlite3.connect(path)
+    conn.execute("INSERT INTO sessions (id, source, started_at) VALUES ('scripted', 'oneshot', 1.65e9)")
+    conn.execute("INSERT INTO sessions (id, source, started_at) VALUES ('brief', 'telegram', 1.65e9)")
+    conn.execute("INSERT INTO sessions (id, source, started_at) VALUES ('child', 'subagent', 1.65e9)")
+    for index, (sid, role, content, active, compacted, summary) in enumerate(SCRIPTED_ROWS):
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp, active, compacted, _compressed_summary) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (sid, role, content, 1.65e9 + index * 60, active, compacted, summary),
+        )
+    conn.commit()
+    conn.close()
+    return path
+
+
+def test_exclude_machine_drops_one_shot_windows_and_keeps_agent_prompted_ones(monkeypatch, tmp_path):
+    for exclude in (False, True):
+        _check_exclude_machine(monkeypatch, tmp_path / str(exclude), exclude)
+
+
+def _check_exclude_machine(monkeypatch, tmp_path, exclude):
+    """Capture CP2 lane filter: off by default and then unchanged; on, a window prompted by a
+    one-shot run is not recalled, while real sessions and agent-prompted sessions (delegation
+    brief, subagent: their findings are asked about later) still are."""
+    tmp_path.mkdir()
+    _state_db_with_scripted_session(tmp_path / "state.db")
+    store, log = {}, []
+    overrides = dict(session_prefetch_enabled=True, session_prefetch_scope="all", session_prefetch_top_k=10,
+                     session_prefetch_max_chars=6000, session_prefetch_total_chars=8000)
+    if exclude:
+        overrides["session_prefetch_exclude_machine"] = True
+    provider = _provider(monkeypatch, tmp_path, store, log, **overrides)
+    _index_windows(provider)
+    for marker in ("SCRIPTEDOK", "BRIEFFINDING", "CHILDFINDING"):
+        assert any(marker in p["payload"]["text"] for p in store[WINDOWS].values()), marker
+    log.clear()
+
+    lane = provider.prefetch(QUERY, session_id="tip")
+
+    assert lane.startswith("# Recalled Earlier Conversation")  # real windows are still recalled
+    assert ("SCRIPTEDOK" in lane) is (not exclude)
+    assert "BRIEFFINDING" in lane and "CHILDFINDING" in lane
+    assert provider._config["session_prefetch_exclude_machine"] is exclude
 
 
 # Incoming messages the host generated, in the shape Hermes core hands to ``prefetch`` (see

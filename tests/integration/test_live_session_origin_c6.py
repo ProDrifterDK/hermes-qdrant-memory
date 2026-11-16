@@ -7,7 +7,8 @@ that the product opens read-only. Vectors come from the deterministic integratio
 Expected digests are computed here from the literal rows (design 5.2 / G1 byte formats).
 
 One test per route class that lost an origin before C'6, plus the CLI:
-  1 re-store with the mode switched back to off (learning store, extraction approve replay)
+  1 re-store with the mode switched back to off (learning store, extraction approval replay
+    through ``approve_extraction_candidate``; capture CP1 removed the approve tool)
                                      -- the off-mode upsert replacing the payload (C'3 M1)
   2 backup restore of a point whose snapshot predates a citation
                                      -- restore putting the snapshot's mapping back
@@ -35,7 +36,7 @@ from typing import Any, Iterator
 
 import pytest
 
-from conftest import DeterministicEmbedding, _delete_and_verify
+from conftest import DeterministicEmbedding, _delete_and_verify, captured_extraction_candidate
 from qdrant_memory.client import QdrantClient
 from qdrant_memory.config import load_config
 
@@ -64,8 +65,6 @@ ROWS = [  # (session, role, content, message_uid); ids come from AUTOINCREMENT i
     (SID_X, "user", "What did we agree on certificates?", "x-u1"),
     (SID_X, "assistant", DECISION + "\nI will note it.", "x-a2"),
 ]
-HOOK_X = [{"role": "user", "content": "What did we agree on certificates?"},
-          {"role": "assistant", "content": DECISION + "\nI will note it."}]
 
 
 def _build_state_db(path: Path) -> dict[str, int]:
@@ -158,7 +157,6 @@ def _provider(live: Live, db: Path, home: Path, session_id: str, mode: str = "re
         "session_origin_mode": mode,
         "vector_size": VECTOR_SIZE,
         "lineage_lock_dir": str(home / "locks"),
-        "source_extraction_enabled": True,
     }})
     for key in ("collection_name", "learning_collection_name"):
         assert str(provider._config[key]).startswith(PREFIX), f"{key} resolved to {provider._config[key]!r}"
@@ -199,11 +197,10 @@ def test_restores_with_the_mode_back_off_keep_the_recorded_origin(live, state, t
     recorded = _provider(live, db, tmp_path, SID_A)
     learning_id = _call(recorded, "qdrant_learning_store", dict(lesson))["id"]
     recorded_x = _provider(live, db, tmp_path, SID_X)
-    recorded_x.on_pre_compress(HOOK_X)
-    (candidate_id, candidate), = recorded_x._pending_extraction_candidates.items()
-    _call(recorded_x, "qdrant_memory_extraction_approve", {"candidate_id": candidate_id})
-    approved = _call(recorded_x, "qdrant_memory_extraction_approve",
-                     {"candidate_id": candidate_id, "dry_run": False, "approve": True})
+    candidate = captured_extraction_candidate(recorded_x, DECISION + "\nI will note it.", DECISION)
+    candidate_id = candidate.candidate_id
+    json.loads(recorded_x.approve_extraction_candidate(candidate))
+    approved = json.loads(recorded_x.approve_extraction_candidate(candidate, dry_run=False, approve=True))
     learning_before = _origin(live, live.learnings, learning_id)
     extraction_before = _origin(live, live.memory, candidate_id)
     assert learning_before and learning_before["citations"], learning_before
@@ -214,10 +211,8 @@ def test_restores_with_the_mode_back_off_keep_the_recorded_origin(live, state, t
     # Extraction candidate ids carry the payload's created_at, so only a replay of the same
     # candidate lands on the stored point: exactly the overwrite this route must survive.
     off_x = _provider(live, db, tmp_path, SID_X, mode="off")
-    off_x._pending_extraction_candidates[candidate_id] = candidate
-    _call(off_x, "qdrant_memory_extraction_approve", {"candidate_id": candidate_id})
-    replayed = _call(off_x, "qdrant_memory_extraction_approve",
-                     {"candidate_id": candidate_id, "dry_run": False, "approve": True})
+    json.loads(off_x.approve_extraction_candidate(candidate))
+    replayed = json.loads(off_x.approve_extraction_candidate(candidate, dry_run=False, approve=True))
 
     assert approved["saved"] is True and restored["id"] == learning_id and replayed["id"] == candidate_id
     assert _origin(live, live.learnings, learning_id) == learning_before

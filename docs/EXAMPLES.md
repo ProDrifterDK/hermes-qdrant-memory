@@ -135,42 +135,11 @@ Equivalent tool payload:
 }
 ```
 
-## Preview and approve gated automatic candidates
+## Automatic learning candidates (removed)
 
-Automatic extraction is off by default. To test it temporarily:
-
-```yaml
-qdrant_memory:
-  learning_auto_extract_enabled: true
-  learning_auto_extract_mode: preview
-  learning_auto_extract_semantic_dedupe_enabled: true
-  learning_auto_extract_semantic_dedupe_threshold: 0.9
-```
-
-When `on_pre_compress` or `on_session_end` sees a strong candidate, M7.2 first searches existing `hermes_learnings` with the same learning type. If no high-similarity duplicate is found, inspect the pending candidate:
-
-```json
-{
-  "include_metadata": true
-}
-```
-
-Approve only after review. Dry-run is the default:
-
-```json
-{
-  "candidate_id": "<candidate_id>"
-}
-```
-
-Store live only when the candidate is durable and non-secret:
-
-```json
-{
-  "candidate_id": "<candidate_id>",
-  "dry_run": false
-}
-```
+The hook-driven learning candidates and their `qdrant_learning_preview` / `qdrant_learning_approve`
+tools were removed in capture CP1. Store a lesson explicitly with `qdrant_learning_store`; automatic
+capture is described in [capture.md](capture.md).
 
 ## Safe delete
 
