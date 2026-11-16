@@ -125,7 +125,7 @@ def _dispatched_tool_names() -> set[str]:
 # filter by this pattern, and (2) is the only one that would have caught it. Every declared
 # name is now asserted to match this pattern, so a name outside it fails loudly instead of
 # being skipped by three of the four reads.
-_TOOL_NAME_SHAPE = re.compile(r"^(?:qdrant_memory_|qdrant_learning_)[a-z0-9_]+$")
+_TOOL_NAME_SHAPE = re.compile(r"^(?:qdrant_memory_|qdrant_learning_|qdrant_capture_)[a-z0-9_]+$")
 
 # A ``_tool_*`` implementation the dispatch does not reach from ``handle_tool_call``, in two
 # classes that are checked against the source rather than described in prose. A reason string
@@ -846,6 +846,15 @@ SYNC_TURN_PINS = [
 SESSION_RECALL_PINS = [
     "tests/test_config_schema_scoring.py::test_config_rejects_session_recall_collection_shared_with_memory_or_learnings",
 ]
+# Capture approval writes only through the extraction approval path and the manual store's
+# write step; these run the overwrite refusal through the capture route itself.
+CAPTURE_RUN_PINS = [
+    "tests/test_capture_run.py::test_the_run_never_overwrites_a_protected_point",
+]
+CAPTURE_APPROVE_PINS = [
+    "tests/test_capture_queue.py::test_capture_approval_refuses_to_overwrite_a_protected_point",
+    "tests/test_capture_queue.py::test_capture_approval_of_a_mirror_item_refuses_to_overwrite_a_protected_point",
+]
 
 ROUTE_INVENTORY: dict[str, dict[str, object]] = {}
 
@@ -951,6 +960,20 @@ _declare(["qdrant_memory_origin_check", "origin-check"], "read_only",
 _declare(["capture", "capture scan"], "read_only",
          note="state.db opened mode=ro through the C' reader; the only write is the cursor file with --advance")
 
+# Capture queue routes. Review reads the queue file; reject appends an event to it (no Qdrant
+# access). Approve writes through the extraction approval path or the manual store's write step.
+_declare(["qdrant_capture_review", "capture review"], "read_only",
+         note="reads $HERMES_HOME/qdrant_memory/capture/queue.jsonl; no Qdrant or state.db write")
+_declare(["qdrant_capture_reject", "capture reject"], "read_only",
+         note="appends a rejected event to the capture queue file; no Qdrant access")
+_declare(["capture digest"], "read_only",
+         note="reads the capture queue; writes only its own marker file (digest.json)")
+_declare(["capture run"], "protection", pins=CAPTURE_RUN_PINS,
+         note="dry run reads only; --apply (capture_mode on) writes the auto and mirror routes through the same "
+              "gated paths as approve and merges duplicate citations through the extraction locked upsert")
+_declare(["qdrant_capture_approve", "capture approve"], "protection", pins=CAPTURE_APPROVE_PINS,
+         note="re-verifies the pinned citation, then approve_extraction_candidate or _manual_store_write")
+
 # Writes outside Qdrant (files, reports, proposal state) with no payload to protect.
 _declare(["backup create", "eval-capture"], "read_only",
          note="writes files only; the restore route that consumes them is the protection row")
@@ -968,10 +991,10 @@ _declare(["backup create", "eval-capture"], "read_only",
 # a check that reads the same source twice is not a check. Because these are duplicates,
 # adding a pin means updating both the constant and this literal.
 
-# The derived surface — 24 tools, 55 CLI commands, 12 provider hooks. A route added or
+# The derived surface — 27 tools, 60 CLI commands, 12 provider hooks. A route added or
 # removed changes this number, which forces someone to touch this file and classify it,
 # even if the completeness check in the test body is later weakened.
-FROZEN_SURFACE_SIZE = 91
+FROZEN_SURFACE_SIZE = 99
 
 # Every `[mode]` row, frozen by name and by kind. Completeness used to ask only whether
 # *some* mode row existed for the route, so deleting both `[capture]` rows, deleting both
@@ -988,6 +1011,15 @@ EXPECTED_MODE_ROWS = {
 }
 
 EXPECTED_PROTECTION_ROUTES = {
+    "capture run": ("tests/test_capture_run.py::test_the_run_never_overwrites_a_protected_point",),
+    "qdrant_capture_approve": (
+        "tests/test_capture_queue.py::test_capture_approval_refuses_to_overwrite_a_protected_point",
+        "tests/test_capture_queue.py::test_capture_approval_of_a_mirror_item_refuses_to_overwrite_a_protected_point",
+    ),
+    "capture approve": (
+        "tests/test_capture_queue.py::test_capture_approval_refuses_to_overwrite_a_protected_point",
+        "tests/test_capture_queue.py::test_capture_approval_of_a_mirror_item_refuses_to_overwrite_a_protected_point",
+    ),
     "qdrant_memory_store": (
         "tests/test_consolidation_apply.py::test_store_refuses_to_overwrite_a_protected_point_in_every_mode",
         "tests/test_consolidation_apply.py::test_store_refuses_a_history_only_dependent_in_every_mode",

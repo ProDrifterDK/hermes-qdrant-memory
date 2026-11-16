@@ -7,10 +7,13 @@ built in slices; this page describes what exists today.
 |---|---|---|
 | CP1 | Removes the session-hook capture paths that never worked | done |
 | CP2 | Read-only `state.db` reader, authorship classifier, cursor, opt-in session-lane filter | done |
+| CP4 | Persisted review queue, approval routes, nightly `capture run` with the heuristic detector, digest | done (review only; the auto route needs a second signal that does not exist yet) |
+| CP5 | Mirror of the agent's built-in `memory` tool writes | done |
 | CP2 follow-up | Opt-in legacy/hybrid recall filter for stored turns of harnesses and probes | done |
-| later | Mirror of built-in memory writes, persisted review queue, watcher drain | not built |
+| later | Local-model extractor (second signal), watcher drain | not built |
 
-Nothing in this page writes to Qdrant or to `state.db`.
+Capture is off by default (`capture_mode: off`): no capture tool is registered, `capture run`
+refuses, and nothing below touches Qdrant or the queue. Capture never writes `state.db`.
 
 ## CP1: what was removed and what stays
 
@@ -217,3 +220,158 @@ hermes qdrant capture scan [--since-days N] [--json] [--advance]
 Counts the rows after the cursor (optionally only the last N days) per class, per role and per
 kind, and prints the cursor state. Read-only on `state.db`; the cursor moves only with `--advance`
 (to the scan's snapshot bound). It never contacts Qdrant or the embedding server.
+
+## CP4 and CP5: the capture pipeline
+
+### Settings
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `capture_mode` | `off` | `off`: no capture tools, `capture run` refuses. `dry_run`: runs only report. `on`: `capture run --apply` queues, writes the auto and mirror routes and advances the cursor. |
+| `capture_owner_senders` | `[]` | Gateway sender tags (the `[Name] ` prefix the gateway puts on messages in shared channels) that are the owner. Empty: no row of a shared channel qualifies. A row without a sender tag in a one-to-one conversation (DM, CLI, desktop, TUI) is the owner's. |
+| `capture_review_expiry_days` | `21` | A review item nobody decided expires after this many days: an `expired` event, no write. |
+| `capture_mirror_builtin_memory` | `false` | Lane C: mirror the agent's built-in `memory` tool writes (part of `capture run`). |
+| `capture_auto_apply` | `false` | Allow the auto route of lane A (see "Auto route"). |
+| `capture_daily_auto_cap` | `5` | At most this many auto-applied facts per local day. |
+| `capture_dedupe_threshold` | `0.92` | Cosine at or above which a candidate is a near duplicate of a stored capture. |
+| `capture_digest_language` | `en` | `en` or `es`. |
+
+A bare `on`/`off` in YAML is read as a boolean; both spellings work for `capture_mode`.
+
+### The queue
+
+`$HERMES_HOME/qdrant_memory/capture/queue.jsonl` (mode 0600) is an append-only file of events, one
+JSON object per line, appended under an exclusive lock and fsynced. The state of an item is the fold
+of its events, so the nightly run, the CLI, a gateway provider and a fresh process after a restart all
+see the same queue.
+
+| Event | Written when | Holds |
+|---|---|---|
+| `queued` | a candidate enters the queue, with its route (`review`, `auto`, `mirror`) | the fact text, the pinned citation, the write it would make, rule ids, run id |
+| `approved` / `rejected` | the owner decides a review item | actor, approving session and platform |
+| `applied` | a write happened | point id, route, rule id, citation and fact digests, run id |
+| `expired` | a review item passed its expiry | rule id, run id |
+| `merged` | a duplicate's citation was added to a queued item or a stored point | the target id and the citation (ids and digests) |
+
+Only `queued` events carry text. Every other event, and every run report
+(`capture/runs/<run_id>.json`), holds ids, digests, rule ids and run ids, never message text.
+The candidate id is `sha256(session_id, msg_id, kind, normalized fact)`; its first 12 hex
+characters are the short id the digest and the review list show, and either form is accepted.
+
+### `hermes qdrant capture run [--dry-run | --apply] [--since-days N] [--json]`
+
+One batch over the rows after the capture cursor (optionally only the last N days):
+
+1. **Lane A, heuristic.** User rows the classifier marks `human` and that the owner wrote
+   (`capture_owner_senders`). A detector of generic Spanish and English signal forms (asking to
+   remember or record something, never/always, preferences, corrections, "from now on", scope
+   decisions, must/must not) runs on the body after code, quoted lines and links are removed. It
+   has no thresholds and no confidence: a hit is a hit, and it cannot rewrite a message into a
+   standalone fact, so the fact is the message itself (one line, 3 to 1,000 characters). A message
+   with a secret is dropped before anything else.
+2. **Citation.** `resolve_span` on the exact row (basis `extractor_source_line`); anything but a
+   resolved span drops the candidate with a reason.
+3. **Gate.** The extraction write gate (`evaluate_source_extraction_candidate`); `reject` and
+   `skip` drop.
+4. **Dedupe**, in order: the same candidate id already queued (any state); the same normalized
+   fact pending in the queue (the citation is merged into that item); the exact point already
+   stored; a dense near match among stored captures (`capture_lane` set, not superseded) at or
+   above `capture_dedupe_threshold` (the citation is merged into that point). A row the host
+   re-copied during compaction (same `message_uid`) is neither a new item nor a new citation.
+5. **Route**: `review`, or `auto` when the auto rule holds.
+6. **Lane C**, when enabled (next section).
+
+A dry run (the default) only reads (Qdrant search included) and writes its run report.
+`--apply` needs `capture_mode: on`: it expires overdue review items, appends the queue events,
+performs the auto and mirror writes and advances the cursor to the run's snapshot bound. Only one
+`--apply` run at a time (a lock under `capture/`).
+
+#### Auto route
+
+Behind `capture_auto_apply` (default `false`), lane A uses the design's rule. All must hold: the
+heuristic fired, a second signal says the statement is durable with confidence at least 0.9, the
+kind is preference, invariant, correction or decision, the second signal does not scope it to the
+task and saw no reversal in the next messages, the item is not identity, money or security, the
+write gate says `store`, and the day has fewer than `capture_daily_auto_cap` auto-applied items.
+The second signal is the local-model extractor of a later slice; **no second signal ships yet, so
+with `capture_auto_apply: true` nothing auto-applies today** and every hit goes to review.
+
+### Lane C: mirror of the built-in `memory` tool
+
+`capture_mirror_builtin_memory: true` makes `capture run` read the assistant rows whose
+`tool_calls` call the built-in `memory` tool, in every argument shape the host accepted: an
+`operations` batch (with or without a top-level `target`; an op may carry its own), and the
+single-op shapes with `action`, `content`, `old_text` and `new_text` (`new_text` stands in for an
+empty `content`, as in the host). A call whose arguments do not parse still counts as one op, so
+the op count equals what the agent sent. The run report's `mirror` block counts calls, ops,
+shapes, actions and outcomes.
+
+- Only calls the tool accepted are mirrored (`success: true`; a persisted oversized result is read
+  from its preview). A batch is atomic: a refused batch mirrors nothing.
+- The whole entry text comes from the tool result when the host returned it (the replaced,
+  removed or patched entry, before and after). Otherwise from an entry the mirror already knows
+  that contains `old_text` exactly once. Otherwise the op is dropped as `entry_text_unknown`; a
+  patch is never stored as its bare span.
+- `target=memory` add, replace and patch results are stored at once through the manual store's
+  write step (producer `manual_store`, basis `agent_proposed`): the agent decided to remember them.
+- The old text of a replace, patch or remove is stored as a capture with
+  `fact_status: superseded`, cited to the turn that removed it. Nothing is deleted. A replace
+  leaves two points: the new entry and the superseded old one.
+- `target=user` (identity) ops, new and superseded, go to the review queue.
+- The citation runs from the last human row before the call to the last eligible row at or before
+  the calling row (a row that only carries tool calls has no text). In a compaction continuation
+  the person's message stayed in the parent session; the span then starts as far back in the
+  calling session as one span may reach (200 rows). A call the host copied into a later
+  continuation (same call id and arguments) is mirrored once.
+- The secret and manual write gates apply.
+
+### Approving and rejecting
+
+```bash
+hermes qdrant capture review [--limit 10] [--offset 0] [--json]
+hermes qdrant capture approve <id> [--no-dry-run --approve] [--json]
+hermes qdrant capture reject <id> [--no-dry-run --approve] [--json]
+```
+
+The tools `qdrant_capture_review` (pending items, paginated), `qdrant_capture_approve` and
+`qdrant_capture_reject` (exact id, `dry_run` defaults to true, a live call needs `approve: true`
+and a dry run of the same id in the same process) do the same in chat. They exist only on the
+`full` tool surface and only while `capture_mode` is not `off`.
+
+- Approval re-verifies the pinned citation against `state.db` and refuses when the row changed
+  (`drifted`) or is gone (`expired`, `partially_missing`).
+- It writes only through an existing gated path: `approve_extraction_candidate` for heuristic
+  items, the manual store's write step for mirror items. The point's `session_origin` names the
+  captured session (`captured_session_id`, and the legacy `session_id` follows it); the approving
+  session appears only as `approved_session_id`.
+- An item is decided once: approved, rejected, expired or applied items refuse further decisions.
+- **Cron sessions never decide** (decision P7): a provider initialized with `platform="cron"` or
+  `agent_context="cron"`, or running with `HERMES_CRON_SESSION` set, can list but every approve or
+  reject is refused.
+- To undo a stored capture: `hermes qdrant forget <point_id> --no-dry-run --approve`.
+
+### `hermes qdrant capture digest [--max-items 10] [--language en|es]`
+
+A short plain-text summary for a no-agent Hermes cron job that delivers stdout to a chat: counts
+per route and decision since the last digest, up to 10 pending review items as one-line facts with
+their short ids (oldest first), items expiring within three days, facts the auto route stored with
+the point id to forget, and the commands and chat phrasing to approve or reject. When nothing
+happened since the last digest it prints nothing, so the job delivers nothing. It writes only its
+own marker, `capture/digest.json`.
+
+### Turning it on
+
+1. Set `capture_owner_senders` if the owner writes in shared channels (otherwise only one-to-one
+   conversations count).
+2. `capture_mode: dry_run`, then `hermes qdrant capture run --since-days 7` and read the report.
+3. Decide where capture starts. With no cursor yet, the first `--apply` reads every row
+   `state.db` still holds (and the mirror stores every accepted memory write in it). To start from
+   now, with no backfill, run `hermes qdrant capture scan --advance` once: it moves the cursor to
+   the newest row without capturing anything. Otherwise bound the first run with `--since-days`.
+4. `capture_mode: on`, `capture_mirror_builtin_memory: true`, and schedule
+   `hermes qdrant capture run --apply` nightly and `hermes qdrant capture digest` daily as
+   no-agent cron jobs.
+5. Keep `capture_auto_apply: false` for the review-only phase.
+
+Superseded captures are hidden from default recall (like any `superseded` fact); they stay
+reachable through searches that include fact history.

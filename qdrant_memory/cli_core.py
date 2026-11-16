@@ -2406,10 +2406,112 @@ def _format_capture_scan(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _execute_capture_command(args: Namespace, stdout) -> int:
-    """`capture scan`: classify state.db rows after the cursor. Never writes state.db or Qdrant."""
+def _format_capture_review(payload: dict[str, Any]) -> str:
+    items = payload.get("items") or []
+    lines = [f"Capture review: {payload.get('total', 0)} pending"]
+    for item in items:
+        fact = " ".join(str(item.get("fact") or "").split())
+        lines.append(f"  [{item.get('short_id')}] ({item.get('kind')}, {item.get('lane')}) "
+                     f"{fact[:160]}{'...' if len(fact) > 160 else ''}  expires {item.get('expires_at')}")
+    if payload.get("next_offset") is not None:
+        lines.append(f"  more: --offset {payload['next_offset']}")
+    if items:
+        lines.append("Approve: hermes qdrant capture approve <id> --no-dry-run --approve")
+        lines.append("Reject:  hermes qdrant capture reject <id> --no-dry-run --approve")
+    return "\n".join(lines)
+
+
+def _format_capture_decision(payload: dict[str, Any]) -> str:
+    head = f"[{payload.get('short_id')}] {' '.join(str(payload.get('fact') or '').split())[:160]}"
+    if payload.get("dry_run"):
+        if "would_reject" in payload:
+            return f"Dry run: would reject {head}\nRun again with --no-dry-run --approve to reject."
+        decision = (payload.get("write_decision") or {}).get("decision")
+        return (f"Dry run: {head}\ncitation: verified; write gate: {decision}; point {payload.get('point_id')}\n"
+                "Run again with --no-dry-run --approve to store it.")
+    if payload.get("rejected"):
+        return f"Rejected {head}"
+    if payload.get("saved"):
+        return f"Stored {head}\npoint {payload.get('point_id')}"
+    return f"Not stored: {head} ({json.dumps(payload.get('write_decision'), sort_keys=True)})"
+
+
+def _execute_capture_decision(args: Namespace, stdout, provider_factory: Callable[[], Any] | None) -> int:
+    """`capture review | approve | reject` through the provider (same rules as the tools)."""
+    if provider_factory is None:
+        raise CliUsageError("capture review/approve/reject need the provider")
+    provider = provider_factory()
+    sub = args.capture_subcommand
+    if sub == "review":
+        result = provider.capture_review(offset=int(getattr(args, "offset", 0) or 0),
+                                         limit=int(getattr(args, "limit", 10) or 10))
+    else:
+        decide = provider.capture_approve if sub == "approve" else provider.capture_reject
+        ident = str(getattr(args, "id", "") or "")
+        # One process per command: a live decision runs its own dry run first (the explicit
+        # --no-dry-run --approve flags are the owner's confirmation).
+        result = decide(ident, dry_run=True, actor="cli")
+        if not getattr(args, "dry_run", True) and "error" not in json.loads(result):
+            result = decide(ident, dry_run=False, approve=bool(getattr(args, "approve", False)), actor="cli")
+    payload = json.loads(result)
+    if payload.get("error"):
+        _print_cli_error(str(payload["error"]), args, sys.stderr)
+        return 1
+    _print_payload(payload, args, stdout, _format_capture_review if sub == "review" else _format_capture_decision)
+    return 0
+
+
+def _format_capture_run(payload: dict[str, Any]) -> str:
+    counts = payload.get("counts") or {}
+    cursor = payload.get("cursor") or {}
+    lines = [
+        f"Capture run {payload.get('run_id')} ({'apply' if payload.get('apply') else 'dry run'}; mode "
+        f"{payload.get('mode')}; mirror {'on' if payload.get('mirror_enabled') else 'off'}; auto "
+        f"{'on' if payload.get('auto_apply') else 'off'}, cap {payload.get('daily_auto_cap')}/day)",
+        f"rows: {json.dumps(payload.get('rows') or {}, sort_keys=True)}",
+        f"routes: {json.dumps(counts.get('by_route') or {}, sort_keys=True)}",
+        f"kinds: {json.dumps(counts.get('by_kind') or {}, sort_keys=True)}",
+        f"drops: {json.dumps(counts.get('drops') or {}, sort_keys=True)}",
+        f"expired: {len(payload.get('expired') or [])}; errors: {len(payload.get('errors') or [])}",
+        f"cursor: {cursor.get('before')} -> {cursor.get('after')} (bound {cursor.get('upto')})"
+        + ("" if payload.get("apply") else "; dry run: cursor unchanged"),
+    ]
+    return "\n".join(lines)
+
+
+def _execute_capture_run(args: Namespace, stdout, provider_factory: Callable[[], Any] | None) -> int:
+    from qdrant_memory.capture_run import CaptureRunRefused, run_capture
+
+    if provider_factory is None:
+        raise CliUsageError("capture run needs the provider")
+    provider = provider_factory()
+    try:
+        result = run_capture(provider, apply=bool(getattr(args, "apply", False)),
+                             since_days=getattr(args, "since_days", None))
+    except CaptureRunRefused as exc:
+        _print_cli_error(str(exc), args, sys.stderr)
+        return 2
+    _print_payload(result["report"], args, stdout, _format_capture_run)
+    return 0
+
+
+def _execute_capture_command(args: Namespace, stdout, provider_factory: Callable[[], Any] | None = None) -> int:
+    """`capture scan` (read-only classification), `capture run` and the review routes."""
     from qdrant_memory.capture_reader import CaptureReadError, scan
 
+    if getattr(args, "capture_subcommand", None) in {"review", "approve", "reject"}:
+        return _execute_capture_decision(args, stdout, provider_factory)
+    if getattr(args, "capture_subcommand", None) == "run":
+        return _execute_capture_run(args, stdout, provider_factory)
+    if getattr(args, "capture_subcommand", None) == "digest":
+        from qdrant_memory.capture_digest import digest, digest_language
+
+        hermes_home, config = _local_config()
+        text = digest(str(hermes_home), max_items=int(getattr(args, "max_items", 10) or 10),
+                      language=digest_language(config, getattr(args, "language", None)))
+        if text:  # nothing new: print nothing, so a cron job delivers nothing
+            print(text, file=stdout)
+        return 0
     if getattr(args, "capture_subcommand", None) != "scan":
         raise CliUsageError("unsupported qdrant capture command")
     hermes_home, config = _local_config()
@@ -2431,7 +2533,7 @@ def _execute_local_command(args: Namespace, stdout, *, provider_factory: Callabl
     if getattr(args, "qdrant_subcommand", None) == "session-recall":
         return _execute_session_recall_command(args, stdout)
     if getattr(args, "qdrant_subcommand", None) == "capture":
-        return _execute_capture_command(args, stdout)
+        return _execute_capture_command(args, stdout, provider_factory)
     inspection_exit = _execute_inspection_command(args, stdout)
     if inspection_exit is not None:
         return inspection_exit

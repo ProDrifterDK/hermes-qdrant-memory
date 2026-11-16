@@ -147,6 +147,26 @@ DEFAULTS: dict[str, Any] = {
     # Opt-in: drop a recalled window prompted only by a one-shot run (capture_reader.window_is_lane_noise),
     # e.g. a test harness's "Reply with exactly: OK" turn. Agent-prompted windows are kept.
     "session_prefetch_exclude_machine": False,
+    # Automatic capture (docs/capture.md). ``off`` (default): no capture tools, ``capture run``
+    # refuses. ``dry_run``: runs only report. ``on``: ``capture run --apply`` queues, writes the
+    # auto and mirror routes and advances the cursor. Review items expire after N days.
+    "capture_mode": "off",
+    "capture_review_expiry_days": 21,
+    # Gateway sender tags (``[Name] ``) that are the owner. Empty: no row of a shared channel
+    # qualifies; a row without a sender tag in a one-to-one conversation is the owner's.
+    "capture_owner_senders": [],
+    # Auto route (lane A): off by default (review only). When on, only the design's auto rule
+    # (heuristic AND a second signal >= 0.9, kind preference/invariant/correction/decision,
+    # not task-scoped, no reversal, not identity/money/security), at most N per day.
+    "capture_auto_apply": False,
+    "capture_daily_auto_cap": 5,
+    # Dense near-duplicate threshold among stored captures (cosine); a match merges the citation.
+    "capture_dedupe_threshold": 0.92,
+    # Lane C: mirror the agent's built-in memory tool writes (target=memory stored, target=user
+    # reviewed, replaced/removed text kept as superseded captures). Part of capture run.
+    "capture_mirror_builtin_memory": False,
+    # Language of ``hermes qdrant capture digest``: en or es.
+    "capture_digest_language": "en",
     "session_prefetch_candidates": 32,
     "session_prefetch_timeout_s": 2.0,
     # Lane relevance floors: a reranked excerpt needs at least min_rerank_score, a dense-ordered
@@ -234,6 +254,8 @@ _BOOL_KEYS = {
     "session_prefetch_rerank",
     "session_prefetch_exclude_machine",
     "session_expand_enabled",
+    "capture_auto_apply",
+    "capture_mirror_builtin_memory",
 }
 _INT_KEYS = {
     "vector_size",
@@ -268,9 +290,11 @@ _INT_KEYS = {
     "session_prefetch_max_chars",
     "session_prefetch_total_chars",
     "session_prefetch_candidates",
+    "capture_daily_auto_cap",
 }
-_FLOAT_KEYS = {"session_prefetch_timeout_s", "session_recall_rerank_timeout_s", "session_recall_inline_catchup_seconds", "decay_rate", "min_raw_score", "min_final_score", "consolidation_duplicate_threshold", "guarded_auto_duplicate_min_confidence", "guarded_auto_learning_min_confidence", "reconsolidation_min_confidence", "manual_store_duplicate_threshold", "lineage_lock_timeout_seconds"}
-_LIST_KEYS = {"index_dirs", "index_extensions", "index_exclude_dirs", "session_recall_exclude_sources"}
+_CAPTURE_MODES = frozenset({"off", "dry_run", "on"})
+_FLOAT_KEYS = {"capture_review_expiry_days", "capture_dedupe_threshold", "session_prefetch_timeout_s", "session_recall_rerank_timeout_s", "session_recall_inline_catchup_seconds", "decay_rate", "min_raw_score", "min_final_score", "consolidation_duplicate_threshold", "guarded_auto_duplicate_min_confidence", "guarded_auto_learning_min_confidence", "reconsolidation_min_confidence", "manual_store_duplicate_threshold", "lineage_lock_timeout_seconds"}
+_LIST_KEYS = {"index_dirs", "index_extensions", "index_exclude_dirs", "session_recall_exclude_sources", "capture_owner_senders"}
 # Automatic-recall relevance floors. "off" (also "", null, false) disables every one of them.
 # On the legacy floors 0 disables too (their scores are never negative); on the lane floors 0
 # is a real threshold (rerank logits and cosine can be negative).
@@ -466,6 +490,14 @@ def _coerce(key: str, value: Any) -> Any:
         return candidate if candidate in _SESSION_ORIGIN_MODES else "off"
     if key == "read_sources":
         return _as_read_sources(value)
+    if key == "capture_mode":
+        if isinstance(value, bool):  # YAML 1.1 reads a bare on/off as a boolean
+            return "on" if value else "off"
+        candidate = value.strip().lower().replace("-", "_") if isinstance(value, str) else ""
+        return candidate if candidate in _CAPTURE_MODES else "off"
+    if key == "capture_digest_language":
+        candidate = value.strip().lower() if isinstance(value, str) else ""
+        return candidate if candidate in {"en", "es"} else "en"
     if isinstance(default, str):
         return str(value)
     return value

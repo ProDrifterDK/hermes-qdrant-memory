@@ -585,6 +585,44 @@ def _register_capture(subcommands) -> None:
                       help="Move the cursor to the end of this scan. Without it the cursor is left unchanged.")
     scan.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
 
+    run = capture_subcommands.add_parser(
+        "run", help="Capture batch: new owner rows (heuristic detector) and, when enabled, the built-in memory "
+                    "mirror. Dry-run by default.")
+    run.set_defaults(qdrant_subcommand="capture")
+    run_mode = run.add_mutually_exclusive_group()
+    run_mode.add_argument("--dry-run", dest="apply", action="store_false", default=False,
+                          help="Report what would happen; write only the run report. Default.")
+    run_mode.add_argument("--apply", dest="apply", action="store_true",
+                          help="Queue, apply the auto/mirror routes and advance the cursor (capture_mode: on).")
+    run.add_argument("--since-days", type=_non_negative_float, default=None,
+                     help="Only rows from the last N days (bounds a first run).")
+    run.add_argument("--json", action="store_true", help="Emit machine-readable JSON output (ids only).")
+
+    digest = capture_subcommands.add_parser(
+        "digest", help="Plain-text digest of the capture queue since the last digest, for a cron delivery. "
+                       "Prints nothing when nothing is new; writes only its own marker.")
+    digest.set_defaults(qdrant_subcommand="capture")
+    digest.add_argument("--max-items", type=_positive_int, default=10, help="Pending items to list (max 10).")
+    digest.add_argument("--language", choices=["en", "es"], default=None,
+                        help="Digest language. Default: qdrant_memory.capture_digest_language (en).")
+
+    review = capture_subcommands.add_parser(
+        "review", help="List capture items waiting for review (pending, oldest first). Read-only.")
+    review.set_defaults(qdrant_subcommand="capture")
+    review.add_argument("--limit", type=_positive_int, default=10, help="Items per page (max 50). Default: 10.")
+    review.add_argument("--offset", type=int, default=0, help="Items to skip. Default: 0.")
+    review.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
+
+    for name, text in (("approve", "Approve one review item: re-verify its cited message, then store it. "
+                                   "Dry-run by default."),
+                       ("reject", "Reject one review item (an event; nothing is written to memory). "
+                                  "Dry-run by default.")):
+        decide = capture_subcommands.add_parser(name, help=text)
+        decide.set_defaults(qdrant_subcommand="capture")
+        decide.add_argument("id", help="Capture item id: the full id or its 12-character short id.")
+        _add_dry_run_flags(decide)
+        decide.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
+
 
 def _register_session_recall(subcommands) -> None:
     recall = subcommands.add_parser(
