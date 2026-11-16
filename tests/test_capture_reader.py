@@ -363,10 +363,16 @@ def test_window_is_machine_only_judges_the_prompting_user_side(db):
 
 def _run_cli(argv, monkeypatch, home, db):
     import argparse
+    import importlib.util
     import io
 
-    import cli
     from qdrant_memory.cli_core import execute_command
+
+    # By path: a bare `import cli` can resolve to Hermes' own cli.py (conftest puts hermes-agent on sys.path).
+    spec = importlib.util.spec_from_file_location("qdrant_plugin_cli_capture_test",
+                                                  Path(__file__).resolve().parents[1] / "cli.py")
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
 
     monkeypatch.setenv("HERMES_HOME", home)
     monkeypatch.setattr("qdrant_memory.config._load_hermes_config",
