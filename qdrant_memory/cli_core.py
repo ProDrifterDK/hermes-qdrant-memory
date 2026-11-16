@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import importlib.util
 import json
 import os
@@ -489,6 +490,28 @@ def _guarded_auto_policy_from_args(args: Namespace) -> GuardedAutoPolicy:
     )
 
 
+_WINDOW_HOLDING_ERRORS = frozenset({"backup_failed", "missing_report_id"})
+
+
+def _run_backup_retention(provider: Any, summary: dict[str, Any]) -> None:
+    """Prune the watcher's old full backups after a guarded-auto night (never on report-only).
+
+    The result goes into the run summary (``backup_retention``, printed to watcher.log) and
+    the log event; a failure is a run error (it alerts) but never holds the scan cursor.
+    """
+    prune = getattr(provider, "guarded_auto_prune_backups", None)
+    if not callable(prune):
+        return
+    try:
+        result = prune()
+        retention: dict[str, Any] = result if isinstance(result, dict) else {"deleted": [], "error": "invalid result"}
+    except Exception as exc:
+        retention = {"deleted": [], "error": f"{type(exc).__name__}"}
+    summary["backup_retention"] = retention
+    if retention.get("error") or retention.get("errors"):
+        summary.setdefault("errors", []).append({"code": "backup_retention_failed"})
+
+
 def _record_watcher_run(args: Namespace, report: dict[str, Any]) -> None:
     if getattr(args, "qdrant_subcommand", None) != "watcher" or getattr(args, "watcher_subcommand", None) != "run":
         return
@@ -513,11 +536,20 @@ def _record_watcher_run(args: Namespace, report: dict[str, Any]) -> None:
     guarded_auto_errors = len(guarded_auto.get("errors", []) or []) if guarded_auto else 0
     guarded_auto_would_apply = len(guarded_auto.get("would_apply", []) or []) if guarded_auto else 0
     rotating = isinstance(report.get("scan_window"), dict) and report["scan_window"].get("mode") == "rotating"
+    # A night whose guarded-auto actions could not be attempted at all (the pre-mutation
+    # backup failed) keeps its cursor, so the same window is retried the next night instead
+    # of waiting a whole cycle. Per-proposal refusals do not hold it: they would recur.
+    held = next((str(error.get("code")) for error in guarded_auto.get("errors", []) or []
+                 if isinstance(error, dict) and error.get("code") in _WINDOW_HOLDING_ERRORS), "") if guarded_auto else ""
     if rotating:
         # Every rotating window differs, so the signature changes nightly; a clean window
         # (no proposals) carries nothing to review and does not page the notifier.
         alerted = bool((signature_changed and proposal_list) or force_alert)
-        state["scan_window"] = next_scan_window_state(state.get("scan_window"), report["scan_window"])
+        if held:
+            state["scan_window_held"] = {"reason": held, "at": timestamp, "report_id": report.get("report_id")}
+        else:
+            state["scan_window"] = next_scan_window_state(state.get("scan_window"), report["scan_window"])
+            state.pop("scan_window_held", None)
         state["last_scan_window"] = {
             label: {
                 key: entry.get(key)
@@ -564,6 +596,9 @@ def _record_watcher_run(args: Namespace, report: dict[str, Any]) -> None:
             "guarded_auto_error_count": guarded_auto_errors,
             "guarded_auto_would_apply_count": guarded_auto_would_apply,
             **({"scan_window": state["last_scan_window"]} if rotating else {}),
+            **({"scan_window_held": held} if rotating and held else {}),
+            **({"backup_retention_deleted": list(guarded_auto["backup_retention"].get("deleted") or [])}
+               if isinstance(guarded_auto.get("backup_retention"), dict) else {}),
         }
     )
 
@@ -2416,7 +2451,7 @@ def _format_capture_review(payload: dict[str, Any]) -> str:
     if payload.get("next_offset") is not None:
         lines.append(f"  more: --offset {payload['next_offset']}")
     if items:
-        lines.append("Approve: hermes qdrant capture approve <id> --no-dry-run --approve")
+        lines.append("Approve: hermes qdrant capture approve <id> --no-dry-run --approve [--fact \"one sentence\"]")
         lines.append("Reject:  hermes qdrant capture reject <id> --no-dry-run --approve")
     return "\n".join(lines)
 
@@ -2446,8 +2481,9 @@ def _execute_capture_decision(args: Namespace, stdout, provider_factory: Callabl
         result = provider.capture_review(offset=int(getattr(args, "offset", 0) or 0),
                                          limit=int(getattr(args, "limit", 10) or 10))
     else:
-        decide = provider.capture_approve if sub == "approve" else provider.capture_reject
         ident = str(getattr(args, "id", "") or "")
+        decide = (functools.partial(provider.capture_approve, fact=getattr(args, "fact", None))
+                  if sub == "approve" else provider.capture_reject)
         # One process per command: a live decision runs its own dry run first (the explicit
         # --no-dry-run --approve flags are the owner's confirmation).
         result = decide(ident, dry_run=True, actor="cli")
@@ -2938,7 +2974,10 @@ def execute_command(
             print(f"Error: {_provider_error_message(parsed)}", file=stderr)
         return 1
     if getattr(args, "qdrant_subcommand", None) == "watcher" and getattr(args, "watcher_subcommand", None) == "run":
-        guarded_auto = apply_guarded_auto(provider, parsed, _guarded_auto_policy_from_args(args))
+        policy = _guarded_auto_policy_from_args(args)
+        guarded_auto = apply_guarded_auto(provider, parsed, policy)
+        if policy.enabled:
+            _run_backup_retention(provider, guarded_auto)
         parsed["guarded_auto"] = guarded_auto
         result = json.dumps(parsed, sort_keys=True)
     _record_watcher_run(args, parsed)

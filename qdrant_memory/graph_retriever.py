@@ -26,7 +26,7 @@ from typing import Any
 from .graph_schema import valid_edge_id, valid_entity_id
 from .lesson_extractor import contains_secret
 from .ranking import RankingContext, RankingPolicy, rank_memory_candidate
-from .retriever import MemoryRetriever, RetrievedMemory
+from .retriever import MemoryRetriever, RetrievedMemory, is_quarantined
 from .scoring import normalize_minmax, recency_score
 from .schema import RELATION_TYPES, valid_fact_status, valid_point_id_link, valid_relation_type
 
@@ -1079,6 +1079,9 @@ class GraphMemoryRetriever:
                     continue
                 # Defensive: structural lineage records are never memories.
                 if _is_structural_lineage_payload(p_payload):
+                    continue
+                # A quarantined memory is out of recall (inspect reaches it by id).
+                if is_quarantined(p_payload):
                     continue
                 p_fs = valid_fact_status(p_payload.get("fact_status")) or "active"
                 if (

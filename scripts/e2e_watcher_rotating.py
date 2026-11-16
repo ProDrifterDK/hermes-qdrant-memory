@@ -11,7 +11,8 @@ real provider) for N simulated nights against a real Qdrant, in two arms:
   the guarded-auto policy relies on).
 
     python3 scripts/e2e_watcher_rotating.py --out DIR [--nights 7] [--max-points 300] \\
-        [--arms prod,tmp] [--qdrant-url http://127.0.0.1:6333] [--keep]
+        [--arms prod,tmp] [--qdrant-url http://127.0.0.1:6333] [--keep] [--tmp-prefix tmp_watch_] \\
+        [--fail-backup-night N] [--backup-keep-last 7] [--backup-keep-days 30] [--embed-seeds]
 
 Safety:
 - Every run uses a temporary HERMES_HOME under ``--out``: the real watcher state, log,
@@ -33,7 +34,15 @@ Oracles (exit non-zero if any fails):
   identity-bearing point changed;
 - one applied action is undone by restoring its snapshot backup, and the point returns to
   its starting payload digest;
-- the production arm issued no write (the fence counts attempts).
+- the production arm issued no write (the fence counts attempts);
+- backup retention (tmp arm, seeded with two old watcher backups and one manual backup): the
+  watcher's full backups left are exactly the configured set, the deletions are reported, and
+  the manual backup and every per-action snapshot are kept;
+- with ``--fail-backup-night N``: that night applies nothing and leaves the cursor unchanged,
+  and night N+1 reads the same window again;
+- with ``--embed-seeds``: every quarantined control seed is absent from a legacy recall query
+  made of its own text and present in ``qdrant_memory_inspect``; after the snapshot restore
+  the restored point is recalled by the same query (control).
 """
 from __future__ import annotations
 
@@ -206,6 +215,10 @@ def _scroll_all(client, name: str, *, with_vector: bool = False):
 
 class Run:
     def __init__(self, args: argparse.Namespace) -> None:
+        global TMP_PREFIX
+        if not args.tmp_prefix.startswith("tmp_"):
+            raise SystemExit("--tmp-prefix must start with tmp_")
+        TMP_PREFIX = args.tmp_prefix  # the fence reads the module value
         self.args = args
         self.out = Path(args.out).expanduser().resolve()
         self.out.mkdir(parents=True, exist_ok=True)
@@ -260,7 +273,7 @@ class Run:
         }
         counts = {"memory": admin.count(self.tmp_memory), "learning": admin.count(self.tmp_learning)}
         expected = {scope: d["count"] for scope, d in backup["collections"].items()}
-        self.check("snapshot restored into tmp_watch_ collections through the plugin backup/restore flow", counts == expected, counts=counts, expected=expected)
+        self.check(f"snapshot restored into {TMP_PREFIX} collections through the plugin backup/restore flow", counts == expected, counts=counts, expected=expected)
         # Starting state of every point, by digest, for the final diff.
         self.start: dict[str, dict[str, Any]] = {}
         for scope in ("memory", "learning"):
@@ -290,7 +303,9 @@ class Run:
         admin = _client(self.args.qdrant_url)
         ordered = sorted(pid for pid, info in self.start.items() if info["scope"] == "memory")
         window = self.args.max_points
-        span = min(len(ordered) - 2, window * self.args.nights - 2)
+        # A held night (forced backup failure) re-reads its window, so one window fewer is read.
+        windows_read = self.args.nights - (1 if 0 < self.args.fail_backup_night < self.args.nights else 0)
+        span = min(len(ordered) - 2, window * windows_read - 2)
         old = "2025-01-01T00:00:00+00:00"
         recent = "2026-11-01T00:00:00+00:00"
         stale = {"importance": 1, "confidence": 0.3, "access_count": 0, "created_at": old}
@@ -310,6 +325,14 @@ class Run:
             ("heading_ok_2", "## Next handoff", {}, True),
         ]
         vector = next(_iter_backup_records(self.backup_dir, "memory"))["vector"]
+        embed = None
+        if self.args.embed_seeds:
+            from qdrant_memory.embeddings import EmbeddingClient
+
+            config = _config(self.out / "home_restore", self.tmp_memory, self.tmp_learning, self.args.qdrant_url)
+            client = EmbeddingClient(config["embedding_url"], config["embedding_model"], query_prefix=config["query_prefix"],
+                                     document_prefix=config["document_prefix"])
+            embed = client.embed_document
         points, seeds = [], []
         for index, (kind, text, extra, expect_touched) in enumerate(kinds):
             # Spread over the nights; the two members of a duplicate pair share a window.
@@ -318,8 +341,8 @@ class Run:
             if seed_id in self.start:
                 raise SystemExit(f"seed id collides with a real point: {seed_id}")
             payload = {"text": text, "profile_id": PROFILE, "source_type": "conversation", "cp6_e2e_seed": kind, **extra}
-            points.append({"id": seed_id, "vector": vector, "payload": payload})
-            seeds.append({"id": seed_id, "kind": kind, "expect_touched": expect_touched})
+            points.append({"id": seed_id, "vector": embed(text) if embed else vector, "payload": payload})
+            seeds.append({"id": seed_id, "kind": kind, "expect_touched": expect_touched, "text": text})
             self.start[seed_id] = {
                 "scope": "memory",
                 "payload_sha256": _sha(_canon(payload)),
@@ -330,6 +353,155 @@ class Run:
         admin.upsert(self.tmp_memory, points)
         self.seeds = seeds
         self.receipt["seeds"] = seeds
+
+    RETENTION_OLD = ("backup-20000101T000000Z-e2eold01", "backup-20000102T000000Z-e2eold02")
+    RETENTION_MANUAL = "backup-20000101T000000Z-e2emanual"
+
+    def seed_retention_fixtures(self, home: Path) -> None:
+        """Old watcher-tagged full backups (unreferenced) and an old manual backup in the arm's home.
+
+        Placeholder files only (a manifest and a one-line collection file, no memory text).
+        Retention must delete the old watcher backups once newer ones take the newest slots and
+        must never delete the manual one.
+        """
+        from qdrant_memory.backup import SCHEMA_VERSION
+        from qdrant_memory.backup_retention import WATCHER_BACKUP_ORIGIN
+
+        root = home / "qdrant_memory" / "backups"
+        for index, backup_id in enumerate((*self.RETENTION_OLD, self.RETENTION_MANUAL)):
+            path = root / backup_id
+            path.mkdir(parents=True, exist_ok=False)
+            (path / "memory.jsonl").write_text('{"schema_version": 1}\n', encoding="utf-8")
+            manifest = {"schema_version": SCHEMA_VERSION, "artifact_type": "qdrant_memory_backup", "backup_id": backup_id,
+                        "created_at": f"2000-01-0{index + 1}T00:00:00Z", "scope": "memory",
+                        "collections": {"memory": {"collection_name": self.tmp_memory, "file": "memory.jsonl", "count": 0}}}
+            if backup_id != self.RETENTION_MANUAL:
+                manifest["created_by"] = WATCHER_BACKUP_ORIGIN
+            (path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    def verify_retention_and_hold(self, records: list[dict[str, Any]]) -> None:
+        from qdrant_memory.backup import _load_manifest_from_dir
+        from qdrant_memory.backup_retention import WATCHER_BACKUP_ORIGIN
+
+        home = self.out / "home_tmp"
+        nights = self.receipt["arms"]["tmp"]["nights"]
+        root = home / "qdrant_memory" / "backups"
+        remaining: dict[str, dict[str, Any]] = {}
+        for child in root.iterdir():
+            try:
+                remaining[child.name] = _load_manifest_from_dir(child)
+            except Exception:  # noqa: BLE001
+                remaining[child.name] = {}
+        taken = [n["backup"]["backup_id"] for n in nights if n.get("backup")]
+        tagged_full = sorted(name for name, m in remaining.items()
+                             if m.get("created_by") == WATCHER_BACKUP_ORIGIN and m.get("partial") is not True)
+        referenced = {r.get("pre_apply_backup_id") for r in records}
+        snapshots = {(r.get("pre_mutation_snapshot") or {}).get("backup_id") for r in records}
+        # The rule applied to every tagged full backup the arm ever had (deletions are final).
+        created = {name: str(remaining.get(name, {}).get("created_at") or "") for name in taken}
+        created.update({name: f"2000-01-0{i + 1}T00:00:00Z" for i, name in enumerate(self.RETENTION_OLD)})
+        newest = [name for _c, name in sorted(((c, n) for n, c in created.items()), reverse=True)][: self.args.backup_keep_last]
+        recent_refs = referenced if self.args.backup_keep_days >= 1 else set()
+        expected = sorted(set(newest) | (set(taken) & recent_refs))
+        deleted_reported = sorted({d for n in nights for d in ((n.get("backup_retention") or {}).get("deleted") or [])})
+        self.receipt["arms"]["tmp"]["retention"] = {
+            "keep_last": self.args.backup_keep_last, "keep_days": self.args.backup_keep_days, "full_backups_taken": taken,
+            "tagged_full_remaining": tagged_full, "expected_remaining": expected, "deleted_reported": deleted_reported,
+            "manual_present": self.RETENTION_MANUAL in remaining,
+            "snapshots_present": sorted(s for s in snapshots if s in remaining), "snapshots_total": len(snapshots),
+        }
+        self.check("retention: the watcher's full backups left are exactly the configured set",
+                   tagged_full == expected, remaining=tagged_full, expected=expected)
+        self.check("retention: what it deleted is reported in the run output",
+                   set(deleted_reported) == (set(self.RETENTION_OLD) | set(taken)) - set(expected),
+                   deleted=deleted_reported)
+        self.check("retention: the manual backup and every per-action snapshot are kept",
+                   self.RETENTION_MANUAL in remaining and all(s in remaining for s in snapshots),
+                   snapshots=len(snapshots))
+        fail_night = self.args.fail_backup_night
+        if fail_night:
+            failed = next((n for n in nights if n["night"] == fail_night), None)
+            following = next((n for n in nights if n["night"] == fail_night + 1), None)
+            ok = bool(failed) and any(e.get("code") == "backup_failed" for e in failed["errors"]) \
+                and not failed["applied"] and failed["held"] == "backup_failed" \
+                and failed["cursor_after"] == failed["cursor_before"]
+            self.check("a failed pre-mutation backup applies nothing and leaves the cursor unchanged", ok,
+                       night=fail_night, cursor_before=failed and failed["cursor_before"],
+                       cursor_after=failed and failed["cursor_after"], errors=failed and failed["errors"])
+            retried = bool(failed) and bool(following) \
+                and following["start_offset"]["memory"] == failed["start_offset"]["memory"] and not following["held"]
+            self.check("the held window is read again the next night", retried,
+                       failed_start=failed and failed["start_offset"], next_start=following and following["start_offset"],
+                       next_applied=following and [a.get("proposal_type") for a in following["applied"]])
+            others = [n["night"] for n in nights if n["held"] and n["night"] != fail_night]
+            self.check("no other night held the cursor", not others, held_nights=others)
+
+    def verify_quarantine_recall(self, records: list[dict[str, Any]]) -> None:
+        """Quarantined seeds are absent from a legacy recall query with their own text; inspect reaches them."""
+        import importlib
+
+        home = self.out / "home_recall"
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "qdrant_memory.json").write_text(json.dumps({
+            **ARM_CONFIG, "qdrant_url": self.args.qdrant_url, "collection_name": self.tmp_memory,
+            "learning_collection_name": self.tmp_learning, "auto_recall_mode": "legacy", "auto_recall_top_k": 10,
+            "session_recall_enabled": False, "session_recall_auto_index": False, "sync_turns": False}), encoding="utf-8")
+        previous_home = os.environ.get("HERMES_HOME")
+        os.environ["HERMES_HOME"] = str(home)
+        try:
+            plugin = importlib.import_module("__init__")
+            provider = plugin.QdrantMemoryProvider()
+            provider.initialize("close-e2e-recall", platform="cli", agent_context="primary", hermes_home=str(home))
+        finally:
+            if previous_home is not None:
+                os.environ["HERMES_HOME"] = previous_home
+        effective = {k: provider._config.get(k) for k in ("collection_name", "learning_collection_name", "auto_recall_mode",
+                                                          "embedding_url", "embedding_model", "qdrant_url")}
+        print("RECALL EFFECTIVE CONFIG:", json.dumps(effective, sort_keys=True), flush=True)
+        seeds = {seed["id"]: seed for seed in getattr(self, "seeds", [])}
+        quarantined = sorted({str(pid) for r in records for pid in (r.get("quarantined_ids") or []) if str(pid) in seeds})
+        admin = _client(self.args.qdrant_url)
+        result: dict[str, Any] = {"effective_config": effective, "quarantined_seeds": []}
+
+        def legacy_ids(text: str) -> list[str]:
+            chain = provider._memory_recall() or provider._retriever
+            return [str(chunk.id) for chunk in chain.search(text, top_k=20, update_access=False)]
+
+        self._recall = (provider, legacy_ids, seeds, result)
+        bad = []
+        for pid in quarantined:
+            seed = seeds[pid]
+            payload = (admin.retrieve(self.tmp_memory, [pid], with_payload=True) or [{}])[0].get("payload") or {}
+            ids = legacy_ids(seed["text"])
+            block = provider.prefetch(seed["text"], session_id="close-e2e-recall") or ""
+            inspected = json.loads(provider.handle_tool_call("qdrant_memory_inspect", {"point_id": pid}))
+            entry = {"id": pid, "kind": seed["kind"], "marker": payload.get("consolidation_quarantined") is True,
+                     "in_legacy_top20": pid in ids, "inspect_found": inspected.get("found") is True,
+                     "prefetch_block_chars": len(block)}
+            if seed["kind"] == "dup_ok_b":  # the canonical copy has the same text and must still be recalled
+                canonical = next(s["id"] for s in seeds.values() if s["kind"] == "dup_ok_a")
+                entry["canonical_in_legacy_top20"] = canonical in ids
+                if not entry["canonical_in_legacy_top20"]:
+                    bad.append(entry)
+            result["quarantined_seeds"].append(entry)
+            if not entry["marker"] or entry["in_legacy_top20"] or not entry["inspect_found"]:
+                bad.append(entry)
+        self.check("quarantined points are absent from a legacy recall query with their own text and present in inspect",
+                   bool(quarantined) and not bad, checked=len(result["quarantined_seeds"]), bad=bad[:3])
+        self.receipt["arms"]["tmp"]["quarantine_recall"] = result
+
+    def recall_control(self, restored_id: str) -> None:
+        """After the snapshot restore: the restored point (marker gone) is recalled by its own text."""
+        provider, legacy_ids, seeds, result = self._recall
+        try:
+            if restored_id in seeds:
+                ids = legacy_ids(seeds[restored_id]["text"])
+                result["restored_control"] = {"id": restored_id, "kind": seeds[restored_id]["kind"],
+                                              "in_legacy_top20": restored_id in ids}
+                self.check("control: the point restored from its snapshot (marker gone) is recalled by the same query",
+                           restored_id in ids, id=restored_id, kind=seeds[restored_id]["kind"])
+        finally:
+            provider.shutdown()
 
     @staticmethod
     def _identity(payload: dict[str, Any]) -> bool:
@@ -351,6 +523,16 @@ class Run:
         config = _config(home, memory, learning, url)
         mode = "report-only" if arm == "prod" else "guarded-auto"
         total_nights = self.args.prod_nights if arm == "prod" else self.args.nights
+        if arm == "tmp":
+            config.update({"guarded_auto_backup_keep_last": self.args.backup_keep_last,
+                           "guarded_auto_backup_keep_days": self.args.backup_keep_days})
+            self.seed_retention_fixtures(home)
+        state_path = home / "qdrant_memory" / "consolidation" / "watcher_state.json"
+
+        def memory_cursor() -> Any:
+            if not state_path.exists():
+                return None
+            return ((json.loads(state_path.read_text(encoding="utf-8")).get("scan_window") or {}).get("memory") or {}).get("next_offset")
         # The watcher only reads points in its own scope (profile filter, no structural
         # lineage records): count with the very same filter.
         from qdrant_memory.consolidation import make_filter
@@ -366,6 +548,13 @@ class Run:
         union: dict[str, set[str]] = {PROD_MEMORY: set(), PROD_LEARNING: set(), self.tmp_memory: set(), self.tmp_learning: set()}
         for night in range(1, total_nights + 1):
             provider = _provider(home, config, url)
+            forced_failure = arm == "tmp" and night == self.args.fail_backup_night
+            if forced_failure:
+                def failing_backup(scope):
+                    raise OSError("e2e: forced pre-mutation backup failure")
+
+                provider.guarded_auto_backup = failing_backup
+            cursor_before = memory_cursor()
             self.recorder.calls.clear()
             out, err = io.StringIO(), io.StringIO()
             started = time.time()
@@ -405,8 +594,12 @@ class Run:
                 "applied": guarded.get("applied", []),
                 "would_apply": guarded.get("would_apply", []),
                 "artifact": (report.get("artifact") or {}).get("path"),
+                "forced_backup_failure": forced_failure,
+                "cursor_before": cursor_before,
+                "cursor_after": memory_cursor(),
+                "held": (json.loads(state_path.read_text(encoding="utf-8")).get("scan_window_held") or {}).get("reason"),
+                "backup_retention": guarded.get("backup_retention"),
             })
-        state_path = home / "qdrant_memory" / "consolidation" / "watcher_state.json"
         state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
         self.receipt["arms"][arm] = {
             "mode": mode,
@@ -419,7 +612,13 @@ class Run:
                 "last_guarded_auto_error_count", "last_artifact")},
         }
         self.notifier_check(arm, home)
-        expected_union = [min(collection_total, self.args.max_points * n) for n in range(1, len(nights) + 1)]
+        # A held night re-reads its window the next night: that next night adds no new ids.
+        expected_union = []
+        windows = 0
+        for index, entry in enumerate(nights):
+            if index == 0 or not nights[index - 1]["held"]:
+                windows += 1
+            expected_union.append(min(collection_total, self.args.max_points * windows))
         self.check(
             f"{arm}: union of analysed memory ids grows by max-points per night",
             [n["union_memory"] for n in nights] == expected_union and len(nights) == total_nights,
@@ -541,15 +740,21 @@ class Run:
             self.samples.append({"arm": "tmp (guarded-auto, applied)", "report_id": record["report_id"],
                                  "proposal_type": record["proposal_type"], "action": record["action"], "points": texts})
 
-        # Undo one action through its snapshot backup.
+        self.verify_retention_and_hold(records)
+        if self.args.embed_seeds:
+            self.verify_quarantine_recall(records)
+
+        # Undo one action through its snapshot backup (a quarantine, when there is one).
         if records:
-            record = records[0]
+            record = next((r for r in records if r.get("action") == "quarantine"), records[0])
             target = str(record["affected_ids"][-1])
             restored = restore_backup(admin, config, hermes_home=str(home), backup_id=record["pre_mutation_snapshot"]["backup_id"], dry_run=False)
             point = admin.retrieve(record["collection_name"], [target], with_payload=True)[0]
             ok = _sha(_canon(point.get("payload") or {})) == self.start[target]["payload_sha256"]
             self.check("restoring one action's snapshot backup returns the point to its starting payload", ok,
                        upserted=restored.get("upserted"), action=record["action"], proposal_type=record["proposal_type"])
+            if self.args.embed_seeds:
+                self.recall_control(target)
 
     def cleanup(self) -> None:
         if self.args.keep:
@@ -578,7 +783,7 @@ class Run:
             self.check("harness completed", False, error=traceback.format_exc()[-3000:])
         finally:
             self.cleanup()
-            self.check("production write fence: no write attempt outside tmp_watch_", not self.fence.refused,
+            self.check(f"production write fence: no write attempt outside {TMP_PREFIX}", not self.fence.refused,
                        refused=self.fence.refused[:5], tmp_writes=dict(self.fence.writes))
             (self.out / "receipt.json").write_text(json.dumps(self.receipt, indent=2, sort_keys=True, default=str), encoding="utf-8")
             (self.out / "samples-private.json").write_text(json.dumps(self.samples, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -597,6 +802,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--arms", default="prod,tmp")
     parser.add_argument("--qdrant-url", default="http://127.0.0.1:6333")
     parser.add_argument("--keep", action="store_true")
+    parser.add_argument("--tmp-prefix", default=TMP_PREFIX,
+                        help="Prefix of the temporary collections (the only ones the fence lets the run write).")
+    parser.add_argument("--fail-backup-night", type=int, default=0,
+                        help="Tmp arm: make the pre-mutation backup fail on this night (0 = never). The oracle "
+                             "checks that the cursor is held and the window is read again the next night.")
+    parser.add_argument("--backup-keep-last", type=int, default=7, help="Tmp arm: guarded_auto_backup_keep_last.")
+    parser.add_argument("--backup-keep-days", type=int, default=30, help="Tmp arm: guarded_auto_backup_keep_days.")
+    parser.add_argument("--embed-seeds", action="store_true",
+                        help="Embed the control seeds' text with the configured embedding server, so a recall "
+                             "query with a seed's text matches it (needed for the quarantine recall oracle).")
     return parser.parse_args(argv)
 
 

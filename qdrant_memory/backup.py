@@ -409,7 +409,10 @@ def export_collection(qdrant: Any, config: dict[str, Any], *, scope: str, out_fi
     return summary
 
 
-def create_backup(qdrant: Any, config: dict[str, Any], *, hermes_home: str | Path, scope: str = "both", backup_id: str | None = None) -> dict[str, Any]:
+def create_backup(qdrant: Any, config: dict[str, Any], *, hermes_home: str | Path, scope: str = "both", backup_id: str | None = None,
+                  created_by: str = "") -> dict[str, Any]:
+    """Full backup of the scope's collections. ``created_by`` tags who took it (the watcher's
+    pre-mutation backup is tagged ``watcher_guarded_auto``; only those are subject to retention)."""
     root = ensure_private_dir(backup_root(config, hermes_home))
     backup_id = validate_backup_id(backup_id or generate_backup_id())
     backup_dir = backup_dir_for_id(root, backup_id)
@@ -449,6 +452,8 @@ def create_backup(qdrant: Any, config: dict[str, Any], *, hermes_home: str | Pat
         "contains_vectors": True,
         "collections": collections,
     }
+    if created_by:
+        manifest["created_by"] = str(created_by)
     _safe_atomic_write_text(backup_dir / "manifest.json", _canonical_json(manifest) + "\n", overwrite=False)
     return sanitize_manifest(manifest, backup_dir=backup_dir)
 
@@ -680,6 +685,8 @@ def sanitize_manifest(manifest: dict[str, Any], *, backup_dir: Path | None = Non
         "contains_vectors": bool(manifest.get("contains_vectors")),
         "collections": collections,
     }
+    if manifest.get("created_by"):
+        result["created_by"] = str(manifest["created_by"])
     if backup_dir is not None:
         result["backup_dir"] = str(backup_dir)
     if checksum_ok is not None:

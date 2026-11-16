@@ -35,9 +35,11 @@ _TEXT = {
         "more": "(+{more} more: hermes qdrant capture review)",
         "expiring": "Expiring within 3 days: {items}",
         "auto": "Stored automatically (undo: hermes qdrant forget <point_id> --no-dry-run --approve):",
-        "approve": "Approve: hermes qdrant capture approve <id> --no-dry-run --approve",
+        "approve": "Approve: hermes qdrant capture approve <id> --no-dry-run --approve "
+                   "[--fact \"one sentence to store instead\"]",
         "reject": "Reject: hermes qdrant capture reject <id> --no-dry-run --approve",
-        "chat": "In chat: \"approve capture <id>\" or \"reject capture <id>\"",
+        "chat": "In chat: \"approve capture <id>\" (the agent proposes one sentence to store; correct it before "
+                "approving) or \"reject capture <id>\"",
     },
     "es": {
         "title": "Resumen de captura de memoria (Qdrant)",
@@ -49,9 +51,11 @@ _TEXT = {
         "more": "(+{more} más: hermes qdrant capture review)",
         "expiring": "Vencen en 3 días o menos: {items}",
         "auto": "Guardadas automáticamente (deshacer: hermes qdrant forget <point_id> --no-dry-run --approve):",
-        "approve": "Aprobar: hermes qdrant capture approve <id> --no-dry-run --approve",
+        "approve": "Aprobar: hermes qdrant capture approve <id> --no-dry-run --approve "
+                   "[--fact \"una frase para guardar en su lugar\"]",
         "reject": "Rechazar: hermes qdrant capture reject <id> --no-dry-run --approve",
-        "chat": "En el chat: \"aprueba la captura <id>\" o \"rechaza la captura <id>\"",
+        "chat": "En el chat: \"aprueba la captura <id>\" (el agente propone una frase para guardar; corrígela antes "
+                "de aprobar) o \"rechaza la captura <id>\"",
     },
 }
 

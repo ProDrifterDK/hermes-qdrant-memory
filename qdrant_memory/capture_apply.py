@@ -17,11 +17,12 @@ re-verified against ``state.db`` here: a row that changed (``drifted``) or is go
 """
 from __future__ import annotations
 
+import copy
 import json
 import time
 from typing import Any
 
-from qdrant_memory.capture_queue import QueueItem, point_id_for
+from qdrant_memory.capture_queue import QueueItem, point_id_for, sha256_text
 from qdrant_memory.extraction_candidates import ExtractionCandidate
 from qdrant_memory.session_origin import (
     MAX_CITATIONS,
@@ -33,10 +34,47 @@ from qdrant_memory.session_origin import (
 from qdrant_memory.write_gate import evaluate_write_candidate
 
 MIRROR_SOURCE = "builtin_memory_mirror"
+# An edited fact is one statement: one line, at most this many characters.
+MAX_EDITED_FACT_CHARS = 500
 
 
 def _now_z() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def normalize_edited_fact(fact: Any) -> str:
+    """The approval-time fact as stored: whitespace collapsed to one line. Raises ``ValueError``."""
+    text = " ".join(str(fact or "").split())
+    if not text:
+        raise ValueError("fact must be a non-empty sentence (or omit it to store the queued text)")
+    if len(text) > MAX_EDITED_FACT_CHARS:
+        raise ValueError(f"fact must be one sentence of at most {MAX_EDITED_FACT_CHARS} characters")
+    return text
+
+
+def with_fact(item: QueueItem, fact: str) -> QueueItem:
+    """A copy of ``item`` whose write stores ``fact`` instead of the queued text.
+
+    Only the text changes: the candidate id, the pinned citation (still re-verified at write
+    time) and the route stay the queued ones. The stored payload says the text was edited and
+    keeps a digest of the queued text, never the text itself.
+    """
+    queued = copy.deepcopy(item.queued)
+    edit_marks = {"capture_fact_edited": True, "capture_original_fact_sha256": queued.get("fact_sha256")
+                  or sha256_text(item.fact)}
+    write = queued.get("write") or {}
+    if write.get("path") == "extraction_approval":
+        payload = write["candidate"]["proposed_payload"]
+        payload["text"] = fact
+        payload.pop("claim_text", None)
+        payload.update(edit_marks)
+    elif write.get("path") == "manual_store":
+        write["text"] = fact
+        write["extra_payload"] = {**(write.get("extra_payload") or {}), **edit_marks}
+    queued["fact"] = fact
+    queued["fact_sha256"] = sha256_text(fact)
+    return QueueItem(item.candidate_id, queued, list(item.history), item.status,
+                     [dict(c) for c in item.extra_citations], item.point_id)
 
 
 def check_citation(provider: Any, item: QueueItem) -> dict[str, Any]:

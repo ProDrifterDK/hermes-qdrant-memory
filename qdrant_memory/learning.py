@@ -9,8 +9,10 @@ from .schema import build_payload, clean_text_for_memory, now_iso
 from .scoring import final_memory_score
 from .session_origin import merge_session_origin, origin_session_id, validate_session_origin
 from .retriever import (
+    QUARANTINE_CONDITION,
     CandidatePool,
     RetrievedMemory,
+    is_quarantined,
     _append_bool_filter,
     _extend_search_filter_conditions,
     _match_condition,
@@ -283,10 +285,9 @@ class LearningStore:
         _append_bool_filter(must, must_not, "stale", stale)
         _append_bool_filter(must, must_not, "requires_review", requires_review)
         _append_bool_filter(must, must_not, "canonical", canonical)
-        result: dict[str, Any] = {"must": must}
-        if must_not:
-            result["must_not"] = must_not
-        return result
+        # A quarantined learning is out of search and duplicate checks (inspect reaches it by id).
+        must_not.append(dict(QUARANTINE_CONDITION))
+        return {"must": must, "must_not": must_not}
 
     def find_semantic_duplicate(
         self,
@@ -415,6 +416,8 @@ class LearningStore:
             if raw_score < self.min_raw_score:
                 continue
             payload = item.get("payload") or {}
+            if is_quarantined(payload):
+                continue
             payload_learning_type = str(payload.get("learning_type") or "").strip()
             if allowed_learning_types and payload_learning_type and payload_learning_type not in allowed_learning_types:
                 continue
