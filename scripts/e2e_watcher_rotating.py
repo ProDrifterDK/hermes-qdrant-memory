@@ -555,11 +555,10 @@ class Run:
         if self.args.keep:
             return
         admin = _client(self.args.qdrant_url)
+        existing = set(admin.get_collections())
         for name in (self.tmp_memory, self.tmp_learning):
-            try:
+            if name in existing:
                 admin._request("DELETE", f"/collections/{name}")
-            except Exception:
-                pass
         remaining = [name for name in admin.get_collections() if name.startswith(TMP_PREFIX)]
         self.check("temporary collections deleted", not remaining, remaining=remaining)
 
