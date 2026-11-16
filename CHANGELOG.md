@@ -9,6 +9,7 @@ This project is currently public beta / experimental. The format follows Keep a 
 ### Added (capture and watcher closing)
 
 - Capture approval takes an optional distilled fact: `qdrant_capture_approve` argument `fact` and `hermes qdrant capture approve <id> --fact TEXT`. The one-sentence statement is stored instead of the queued message; the citation stays the queued row and is re-verified, the write gate runs on the new text, the dry run binds the text, and the stored point and the audit events record the edit as a digest of the original (`capture_fact_edited`, `capture_original_fact_sha256`; `fact_edited`, `original_fact_sha256`). The tool description asks the agent to propose the sentence; the digest's chat hint says so.
+- Retention for the watcher's full pre-mutation backups (about 264 MB each, one per mutating night). After each guarded-auto night the watcher keeps the newest `guarded_auto_backup_keep_last` (default 7) plus every backup an application record of the last `guarded_auto_backup_keep_days` (default 30) references, and deletes the rest. Only backups tagged `created_by: watcher_guarded_auto` (new manifest field, written by the watcher's backup only) are candidates; manual backups and per-action snapshots are never deleted, and an unreadable application record stops the pruning. Deletions are listed in the run output and the watcher log.
 
 ### Fixed (capture and watcher closing)
 

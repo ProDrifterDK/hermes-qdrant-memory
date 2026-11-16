@@ -493,6 +493,25 @@ def _guarded_auto_policy_from_args(args: Namespace) -> GuardedAutoPolicy:
 _WINDOW_HOLDING_ERRORS = frozenset({"backup_failed", "missing_report_id"})
 
 
+def _run_backup_retention(provider: Any, summary: dict[str, Any]) -> None:
+    """Prune the watcher's old full backups after a guarded-auto night (never on report-only).
+
+    The result goes into the run summary (``backup_retention``, printed to watcher.log) and
+    the log event; a failure is a run error (it alerts) but never holds the scan cursor.
+    """
+    prune = getattr(provider, "guarded_auto_prune_backups", None)
+    if not callable(prune):
+        return
+    try:
+        result = prune()
+        retention: dict[str, Any] = result if isinstance(result, dict) else {"deleted": [], "error": "invalid result"}
+    except Exception as exc:
+        retention = {"deleted": [], "error": f"{type(exc).__name__}"}
+    summary["backup_retention"] = retention
+    if retention.get("error") or retention.get("errors"):
+        summary.setdefault("errors", []).append({"code": "backup_retention_failed"})
+
+
 def _record_watcher_run(args: Namespace, report: dict[str, Any]) -> None:
     if getattr(args, "qdrant_subcommand", None) != "watcher" or getattr(args, "watcher_subcommand", None) != "run":
         return
@@ -578,6 +597,8 @@ def _record_watcher_run(args: Namespace, report: dict[str, Any]) -> None:
             "guarded_auto_would_apply_count": guarded_auto_would_apply,
             **({"scan_window": state["last_scan_window"]} if rotating else {}),
             **({"scan_window_held": held} if rotating and held else {}),
+            **({"backup_retention_deleted": list(guarded_auto["backup_retention"].get("deleted") or [])}
+               if isinstance(guarded_auto.get("backup_retention"), dict) else {}),
         }
     )
 
@@ -2953,7 +2974,10 @@ def execute_command(
             print(f"Error: {_provider_error_message(parsed)}", file=stderr)
         return 1
     if getattr(args, "qdrant_subcommand", None) == "watcher" and getattr(args, "watcher_subcommand", None) == "run":
-        guarded_auto = apply_guarded_auto(provider, parsed, _guarded_auto_policy_from_args(args))
+        policy = _guarded_auto_policy_from_args(args)
+        guarded_auto = apply_guarded_auto(provider, parsed, policy)
+        if policy.enabled:
+            _run_backup_retention(provider, guarded_auto)
         parsed["guarded_auto"] = guarded_auto
         result = json.dumps(parsed, sort_keys=True)
     _record_watcher_run(args, parsed)

@@ -2716,9 +2716,26 @@ class QdrantMemoryProvider(MemoryProvider):
 
         Raises on any failure; the caller must then apply nothing.
         """
+        from qdrant_memory.backup_retention import WATCHER_BACKUP_ORIGIN
+
         if not self._qdrant:
             raise RuntimeError("Qdrant memory provider is not initialized")
-        return create_backup(self._qdrant, self._config, hermes_home=self._hermes_home, scope=scope)
+        return create_backup(self._qdrant, self._config, hermes_home=self._hermes_home, scope=scope,
+                             created_by=WATCHER_BACKUP_ORIGIN)
+
+    def guarded_auto_prune_backups(self) -> dict[str, Any]:
+        """Backup retention after a guarded-auto night (``qdrant_memory.backup_retention``).
+
+        Only the watcher's own full pre-mutation backups are candidates; the counts come from
+        ``guarded_auto_backup_keep_last`` and ``guarded_auto_backup_keep_days``.
+        """
+        from qdrant_memory.backup_retention import DEFAULT_KEEP_DAYS, DEFAULT_KEEP_LAST, prune_watcher_backups
+
+        return prune_watcher_backups(
+            self._config, hermes_home=str(self._hermes_home or Path.home() / ".hermes"),
+            keep_last=int(self._config.get("guarded_auto_backup_keep_last", DEFAULT_KEEP_LAST)),
+            keep_days=int(self._config.get("guarded_auto_backup_keep_days", DEFAULT_KEEP_DAYS)),
+        )
 
     def _guarded_auto_backup_covers(self, backup_id: str, collection_name: str) -> bool:
         """True when ``backup_id`` names a readable backup manifest holding ``collection_name``."""

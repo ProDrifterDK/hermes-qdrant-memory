@@ -47,6 +47,10 @@ DEFAULTS: dict[str, Any] = {
     "guarded_auto_learning_min_confidence": 0.90,
     "guarded_auto_stale_quarantine_enabled": True,
     "guarded_auto_quarantine_days": 30,
+    # Retention of the watcher's full pre-mutation backups: keep the newest N plus any an
+    # application record of the last D days references (qdrant_memory/backup_retention.py).
+    "guarded_auto_backup_keep_last": 7,
+    "guarded_auto_backup_keep_days": 30,
     "backup_artifact_dir": "",
     "reconsolidation_enabled": False,
     "reconsolidation_report_only": True,
@@ -273,6 +277,8 @@ _INT_KEYS = {
     "guarded_auto_max_actions",
     "guarded_auto_duplicate_max_cluster_size",
     "guarded_auto_quarantine_days",
+    "guarded_auto_backup_keep_last",
+    "guarded_auto_backup_keep_days",
     "reconsolidation_max_candidates",
     "manual_store_duplicate_top_k",
     "auto_recall_shadow_max_per_session",
