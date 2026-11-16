@@ -170,10 +170,10 @@ The rule, in order (`recall_noise.turn_noise_reason`):
    all of these; the classifier adds the shapes `host_markers` does not know (for example the
    tool-iteration limit notice).
 2. **Known session.** When `state.db` has the turn's session (payload `session_id`), structure
-   decides and the text does not: a session with a `parent_session_id` (a delegated child, a
-   compression continuation) is kept; a `oneshot` session (`ONE_SHOT_SOURCES`, the same kind the
-   session-lane filter drops) is left out (`one_shot_session`); every other session, interactive
-   or agent (subagent, cron, tool, API clients), is kept. A probe typed into a person's
+   decides and the text does not: a `oneshot` session (`ONE_SHOT_SOURCES`, the same kind the
+   session-lane filter drops, including a one-shot run's compression continuation) is left out
+   (`one_shot_session`); every other session, interactive or agent (a delegated child is a
+   `subagent` session; cron, tool, API clients), is kept. A probe typed into a person's
    interactive session is therefore kept.
 3. **Session gone.** The host prunes sessions while their turn points stay in Qdrant: on one
    install 7,260 of 10,355 turn points (70%) name a session no `state.db` holds any more. Such a

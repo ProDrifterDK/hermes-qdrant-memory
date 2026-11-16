@@ -5,8 +5,7 @@ leave out a conversation-turn point (``memory_kind=conversation_turn``, or
 ``source_type=conversation`` with ``chunk_type=turn``) when one of these holds:
 
 - ``one_shot_session``: its session (payload ``session_id``) is a non-interactive one-shot run:
-  ``sessions.source`` is in ``capture_reader.ONE_SHOT_SOURCES`` and the session has no
-  ``parent_session_id``. Its text does not matter.
+  ``sessions.source`` is in ``capture_reader.ONE_SHOT_SOURCES``. Its text does not matter.
 - ``host_user_side``: its user side is host text under ``capture_reader.classify_row`` (the
   session-lane filter's classifier), judged with the session's fields when its row exists.
 - ``echo_probe``: its session has no row in ``state.db`` (the host prunes sessions; turn points
@@ -14,12 +13,11 @@ leave out a conversation-turn point (``memory_kind=conversation_turn``, or
   user side demands an exact reply and the whole assistant side is that literal, copied from
   the user side (``is_echo_probe``).
 
-Everything else is kept. A session that has a ``parent_session_id`` (a delegated child or a
-compression continuation) or a non-interactive source other than one-shot (subagent, cron,
-tool, API clients) is kept unless its user side is host text: agent-prompted sessions hold
-findings the user asks about later. A session whose row exists is judged by structure only, so
-a probe typed in a person's interactive session is kept. Documents, manual facts and every
-other point kind are never judged.
+Everything else is kept. A session with a non-interactive source other than one-shot (a
+delegated child is a ``subagent`` session; cron, tool, API clients) is kept unless its user
+side is host text: agent-prompted sessions hold findings the user asks about later. A session
+whose row exists is judged by structure only, so a probe typed in a person's interactive
+session is kept. Documents, manual facts and every other point kind are never judged.
 
 The session's fields come from ``state.db`` (``session_recall_state_db``), read through the C'
 read-only reader without its lock retry (a busy database means "no structural evidence", never a
@@ -124,8 +122,8 @@ def turn_noise_reason(payload: Mapping[str, Any], facts: SessionFacts | None) ->
     if verdict.classification == CLASS_HOST:
         return REASON_HOST_USER_SIDE
     if known:
-        if parent:
-            return ""  # a delegated child or a continuation: kept
+        # Structure decides. Delegated children are ``subagent`` sessions (kept); a one-shot
+        # run's compression continuation keeps the ``oneshot`` source (left out with it).
         if source in ONE_SHOT_SOURCES or (verdict.classification == CLASS_MACHINE
                                           and verdict.kind in LANE_NOISE_KINDS):
             return REASON_ONE_SHOT_SESSION
