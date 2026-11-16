@@ -966,6 +966,8 @@ _declare(["qdrant_capture_review", "capture review"], "read_only",
          note="reads $HERMES_HOME/qdrant_memory/capture/queue.jsonl; no Qdrant or state.db write")
 _declare(["qdrant_capture_reject", "capture reject"], "read_only",
          note="appends a rejected event to the capture queue file; no Qdrant access")
+_declare(["capture digest"], "read_only",
+         note="reads the capture queue; writes only its own marker file (digest.json)")
 _declare(["capture run"], "protection", pins=CAPTURE_RUN_PINS,
          note="dry run reads only; --apply (capture_mode on) writes the auto and mirror routes through the same "
               "gated paths as approve and merges duplicate citations through the extraction locked upsert")
@@ -989,10 +991,10 @@ _declare(["backup create", "eval-capture"], "read_only",
 # a check that reads the same source twice is not a check. Because these are duplicates,
 # adding a pin means updating both the constant and this literal.
 
-# The derived surface — 27 tools, 59 CLI commands, 12 provider hooks. A route added or
+# The derived surface — 27 tools, 60 CLI commands, 12 provider hooks. A route added or
 # removed changes this number, which forces someone to touch this file and classify it,
 # even if the completeness check in the test body is later weakened.
-FROZEN_SURFACE_SIZE = 98
+FROZEN_SURFACE_SIZE = 99
 
 # Every `[mode]` row, frozen by name and by kind. Completeness used to ask only whether
 # *some* mode row existed for the route, so deleting both `[capture]` rows, deleting both

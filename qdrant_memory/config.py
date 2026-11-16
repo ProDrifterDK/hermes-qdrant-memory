@@ -161,6 +161,8 @@ DEFAULTS: dict[str, Any] = {
     # Lane C: mirror the agent's built-in memory tool writes (target=memory stored, target=user
     # reviewed, replaced/removed text kept as superseded captures). Part of capture run.
     "capture_mirror_builtin_memory": False,
+    # Language of ``hermes qdrant capture digest``: en or es.
+    "capture_digest_language": "en",
     "session_prefetch_candidates": 32,
     "session_prefetch_timeout_s": 2.0,
     # Lane relevance floors: a reranked excerpt needs at least min_rerank_score, a dense-ordered
@@ -488,6 +490,9 @@ def _coerce(key: str, value: Any) -> Any:
             return "on" if value else "off"
         candidate = value.strip().lower().replace("-", "_") if isinstance(value, str) else ""
         return candidate if candidate in _CAPTURE_MODES else "off"
+    if key == "capture_digest_language":
+        candidate = value.strip().lower() if isinstance(value, str) else ""
+        return candidate if candidate in {"en", "es"} else "en"
     if isinstance(default, str):
         return str(value)
     return value

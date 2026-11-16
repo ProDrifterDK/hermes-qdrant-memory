@@ -2460,6 +2460,15 @@ def _execute_capture_command(args: Namespace, stdout, provider_factory: Callable
         return _execute_capture_decision(args, stdout, provider_factory)
     if getattr(args, "capture_subcommand", None) == "run":
         return _execute_capture_run(args, stdout, provider_factory)
+    if getattr(args, "capture_subcommand", None) == "digest":
+        from qdrant_memory.capture_digest import digest, digest_language
+
+        hermes_home, config = _local_config()
+        text = digest(str(hermes_home), max_items=int(getattr(args, "max_items", 10) or 10),
+                      language=digest_language(config, getattr(args, "language", None)))
+        if text:  # nothing new: print nothing, so a cron job delivers nothing
+            print(text, file=stdout)
+        return 0
     if getattr(args, "capture_subcommand", None) != "scan":
         raise CliUsageError("unsupported qdrant capture command")
     hermes_home, config = _local_config()

@@ -596,6 +596,14 @@ def _register_capture(subcommands) -> None:
                      help="Only rows from the last N days (bounds a first run).")
     run.add_argument("--json", action="store_true", help="Emit machine-readable JSON output (ids only).")
 
+    digest = capture_subcommands.add_parser(
+        "digest", help="Plain-text digest of the capture queue since the last digest, for a cron delivery. "
+                       "Prints nothing when nothing is new; writes only its own marker.")
+    digest.set_defaults(qdrant_subcommand="capture")
+    digest.add_argument("--max-items", type=_positive_int, default=10, help="Pending items to list (max 10).")
+    digest.add_argument("--language", choices=["en", "es"], default=None,
+                        help="Digest language. Default: qdrant_memory.capture_digest_language (en).")
+
     review = capture_subcommands.add_parser(
         "review", help="List capture items waiting for review (pending, oldest first). Read-only.")
     review.set_defaults(qdrant_subcommand="capture")
