@@ -307,7 +307,9 @@ def mirror_lane(run: Any, before: int, upto: int, since_ts: float | None, items:
     known = _known_from_queue(items)
     expiry = float(run.config.get("capture_review_expiry_days", 21))
     seen_ids = set(items)
-    seen_calls = {str(item.queued.get("call_digest")) for item in items.values() if item.queued.get("call_digest")}
+    # call digest -> the row that first carried it; a later row with the same call is a copy.
+    seen_calls = {str(item.queued["call_digest"]): int(item.queued.get("msg_id") or 0) for item in items.values()
+                  if item.queued.get("call_digest")}
     for msg_id, session_id, _ts, tool_calls, message_uid in read_memory_call_rows(run.state_db, before, upto, since_ts):
         calls = parse_tool_calls(tool_calls)
         if not calls:
@@ -319,8 +321,7 @@ def mirror_lane(run: Any, before: int, upto: int, since_ts: float | None, items:
             stats["ops"] += len(call.ops)
             accepted, result = call_outcome(context["results"].get(call.call_id))
             stats["outcomes"][{True: "accepted", False: "refused", None: "unknown"}[accepted]] += len(call.ops)
-            copied = call.digest in seen_calls
-            seen_calls.add(call.digest)
+            copied = seen_calls.setdefault(call.digest, msg_id) != msg_id
             for op in call.ops:
                 stats["actions"][f"{op.target}:{op.action or '-'}"] += 1
                 if context["clone"]:

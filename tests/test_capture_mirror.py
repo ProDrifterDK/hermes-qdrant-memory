@@ -208,6 +208,8 @@ def test_a_rerun_creates_no_new_points_or_items(world):
     save_cursor(cursor_path(str(world["home"])), str(world["db"]), 0)
     rerun = _run(world, apply=True)
     assert _mirror(rerun) == []
+    assert "copied_call" not in rerun["report"]["counts"]["drops"]  # the same rows: duplicates, not copies
+    assert rerun["report"]["counts"]["drops"]["duplicate_id"] == 9  # 8 mirror items and 1 heuristic item
     assert world["qdrant"].collection("memory").keys() == points.keys()
     assert [e for e in cq.CaptureQueue(str(world["home"])).events() if e["event"] == "queued"] == queued
 
