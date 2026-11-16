@@ -866,13 +866,28 @@ persisted capture queue that replaces them; see [docs/capture.md](docs/capture.m
 The settings `learning_auto_extract_*` and `source_extraction_*` are still accepted so existing configs
 keep loading, have no effect, and log one warning per process. Remove them from your config.
 
-What exists of the replacement so far is read-only: `qdrant_memory/capture_reader.py` reads new
-`state.db` rows after a persisted cursor and classifies who wrote each one (host, machine, or a
-person), and `hermes qdrant capture scan [--since-days N] [--json] [--advance]` reports the counts.
-`session_prefetch_exclude_machine: true` (default `false`) uses the same classifier to keep windows
-of one-shot runs (test harnesses, probes) out of the automatic-recall session lane; windows prompted
-by an agent (delegation briefs, subagent, cron, tool runs) stay recallable. See
-[docs/capture.md](docs/capture.md).
+The replacement is automatic capture, off by default (`capture_mode: off`; nothing below changes
+an install that does not turn it on):
+
+- `qdrant_memory/capture_reader.py` reads new `state.db` rows after a persisted cursor and
+  classifies who wrote each one (host, machine, or a person); `hermes qdrant capture scan` reports
+  the counts.
+- `hermes qdrant capture run [--dry-run | --apply] [--since-days N]` is the nightly batch: a
+  heuristic detector over the owner's own messages (`capture_owner_senders`), and, with
+  `capture_mirror_builtin_memory: true`, a mirror of the agent's built-in `memory` tool writes.
+  Every candidate cites its exact `state.db` row, goes through the existing write gate and dedupe,
+  and lands in a persisted review queue (`$HERMES_HOME/qdrant_memory/capture/queue.jsonl`).
+- `hermes qdrant capture review | approve <id> | reject <id>` and the tools `qdrant_capture_review`,
+  `qdrant_capture_approve`, `qdrant_capture_reject` (full surface only, shown only while capture is
+  on) decide review items. Approval re-verifies the citation and writes only through the existing
+  extraction-approval or manual-store path, with the captured conversation as origin. Cron sessions
+  can list but never approve.
+- `hermes qdrant capture digest` prints a short daily summary for a no-agent cron delivery, and
+  nothing when nothing is new.
+- `session_prefetch_exclude_machine: true` (default `false`) uses the same classifier to keep
+  windows of one-shot runs (test harnesses, probes) out of the automatic-recall session lane.
+
+See [docs/capture.md](docs/capture.md) for the settings, routes and how to turn it on.
 
 ### `qdrant_memory_session_recall`
 
