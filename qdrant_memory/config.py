@@ -140,7 +140,7 @@ DEFAULTS: dict[str, Any] = {
     # 0 = the legacy block's cap (max(800, display_tokens * 4)) plus session_prefetch_max_chars.
     "session_prefetch_total_chars": 0,
     "session_prefetch_rerank": True,
-    # Opt-in: drop a recalled window when every user row in it is host or machine text
+    # Opt-in: drop a recalled window whose prompting user side is machine text only
     # (capture_reader.classify_row), e.g. a scripted "Reply with exactly: OK" turn.
     "session_prefetch_exclude_machine": False,
     "session_prefetch_candidates": 32,

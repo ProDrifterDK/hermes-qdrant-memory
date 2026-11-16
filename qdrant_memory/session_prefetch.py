@@ -89,7 +89,8 @@ class PrefetchSettings:
     # dense-ordered one (no reranker, or the reranker failed) by its cosine similarity.
     min_rerank_score: float | None = None
     min_dense_score: float | None = None
-    # Drop a window whose user rows are all host or machine text (opt-in).
+    # Drop a window whose prompting user side is machine text only (opt-in;
+    # capture_reader.window_is_machine_only).
     exclude_machine: bool = False
 
     @classmethod
@@ -287,7 +288,7 @@ class SessionPrefetchLane:
         self.expand_hint = expand_hint
         self.last_rerank = ""  # the window search's rerank status of the last collect
         # (session_id, first_msg_id, last_msg_id) of the windows the last collect dropped
-        # because every user row in them is host or machine text (exclude_machine).
+        # because their prompting user side is machine text (exclude_machine).
         self.last_excluded: list[tuple[str, int, int]] = []
 
     def build(
