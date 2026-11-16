@@ -537,6 +537,8 @@ qdrant_memory:
   auto_recall_min_final_score: off
   auto_recall_min_raw_score: off
   auto_recall_min_word_chars: off
+  # Leave stored turns of test harnesses and probes out of the legacy/hybrid block (docs/capture.md).
+  auto_recall_exclude_machine: false
   search_candidates: 20
   decay_rate: 0.001
   max_chunk_tokens: 256
@@ -871,7 +873,11 @@ What exists of the replacement so far is read-only: `qdrant_memory/capture_reade
 person), and `hermes qdrant capture scan [--since-days N] [--json] [--advance]` reports the counts.
 `session_prefetch_exclude_machine: true` (default `false`) uses the same classifier to keep windows
 of one-shot runs (test harnesses, probes) out of the automatic-recall session lane; windows prompted
-by an agent (delegation briefs, subagent, cron, tool runs) stay recallable. See
+by an agent (delegation briefs, subagent, cron, tool runs) stay recallable.
+`auto_recall_exclude_machine: true` (default `false`) does the same for the legacy block and the
+hybrid dense lane: stored conversation turns of one-shot runs are left out, and so are turns of
+pruned sessions whose own text is a scripted exact-reply check ("Reply with exactly: OK" answered
+"OK"); turns of delegated and subagent sessions are kept. See
 [docs/capture.md](docs/capture.md).
 
 ### `qdrant_memory_session_recall`
