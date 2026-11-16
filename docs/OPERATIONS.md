@@ -363,7 +363,8 @@ include_reconsolidation=true
 
 - the cursor is a Qdrant point ID, persisted per collection in `watcher_state.json` under `scan_window` (`next_offset`, `cycle`, `runs_in_cycle`, `scanned_in_cycle`, `last_completed_cycle_scanned`); N runs read N × `--max-points` distinct IDs until the collection is covered, then the cursor resets and the next run starts a new cycle (17,728 points at 300 a night is a 60-night cycle; a collection smaller than the window is read whole every night);
 - Qdrant scrolls in point-ID order and treats the offset as a lower bound, so a cursor whose point was deleted still resumes at the next ID, and new points (random UUIDs) are reached within one cycle;
-- a failed run does not advance the cursor; a cursor recorded for another collection name, or a malformed one, starts a new cycle;
+- a failed run does not advance the cursor; neither does a guarded-auto night whose pre-mutation backup failed (nothing was applied): the state records `scan_window_held` (`reason: backup_failed`), the log event carries `scan_window_held`, the run alerts, and the next night reads the same window again. A backup that keeps failing keeps the watcher on that window and alerts every night. Per-proposal refusals (`provider_rejected`) do not hold the cursor;
+- a cursor recorded for another collection name, or a malformed one, starts a new cycle;
 - the report carries `scan_window` (start and next offset, points read, whether the end was reached, and a digest of the IDs read); the log event carries the per-collection counts;
 - in rotating mode a clean window (no proposals, nothing applied, no error) does not raise an alert; any window with proposals does, because each window is new.
 

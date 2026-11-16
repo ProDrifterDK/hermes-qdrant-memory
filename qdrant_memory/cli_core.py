@@ -490,6 +490,9 @@ def _guarded_auto_policy_from_args(args: Namespace) -> GuardedAutoPolicy:
     )
 
 
+_WINDOW_HOLDING_ERRORS = frozenset({"backup_failed", "missing_report_id"})
+
+
 def _record_watcher_run(args: Namespace, report: dict[str, Any]) -> None:
     if getattr(args, "qdrant_subcommand", None) != "watcher" or getattr(args, "watcher_subcommand", None) != "run":
         return
@@ -514,11 +517,20 @@ def _record_watcher_run(args: Namespace, report: dict[str, Any]) -> None:
     guarded_auto_errors = len(guarded_auto.get("errors", []) or []) if guarded_auto else 0
     guarded_auto_would_apply = len(guarded_auto.get("would_apply", []) or []) if guarded_auto else 0
     rotating = isinstance(report.get("scan_window"), dict) and report["scan_window"].get("mode") == "rotating"
+    # A night whose guarded-auto actions could not be attempted at all (the pre-mutation
+    # backup failed) keeps its cursor, so the same window is retried the next night instead
+    # of waiting a whole cycle. Per-proposal refusals do not hold it: they would recur.
+    held = next((str(error.get("code")) for error in guarded_auto.get("errors", []) or []
+                 if isinstance(error, dict) and error.get("code") in _WINDOW_HOLDING_ERRORS), "") if guarded_auto else ""
     if rotating:
         # Every rotating window differs, so the signature changes nightly; a clean window
         # (no proposals) carries nothing to review and does not page the notifier.
         alerted = bool((signature_changed and proposal_list) or force_alert)
-        state["scan_window"] = next_scan_window_state(state.get("scan_window"), report["scan_window"])
+        if held:
+            state["scan_window_held"] = {"reason": held, "at": timestamp, "report_id": report.get("report_id")}
+        else:
+            state["scan_window"] = next_scan_window_state(state.get("scan_window"), report["scan_window"])
+            state.pop("scan_window_held", None)
         state["last_scan_window"] = {
             label: {
                 key: entry.get(key)
@@ -565,6 +577,7 @@ def _record_watcher_run(args: Namespace, report: dict[str, Any]) -> None:
             "guarded_auto_error_count": guarded_auto_errors,
             "guarded_auto_would_apply_count": guarded_auto_would_apply,
             **({"scan_window": state["last_scan_window"]} if rotating else {}),
+            **({"scan_window_held": held} if rotating and held else {}),
         }
     )
 

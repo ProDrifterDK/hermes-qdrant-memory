@@ -13,6 +13,7 @@ This project is currently public beta / experimental. The format follows Keep a 
 ### Fixed (capture and watcher closing)
 
 - Quarantine now hides a point from recall. The legacy dense lane (production `auto_recall_mode: legacy`), `qdrant_memory_search`/`context`, memory read sources, `qdrant_learning_search` and graph entity resolution ignored `consolidation_quarantined`, so the watcher's quarantine of heading noise and duplicate copies changed nothing the owner saw. The dense and learning searches send the marker as a server-side `must_not` (a quarantined point no longer takes a top-k slot) and drop it again client-side. Inspect, trace and restore still reach the point by id.
+- A guarded-auto night whose pre-mutation backup failed no longer advances the rotating scan cursor: the window is retried the next night instead of a cycle later. The state records `scan_window_held` and the log event says why.
 
 ### Changed (watcher, capture CP6)
 
