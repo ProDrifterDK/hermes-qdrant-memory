@@ -483,6 +483,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     except AttributeError:  # pragma: no cover - Python < 3.9 compatibility
         watcher_run.add_argument("--include-reconsolidation", action="store_true", default=True, help="Include reconsolidation candidates. Default: enabled.")
         watcher_run.add_argument("--no-include-reconsolidation", dest="include_reconsolidation", action="store_false", help="Disable reconsolidation candidates.")
+    watcher_run.add_argument("--scan-window", choices=["fixed", "rotating"], default="fixed", help="fixed (default) inspects the first --max-points IDs every run; rotating resumes from a persisted cursor so successive runs cover the whole collection, then wrap.")
     watcher_run.add_argument("--force-alert", action="store_true", help="Record an alert event even when the proposal signature is unchanged.")
     watcher_run.add_argument("--autonomy-mode", choices=["report-only", "guarded-auto"], default="report-only", help="Watcher autonomy policy. Default: report-only.")
     watcher_run.add_argument("--max-auto-actions", type=_positive_int, default=10, help="Maximum guarded-auto actions per run. Default: 10.")
@@ -501,6 +502,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     except AttributeError:  # pragma: no cover - Python < 3.9 compatibility
         watcher_install.add_argument("--include-reconsolidation", action="store_true", default=True, help="Include reconsolidation candidates. Default: enabled.")
         watcher_install.add_argument("--no-include-reconsolidation", dest="include_reconsolidation", action="store_false", help="Disable reconsolidation candidates.")
+    watcher_install.add_argument("--scan-window", choices=["fixed", "rotating"], default="fixed", help="Scan window for scheduled runs. Default: fixed.")
     watcher_install.add_argument("--approve", action="store_true", help="Required to replace an existing different managed watcher entry.")
     watcher_install.add_argument("--autonomy-mode", choices=["report-only", "guarded-auto"], default="report-only", help="Scheduled watcher autonomy policy. Default: report-only.")
     watcher_install.add_argument("--max-auto-actions", type=_positive_int, default=10, help="Maximum guarded-auto actions per run. Default: 10.")

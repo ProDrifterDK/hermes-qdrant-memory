@@ -1122,6 +1122,7 @@ hermes qdrant watcher status --verbose
 hermes qdrant watcher install --schedule "0 3 * * *"
 hermes qdrant watcher run --scope both --force-alert
 hermes qdrant watcher run --scope both --autonomy-mode guarded-auto --max-auto-actions 10 --force-alert
+hermes qdrant watcher run --scope both --max-points 300 --scan-window rotating --autonomy-mode guarded-auto
 hermes qdrant watcher logs --tail 20
 hermes qdrant watcher inspect-state
 hermes qdrant watcher reset-signature --approve
@@ -1148,6 +1149,8 @@ Mutation safety mirrors the tool surface:
 - live maintenance mutation requires both `--no-dry-run` and `--approve`;
 - `forget` only accepts explicit point IDs;
 - `watcher run` defaults to report-only consolidation with `dry_run=true`, `persist=true`, and no apply/proposal mutation; when explicitly run with `--autonomy-mode guarded-auto`, it may apply only preauthorized low-risk exact-ID proposals through the same exact `report_id` + `proposal_id` apply path and records guarded-auto counts in watcher state/logs; `--force-alert` only affects alerting and does not widen Qdrant authority;
+- guarded-auto never deletes and never touches a point carrying `session_origin`, identity metadata, or money, security or secret signals: cleanups and retired duplicates are quarantined, and it takes a full plugin backup before the first mutation of a run (nothing is applied if that fails) plus a restorable digest-bound snapshot of the points each action changes;
+- `watcher run --scan-window rotating` resumes from a persisted point-ID cursor so successive runs cover the whole collection and then wrap (the default `fixed` window re-reads the first `--max-points` IDs every run). See docs/OPERATIONS.md section 6 for the per-proposal-type policy, the audit trail and the exact command to turn guarded-auto on;
 - `watcher install` / `watcher uninstall --approve` edit only the sentinel-managed crontab block; replacing an existing different watcher block requires `--approve`;
 - `watcher reset-signature --approve` clears only local watcher signature fields and preserves unrelated watcher state;
 - `apply` requires explicit report/proposal IDs and expected action;
