@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional
 
 # User plugins may be imported outside Hermes' package context during tests.
 _HERMES_AGENT = Path.home() / ".hermes" / "hermes-agent"
@@ -205,6 +205,25 @@ _LOCK_REFUSAL_REDACTED = "lineage lock refusal redacted from a tool response"
 # therefore always reaches the log; an over-long *attempted* path (ENAMETOOLONG is not
 # bounded by PATH_MAX) is cut, prefix first.
 _LOCK_REFUSAL_LOG_CAP = 4300
+
+
+class _QueuedRecall(NamedTuple):
+    """A block ``queue_prefetch`` computed, and the message it was computed for.
+
+    ``block`` is ``None`` while the background search runs. Each queue call stores a new
+    entry; the search stores its block only while that same entry is still in the cache.
+    """
+
+    query_key: str
+    block: Optional[str]
+
+
+def _recall_key(query: str) -> str:
+    """The message a recall block belongs to: a digest of its recall text, whitespace collapsed.
+
+    A digest, so the cache never holds the message itself.
+    """
+    return hashlib.sha256(" ".join(str(query or "").split()).encode("utf-8")).hexdigest()
 
 
 def _json_error(message: str) -> str:
@@ -571,7 +590,7 @@ class QdrantMemoryProvider(MemoryProvider):
         self._learning_store: Optional[LearningStore] = None
         self._writer: Optional[ConversationWriter] = None
         self._executor: Optional[ThreadPoolExecutor] = None
-        self._prefetch_cache: dict[str, str] = {}
+        self._prefetch_cache: dict[str, _QueuedRecall] = {}
         self._prefetch_lock = threading.Lock()
         self._session_id = ""
         self._hermes_home = environment_hermes_home
@@ -984,33 +1003,32 @@ class QdrantMemoryProvider(MemoryProvider):
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if not self._active or not self._config.get("auto_recall") or not self._retriever:
             return ""
+        sid = session_id or self._session_id or "default"
+        # The block a previous ``queue_prefetch`` left for this session belongs to this turn
+        # or to none: it is taken out before any early return, so a turn that recalls nothing
+        # cannot hand it on to a later message (after its memories were quarantined, say).
+        with self._prefetch_lock:
+            queued = self._prefetch_cache.pop(sid, None)
         # A host-generated message (a gateway notification, a cron run) recalls nothing; a
         # host wrapper around real words (sender tag, Discord note, steer frame) comes off.
         query = recall_query(query)
         if not query or too_short_for_recall(query, self._config.get("auto_recall_min_word_chars")):
             return ""
-        sid = session_id or self._session_id or "default"
         # Phase 6I: determine the active auto-recall mode.
         active_mode = str(self._config.get("auto_recall_mode") or "legacy").strip().lower()
         if active_mode not in ("legacy", "hybrid"):
             active_mode = "legacy"
         # Phase 6H: ``prefetch`` is the single shadow emission point — it
         # is the call site that actually builds the prompt-context string
-        # returned to the caller. We pop the cache (a previous
-        # ``queue_prefetch`` for the same session may have populated it)
-        # and use the cached value as the legacy result **only when it is
-        # non-empty/truthy**. An empty cached value (e.g. ``queue_prefetch``
-        # legitimately produced no hits, or a stale empty entry was left
-        # behind) falls through to the normal search + format path so the
-        # prompt-context semantics match the pre-fix2 legacy behavior.
-        # Critically, this preserves the original ``if cached:`` truthiness
-        # check — the empty string is treated identically to a cache miss.
+        # returned to the caller. The queued block is used only when it was
+        # computed for this same message (Hermes queues with the turn that just
+        # ended, so usually it was not) and is non-empty: an empty block, a block
+        # still being computed, or one for other words falls through to the normal
+        # search + format path. A block computed for another message is never injected.
         result = ""
-        with self._prefetch_lock:
-            cached = self._prefetch_cache.pop(sid, "")
-        if cached:
-            # Cache hit (non-empty): use the queued formatted result as-is.
-            result = cached
+        if queued is not None and queued.block and queued.query_key == _recall_key(query):
+            # Cache hit: the queued block for these very words, used as-is.
+            result = queued.block
         elif active_mode == "hybrid":
             # Phase 6I: hybrid auto-recall path. Try the hybrid retrieve
             # + prompt-safe formatter. If it fails or returns empty,
@@ -1153,6 +1171,12 @@ class QdrantMemoryProvider(MemoryProvider):
         active_mode = str(self._config.get("auto_recall_mode") or "legacy").strip().lower()
         if active_mode not in ("legacy", "hybrid"):
             active_mode = "legacy"
+        # The entry is stored now, before the search runs: a ``prefetch`` that comes first
+        # takes it (still empty, so a miss), and the search's late block is then dropped
+        # instead of waiting in the cache for a later turn.
+        pending = _QueuedRecall(_recall_key(query), None)
+        with self._prefetch_lock:
+            self._prefetch_cache[sid] = pending
 
         def _run() -> None:
             try:
@@ -1163,7 +1187,8 @@ class QdrantMemoryProvider(MemoryProvider):
                     # Legacy dense path (always the fallback).
                     formatted = self._legacy_recall_block(query)
                 with self._prefetch_lock:
-                    self._prefetch_cache[sid] = formatted
+                    if self._prefetch_cache.get(sid) is pending:
+                        self._prefetch_cache[sid] = pending._replace(block=formatted)
             except Exception:
                 logger.debug("Qdrant queued prefetch failed", exc_info=True)
 

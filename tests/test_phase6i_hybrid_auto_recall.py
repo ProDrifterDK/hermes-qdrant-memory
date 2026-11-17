@@ -539,7 +539,7 @@ class TestQueuePrefetchHybridMode:
         )
         provider.queue_prefetch("queued query", session_id="s1")
         provider._executor.shutdown(wait=True)
-        cached = provider._prefetch_cache.get("s1", "")
+        cached = provider._prefetch_cache["s1"].block
         assert "queued hybrid content" in cached
 
     def test_hybrid_queue_falls_back_to_legacy(self, tmp_path):
@@ -561,7 +561,7 @@ class TestQueuePrefetchHybridMode:
         )
         provider.queue_prefetch("queued query", session_id="s1")
         provider._executor.shutdown(wait=True)
-        cached = provider._prefetch_cache.get("s1", "")
+        cached = provider._prefetch_cache["s1"].block
         assert "legacy queue fallback" in cached
 
     def test_queue_prefetch_no_shadow_event(self, tmp_path):

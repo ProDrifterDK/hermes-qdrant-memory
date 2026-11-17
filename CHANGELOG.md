@@ -6,6 +6,10 @@ This project is currently public beta / experimental. The format follows Keep a 
 
 ## [Unreleased]
 
+### Fixed (automatic recall)
+
+- Automatic recall no longer injects a block computed for an earlier message. Hermes calls `queue_prefetch` after each completed turn with that turn's message, and the next `prefetch` used the queued block whatever its own message was. A turn that recalls nothing (a short confirmation, host text) also left the block in place, so it could reach an unrelated message several turns later, after its memories were quarantined. The queued block now records a digest of the message it was computed for and is used only for that same message (whitespace aside); every `prefetch` takes it out before any early return, and a queued search that finishes after the next turn started discards its block. Hybrid mode keeps its legacy fallback.
+
 ### Added (capture and watcher closing)
 
 - Capture approval takes an optional distilled fact: `qdrant_capture_approve` argument `fact` and `hermes qdrant capture approve <id> --fact TEXT`. The one-sentence statement is stored instead of the queued message; the citation stays the queued row and is re-verified, the write gate runs on the new text, the dry run binds the text, and the stored point and the audit events record the edit as a digest of the original (`capture_fact_edited`, `capture_original_fact_sha256`; `fact_edited`, `original_fact_sha256`). The tool description asks the agent to propose the sentence; the digest's chat hint says so.
