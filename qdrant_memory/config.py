@@ -75,6 +75,16 @@ DEFAULTS: dict[str, Any] = {
     # one-shot runs and probes (qdrant_memory/recall_noise.py), e.g. a test harness's
     # "Reply with exactly: OK". Turns of delegated and subagent sessions are kept.
     "auto_recall_exclude_machine": False,
+    # Opt-in: rerank the legacy block with the session lane's reranker (session_recall_rerank_url).
+    # A pool of up to auto_recall_rerank_candidates chunks of the same search (never more than
+    # search_candidates, at most 20) is scored against the message, ordered by that score and
+    # admitted by auto_recall_min_rerank_score (reranker scale; "off" admits all, 0 is a real
+    # threshold). Fail-open: no reranker, an error or the timeout give the plain block.
+    # See qdrant_memory/legacy_rerank.py and docs/session-recall-prefetch.md "Legacy rerank".
+    "auto_recall_rerank": False,
+    "auto_recall_rerank_candidates": 20,
+    "auto_recall_rerank_timeout_s": 1.5,
+    "auto_recall_min_rerank_score": "off",
     "provenance_ranking_enabled": True,
     "qdrant_api_key": "",
     "embedding_api_key": "",
@@ -251,6 +261,7 @@ _BOOL_KEYS = {
     "provenance_ranking_enabled",
     "auto_recall_shadow_enabled",
     "auto_recall_exclude_machine",
+    "auto_recall_rerank",
     "session_recall_enabled",
     "session_recall_auto_index",
     "session_recall_dedup",
@@ -266,6 +277,7 @@ _INT_KEYS = {
     "embedding_max_input_chars",
     "embedding_max_chunks",
     "auto_recall_top_k",
+    "auto_recall_rerank_candidates",
     "search_candidates",
     "max_chunk_tokens",
     "display_tokens",
@@ -299,13 +311,14 @@ _INT_KEYS = {
     "capture_daily_auto_cap",
 }
 _CAPTURE_MODES = frozenset({"off", "dry_run", "on"})
-_FLOAT_KEYS = {"capture_review_expiry_days", "capture_dedupe_threshold", "session_prefetch_timeout_s", "session_recall_rerank_timeout_s", "session_recall_inline_catchup_seconds", "decay_rate", "min_raw_score", "min_final_score", "consolidation_duplicate_threshold", "guarded_auto_duplicate_min_confidence", "guarded_auto_learning_min_confidence", "reconsolidation_min_confidence", "manual_store_duplicate_threshold", "lineage_lock_timeout_seconds"}
+_FLOAT_KEYS = {"auto_recall_rerank_timeout_s", "capture_review_expiry_days", "capture_dedupe_threshold", "session_prefetch_timeout_s", "session_recall_rerank_timeout_s", "session_recall_inline_catchup_seconds", "decay_rate", "min_raw_score", "min_final_score", "consolidation_duplicate_threshold", "guarded_auto_duplicate_min_confidence", "guarded_auto_learning_min_confidence", "reconsolidation_min_confidence", "manual_store_duplicate_threshold", "lineage_lock_timeout_seconds"}
 _LIST_KEYS = {"index_dirs", "index_extensions", "index_exclude_dirs", "session_recall_exclude_sources", "capture_owner_senders"}
 # Automatic-recall relevance floors. "off" (also "", null, false) disables every one of them.
-# On the legacy floors 0 disables too (their scores are never negative); on the lane floors 0
-# is a real threshold (rerank logits and cosine can be negative).
+# On the legacy score floors 0 disables too (their scores are never negative); on the rerank
+# and cosine floors 0 is a real threshold (rerank logits and cosine can be negative).
 _LEGACY_FLOOR_KEYS = {"auto_recall_min_final_score", "auto_recall_min_raw_score"}
-_LANE_FLOOR_KEYS = {"session_prefetch_min_rerank_score", "session_prefetch_min_dense_score"}
+_LANE_FLOOR_KEYS = {"session_prefetch_min_rerank_score", "session_prefetch_min_dense_score",
+                    "auto_recall_min_rerank_score"}
 _OFF_WORDS = {"", "off", "none", "null", "false", "no", "disabled"}
 
 

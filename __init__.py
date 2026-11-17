@@ -143,6 +143,7 @@ from qdrant_memory.raptor.apply import (
 )
 from qdrant_memory.raptor.search import RaptorSearcher
 from qdrant_memory.recall_noise import NoiseFilteredRecall, SessionFactsCache, TurnNoiseFilter
+from qdrant_memory.legacy_rerank import LegacyRerankSettings, rerank_order, rerank_pool
 from qdrant_memory.hybrid.router import (
     HybridRouter,
     HybridRouteResult,
@@ -1026,6 +1027,9 @@ class QdrantMemoryProvider(MemoryProvider):
         # still being computed, or one for other words falls through to the normal
         # search + format path. A block computed for another message is never injected.
         result = ""
+        # Whether the legacy block is in rerank order (``auto_recall_rerank`` applied); the lane
+        # then leaves out what the block shows. False on a cache hit and in hybrid output.
+        legacy_reranked = False
         if queued is not None and queued.block and queued.query_key == _recall_key(query):
             # Cache hit: the queued block for these very words, used as-is.
             result = queued.block
@@ -1037,7 +1041,7 @@ class QdrantMemoryProvider(MemoryProvider):
             if not result:
                 # Hybrid fallback to legacy dense formatted result.
                 try:
-                    result = self._legacy_recall_block(query)
+                    result, legacy_reranked = self._legacy_recall(query)
                 except Exception:
                     logger.debug("Qdrant prefetch legacy fallback failed", exc_info=True)
                     result = ""
@@ -1046,7 +1050,7 @@ class QdrantMemoryProvider(MemoryProvider):
             # dense search + format path. This is the legacy behavior the
             # prompt-context contract relies on.
             try:
-                result = self._legacy_recall_block(query)
+                result, legacy_reranked = self._legacy_recall(query)
             except Exception:
                 logger.debug("Qdrant prefetch failed", exc_info=True)
                 result = ""
@@ -1075,26 +1079,47 @@ class QdrantMemoryProvider(MemoryProvider):
             except Exception:
                 logger.debug("Shadow submit failed", exc_info=True)
         if self._config.get("session_prefetch_enabled"):
-            return self._with_session_prefetch(query, session_id or self._session_id, result)
+            return self._with_session_prefetch(
+                query, session_id or self._session_id, result, shown=result if legacy_reranked else ""
+            )
         return result
 
     def _legacy_recall_block(self, query: str) -> str:
-        """The legacy auto-recall block: dense top-k, the relevance floor, the formatter.
+        """The legacy auto-recall block (see ``_legacy_recall``)."""
+        return self._legacy_recall(query)[0]
 
-        Below ``auto_recall_min_final_score`` / ``auto_recall_min_raw_score`` a memory is
-        left out; with none left the block is ``""`` (no header). With
-        ``auto_recall_exclude_machine`` the stored turns of one-shot runs and probes are left
-        out first (``qdrant_memory.recall_noise``).
+    def _legacy_recall(self, query: str) -> tuple[str, bool]:
+        """The legacy auto-recall block, and whether the reranker ordered it.
+
+        Dense top-k, the relevance floor, the formatter. Below ``auto_recall_min_final_score``
+        / ``auto_recall_min_raw_score`` a memory is left out; with none left the block is ``""``
+        (no header). With ``auto_recall_exclude_machine`` the stored turns of one-shot runs and
+        probes are left out first (``qdrant_memory.recall_noise``).
+
+        With ``auto_recall_rerank`` (``qdrant_memory.legacy_rerank``) the same search returns a
+        wider pool, which the reranker orders and ``auto_recall_min_rerank_score`` admits. The
+        reranker gets until ``auto_recall_rerank_timeout_s`` after the search started; without
+        an answer by then (or any error) the block is the one above, byte for byte: the pool's
+        first ``top_k`` are those chunks.
         """
-        chunks = self._noise_filtered(self._memory_recall() or self._retriever).search(
-            query, top_k=int(self._config["auto_recall_top_k"]), update_access=False
-        )
+        started = time.monotonic()
+        top_k = int(self._config["auto_recall_top_k"])
+        recall = self._noise_filtered(self._memory_recall() or self._retriever)
+        rerank_settings = LegacyRerankSettings.from_config(self._config)
+        pool_size = rerank_settings.candidates if rerank_settings.enabled else top_k
+        chunks = recall.search(query, top_k=pool_size, update_access=False)
+        if rerank_settings.enabled:
+            ranking = rerank_pool(query, chunks, rerank_settings, deadline=started + rerank_settings.timeout_s)
+            if ranking is not None:
+                ranked = rerank_order(chunks, ranking, top_k, rerank_settings.min_rerank_score)
+                return format_for_prompt(ranked, int(self._config["display_tokens"])), True
+            chunks = chunks[:top_k]
         chunks = above_auto_recall_floor(
             chunks,
             self._config.get("auto_recall_min_final_score"),
             self._config.get("auto_recall_min_raw_score"),
         )
-        return format_for_prompt(chunks, int(self._config["display_tokens"]))
+        return format_for_prompt(chunks, int(self._config["display_tokens"])), False
 
     def _noise_filtered(self, recall: Any) -> Any:
         """``recall`` itself when ``auto_recall_exclude_machine`` is off, else wrapped in the filter.
@@ -1109,8 +1134,10 @@ class QdrantMemoryProvider(MemoryProvider):
         widened = max(int(self._config["auto_recall_top_k"]), min(20, int(self._config.get("search_candidates", 20))))
         return NoiseFilteredRecall(recall, TurnNoiseFilter(self._turn_session_facts), widened)
 
-    def _with_session_prefetch(self, query: str, session_id: str, legacy: str) -> str:
+    def _with_session_prefetch(self, query: str, session_id: str, legacy: str, *, shown: str = "") -> str:
         """Append the session-recall lane to ``legacy``; fail-open to ``legacy`` unchanged.
+
+        ``shown`` (the reranked legacy block, else ``""``) is text the lane does not repeat.
 
         Any error, a timeout, or a previous lane call still running returns ``legacy``
         byte for byte. The lane runs on its own single worker, so a slow reranker or
@@ -1140,7 +1167,7 @@ class QdrantMemoryProvider(MemoryProvider):
                     )
                 deadline = time.monotonic() + settings.timeout_s
                 future = self._session_prefetch_executor.submit(
-                    lane.build, query, session_id, budget, deadline=deadline
+                    lane.build, query, session_id, budget, deadline=deadline, shown=shown
                 )
                 self._session_prefetch_future = future
             block = future.result(timeout=max(0.0, deadline - time.monotonic()))
@@ -1166,6 +1193,10 @@ class QdrantMemoryProvider(MemoryProvider):
             return
         query = recall_query(query)  # same rule as ``prefetch``: no block cached from host text
         if not query or too_short_for_recall(query, self._config.get("auto_recall_min_word_chars")):
+            return
+        if LegacyRerankSettings.from_config(self._config).enabled:
+            # Only an identical next message could use the block, and computing it would cost a
+            # call to the reranker the lane shares; ``prefetch`` computes it when it is needed.
             return
         sid = session_id or self._session_id or "default"
         active_mode = str(self._config.get("auto_recall_mode") or "legacy").strip().lower()

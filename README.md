@@ -539,6 +539,12 @@ qdrant_memory:
   auto_recall_min_word_chars: off
   # Leave stored turns of test harnesses and probes out of the legacy/hybrid block (docs/capture.md).
   auto_recall_exclude_machine: false
+  # Opt-in: order and admit the legacy block by the session_recall_rerank_url reranker's score
+  # (docs/session-recall-prefetch.md "Legacy rerank"). Fail-open to the plain block.
+  auto_recall_rerank: false
+  auto_recall_rerank_candidates: 20
+  auto_recall_rerank_timeout_s: 1.5
+  auto_recall_min_rerank_score: off
   search_candidates: 20
   decay_rate: 0.001
   max_chunk_tokens: 256
