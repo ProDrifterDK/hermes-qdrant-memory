@@ -814,6 +814,13 @@ class TestSafeHybridCounts:
 # ---------------------------------------------------------------------------
 
 
+def _queued(query: str, block: str):
+    """A ``queue_prefetch`` cache entry: ``block`` computed for ``query``."""
+    from __init__ import _QueuedRecall, _recall_key  # type: ignore  # noqa: PLC0415
+
+    return _QueuedRecall(_recall_key(query), block)
+
+
 def _build_provider(
     *,
     shadow_enabled: bool = False,
@@ -987,7 +994,7 @@ class TestProviderShadowEnabled:
         assert len(lines) == 0
         # And the cache was populated as a side effect of queue_prefetch.
         # With an empty chunks list the legacy format_for_prompt returns "".
-        assert provider._prefetch_cache.get("s1") == ""
+        assert provider._prefetch_cache.get("s1").block == ""
         assert "queued secret query" not in str(provider._prefetch_cache)
 
     def test_status_exposes_safe_shadow_fields(self, tmp_path):
@@ -1066,7 +1073,7 @@ class TestProviderShadowEnabled:
 
 class TestProviderCacheMissRegression:
     def test_empty_cached_value_triggers_legacy_search(self, tmp_path):
-        """Seeding ``_prefetch_cache[sid] = ""`` must be treated as a cache
+        """Seeding an empty queued block (for this very query) must be treated as a cache
         miss. The legacy dense search must run and ``format_for_prompt``
         must be invoked; the freshly formatted result is what
         ``prefetch`` returns.
@@ -1088,7 +1095,7 @@ class TestProviderCacheMissRegression:
         # Seed the cache with an empty string — the exact bug shape the
         # reviewer flagged.
         sid = "empty-cache-sid"
-        provider._prefetch_cache[sid] = ""
+        provider._prefetch_cache[sid] = _queued("some query", "")
         # Spy on retriever.search + format_for_prompt. The legacy
         # truthiness contract is "if cached: return it; else run
         # retriever.search + format_for_prompt". An empty cached value
@@ -1148,7 +1155,7 @@ class TestProviderCacheMissRegression:
             hybrid_result=FakeHybrid(),
         )
         sid = "seeded-empty-sid"
-        provider._prefetch_cache[sid] = ""
+        provider._prefetch_cache[sid] = _queued("query with empty cache", "")
         provider.prefetch("query with empty cache", session_id=sid)
         provider._executor.shutdown(wait=True)
         events_file = tmp_path / "shadow" / "shadow_events.jsonl"
@@ -1174,7 +1181,7 @@ class TestProviderCacheMissRegression:
             shadow_dir=str(tmp_path / "shadow"),
         )
         sid = "shadow-off-sid"
-        provider._prefetch_cache[sid] = ""
+        provider._prefetch_cache[sid] = _queued("shadow off query", "")
         from unittest.mock import patch as _patch
 
         with _patch(
@@ -1211,7 +1218,8 @@ class TestProviderCacheMissRegression:
         )
         sid = "nonempty-cache-sid"
         cached_text = "meaningful legacy result string"
-        provider._prefetch_cache[sid] = cached_text
+        # A queued block is a hit only for the message it was computed for.
+        provider._prefetch_cache[sid] = _queued("nonempty cache query", cached_text)
         with _patch(
             "__init__.format_for_prompt", return_value="should-not-be-called"
         ) as fmt_spy:
@@ -1252,7 +1260,7 @@ class TestProviderCacheMissRegression:
         sid = "format-empty-sid"
 
         # Simulate queue_prefetch populating cache with empty string.
-        provider._prefetch_cache[sid] = ""
+        provider._prefetch_cache[sid] = _queued("format empty cache query", "")
 
         seen_calls = {"n": 0}
 
@@ -1332,7 +1340,7 @@ class TestProviderShadowDedup:
             # queue_prefetch alone must not write a shadow.
             provider.queue_prefetch(query, session_id=sid)
             provider._executor.shutdown(wait=True)
-            assert provider._prefetch_cache.get(sid) == queue_formatted
+            assert provider._prefetch_cache.get(sid).block == queue_formatted
             # 2) Spin up a fresh executor for prefetch's shadow submit.
             from concurrent.futures import ThreadPoolExecutor
 
@@ -1610,7 +1618,7 @@ class TestShadowRaceOrder:
         assert len(lines) == 0
         # Cache is populated; the prompt-context build that *would*
         # later happen via prefetch still has not occurred.
-        assert provider._prefetch_cache.get("only-queue-sid") == ""
+        assert provider._prefetch_cache.get("only-queue-sid").block == ""
 
 
 # ---------------------------------------------------------------------------

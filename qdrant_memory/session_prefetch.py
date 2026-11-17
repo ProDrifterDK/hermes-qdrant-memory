@@ -139,6 +139,39 @@ def _norm(text: str) -> str:
     return " ".join(redact_secret_spans(str(text or "")).split())
 
 
+# A message header inside a lane entry's text (whitespace is collapsed there, so not at a line start).
+_INLINE_HEADER_RE = re.compile(r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} (?:user|assistant)\] ")
+# Shorter messages ("ok", "dale") would match inside any block; they are never dropped as shown.
+SHOWN_MIN_CHARS = 40
+
+
+def drop_shown_segments(text: str, shown: str) -> str:
+    """A lane entry's ``text`` without the messages whose whole text ``shown`` already holds.
+
+    ``shown`` is a block injected before the lane (the reranked legacy block). A message
+    shorter than ``SHOWN_MIN_CHARS`` is kept. Returns ``text`` unchanged when nothing is
+    dropped, and ``""`` when every message is.
+    """
+    shown_norm = _norm(shown)
+    if not shown_norm or not text:
+        return text
+    starts = [m.start() for m in _INLINE_HEADER_RE.finditer(text)]
+    if not starts or starts[0] != 0:
+        starts.insert(0, 0)
+    kept: list[str] = []
+    dropped = False
+    for a, b in zip(starts, starts[1:] + [len(text)]):
+        segment = text[a:b]
+        header = _INLINE_HEADER_RE.match(segment)
+        body = _norm(segment[header.end():] if header else segment)
+        if len(body) >= SHOWN_MIN_CHARS and body in shown_norm:
+            dropped = True
+            continue
+        if segment.strip():
+            kept.append(segment.strip())
+    return " ".join(kept) if dropped else text
+
+
 @dataclass
 class ActiveView:
     """What the caller's prompt holds, as far as ``state.db`` can tell."""
@@ -292,7 +325,8 @@ class SessionPrefetchLane:
         self.last_excluded: list[tuple[str, int, int]] = []
 
     def build(
-        self, query: str, session_id: str, budget_chars: int, *, before: Any = None, deadline: float | None = None
+        self, query: str, session_id: str, budget_chars: int, *, before: Any = None, deadline: float | None = None,
+        shown: str = "",
     ) -> str:
         """Search session windows with ``query`` and format what the prompt no longer holds.
 
@@ -301,19 +335,24 @@ class SessionPrefetchLane:
         whatever time the embedding and the dense search took, so a slow or sleeping
         reranker degrades to dense order that still reaches the turn. Results below the
         relevance floor are left out; when none is left the block is ``""``, not a header.
+        Messages whose text ``shown`` (a block injected before this one) already holds are
+        not repeated (``drop_shown_segments``).
         """
         if budget_chars < MIN_LANE_CHARS:
             return ""
-        entries = self.collect(query, session_id, before=before, deadline=deadline)
+        entries = self.collect(query, session_id, before=before, deadline=deadline, shown=shown)
         return format_session_block(entries[: self.settings.top_k], budget_chars, expand_hint=self.expand_hint)
 
     def collect(
-        self, query: str, session_id: str, *, before: Any = None, deadline: float | None = None, floors: bool = True
+        self, query: str, session_id: str, *, before: Any = None, deadline: float | None = None, floors: bool = True,
+        shown: str = "",
     ) -> list[_Entry]:
         """The lane's entries in rank order, each with its scores; ``build`` formats them.
 
         With ``floors=False`` the relevance floors are not applied (measurement only: the
         floors cut a suffix of the rank order, so applying them afterwards is equivalent).
+        ``shown`` is dropped from each entry after the overlap check, so applying
+        ``drop_shown_segments`` to entries collected without it is equivalent too.
         """
         if deadline is None:
             deadline = time.monotonic() + self.settings.timeout_s
@@ -374,6 +413,10 @@ class SessionPrefetchLane:
                 if not text or contains_secret(text):
                     continue
                 emitted += "\n" + _norm(text)
+                if shown:
+                    text = drop_shown_segments(text, shown)
+                    if not text:
+                        continue
                 where = "this conversation, compacted" if result.get("session_id") in chain_ids else "another session"
                 day = str(result.get("start_time") or "")[:10]
                 entries.append(_Entry(f"{where}, {day}" if day else where, msg_id, text,

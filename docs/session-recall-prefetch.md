@@ -335,6 +335,62 @@ real `prefetch` output for 41 of 41 messages.
 Not solved by a floor: a short status ping that repeats an earlier one word for word (the
 cross-encoder rates an exact phrase match high) can still recall that earlier exchange.
 
+## Legacy rerank
+
+`auto_recall_min_final_score` judges a min-max normalized score: its scale is set per search,
+so it cuts by rank inside that search. It drops answer-bearing chunks whose final score is low
+and keeps off-topic ones that happen to top a weak search. `auto_recall_rerank: true` (off by
+default) judges the legacy block with an absolute score instead: the reranker of the session
+lane (`session_recall_rerank_url`) scores a wider pool of the same search, the block is
+ordered by that score, and a chunk is admitted when it clears `auto_recall_min_rerank_score`
+(`off` admits the pool's best `auto_recall_top_k` in rerank order). A reranked chunk is judged
+by the rerank floor alone; the final and raw floors apply only when the block is not reranked.
+
+- **Pool.** `auto_recall_rerank_candidates` (default 20), never more than `search_candidates`
+  (at most 20), so the Qdrant request, the scores, the quarantine filter and
+  `auto_recall_exclude_machine` are those of the plain block. The pool's first
+  `auto_recall_top_k` chunks are exactly the plain block's candidates.
+- **What the reranker sees.** Each chunk as the block would print it (whitespace collapsed),
+  cut to the block's character cap (`max(800, display_tokens * 4)`, at most 4,000). Stored
+  conversation turns reach 12,000 characters; a reranker server with a 4,096-token context
+  rejects the whole request for one such document.
+- **Fail-open.** No reranker URL, an error, an invalid response, or no answer within
+  `auto_recall_rerank_timeout_s` (default 1.5 s, counted from the start of the legacy search)
+  gives the plain block, byte for byte, and the lane runs as without the option.
+- **Budget shared with the lane.** The two calls stay separate and sequential: the lane's
+  budget depends on the legacy block's length, and one shared call would tie the legacy
+  fallback to the lane's deadline. Characters: unchanged (the lane keeps its own cap inside
+  `session_prefetch_total_chars`). Text: when the legacy block was reranked, the lane leaves
+  out any message of 40 characters or more whose whole text the block already shows (on the
+  gate sets the production arm repeated legacy text in 3 lane entries; 0 with the option).
+  Time: the legacy call adds its own time before the lane starts.
+- **`queue_prefetch`** computes nothing while the option is on: its block would serve only an
+  identical next message, and computing it would cost one more call to the reranker the lane
+  shares.
+
+**Measured** (one install, 2026-11-16, bge-m3 with bge-reranker-v2-m3, main-profile settings:
+`display_tokens: 700`, final floor 0.05, skip under 12 word characters, lane floors -1.5 /
+0.55, both machine filters on; the C'5 gate sets (51 questions) and a 46-message noise set,
+every chunk injected on a noise message counted as off-topic). Coarse grid, fixed before the
+run: rerank floor -2, -1, 0, 1 with pools of 10 and 20.
+
+| Setting | Gate hits, legacy + lane (of 51) | Gate hits, legacy alone | Noise chars (legacy / legacy + lane) | Noise off-topic chunks (legacy / legacy + lane) | Noise messages injected (legacy + lane) |
+|---|---|---|---|---|---|
+| plain block (today) | 43 | 7 | 7,774 / 21,150 | 6 / 20 | 13 |
+| rerank, pool 10, floor 1 | 44 | 12 | 6,747 / 20,119 | 7 / 21 | 14 |
+| rerank, pool 20, floor 1 | 44 | 13 | 6,747 / 20,119 | 7 / 21 | 14 |
+| rerank, pool 20, floor 0 | 44 | 14 | 7,225 / 20,597 | 8 / 22 | 15 |
+| rerank, pool 20, floor -1 | 44 | 14 | 8,625 / 22,001 | 11 / 25 | 16 |
+
+No question answered by the plain block was lost at any point. The rerank call added 0.26 s at
+p50 and 0.66 s at p95 (0.20 s / 0.52 s measured end to end through `prefetch` with the lane).
+The reranker removed the noise injected into two longer conversational messages, but admitted
+short status pings that repeat a stored phrase word for word (scores 2 to 4.5, inside the range
+of answer-bearing chunks), so at every floor of the grid the noise set gained off-topic chunks
+and injected messages (one of each at floor 1, more below). The option therefore stays off on
+that install. The simulation of the legacy block matched the provider's own reranked block on
+the three parity questions.
+
 ## `qdrant_memory_session_expand`
 
 With `session_expand_enabled: true` the tool joins the `full` and `recall` surfaces.
@@ -373,6 +429,10 @@ the tool only on profiles that may read the whole local conversation history.
 | `auto_recall_min_raw_score` | `off` | Legacy block floor on raw cosine. |
 | `auto_recall_min_word_chars` | `off` | Shorter messages skip automatic recall (legacy, hybrid and lane). |
 | `auto_recall_exclude_machine` | `false` | Legacy block and hybrid dense lane: leave out stored conversation turns of one-shot runs, and of pruned sessions whose text is a scripted exact-reply check; turns of delegated and subagent sessions are kept. See docs/capture.md "Legacy-recall filter". `c5_gate_harness.py --legacy-exclude-machine` measures it. |
+| `auto_recall_rerank` | `false` | Order and admit the legacy block by the reranker's score (see "Legacy rerank"). Needs `session_recall_rerank_url`. |
+| `auto_recall_rerank_candidates` | `20` | Legacy chunks sent to the reranker; never more than `search_candidates` (at most 20). |
+| `auto_recall_rerank_timeout_s` | `1.5` | Deadline from the start of the legacy search; past it the plain block is used. |
+| `auto_recall_min_rerank_score` | `off` | Legacy floor on the rerank score (`0` is a real threshold; model-specific). |
 | `session_expand_enabled` | `false` | Register `qdrant_memory_session_expand`. |
 
 ## Measurement (gate C'5)
